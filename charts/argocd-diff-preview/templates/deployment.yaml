@@ -1,0 +1,76 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "argocd-diff-preview.fullname" . }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "argocd-diff-preview.labels" . | nindent 4 }}
+  annotations:
+    cops.appspace.com/ticket: COPS-2498
+    # Restart pod when argocd-diff-preview-creds Secret changes (ESO rotation).
+    reloader.stakater.com/auto: "true"
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      {{- include "argocd-diff-preview.selectorLabels" . | nindent 6 }}
+  strategy:
+    # Recreate prevents two instances running concurrently and racing on _seen.
+    type: Recreate
+  template:
+    metadata:
+      labels:
+        {{- include "argocd-diff-preview.selectorLabels" . | nindent 8 }}
+    spec:
+      serviceAccountName: {{ include "argocd-diff-preview.fullname" . }}
+      terminationGracePeriodSeconds: 60
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65534
+        runAsGroup: 65534
+      containers:
+        - name: diff-preview
+          image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          # Code is in the image at /app/diff_preview.py — no ConfigMap mount needed.
+          command: ["python3", "/app/diff_preview.py"]
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: [ALL]
+          env:
+            # argocd login writes ~/.argocd/config. HOME=/tmp redirects to emptyDir.
+            - name: HOME
+              value: /tmp
+          envFrom:
+            - secretRef:
+                name: {{ include "argocd-diff-preview.fullname" . }}-creds
+          ports:
+            - containerPort: {{ .Values.service.port }}
+              name: health
+              protocol: TCP
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: {{ .Values.service.port }}
+            initialDelaySeconds: 60
+            periodSeconds: 60
+            failureThreshold: 5
+            timeoutSeconds: 5
+          readinessProbe:
+            httpGet:
+              path: /readyz
+              port: {{ .Values.service.port }}
+            initialDelaySeconds: 30
+            periodSeconds: 30
+            failureThreshold: 3
+            timeoutSeconds: 10
+          volumeMounts:
+            - name: tmp
+              mountPath: /tmp
+          resources:
+            {{- toYaml .Values.resources | nindent 12 }}
+      volumes:
+        - name: tmp
+          emptyDir: {}

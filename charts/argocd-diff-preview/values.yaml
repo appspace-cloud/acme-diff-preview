@@ -1,0 +1,66 @@
+# Default values for argocd-diff-preview.
+# Override in acme-infrastructure helm_releases block.
+
+# Use fullnameOverride to keep resource names stable regardless of release name.
+# The ArgoCD Ingress extraPaths hardcodes "argocd-diff-preview" as the Service name.
+fullnameOverride: "argocd-diff-preview"
+
+image:
+  repository: ghcr.io/appspace-cloud/acme-diff-preview
+  tag: "1.1.0"
+  pullPolicy: IfNotPresent
+
+# ArgoCD server (hub cluster ingress)
+argocd:
+  server: argocd.appspace.com
+
+# Bitbucket Cloud repository to watch for open PRs
+bitbucket:
+  workspace: appspace-cloud
+  repo: acme-config-dev
+
+# Vertex AI for diff summaries (COPS-2496)
+vertex:
+  project: appspace-devops
+  location: us-central1
+  model: gemini-2.5-flash
+
+# External Secrets Operator — ClusterSecretStore used to pull credentials
+secrets:
+  externalSecretStore: argocd-gcp-sm
+  # GCP Secret Manager secret names (keys in the store)
+  bbUserKey: argocd-diff-preview-bb-user
+  bbTokenKey: argocd-diff-preview-bb-token
+  argocdPassKey: argocd-diff-preview-admin-pass
+
+# Webhook endpoint exposed via the ArgoCD Ingress extraPaths
+webhook:
+  path: /diff-preview/webhook
+
+# NodePort Service — exposes port 8080 for the GKE Ingress backend
+service:
+  type: NodePort
+  port: 8080
+
+# ServiceAccount — WIF annotation maps to argocd@appspace-devops GSA
+serviceAccount:
+  annotations:
+    iam.gke.io/gcp-service-account: argocd@appspace-devops.iam.gserviceaccount.com
+
+# Deployment resource requests / limits
+resources:
+  requests:
+    cpu: 150m
+    memory: 128Mi
+  limits:
+    memory: 512Mi
+
+# Hard-refresh CronJob — hard-refreshes all dev/QA apps every 2 hours
+hardRefresh:
+  schedule: "0 */2 * * *"
+  resources:
+    requests:
+      cpu: 50m
+      memory: 128Mi
+    limits:
+      memory: 256Mi

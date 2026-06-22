@@ -1,0 +1,18 @@
+apiVersion: v2
+name: argocd-diff-preview
+description: ArgoCD Diff Preview — posts Kubernetes manifest diffs as Bitbucket PR comments with AI-generated summaries via Vertex AI Gemini.
+type: application
+version: 1.0.0
+appVersion: "1.1.0"
+home: https://github.com/appspace-cloud/acme-diff-preview
+sources:
+  - https://github.com/appspace-cloud/acme-diff-preview
+maintainers:
+  - name: Appspace CloudOps
+    url: https://github.com/appspace-cloud
+keywords:
+  - argocd
+  - gitops
+  - diff-preview
+  - bitbucket
+kubeVersion: ">=1.28.0-0"

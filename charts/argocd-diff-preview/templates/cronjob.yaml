@@ -1,0 +1,52 @@
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: argocd-dev-hard-refresh
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "argocd-diff-preview.labels" . | nindent 4 }}
+    component: argocd-dev-hard-refresh
+spec:
+  schedule: {{ .Values.hardRefresh.schedule | quote }}
+  concurrencyPolicy: Forbid
+  successfulJobsHistoryLimit: 2
+  failedJobsHistoryLimit: 3
+  jobTemplate:
+    spec:
+      template:
+        spec:
+          serviceAccountName: {{ include "argocd-diff-preview.fullname" . }}
+          restartPolicy: OnFailure
+          securityContext:
+            runAsNonRoot: true
+            runAsUser: 65534
+            runAsGroup: 65534
+          containers:
+            - name: hard-refresh
+              image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"
+              imagePullPolicy: {{ .Values.image.pullPolicy }}
+              # Uses ARGOCD_ADMIN_PASS from ESO secret — no gcloud at runtime.
+              command: ["/bin/sh", "-c"]
+              args:
+                - |
+                  set -euo pipefail
+                  ARGOCD_SERVER="{{ .Values.argocd.server }}"
+                  argocd login "$ARGOCD_SERVER" \
+                    --username admin \
+                    --password "$ARGOCD_ADMIN_PASS" \
+                    --grpc-web --insecure
+                  python3 /app/dev_hard_refresh.py
+              env:
+                - name: HOME
+                  value: /tmp
+              envFrom:
+                - secretRef:
+                    name: {{ include "argocd-diff-preview.fullname" . }}-creds
+              volumeMounts:
+                - name: tmp
+                  mountPath: /tmp
+              resources:
+                {{- toYaml .Values.hardRefresh.resources | nindent 16 }}
+          volumes:
+            - name: tmp
+              emptyDir: {}

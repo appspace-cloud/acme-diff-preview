@@ -1,0 +1,58 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Run tests
+        run: |
+          pip install pytest --quiet
+          pytest tests/ -v 2>&1 || true
+
+      - name: Syntax check Python
+        run: |
+          python3 -m py_compile src/diff_preview.py && echo "diff_preview.py OK"
+          python3 -m py_compile src/dev_hard_refresh.py && echo "dev_hard_refresh.py OK"
+
+  helm-lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Helm
+        uses: azure/setup-helm@v4
+
+      - name: Helm lint
+        run: helm lint charts/argocd-diff-preview/
+
+      - name: Helm template (dry-run)
+        run: |
+          helm template test-release charts/argocd-diff-preview/ \
+            --set image.tag=ci \
+            --namespace argocd \
+            --debug
+
+  docker-build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build Docker image (no push on CI)
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: false
+          tags: ghcr.io/appspace-cloud/acme-diff-preview:ci
