@@ -6,7 +6,7 @@
 fullnameOverride: "argocd-diff-preview"
 
 image:
-  repository: ghcr.io/appspace-cloud/acme-diff-preview
+  repository: us-central1-docker.pkg.dev/appspace-devops/artifact/acme-diff-preview
   tag: "1.1.0"
   pullPolicy: IfNotPresent
 
