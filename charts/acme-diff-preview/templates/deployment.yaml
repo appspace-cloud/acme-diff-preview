@@ -1,28 +1,28 @@
 apiVersion: apps/v1
 kind: Deployment
 metadata:
-  name: {{ include "argocd-diff-preview.fullname" . }}
+  name: {{ include "acme-diff-preview.fullname" . }}
   namespace: {{ .Release.Namespace }}
   labels:
-    {{- include "argocd-diff-preview.labels" . | nindent 4 }}
+    {{- include "acme-diff-preview.labels" . | nindent 4 }}
   annotations:
     cops.appspace.com/ticket: COPS-2498
-    # Restart pod when argocd-diff-preview-creds Secret changes (ESO rotation).
+    # Restart pod when acme-diff-preview-creds Secret changes (ESO rotation).
     reloader.stakater.com/auto: "true"
 spec:
   replicas: 1
   selector:
     matchLabels:
-      {{- include "argocd-diff-preview.selectorLabels" . | nindent 6 }}
+      {{- include "acme-diff-preview.selectorLabels" . | nindent 6 }}
   strategy:
     # Recreate prevents two instances running concurrently and racing on _seen.
     type: Recreate
   template:
     metadata:
       labels:
-        {{- include "argocd-diff-preview.selectorLabels" . | nindent 8 }}
+        {{- include "acme-diff-preview.selectorLabels" . | nindent 8 }}
     spec:
-      serviceAccountName: {{ include "argocd-diff-preview.fullname" . }}
+      serviceAccountName: {{ include "acme-diff-preview.fullname" . }}
       terminationGracePeriodSeconds: 60
       securityContext:
         runAsNonRoot: true
@@ -45,7 +45,7 @@ spec:
               value: /tmp
           envFrom:
             - secretRef:
-                name: {{ include "argocd-diff-preview.fullname" . }}-creds
+                name: {{ include "acme-diff-preview.fullname" . }}-creds
           ports:
             - containerPort: {{ .Values.service.port }}
               name: health

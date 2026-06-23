@@ -20,14 +20,14 @@ acme-diff-preview/
 ├── tests/
 │   └── test_diff_preview.py    Unit tests (syntax, key functions, no-gcloud)
 ├── charts/
-│   └── argocd-diff-preview/    Helm chart — all Kubernetes resources
+│   └── acme-diff-preview/      Helm chart — all Kubernetes resources
 │       ├── Chart.yaml          version: 1.0.0, appVersion: "1.1.0"
 │       ├── values.yaml         All tuneable parameters with defaults
 │       └── templates/
 │           ├── deployment.yaml      Long-running diff-preview service
 │           ├── service.yaml         NodePort :8080 for ArgoCD Ingress backend
 │           ├── serviceaccount.yaml  WIF annotation → argocd@appspace-devops GSA
-│           ├── externalsecret.yaml  ESO → argocd-diff-preview-creds K8s Secret
+│           ├── externalsecret.yaml  ESO → acme-diff-preview-creds K8s Secret
 │           └── cronjob.yaml         Hard-refresh, runs every 2h
 ├── Dockerfile                  python:3.12-slim + argocd CLI v3.4.3
 └── .github/workflows/

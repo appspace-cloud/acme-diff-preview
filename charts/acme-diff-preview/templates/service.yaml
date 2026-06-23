@@ -1,14 +1,14 @@
 apiVersion: v1
 kind: Service
 metadata:
-  name: {{ include "argocd-diff-preview.fullname" . }}
+  name: {{ include "acme-diff-preview.fullname" . }}
   namespace: {{ .Release.Namespace }}
   labels:
-    {{- include "argocd-diff-preview.labels" . | nindent 4 }}
+    {{- include "acme-diff-preview.labels" . | nindent 4 }}
 spec:
   type: {{ .Values.service.type }}
   selector:
-    {{- include "argocd-diff-preview.selectorLabels" . | nindent 4 }}
+    {{- include "acme-diff-preview.selectorLabels" . | nindent 4 }}
   ports:
     - port: {{ .Values.service.port }}
       targetPort: {{ .Values.service.port }}
