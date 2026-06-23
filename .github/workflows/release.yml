@@ -10,43 +10,10 @@ env:
   IMAGE_NAME: acme-diff-preview
 
 jobs:
-  docker:
-    runs-on: ubuntu-latest
-    permissions:
-      contents: read
-    outputs:
-      image_tag: ${{ steps.meta.outputs.version }}
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: Extract version from tag
-        id: meta
-        run: |
-          VERSION=${GITHUB_REF_NAME#v}
-          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
-          echo "Building version: $VERSION"
-
-      - name: Log in to JFrog
-        uses: docker/login-action@v3
-        with:
-          registry: ${{ env.JFROG_REGISTRY }}
-          username: ${{ secrets.JFROG_USER }}
-          password: ${{ secrets.JFROG_PASSWORD }}
-
-      - name: Build and push to JFrog
-        uses: docker/build-push-action@v6
-        with:
-          context: .
-          push: true
-          tags: |
-            ${{ env.JFROG_REGISTRY }}/${{ env.IMAGE_NAME }}:${{ steps.meta.outputs.version }}
-            ${{ env.JFROG_REGISTRY }}/${{ env.IMAGE_NAME }}:latest
-          build-args: |
-            ARGOCD_VERSION=v3.4.3
-
+  # Publishes the Helm chart to GitHub Pages via chart-releaser-action.
+  # Runs independently so chart releases work even when Docker push is unavailable.
   helm-chart:
     runs-on: ubuntu-latest
-    needs: docker
     permissions:
       contents: write
       pages: write
@@ -71,3 +38,41 @@ jobs:
           skip_existing: true
         env:
           CR_TOKEN: "${{ secrets.GITHUB_TOKEN }}"
+
+  # Builds and pushes the Docker image to JFrog Artifactory.
+  # NOTE: Requires the GitHub Actions runner to have network access to
+  # docker-dev.repo.appspace.com. If JFrog IP restrictions block GitHub-hosted
+  # runners, run this job manually from a machine on the appspace network:
+  #   docker build -t docker-dev.repo.appspace.com/acme-diff-preview:<version> .
+  #   docker push docker-dev.repo.appspace.com/acme-diff-preview:<version>
+  docker:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Extract version from tag
+        id: meta
+        run: |
+          VERSION=${GITHUB_REF_NAME#v}
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+
+      - name: Log in to JFrog
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.JFROG_REGISTRY }}
+          username: ${{ secrets.JFROG_USER }}
+          password: ${{ secrets.JFROG_PASSWORD }}
+
+      - name: Build and push to JFrog
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: true
+          tags: |
+            ${{ env.JFROG_REGISTRY }}/${{ env.IMAGE_NAME }}:${{ steps.meta.outputs.version }}
+            ${{ env.JFROG_REGISTRY }}/${{ env.IMAGE_NAME }}:latest
+          build-args: |
+            ARGOCD_VERSION=v3.4.3
