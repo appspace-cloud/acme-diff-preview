@@ -73,6 +73,5 @@ jobs:
           push: true
           tags: |
             ${{ env.JFROG_REGISTRY }}/${{ env.IMAGE_NAME }}:${{ steps.meta.outputs.version }}
-            ${{ env.JFROG_REGISTRY }}/${{ env.IMAGE_NAME }}:latest
           build-args: |
             ARGOCD_VERSION=v3.4.3
