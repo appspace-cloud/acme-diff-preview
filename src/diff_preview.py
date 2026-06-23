@@ -329,11 +329,27 @@ def argocd_diff(app, pr_sha):
         )
         return diff_text, True, None
     err_out = (r.stderr or r.stdout or "unknown error")
-    # Apps on skip-reconcile clusters (argocd-agent managed mode) route through
-    # the resource proxy, which does not expose full K8s API. These errors are
-    # expected and should be treated as no-diff, not fatal errors.
+
+    # "error getting cached app managed resources" appears in two distinct cases:
+    #
+    # A) ArgoCD-agent managed-mode cluster: the resource proxy does not expose
+    #    the full K8s API so ArgoCD cannot list managed resources. This is an
+    #    expected structural limitation — treat as no-diff (silent, no comment).
+    #
+    # B) Redis i/o timeout: the ArgoCD hub cannot reach the spoke Redis cache.
+    #    This is a TRANSIENT infrastructure failure. We must NOT report it as
+    #    no-diff because the PR may have real changes we cannot determine yet.
+    #    Report as error so the retry logic fires on the next iteration.
+    if "error getting cached app managed resources" in err_out:
+        if "i/o timeout" in err_out or "connection refused" in err_out:
+            # Case B — Redis infrastructure failure, diff indeterminate
+            return "", False, f"Redis timeout — could not determine diff: {err_out[:300]}"
+        # Case A — managed-mode cluster, resource proxy limitation (expected)
+        return "", False, None
+
+    # Other errors produced by argocd-agent managed-mode or transient infra issues.
+    # These are expected and should be treated as no-diff, not fatal errors.
     MANAGED_MODE_ERRORS = [
-        "error getting cached app managed resources",
         "error getting server version",
         "the server is not currently accepting requests",
         "rpc error: code = PermissionDenied",
@@ -913,8 +929,14 @@ def process_pr(pr, path_map):
         else:
             post_build_status(pr_sha, "SUCCESSFUL", "No manifest changes")
 
-        with _seen_lock:
-            _seen[pr_id] = pr_sha
+        # Only mark as seen when the run was fully clean (no errors).
+        # If any app had a transient error (Redis timeout, auth failure, etc.)
+        # we leave _seen empty for this PR so the next iteration retries it.
+        # The existing-comment retry logic (find_existing_comment -> ❌ check)
+        # will then pick it up and re-run the diff automatically.
+        if not any_error:
+            with _seen_lock:
+                _seen[pr_id] = pr_sha
 
     except Exception as e:
         print(f"    [ERROR] PR #{pr_id}: {e}", file=sys.stderr)
@@ -978,7 +1000,7 @@ def main_iteration():
     # Evict _seen entries for PRs no longer open. Without this, a PR that
     # is declined and immediately reopened with the same SHA would be silently
     # skipped because the old SHA is still in _seen.
-    open_ids = {str(pr["id"]) for pr in prs}
+    open_ids = {pr["id"] for pr in prs}
     for stale_id in list(_seen.keys()):
         if stale_id not in open_ids:
             del _seen[stale_id]
