@@ -7,7 +7,7 @@ fullnameOverride: "argocd-diff-preview"
 
 image:
   repository: us-central1-docker.pkg.dev/appspace-devops/artifact/acme-diff-preview
-  tag: "1.2.1"
+  tag: "1.2.2"
   pullPolicy: IfNotPresent
 
 # ArgoCD server (hub cluster ingress)

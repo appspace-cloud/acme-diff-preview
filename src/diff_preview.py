@@ -36,7 +36,7 @@ BUILD_KEY          = "argocd-diff-preview"
 MAX_RESOURCES_FULL = 5       # resources shown with full diff block
 MAX_DIFF_CHARS     = 2000    # chars per resource diff block
 MAX_APPS_PER_RUN   = 30      # safety cap
-DIFF_WORKERS       = 4       # parallel argocd app diff calls
+DIFF_WORKERS       = 3       # parallel argocd app diff calls (reduced to limit gRPC load on ArgoCD)
 MAX_COMMENT_BYTES  = 245_000 # Bitbucket ~256KB limit; leave headroom
 
 # In-memory SHA dedup: avoids reprocessing same PR SHA within this pod run
@@ -296,25 +296,113 @@ def _filter_diff_sections(sections: list) -> list:
         result.append((header, body))
     return result
 
-def argocd_diff(app, pr_sha):
-    """Returns (diff_text, has_diff, error_msg). Never raises.
+# Errors that are worth retrying quickly — they typically resolve within 2-5s.
+# - i/o timeout: spoke Redis temporarily unreachable via argocd-agent-redis-proxy
+# - connection refused: transient connectivity blip to ArgoCD server or proxy
+# - context deadline exceeded: short deadline expired, usually recovers fast
+_RETRYABLE_DIFF_ERRORS = (
+    "i/o timeout",
+    "connection refused",
+    "context deadline exceeded",
+)
 
-    Exit codes: 0=no diff, 1=diff found (or auth error with empty stdout),
-    2+=error. Timeout raises TimeoutExpired, caught here.
+# Auth-failure patterns that should trigger an ArgoCD re-login.
+_AUTH_ERROR_PATTERNS = (
+    "invalid session",
+    "token has expired",
+    "token is expired",
+    "unauthenticated",
+    "unauthorized",
+)
+
+def _async_relogin():
+    """Re-login to ArgoCD in a background thread when auth errors are detected.
+
+    Called when argocd app diff returns exit 1 with an auth failure message.
+    The JWT token may have expired (default ArgoCD expiry: 24h). Re-logging
+    in the background means the NEXT diff call will pick up a fresh session
+    without blocking the current iteration.
     """
+    try:
+        argocd_login()
+        print("  [auth] background re-login succeeded", flush=True)
+    except Exception as e:
+        print(f"  [auth] background re-login failed: {e}", flush=True)
+
+
+def _run_one_diff(app, pr_sha):
+    """Single subprocess call. Returns (proc, timed_out)."""
     try:
         r = subprocess.run(
             [ARGOCD_BIN, "app", "diff", app,
              "--revisions", pr_sha, "--source-positions", "1"] + _auth_flags(),
-            capture_output=True, text=True, timeout=120)
+            capture_output=True, text=True, timeout=60)
+        return r, False
     except subprocess.TimeoutExpired:
-        return "", False, "diff timed out after 120s"
-    if r.returncode == 0:
-        return "", False, None
-    if r.returncode == 1:
-        if not r.stdout and r.stderr:
-            # Exit 1 with only stderr = auth/rendering error, not a diff
-            return "", False, r.stderr[:400]
+        return None, True
+
+
+def argocd_diff(app, pr_sha):
+    """Returns (diff_text, has_diff, error_msg). Never raises.
+
+    Exit codes: 0=no diff, 1=diff found (or auth error with empty stdout),
+    2+=error.
+
+    Retry policy:
+      - Fast retryable errors (i/o timeout, connection refused, context deadline):
+        one immediate retry after a 3s pause. This makes brief spoke-Redis hiccups
+        (2-5s) transparent to the user without waiting for the next 60s loop.
+      - Persistent errors: reported via error_msg so the cross-iteration retry fires.
+      - Command timeout (60s): not retried per-diff; let cross-iteration handle it.
+    """
+    for attempt in range(2):
+        r, timed_out = _run_one_diff(app, pr_sha)
+        if timed_out:
+            return "", False, "diff timed out after 60s"
+        if r.returncode == 0:
+            return "", False, None
+        if r.returncode == 1:
+            if not r.stdout and r.stderr:
+                # Auth error: trigger re-login so the next diff call succeeds.
+                err_text = r.stderr[:400]
+                if any(p in err_text.lower() for p in _AUTH_ERROR_PATTERNS):
+                    threading.Thread(target=_async_relogin, daemon=True).start()
+                return "", False, err_text
+
+        if r.returncode >= 2:
+            err_out = (r.stderr or r.stdout or "unknown error")
+
+            # Retryable fast errors — brief spoke-Redis or connectivity hiccup.
+            if attempt == 0 and any(p in err_out for p in _RETRYABLE_DIFF_ERRORS):
+                print(f"    [{app}] transient error on attempt 1, retrying in 3s: "
+                      f"{err_out[:80]}", flush=True)
+                time.sleep(3)
+                continue  # → attempt 1 (the second and final attempt)
+
+            # "error getting cached app managed resources" — two distinct cases:
+            if "error getting cached app managed resources" in err_out:
+                if "i/o timeout" in err_out or "connection refused" in err_out:
+                    # Spoke Redis unreachable (persisted past retry) — diff indeterminate.
+                    return "", False, f"Redis timeout — could not determine diff: {err_out[:300]}"
+                # True managed-mode (argocd-agent resource proxy limitation) — expected.
+                return "", False, None
+
+            # Other managed-mode / transient errors treated as silent no-diff.
+            MANAGED_MODE_ERRORS = [
+                "error getting server version",
+                "the server is not currently accepting requests",
+                "rpc error: code = PermissionDenied",
+                "permission denied",
+                "context canceled",
+                "code = Canceled",
+                "502",
+                "code = Unknown desc = POST",
+            ]
+            if any(e in err_out for e in MANAGED_MODE_ERRORS):
+                return "", False, None
+            return "", False, err_out[:400]
+
+        # returncode == 1 with stdout (actual diff output) — fall through.
         # Apply section filter: remove micro-versions-info and checksum-only
         # noise before the diff reaches both the comment and the AI analysis.
         raw = r.stdout
@@ -328,40 +416,9 @@ def argocd_diff(app, pr_sha):
             for hdr, body in filtered_sections
         )
         return diff_text, True, None
-    err_out = (r.stderr or r.stdout or "unknown error")
+    # Should not be reached — loop always returns or continues.
+    return "", False, "unexpected: argocd_diff loop exhausted"
 
-    # "error getting cached app managed resources" appears in two distinct cases:
-    #
-    # A) ArgoCD-agent managed-mode cluster: the resource proxy does not expose
-    #    the full K8s API so ArgoCD cannot list managed resources. This is an
-    #    expected structural limitation — treat as no-diff (silent, no comment).
-    #
-    # B) Redis i/o timeout: the ArgoCD hub cannot reach the spoke Redis cache.
-    #    This is a TRANSIENT infrastructure failure. We must NOT report it as
-    #    no-diff because the PR may have real changes we cannot determine yet.
-    #    Report as error so the retry logic fires on the next iteration.
-    if "error getting cached app managed resources" in err_out:
-        if "i/o timeout" in err_out or "connection refused" in err_out:
-            # Case B — Redis infrastructure failure, diff indeterminate
-            return "", False, f"Redis timeout — could not determine diff: {err_out[:300]}"
-        # Case A — managed-mode cluster, resource proxy limitation (expected)
-        return "", False, None
-
-    # Other errors produced by argocd-agent managed-mode or transient infra issues.
-    # These are expected and should be treated as no-diff, not fatal errors.
-    MANAGED_MODE_ERRORS = [
-        "error getting server version",
-        "the server is not currently accepting requests",
-        "rpc error: code = PermissionDenied",
-        "permission denied",
-        "context canceled",
-        "code = Canceled",
-        "502",
-        "code = Unknown desc = POST",
-    ]
-    if any(e in err_out for e in MANAGED_MODE_ERRORS):
-        return "", False, None
-    return "", False, err_out[:400]
 
 def parse_diff_sections(diff_text):
     """Parse ArgoCD diff output into [(header, body)] list.

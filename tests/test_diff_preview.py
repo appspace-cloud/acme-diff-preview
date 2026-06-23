@@ -130,3 +130,76 @@ def test_managed_mode_errors_list_intact():
         assert pattern in src, (
             f"REGRESSION: managed-mode error pattern missing: {pattern!r}"
         )
+
+
+# ── Retry and resilience tests ───────────────────────────────────────────────
+
+def test_retryable_diff_errors_defined():
+    """_RETRYABLE_DIFF_ERRORS must cover the known transient spoke-Redis patterns."""
+    src = _source()
+    assert "_RETRYABLE_DIFF_ERRORS" in src, "Missing _RETRYABLE_DIFF_ERRORS constant"
+    for pattern in ("i/o timeout", "connection refused", "context deadline exceeded"):
+        assert pattern in src, f"Retryable pattern missing: {pattern!r}"
+
+
+def test_auth_error_patterns_defined():
+    """_AUTH_ERROR_PATTERNS must cover known JWT expiry messages."""
+    src = _source()
+    assert "_AUTH_ERROR_PATTERNS" in src, "Missing _AUTH_ERROR_PATTERNS constant"
+    for pattern in ("invalid session", "token has expired", "unauthenticated"):
+        assert pattern in src, f"Auth pattern missing: {pattern!r}"
+
+
+def test_async_relogin_function_exists():
+    """_async_relogin must be present for background JWT refresh on auth errors."""
+    src = _source()
+    assert "def _async_relogin" in src, "Missing _async_relogin helper"
+    assert "argocd_login()" in src, "_async_relogin must call argocd_login()"
+
+
+def test_diff_timeout_reduced():
+    """Per-attempt diff timeout must be 60s not 120s.
+
+    120s was too long — a diff command that hasn't finished in 60s is unlikely
+    to succeed. Shorter timeout means faster failure detection and faster retries.
+    """
+    src = _source()
+    assert "timeout=60" in src, "Per-attempt diff timeout must be 60s"
+    assert "timeout=120" not in src, (
+        "REGRESSION: 120s timeout still present — must use 60s per attempt"
+    )
+
+
+def test_diff_workers_reduced():
+    """DIFF_WORKERS must be 3, not 4.
+
+    Reduced to limit concurrent gRPC connections to ArgoCD server under load.
+    With MAX_PR_WORKERS=3: max concurrent diffs = 3 * 3 = 9 (down from 12).
+    """
+    src = _source()
+    assert "DIFF_WORKERS       = 3" in src, (
+        "DIFF_WORKERS must be 3 to limit concurrent ArgoCD gRPC load"
+    )
+
+
+def test_retry_loop_in_argocd_diff():
+    """argocd_diff must use a retry loop, not a single subprocess call."""
+    src = _source()
+    # The loop exists
+    assert "for attempt in range(2):" in src, (
+        "argocd_diff must use 'for attempt in range(2)' retry loop"
+    )
+    # Retry on transient errors
+    assert "retrying in 3s" in src, (
+        "Retry log message missing — 3s backoff between attempts"
+    )
+    # argocd_diff loop is exactly 2 attempts
+    # (range(3) at file level is the Bitbucket http() helper, separate function)
+    fn_start = src.index("def argocd_diff(")
+    fn_end   = src.index("\ndef parse_diff_sections", fn_start)
+    fn_body  = src[fn_start:fn_end]
+    import re
+    loops = re.findall(r"for attempt in range\((\d+)\)", fn_body)
+    assert loops and int(loops[0]) == 2, (
+        f"argocd_diff retry loop must be 2 attempts, found: {loops}"
+    )
