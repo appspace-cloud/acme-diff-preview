@@ -6,9 +6,6 @@ on:
       - 'v*'
 
 env:
-  # JFrog Docker registry (source of truth for images).
-  # GKE clusters pull via the GAR remote proxy:
-  #   us-central1-docker.pkg.dev/appspace-devops/artifact/<name>:<tag>
   JFROG_REGISTRY: docker-dev.repo.appspace.com
   IMAGE_NAME: acme-diff-preview
 
@@ -52,6 +49,8 @@ jobs:
     needs: docker
     permissions:
       contents: write
+      pages: write
+      id-token: write
     steps:
       - uses: actions/checkout@v4
         with:
