@@ -40,6 +40,8 @@ spec:
             capabilities:
               drop: [ALL]
           env:
+            - name: ARGOCD_USER
+              value: {{ .Values.argocd.username | quote }}
             # argocd login writes ~/.argocd/config. HOME=/tmp redirects to emptyDir.
             - name: HOME
               value: /tmp

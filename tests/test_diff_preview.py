@@ -50,6 +50,16 @@ def test_no_gcloud_calls():
     assert "gcloud" not in _source()
 
 
+def test_dedicated_argocd_account():
+    """Must use dedicated diff-preview local account, not the global admin user."""
+    src = _source()
+    assert "ARGOCD_PASS" in src
+    assert "ARGOCD_ADMIN_PASS" not in src
+    assert "ARGOCD_USER" in src
+    assert '--username", "admin"' not in src
+    assert '--username", ARGOCD_USER' in src
+
+
 # ── Bug-regression tests ─────────────────────────────────────────────────────
 
 def test_seen_eviction_uses_integer_ids():

@@ -36,11 +36,11 @@ jobs:
         uses: azure/setup-helm@v5.0.0
 
       - name: Helm lint
-        run: helm lint charts/argocd-diff-preview/
+        run: helm lint charts/acme-diff-preview/
 
       - name: Helm template (dry-run)
         run: |
-          helm template test-release charts/argocd-diff-preview/ \
+          helm template test-release charts/acme-diff-preview/ \
             --set image.tag=ci \
             --namespace argocd \
             --debug

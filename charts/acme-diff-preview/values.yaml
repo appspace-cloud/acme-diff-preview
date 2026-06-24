@@ -7,12 +7,13 @@ fullnameOverride: "acme-diff-preview"
 
 image:
   repository: us-central1-docker.pkg.dev/appspace-devops/artifact/acme-diff-preview
-  tag: "1.2.2"
+  tag: "1.3.0"
   pullPolicy: IfNotPresent
 
 # ArgoCD server (hub cluster ingress)
 argocd:
   server: argocd.appspace.com
+  username: diff-preview
 
 # Bitbucket Cloud repository to watch for open PRs
 bitbucket:
@@ -31,7 +32,7 @@ secrets:
   # GCP Secret Manager secret names (keys in the store)
   bbUserKey: acme-diff-preview-bb-user
   bbTokenKey: acme-diff-preview-bb-token
-  argocdPassKey: acme-diff-preview-admin-pass
+  argocdPassKey: argocd-diff-preview-admin-pass
 
 # Webhook endpoint exposed via the ArgoCD Ingress extraPaths
 webhook:
