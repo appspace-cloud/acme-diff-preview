@@ -212,8 +212,10 @@ def _jfrog_hard_refresh(chart_name: str, chart_version: str) -> None:
         log(f"JFrog webhook: malformed app list JSON: {exc}", "ERROR")
         return
 
+    # argocd app list -o json returns a JSON array directly (not {"items": [...]})
+    apps = data if isinstance(data, list) else data.get("items", [])
     matching = []
-    for app in data.get("items", []):
+    for app in apps:
         for src_entry in app["spec"].get("sources", []):
             if (src_entry.get("chart") == chart_name
                     and src_entry.get("targetRevision") == chart_version):
