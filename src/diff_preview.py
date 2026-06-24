@@ -30,8 +30,13 @@ BB_USER            = os.environ["BB_USER"]
 BB_TOKEN           = os.environ["BB_TOKEN"]
 ARGOCD_SERVER      = "argocd.appspace.com"
 ARGOCD_BIN         = os.environ.get("ARGOCD_BIN", "/usr/local/bin/argocd")
-ARGOCD_USER        = os.environ.get("ARGOCD_USER", "diff-preview")
-ARGOCD_PASS        = os.environ["ARGOCD_PASS"]
+# Configurable via environment variables — set via ExternalSecret.
+ARGOCD_USER          = os.environ.get("ARGOCD_USER", "diff-preview")
+ARGOCD_PASS          = os.environ["ARGOCD_PASS"]
+# Comma-separated list of ArgoCD projects the webhook hard-refresh targets.
+ARGOCD_PROJECTS      = os.environ.get("ARGOCD_PROJECTS", "appspace-dev,appspace-qa").split(",")
+# HMAC-SHA256 key for verifying incoming JFrog webhook requests.
+JFROG_WEBHOOK_SECRET = os.environ.get("JFROG_WEBHOOK_SECRET", "")
 COMMENT_MARKER     = "argocd-diff-preview"
 BUILD_KEY          = "argocd-diff-preview"
 MAX_RESOURCES_FULL = 5       # resources shown with full diff block
@@ -112,6 +117,7 @@ class _HealthHandler(BaseHTTPRequestHandler):
 # HTTP POST handler — receives Bitbucket webhook events
     def do_POST(self):
         if self.path == "/diff-preview/webhook":
+            # Bitbucket PR webhook — wake the diff loop immediately
             length = int(self.headers.get("Content-Length", 0))
             if length:
                 self.rfile.read(length)
@@ -121,16 +127,131 @@ class _HealthHandler(BaseHTTPRequestHandler):
                 _wake.set()
             self.send_response(200)
             self.end_headers()
+
+        elif self.path == "/jfrog-webhook":
+            # JFrog OCI push webhook — hard-refresh matching ArgoCD apps
+            length = int(self.headers.get("Content-Length", 0))
+            body = self.rfile.read(length) if length else b""
+
+            # Verify HMAC-SHA256 shared secret (X-JFrog-Event-Auth header)
+            if not _verify_jfrog_hmac(body, self.headers.get("X-JFrog-Event-Auth", "")):
+                log("JFrog webhook: HMAC verification failed — rejecting request", "WARNING")
+                self.send_response(401)
+                self.end_headers()
+                return
+
+            # Parse docker:pushed payload
+            try:
+                payload     = json.loads(body)
+                event_type  = payload.get("event_type", "")
+                data        = payload.get("data", {})
+                chart_name  = data["image_name"]
+                chart_ver   = data["tag"]
+            except (KeyError, json.JSONDecodeError, TypeError) as exc:
+                log(f"JFrog webhook: malformed payload: {exc}", "WARNING")
+                self.send_response(400)
+                self.end_headers()
+                return
+
+            if event_type != "pushed":
+                self.send_response(200)
+                self.end_headers()
+                return
+
+            # Respond immediately so JFrog does not time out, then refresh in background
+            self.send_response(202)
+            self.end_headers()
+            log(f"JFrog webhook: push event for {chart_name}:{chart_ver} — triggering hard-refresh")
+            threading.Thread(
+                target=_jfrog_hard_refresh,
+                args=(chart_name, chart_ver),
+                daemon=True,
+                name=f"jfrog-refresh-{chart_name}:{chart_ver}",
+            ).start()
+
         else:
             self.send_response(404)
             self.end_headers()
+
+def _verify_jfrog_hmac(body: bytes, header: str) -> bool:
+    """Verify X-JFrog-Event-Auth HMAC-SHA256 against the shared webhook secret.
+
+    JFrog signs the payload with HMAC-SHA256 using the secret configured in
+    Administration -> Webhooks. The signature is the hex digest of the HMAC,
+    sent in the X-JFrog-Event-Auth header.
+    """
+    import hmac as _hmac, hashlib as _hashlib
+    if not JFROG_WEBHOOK_SECRET or not header:
+        return False
+    expected = _hmac.new(JFROG_WEBHOOK_SECRET.encode(), body, _hashlib.sha256).hexdigest()
+    return _hmac.compare_digest(header, expected)
+
+
+def _jfrog_hard_refresh(chart_name: str, chart_version: str) -> None:
+    """Hard-refresh all ArgoCD apps tracking chart_name:chart_version.
+
+    Called in a daemon thread after responding 202 to the JFrog webhook.
+    Bypasses the repo-server OCI cache so ArgoCD picks up the new image
+    even when CI pushes a new build without bumping the chart version.
+    """
+    log(f"JFrog webhook: looking for apps tracking {chart_name}:{chart_version}",
+        chart=chart_name, version=chart_version)
+
+    r = subprocess.run(
+        [ARGOCD_BIN, "app", "list", "--output", "json"]
+         + [arg for p in ARGOCD_PROJECTS for arg in ("--project", p)] + _auth_flags(),
+        capture_output=True, text=True, timeout=60)
+
+    if r.returncode != 0:
+        log(f"JFrog webhook: app list failed: {r.stderr[:200]}", "ERROR")
+        return
+
+    try:
+        data = json.loads(r.stdout)
+    except json.JSONDecodeError as exc:
+        log(f"JFrog webhook: malformed app list JSON: {exc}", "ERROR")
+        return
+
+    matching = []
+    for app in data.get("items", []):
+        for src_entry in app["spec"].get("sources", []):
+            if (src_entry.get("chart") == chart_name
+                    and src_entry.get("targetRevision") == chart_version):
+                matching.append(app["metadata"]["name"])
+                break
+
+    if not matching:
+        log(f"JFrog webhook: no apps found for {chart_name}:{chart_version}")
+        return
+
+    log(f"JFrog webhook: {len(matching)} apps to hard-refresh: "
+        f"{', '.join(matching[:5])}{'...' if len(matching) > 5 else ''}")
+
+    ok = failed = 0
+    for app_name in matching:
+        try:
+            r = subprocess.run(
+                [ARGOCD_BIN, "app", "get", app_name, "--hard-refresh"] + _auth_flags(),
+                capture_output=True, text=True, timeout=60)
+            if r.returncode == 0:
+                ok += 1
+                log(f"  hard-refresh OK: {app_name}")
+            else:
+                failed += 1
+                log(f"  hard-refresh FAILED: {app_name}: {r.stderr[:100]}", "WARNING")
+        except subprocess.TimeoutExpired:
+            failed += 1
+            log(f"  hard-refresh timed out: {app_name}", "WARNING")
+
+    log(f"JFrog webhook: done — {ok} refreshed, {failed} failed")
+
 
 def _start_health_server(port: int = 8080) -> HTTPServer:
     """Start the health server in a daemon thread and handle webhook POSTs."""
     server = HTTPServer(("", port), _HealthHandler)
     t = threading.Thread(target=server.serve_forever, daemon=True, name="health-server")
     t.start()
-    log(f"Health server listening on :{port} (/healthz /readyz /diff-preview/webhook)")
+    log(f"Health server listening on :{port}")
     return server
 
 def _auth_flags():
@@ -257,7 +378,7 @@ def argocd_login():
     _path_map_ts    = 0.0  # Invalidate path map cache on re-login.
     _path_map_count = 0
     _ready = True
-    print(f"  ArgoCD auth: logged in as {ARGOCD_USER}")
+    log(f"ArgoCD auth: logged in as {ARGOCD_USER}")
 
 # Resource patterns filtered from ALL diff output and AI analysis.
 # micro-versions-info is an auto-generated ConfigMap that always changes
@@ -326,7 +447,7 @@ def _async_relogin():
     """
     try:
         argocd_login()
-        print("  [auth] background re-login succeeded", flush=True)
+        log(f"[auth] background re-login succeeded as {ARGOCD_USER}")
     except Exception as e:
         print(f"  [auth] background re-login failed: {e}", flush=True)
 
