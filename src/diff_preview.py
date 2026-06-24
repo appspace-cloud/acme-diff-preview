@@ -30,7 +30,8 @@ BB_USER            = os.environ["BB_USER"]
 BB_TOKEN           = os.environ["BB_TOKEN"]
 ARGOCD_SERVER      = "argocd.appspace.com"
 ARGOCD_BIN         = os.environ.get("ARGOCD_BIN", "/usr/local/bin/argocd")
-ARGOCD_ADMIN_PASS  = os.environ["ARGOCD_ADMIN_PASS"]
+ARGOCD_USER        = os.environ.get("ARGOCD_USER", "diff-preview")
+ARGOCD_PASS        = os.environ["ARGOCD_PASS"]
 COMMENT_MARKER     = "argocd-diff-preview"
 BUILD_KEY          = "argocd-diff-preview"
 MAX_RESOURCES_FULL = 5       # resources shown with full diff block
@@ -248,7 +249,7 @@ def argocd_login():
     global _ready, _path_map_ts
     r = subprocess.run(
         [ARGOCD_BIN, "login", ARGOCD_SERVER,
-         "--username", "admin", "--password", ARGOCD_ADMIN_PASS,
+         "--username", ARGOCD_USER, "--password", ARGOCD_PASS,
          "--grpc-web", "--insecure"],
         capture_output=True, text=True, timeout=60)
     if r.returncode != 0:
@@ -256,7 +257,7 @@ def argocd_login():
     _path_map_ts    = 0.0  # Invalidate path map cache on re-login.
     _path_map_count = 0
     _ready = True
-    print("  ArgoCD auth: logged in as admin")
+    print(f"  ArgoCD auth: logged in as {ARGOCD_USER}")
 
 # Resource patterns filtered from ALL diff output and AI analysis.
 # micro-versions-info is an auto-generated ConfigMap that always changes

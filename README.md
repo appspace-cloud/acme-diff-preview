@@ -94,6 +94,7 @@ image:
   tag: "1.1.0"
 argocd:
   server: argocd.appspace.com
+  username: diff-preview
 bitbucket:
   workspace: appspace-cloud
   repo: acme-config-dev
@@ -117,7 +118,8 @@ in the ArgoCD Helm values (not in this chart).
 |---|---|
 | `argocd-diff-preview-bb-user` | Bitbucket username |
 | `argocd-diff-preview-bb-token` | Bitbucket app password |
-| `argocd-diff-preview-admin-pass` | ArgoCD admin password |
+| `argocd-diff-preview-admin-pass` | ArgoCD `diff-preview` account password (plaintext, stable) |
+| `argocd-diff-preview-password` | Bcrypt hash for `accounts.diff-preview.password` in ArgoCD (Terraform) |
 | `acme-repo-password` | JFrog pull credentials (for GAR proxy + CI) |
 
 ## Related tickets
