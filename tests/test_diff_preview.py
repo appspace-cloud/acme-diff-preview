@@ -50,6 +50,15 @@ def test_no_gcloud_calls():
     assert "gcloud" not in _source()
 
 
+def test_dedicated_argocd_account():
+    """Must use dedicated diff-preview local account, not the global admin user."""
+    src = _source()
+    assert "ARGOCD_PASS" in src
+    assert "ARGOCD_USER" in src
+    assert '--username", "admin"' not in src
+    assert '--username", ARGOCD_USER' in src
+
+
 # ── Bug-regression tests ─────────────────────────────────────────────────────
 
 def test_seen_eviction_uses_integer_ids():
@@ -203,3 +212,59 @@ def test_retry_loop_in_argocd_diff():
     assert loops and int(loops[0]) == 2, (
         f"argocd_diff retry loop must be 2 attempts, found: {loops}"
     )
+
+
+# ── COPS-2500: JFrog webhook + account fix ───────────────────────────────────
+
+def test_argocd_uses_diff_preview_account():
+    """argocd_login must use ARGOCD_USER (diff-preview), never hardcoded admin.
+
+    The diff-preview local account has limited RBAC (applications:*, repos/projects/clusters:get).
+    Using admin would give unnecessary access to account management, RBAC config, etc.
+    Password independence: rotating admin does not break the service.
+    """
+    src = _source()
+    assert '"--username", ARGOCD_USER' in src, (
+        "argocd_login must use ARGOCD_USER variable, not hardcoded 'admin'"
+    )
+    assert '"--username", "admin"' not in src, (
+        "REGRESSION: hardcoded admin username found — use ARGOCD_USER instead"
+    )
+    assert 'os.environ.get("ARGOCD_USER", "diff-preview")' in src, (
+        "ARGOCD_USER must default to 'diff-preview'"
+    )
+
+
+def test_jfrog_webhook_secret_constant():
+    """JFROG_WEBHOOK_SECRET env var must be present for HMAC verification."""
+    src = _source()
+    assert 'JFROG_WEBHOOK_SECRET' in src, "Missing JFROG_WEBHOOK_SECRET constant"
+    assert 'JFROG_WEBHOOK_SECRET' in src
+
+
+def test_jfrog_webhook_endpoint():
+    """/jfrog-webhook route must exist in do_POST."""
+    src = _source()
+    assert '"/jfrog-webhook"' in src, "Missing /jfrog-webhook route in do_POST"
+    assert 'X-JFrog-Event-Auth' in src, "Missing X-JFrog-Event-Auth header check"
+    assert '202' in src, "JFrog webhook must respond 202 Accepted before background processing"
+    assert '401' in src, "JFrog webhook must return 401 on HMAC failure"
+
+
+def test_hmac_verification():
+    """_verify_jfrog_hmac function must exist and use HMAC-SHA256."""
+    src = _source()
+    assert "def _verify_jfrog_hmac" in src, "Missing _verify_jfrog_hmac function"
+    assert "hmac" in src.lower(), "HMAC verification must use Python hmac module"
+    assert "compare_digest" in src, "Must use hmac.compare_digest to prevent timing attacks"
+
+
+def test_jfrog_hard_refresh_function():
+    """_jfrog_hard_refresh function must list apps and call hard-refresh."""
+    src = _source()
+    assert "def _jfrog_hard_refresh" in src, "Missing _jfrog_hard_refresh function"
+    assert "ARGOCD_PROJECTS" in src, "Must use configurable project list"
+    assert "ARGOCD_PROJECTS" in src or "--project" in src, "Must target ArgoCD projects"
+    assert "--hard-refresh" in src, "Must call argocd app get --hard-refresh"
+    assert "image_name" in src, "Must parse data.image_name from JFrog payload"
+    assert "tag" in src, "Must parse data.tag from JFrog payload"
