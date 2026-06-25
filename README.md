@@ -1,130 +1,193 @@
 # acme-diff-preview
 
-ArgoCD Diff Preview — posts Kubernetes manifest diffs as Bitbucket PR comments with AI-generated summaries powered by Vertex AI Gemini (COPS-2494/2496/2497/2498).
+ArgoCD Diff Preview service for Appspace. A long-running Kubernetes Deployment
+that does two distinct jobs:
 
-## What it does
+1. **PR diff comments** — watches `acme-config-dev` Bitbucket PRs, runs
+   `argocd app diff` against every affected app, and posts a formatted diff
+   comment with a Vertex AI Gemini summary.
 
-On every open PR in `acme-config-dev`, the service:
-1. Detects changes within seconds via Bitbucket webhook (COPS-2497)
-2. Runs `argocd app diff --revisions <PR_SHA>` against all affected ArgoCD apps
-3. Posts a formatted diff comment on the Bitbucket PR with a Vertex AI summary
-4. Updates the Bitbucket build status (INPROGRESS → SUCCESSFUL/FAILED)
+2. **JFrog OCI webhook** — receives push events from JFrog when CI publishes
+   a new Helm chart to `helm-oci-dev`, finds every dev/QA ArgoCD app tracking
+   that chart version, and hard-refreshes them to bypass the OCI cache.
 
-## Repository structure
+A CronJob runs a full hard-refresh of all dev/QA apps every 30 minutes as a
+fallback safety net.
+
+---
+
+## Repository layout
 
 ```
 acme-diff-preview/
 ├── src/
-│   ├── diff_preview.py         Main service (long-running Deployment)
-│   └── dev_hard_refresh.py     Hard-refresh all dev/QA apps (CronJob every 2h)
+│   ├── diff_preview.py        Main service (Deployment)
+│   └── dev_hard_refresh.py    Full hard-refresh of all dev/QA apps (CronJob)
 ├── tests/
-│   └── test_diff_preview.py    Unit tests (syntax, key functions, no-gcloud)
+│   └── test_diff_preview.py   Unit tests (no external dependencies)
 ├── charts/
-│   └── acme-diff-preview/      Helm chart — all Kubernetes resources
-│       ├── Chart.yaml          version: 1.0.0, appVersion: "1.1.0"
-│       ├── values.yaml         All tuneable parameters with defaults
+│   └── acme-diff-preview/     Helm chart
+│       ├── Chart.yaml
+│       ├── values.yaml
 │       └── templates/
-│           ├── deployment.yaml      Long-running diff-preview service
-│           ├── service.yaml         NodePort :8080 for ArgoCD Ingress backend
-│           ├── serviceaccount.yaml  WIF annotation → argocd@appspace-devops GSA
-│           ├── externalsecret.yaml  ESO → acme-diff-preview-creds K8s Secret
-│           └── cronjob.yaml         Hard-refresh, runs every 2h
-├── Dockerfile                  python:3.12-slim + argocd CLI v3.4.3
+│           ├── deployment.yaml
+│           ├── service.yaml
+│           ├── serviceaccount.yaml
+│           ├── externalsecret.yaml
+│           └── cronjob.yaml
+├── docs/
+│   └── runbooks/
+│       └── jfrog-webhook-secret-rotation.md
+├── Dockerfile                 python:3.12-slim + argocd CLI
+├── RELEASING.md               How to cut a release (read before pushing tags)
 └── .github/workflows/
-    ├── ci.yml                  PR gate: syntax, pytest, helm lint, docker build
-    └── release.yml             Tag v*: push image to JFrog + publish Helm chart
+    ├── ci.yml                 PR gate: tests, helm lint, docker build (no push)
+    ├── release.yml            Push to main: publish Helm chart to GitHub Pages
+    └── docker.yml             Push of v* tag: build + push image to JFrog
 ```
+
+---
+
+## HTTP endpoints
+
+All endpoints are served on port **8080** inside the pod.
+
+| Method | Path | Description |
+|---|---|---|
+| `POST` | `/diff-preview/webhook` | Bitbucket PR webhook (wakes the diff loop) |
+| `POST` | `/jfrog-webhook` | JFrog OCI push webhook (triggers hard-refresh) |
+| `GET` | `/jfrog-webhook/stats` | Webhook counters (JSON) |
+| `GET` | `/healthz` | Liveness probe |
+| `GET` | `/readyz` | Readiness probe |
+
+### JFrog webhook security
+
+Every request to `/jfrog-webhook` must include an `X-JFrog-Event-Auth` header
+with an HMAC-SHA256 signature computed from the request body using the shared
+secret stored in GCP Secret Manager. Requests without a valid signature are
+rejected with HTTP 401. Bodies over 64 KB are rejected with HTTP 413 before
+the signature is even checked.
+
+The stats endpoint returns something like:
+
+```json
+{
+  "received": 42,
+  "rejected_hmac": 1,
+  "rejected_format": 0,
+  "dedup_skipped": 3,
+  "refreshes_ok": 87,
+  "refreshes_failed": 0,
+  "started_at": "2026-06-25T10:00:00+00:00"
+}
+```
+
+---
 
 ## Docker image
 
-Images are pushed to JFrog Artifactory and pulled by GKE via the existing
-**Google Artifact Registry remote proxy** in `appspace-devops`:
+Images are pushed to JFrog and pulled by GKE through the GAR remote proxy in
+`appspace-devops`. No `imagePullSecrets` are needed — the node service account
+already has IAM access to Artifact Registry.
 
 | Registry | URL |
 |---|---|
 | Source (JFrog) | `docker-dev.repo.appspace.com/acme-diff-preview:<tag>` |
 | GKE pull URL (GAR proxy) | `us-central1-docker.pkg.dev/appspace-devops/artifact/acme-diff-preview:<tag>` |
 
-GKE node pools pull from the GAR proxy URL — no `imagePullSecrets` needed
-since the node service account already has IAM access to `appspace-devops`
-Artifact Registry.
+---
 
 ## Helm chart
 
-The chart is published to GitHub Pages via `chart-releaser-action`:
+Published to GitHub Pages on every merge to `main`:
 
 ```
 https://appspace-cloud.github.io/acme-diff-preview
 ```
 
+---
+
 ## CI/CD
 
 | Trigger | What runs |
 |---|---|
-| PR to `main` | Python syntax check, pytest, `helm lint`, `docker build` (no push) |
-| Tag `v*` | Build + push image to JFrog, package + publish Helm chart to GitHub Pages |
+| PR to `main` | Tests, helm lint, docker build (no push) |
+| Push to `main` | Helm chart published to GitHub Pages |
+| Tag `v*` | Docker image built and pushed to JFrog |
 
-### Adding GitHub Actions secrets
+See [RELEASING.md](RELEASING.md) for the full release process and the rule
+about never overwriting an existing image tag.
 
-The release workflow needs two repository secrets:
+### GitHub Actions secrets required
 
 | Secret | Value |
 |---|---|
 | `JFROG_USER` | `acme-repo` |
-| `JFROG_PASSWORD` | Contents of GCP SM secret `acme-repo-password` in `appspace-devops` |
+| `JFROG_PASSWORD` | GCP SM secret `acme-repo-password` in `appspace-devops` |
 
-To set them:
-```bash
-gh secret set JFROG_USER --body "acme-repo" --repo appspace-cloud/acme-diff-preview
-PASS=$(gcloud secrets versions access latest --secret=acme-repo-password --project=appspace-devops)
-gh secret set JFROG_PASSWORD --body "$PASS" --repo appspace-cloud/acme-diff-preview
-```
+---
 
-## Installation (via acme-infrastructure)
+## Installation
 
-The service is installed as a `helm_release` in:
+Deployed via Terraform in `acme-infrastructure`:
+
 ```
 deployments/appspace-com/gcp/appspace-devops/shared/infrastructure/gke/na1-a/config/terragrunt.hcl
 ```
 
-Key values passed from acme-infrastructure:
+Key Helm values configured from `acme-infrastructure`:
+
 ```yaml
 image:
   repository: us-central1-docker.pkg.dev/appspace-devops/artifact/acme-diff-preview
-  tag: "1.1.0"
+  tag: "1.3.4"
+
 argocd:
   server: argocd.appspace.com
   username: diff-preview
+
 bitbucket:
   workspace: appspace-cloud
   repo: acme-config-dev
+
 vertex:
   project: appspace-devops
   location: us-central1
   model: gemini-2.5-flash
+
+hardRefresh:
+  schedule: "*/30 * * * *"
+
 secrets:
   externalSecretStore: argocd-gcp-sm
+  bbUserKey: argocd-diff-preview-bb-user
+  bbTokenKey: argocd-diff-preview-bb-token
+  argocdPassKey: argocd-diff-preview-admin-pass
+  jfrogWebhookSecretKey: argocd-jfrog-webhook-shared-secret
+
 serviceAccount:
   annotations:
     iam.gke.io/gcp-service-account: argocd@appspace-devops.iam.gserviceaccount.com
 ```
 
-The ArgoCD Ingress `extraPaths` for `/diff-preview/webhook` is configured
-in the ArgoCD Helm values (not in this chart).
+The ArgoCD Ingress `extraPaths` for `/diff-preview/webhook` and
+`/jfrog-webhook` are configured in the ArgoCD Helm values block inside
+`acme-infrastructure`.
 
-## GCP Secrets Manager keys
+---
 
-| Secret name | Used for |
+## GCP Secret Manager keys
+
+All secrets are in the `appspace-devops` project.
+
+| Secret | Used for |
 |---|---|
 | `argocd-diff-preview-bb-user` | Bitbucket username |
 | `argocd-diff-preview-bb-token` | Bitbucket app password |
-| `argocd-diff-preview-admin-pass` | ArgoCD `diff-preview` account password (plaintext, stable) |
-| `argocd-diff-preview-password` | Bcrypt hash for `accounts.diff-preview.password` in ArgoCD (Terraform) |
-| `acme-repo-password` | JFrog pull credentials (for GAR proxy + CI) |
+| `argocd-diff-preview-admin-pass` | ArgoCD `diff-preview` account password (plaintext) |
+| `argocd-diff-preview-password` | Bcrypt hash for the ArgoCD accounts config |
+| `acme-repo-password` | JFrog pull credentials for GAR proxy and CI |
+| `argocd-jfrog-webhook-shared-secret` | HMAC key for the JFrog webhook endpoint |
 
-## Related tickets
-
-- [COPS-2494](https://appspace.atlassian.net/browse/COPS-2494) — Convert CronJob to Deployment
-- [COPS-2496](https://appspace.atlassian.net/browse/COPS-2496) — Vertex AI diff summaries
-- [COPS-2497](https://appspace.atlassian.net/browse/COPS-2497) — Bitbucket webhook
-- [COPS-2498](https://appspace.atlassian.net/browse/COPS-2498) — Extract to GitHub repo + Helm chart (this)
+To rotate the JFrog webhook secret, follow the runbook at
+`docs/runbooks/jfrog-webhook-secret-rotation.md`.

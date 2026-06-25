@@ -34,11 +34,39 @@ jobs:
           username: ${{ secrets.JFROG_USER }}
           password: ${{ secrets.JFROG_PASSWORD }}
 
+      - name: Check if tag already exists in JFrog
+        id: check
+        run: |
+          VERSION="${{ steps.meta.outputs.version }}"
+          # Use Docker Registry HTTP API v2 — more reliable than docker manifest inspect
+          # which can fail silently with certain credential scopes.
+          HTTP=$(curl -s -o /dev/null -w "%{http_code}" \
+            -u "${{ secrets.JFROG_USER }}:${{ secrets.JFROG_PASSWORD }}" \
+            -H "Accept: application/vnd.docker.distribution.manifest.v2+json" \
+            "https://${{ env.JFROG_REGISTRY }}/v2/${{ env.IMAGE_NAME }}/manifests/${VERSION}")
+          if [ "$HTTP" = "200" ]; then
+            echo "exists=true" >> "$GITHUB_OUTPUT"
+            echo "Tag ${VERSION} already exists in JFrog (HTTP 200) — skipping build and push."
+          else
+            echo "exists=false" >> "$GITHUB_OUTPUT"
+            echo "Tag ${VERSION} not found (HTTP ${HTTP}) — will build and push."
+          fi
+
       - name: Build and push to JFrog
+        if: steps.check.outputs.exists == 'false'
         uses: docker/build-push-action@v7.2.0
         with:
           context: .
+          platforms: linux/amd64
           push: true
           tags: ${{ env.JFROG_REGISTRY }}/${{ env.IMAGE_NAME }}:${{ steps.meta.outputs.version }}
           build-args: |
             ARGOCD_VERSION=v3.4.3
+          # No registry cache — avoids the manifest write that triggers an
+          # overwrite-permission error on JFrog when the tag already exists.
+          cache-from: ''
+          cache-to: ''
+
+      - name: Skip notice
+        if: steps.check.outputs.exists == 'true'
+        run: echo "Image ${{ steps.meta.outputs.version }} already in JFrog. No push needed."
