@@ -236,9 +236,12 @@ def test_argocd_uses_diff_preview_account():
 
 
 def test_jfrog_webhook_secret_constant():
-    """JFROG_WEBHOOK_SECRET env var must be present for HMAC verification."""
+    """All JFrog webhook constants must be present and configurable."""
     src = _source()
     assert 'JFROG_WEBHOOK_SECRET' in src, "Missing JFROG_WEBHOOK_SECRET constant"
+    assert 'JFROG_MAX_BODY_BYTES' in src, "Missing body size limit constant"
+    assert 'JFROG_DEDUP_WINDOW' in src, "Missing dedup window constant"
+    assert 'JFROG_REFRESH_WORKERS' in src, "Missing parallel workers constant"
     assert 'JFROG_WEBHOOK_SECRET' in src
 
 
@@ -333,3 +336,59 @@ def test_stats_endpoint():
     src = _source()
     assert '"/jfrog-webhook/stats"' in src, "Missing /jfrog-webhook/stats route"
     assert '"Content-Type", "application/json"' in src, "Stats must return JSON"
+
+
+def test_body_size_limit():
+    """JFROG_MAX_BODY_BYTES must be used to reject oversized bodies before reading."""
+    src = _source()
+    assert "JFROG_MAX_BODY_BYTES" in src
+    assert "413" in src, "Must return HTTP 413 for oversized bodies"
+    # Size check must happen before HMAC (HMAC check happens after reading body)
+    size_pos = src.find("JFROG_MAX_BODY_BYTES")
+    hmac_pos = src.find("_verify_jfrog_hmac")
+    assert size_pos < hmac_pos, "Body size check must come before HMAC verification"
+
+
+def test_content_length_error_defaults_to_zero():
+    """Malformed Content-Length must not return 400 — should default to 0."""
+    src = _source()
+    # The except block should assign length = 0, not send_response(400)
+    idx = src.find("length = 0  # malformed header")
+    assert idx > 0, "Content-Length parse error must default to length=0, not return 400"
+
+
+def test_dedup_state_and_lock():
+    """Dedup state (_jfrog_recent, _jfrog_dedup_lock, JFROG_DEDUP_WINDOW) must exist."""
+    src = _source()
+    assert "_jfrog_recent" in src, "Missing dedup dict"
+    assert "_jfrog_dedup_lock" in src, "Missing dedup lock"
+    assert "JFROG_DEDUP_WINDOW" in src, "Missing dedup window"
+    assert "dedup_key" in src, "Missing dedup key construction"
+
+
+def test_stats_counters():
+    """All expected stats counters must be present."""
+    src = _source()
+    for key in ("received", "rejected_hmac", "rejected_format",
+                "dedup_skipped", "refreshes_ok", "refreshes_failed"):
+        assert f'"{key}"' in src, f"Missing stats counter: {key}"
+
+
+def test_stats_endpoint():
+    """GET /jfrog-webhook/stats must exist and return JSON."""
+    src = _source()
+    assert '"/jfrog-webhook/stats"' in src, "Missing /jfrog-webhook/stats route"
+    assert '"application/json"' in src, "Stats endpoint must set Content-Type: application/json"
+
+
+def test_parallel_refresh():
+    """Hard-refresh must use ThreadPoolExecutor for parallel app refreshes."""
+    src = _source()
+    assert "ThreadPoolExecutor" in src, "Missing ThreadPoolExecutor"
+    assert "JFROG_REFRESH_WORKERS" in src or "REFRESH_WORKERS" in src, "Missing refresh workers constant"
+    # Pool must be used inside _jfrog_hard_refresh
+    func_start = src.find("def _jfrog_hard_refresh")
+    next_def   = src.find("\ndef ", func_start + 1)
+    func_body  = src[func_start:next_def] if next_def > 0 else src[func_start:]
+    assert "ThreadPoolExecutor" in func_body or "_TPE" in func_body, \
+        "_jfrog_hard_refresh must parallelize with ThreadPoolExecutor"
