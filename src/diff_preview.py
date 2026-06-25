@@ -37,6 +37,9 @@ ARGOCD_PASS          = os.environ["ARGOCD_PASS"]
 ARGOCD_PROJECTS      = os.environ.get("ARGOCD_PROJECTS", "appspace-dev,appspace-qa").split(",")
 # HMAC-SHA256 key for verifying incoming JFrog webhook requests.
 JFROG_WEBHOOK_SECRET = os.environ.get("JFROG_WEBHOOK_SECRET", "")
+# Deduplication window: skip hard-refresh if same chart:version was processed
+# within this many seconds. Handles JFrog retries and rapid successive pushes.
+JFROG_DEDUP_WINDOW   = int(os.environ.get("JFROG_DEDUP_WINDOW", "15"))
 COMMENT_MARKER     = "argocd-diff-preview"
 BUILD_KEY          = "argocd-diff-preview"
 MAX_RESOURCES_FULL = 5       # resources shown with full diff block
@@ -44,6 +47,23 @@ MAX_DIFF_CHARS     = 2000    # chars per resource diff block
 MAX_APPS_PER_RUN   = 30      # safety cap
 DIFF_WORKERS       = 3       # parallel argocd app diff calls (reduced to limit gRPC load on ArgoCD)
 MAX_COMMENT_BYTES  = 245_000 # Bitbucket ~256KB limit; leave headroom
+JFROG_MAX_BODY_BYTES = int(os.environ.get("JFROG_MAX_BODY_BYTES", "65536"))  # 64 KB — reject oversized bodies before HMAC
+
+# JFrog webhook dedup state: {chart:version -> last_processed_timestamp}
+_jfrog_recent:     dict          = {}
+_jfrog_dedup_lock: threading.Lock = threading.Lock()
+
+# JFrog webhook counters — exposed at GET /jfrog-webhook/stats
+_jfrog_stats:      dict          = {
+    "received": 0,       # all POST requests reaching /jfrog-webhook
+    "rejected_hmac": 0,  # HMAC verification failed
+    "rejected_format": 0,# malformed payload or oversized body
+    "dedup_skipped": 0,  # duplicate within JFROG_DEDUP_WINDOW
+    "refreshes_ok": 0,   # individual app hard-refreshes succeeded
+    "refreshes_failed": 0,# individual app hard-refreshes failed
+    "started_at": None,  # ISO timestamp, set on first received request
+}
+_jfrog_stats_lock: threading.Lock = threading.Lock()
 
 # In-memory SHA dedup: avoids reprocessing same PR SHA within this pod run
 _seen: dict    = {}
@@ -96,7 +116,18 @@ class _HealthHandler(BaseHTTPRequestHandler):
         pass  # Suppress per-request access logs
 
     def do_GET(self):
-        if self.path == "/healthz":
+        if self.path == "/jfrog-webhook/stats":
+            # JSON counters for the JFrog webhook — useful for monitoring
+            with _jfrog_stats_lock:
+                payload = dict(_jfrog_stats)
+            data = json.dumps(payload, indent=2).encode()
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(data)))
+            self.end_headers()
+            self.wfile.write(data)
+
+        elif self.path == "/healthz":
             # Healthy if the main loop completed successfully within 5 min.
             age = time.monotonic() - _last_ok
             ok  = age < 300
@@ -130,12 +161,30 @@ class _HealthHandler(BaseHTTPRequestHandler):
 
         elif self.path == "/jfrog-webhook":
             # JFrog OCI push webhook — hard-refresh matching ArgoCD apps
-            length = int(self.headers.get("Content-Length", 0))
+            try:
+                length = int(self.headers.get("Content-Length", 0))
+            except (ValueError, TypeError):
+                self.send_response(400)
+                self.end_headers()
+                return
+            if length > JFROG_MAX_BODY_BYTES:
+                log(f"JFrog webhook: body too large ({length} bytes > {JFROG_MAX_BODY_BYTES}), rejecting", "WARNING")
+                self.send_response(413)
+                self.end_headers()
+                return
             body = self.rfile.read(length) if length else b""
+
+            # Track every request that passes the size check
+            with _jfrog_stats_lock:
+                _jfrog_stats["received"] += 1
+                if _jfrog_stats["started_at"] is None:
+                    _jfrog_stats["started_at"] = datetime.now(timezone.utc).isoformat()
 
             # Verify HMAC-SHA256 shared secret (X-JFrog-Event-Auth header)
             if not _verify_jfrog_hmac(body, self.headers.get("X-JFrog-Event-Auth", "")):
                 log("JFrog webhook: HMAC verification failed — rejecting request", "WARNING")
+                with _jfrog_stats_lock:
+                    _jfrog_stats["rejected_hmac"] += 1
                 self.send_response(401)
                 self.end_headers()
                 return
@@ -149,6 +198,8 @@ class _HealthHandler(BaseHTTPRequestHandler):
                 chart_ver   = data["tag"]
             except (KeyError, json.JSONDecodeError, TypeError) as exc:
                 log(f"JFrog webhook: malformed payload: {exc}", "WARNING")
+                with _jfrog_stats_lock:
+                    _jfrog_stats["rejected_format"] += 1
                 self.send_response(400)
                 self.end_headers()
                 return
@@ -158,9 +209,24 @@ class _HealthHandler(BaseHTTPRequestHandler):
                 self.end_headers()
                 return
 
-            # Respond immediately so JFrog does not time out, then refresh in background
+            # Respond immediately so JFrog does not time out
             self.send_response(202)
             self.end_headers()
+
+            # Dedup: skip if same chart:version was hard-refreshed very recently
+            dedup_key = f"{chart_name}:{chart_ver}"
+            now = time.monotonic()
+            with _jfrog_dedup_lock:
+                last = _jfrog_recent.get(dedup_key, 0)
+                if now - last < JFROG_DEDUP_WINDOW:
+                    age = round(now - last, 1)
+                    log(f"JFrog webhook: skipping duplicate {dedup_key} "
+                        f"(last refresh {age}s ago, window={JFROG_DEDUP_WINDOW}s)")
+                    with _jfrog_stats_lock:
+                        _jfrog_stats["dedup_skipped"] += 1
+                    return
+                _jfrog_recent[dedup_key] = now
+
             log(f"JFrog webhook: push event for {chart_name}:{chart_ver} — triggering hard-refresh")
             threading.Thread(
                 target=_jfrog_hard_refresh,
@@ -229,21 +295,36 @@ def _jfrog_hard_refresh(chart_name: str, chart_version: str) -> None:
     log(f"JFrog webhook: {len(matching)} apps to hard-refresh: "
         f"{', '.join(matching[:5])}{'...' if len(matching) > 5 else ''}")
 
-    ok = failed = 0
-    for app_name in matching:
+    # Parallel hard-refresh: same approach as the CronJob in dev_hard_refresh.py
+    REFRESH_WORKERS = int(os.environ.get("JFROG_REFRESH_WORKERS", "8"))
+
+    def _do_refresh(app_name: str):
         try:
             r = subprocess.run(
                 [ARGOCD_BIN, "app", "get", app_name, "--hard-refresh"] + _auth_flags(),
                 capture_output=True, text=True, timeout=60)
             if r.returncode == 0:
-                ok += 1
                 log(f"  hard-refresh OK: {app_name}")
+                return True
+            log(f"  hard-refresh FAILED: {app_name}: {r.stderr[:100]}", "WARNING")
+            return False
+        except subprocess.TimeoutExpired:
+            log(f"  hard-refresh timed out: {app_name}", "WARNING")
+            return False
+
+    from concurrent.futures import ThreadPoolExecutor as _TPE, as_completed as _asc
+    ok = failed = 0
+    with _TPE(max_workers=REFRESH_WORKERS) as pool:
+        futures = {pool.submit(_do_refresh, app): app for app in matching}
+        for fut in _asc(futures):
+            if fut.result():
+                ok += 1
             else:
                 failed += 1
-                log(f"  hard-refresh FAILED: {app_name}: {r.stderr[:100]}", "WARNING")
-        except subprocess.TimeoutExpired:
-            failed += 1
-            log(f"  hard-refresh timed out: {app_name}", "WARNING")
+
+    with _jfrog_stats_lock:
+        _jfrog_stats["refreshes_ok"]     += ok
+        _jfrog_stats["refreshes_failed"] += failed
 
     log(f"JFrog webhook: done — {ok} refreshed, {failed} failed")
 

@@ -268,3 +268,68 @@ def test_jfrog_hard_refresh_function():
     assert "--hard-refresh" in src, "Must call argocd app get --hard-refresh"
     assert "image_name" in src, "Must parse data.image_name from JFrog payload"
     assert "tag" in src, "Must parse data.tag from JFrog payload"
+
+
+# ── Improvements: security, performance, dedup, observability ────────────────
+
+def test_body_size_limit_constant():
+    """JFROG_MAX_BODY_BYTES constant must exist."""
+    src = _source()
+    assert 'JFROG_MAX_BODY_BYTES' in src, "Missing JFROG_MAX_BODY_BYTES constant"
+    assert '65536' in src, "Default must be 64KB"
+
+def test_body_size_check_before_hmac():
+    """Size check must appear before HMAC check in do_POST."""
+    src = _source()
+    size_pos = src.find('JFROG_MAX_BODY_BYTES')
+    hmac_pos = src.find('_verify_jfrog_hmac')
+    assert size_pos > 0 and hmac_pos > 0
+    # The 413 response (size rejection) must appear before the 401 (HMAC rejection)
+    pos_413 = src.find('send_response(413)')
+    pos_401 = src.find('send_response(401)')
+    assert pos_413 < pos_401, "Size check (413) must appear before HMAC check (401)"
+
+def test_content_length_safe_parse():
+    """Content-Length parsing must be inside a try/except to prevent ValueError crash."""
+    src = _source()
+    # The try/except block wrapping Content-Length must be present
+    assert "except (ValueError, TypeError):" in src, \
+        "Content-Length int() must be inside a try/except (ValueError, TypeError)"
+
+def test_parallel_hard_refresh():
+    """Hard-refresh must use ThreadPoolExecutor, not a sequential for-loop."""
+    src = _source()
+    assert 'ThreadPoolExecutor' in src, "Hard-refresh must be parallelized with ThreadPoolExecutor"
+    assert 'JFROG_REFRESH_WORKERS' in src, "Worker count must be configurable"
+
+def test_dedup_constants():
+    """Deduplication window constant and state must exist."""
+    src = _source()
+    assert 'JFROG_DEDUP_WINDOW' in src, "Missing JFROG_DEDUP_WINDOW constant"
+    assert '_jfrog_recent' in src, "Missing _jfrog_recent dedup state"
+    assert '_jfrog_dedup_lock' in src, "Missing _jfrog_dedup_lock"
+    assert 'dedup_skipped' in src, "Missing dedup_skipped stats counter"
+
+def test_dedup_logic():
+    """Dedup check must happen AFTER 202 response and before spawning thread."""
+    src = _source()
+    # Find the 202 send, the dedup_key assignment, and the thread name in do_POST
+    idx_202    = src.find('send_response(202)')
+    idx_dedup  = src.find('dedup_key = f"')
+    idx_thread = src.find('jfrog-refresh-{chart_name}:{chart_ver}')
+    assert idx_202 > 0 and idx_dedup > 0 and idx_thread > 0
+    assert idx_202 < idx_dedup < idx_thread, \
+        "Order must be: 202 response -> dedup check -> thread spawn"
+
+def test_stats_counters():
+    """Stats counters must exist and cover key events."""
+    src = _source()
+    for key in ('received', 'rejected_hmac', 'rejected_format',
+                'dedup_skipped', 'refreshes_ok', 'refreshes_failed'):
+        assert f'"{key}"' in src, f"Missing stats counter: {key}"
+
+def test_stats_endpoint():
+    """GET /jfrog-webhook/stats endpoint must exist."""
+    src = _source()
+    assert '"/jfrog-webhook/stats"' in src, "Missing /jfrog-webhook/stats route"
+    assert '"Content-Type", "application/json"' in src, "Stats must return JSON"
