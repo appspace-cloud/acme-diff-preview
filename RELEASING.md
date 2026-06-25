@@ -40,9 +40,31 @@ They can be the same bump or different — keep them in sync with what changed.
 3. Open a PR — CI runs tests and builds the image (no push on PR).
 4. Merge to `main` — `release.yml` publishes the Helm chart to GitHub Pages.
 5. Push tag `v<appVersion>` (e.g. `v1.3.4`) — `docker.yml` builds and pushes
-   the Docker image to JFrog.
+   the Docker image to JFrog. **Do not push the image manually first — see below.**
 6. Update `acme-infrastructure` config with the new chart version and image tag,
    open a PR, and let Atlantis apply it.
+
+## Critical: never push the image manually AND push a git tag for the same version
+
+If you push a Docker image manually with `docker push` and then also push the
+matching git tag, the CI workflow will try to push the same image again.
+JFrog will reject it because it cannot overwrite an existing tag:
+
+```
+Artifact deletion error: Not enough permissions to delete/overwrite all artifacts
+```
+
+**Pick one path — never both:**
+
+| Path | When to use |
+|---|---|
+| Push git tag only | Normal releases — CI builds and pushes the image |
+| Push image manually | Emergency hotfix only — do NOT also push a git tag for that version |
+
+The `docker.yml` workflow uses the Docker Registry HTTP API to check if the tag
+already exists before attempting a push. If you pushed manually and CI still
+fails, re-run the workflow — the check will detect the existing tag and exit
+cleanly without error.
 
 ## GitHub Actions workflows
 
