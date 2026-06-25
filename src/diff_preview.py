@@ -164,9 +164,7 @@ class _HealthHandler(BaseHTTPRequestHandler):
             try:
                 length = int(self.headers.get("Content-Length", 0))
             except (ValueError, TypeError):
-                self.send_response(400)
-                self.end_headers()
-                return
+                length = 0  # malformed header — treat as no body
             if length > JFROG_MAX_BODY_BYTES:
                 log(f"JFrog webhook: body too large ({length} bytes > {JFROG_MAX_BODY_BYTES}), rejecting", "WARNING")
                 self.send_response(413)
@@ -174,7 +172,7 @@ class _HealthHandler(BaseHTTPRequestHandler):
                 return
             body = self.rfile.read(length) if length else b""
 
-            # Track every request that passes the size check
+            # Count every request that reaches HMAC verification
             with _jfrog_stats_lock:
                 _jfrog_stats["received"] += 1
                 if _jfrog_stats["started_at"] is None:
