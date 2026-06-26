@@ -1625,7 +1625,7 @@ def process_pr(pr, path_map):
         # chart, making the diff show the actual image changes that will happen.
         pr_chart_revisions = {}
         for app in affected:
-            new_rev = _pr_chart_revision(app, changed_files, pr_sha)
+            new_rev = _pr_chart_revision(app, changed, pr_sha)
             if new_rev:
                 pr_chart_revisions[app] = new_rev
         if pr_chart_revisions:
