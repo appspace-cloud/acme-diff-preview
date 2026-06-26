@@ -82,6 +82,12 @@ DIFF_WORKERS       = int(os.environ.get("DIFF_WORKERS", "16"))        # parallel
 DIFF_TIMEOUT       = int(os.environ.get("DIFF_TIMEOUT", "120"))       # seconds per argocd app diff (OCI cache-miss renders are slow)
 WARM_WORKERS       = int(os.environ.get("WARM_WORKERS", "4"))         # parallel chart-cache warm-up diffs
 WARM_THRESHOLD     = int(os.environ.get("WARM_THRESHOLD", "8"))       # only warm when a PR fans out to more apps than this
+# Max concurrent diffs targeting a SINGLE agent / spoke cluster. All apps on one
+# spoke share one argocd-agent + redis/resource proxy connection, so this is the
+# real saturation limit (not total concurrency). Total stays high across agents;
+# per-agent stays gentle so a mass bump that lands many apps on the same cluster
+# does not overwhelm that one agent (redis_timeout / "resource response not tracked").
+AGENT_MAX_CONCURRENCY = int(os.environ.get("AGENT_MAX_CONCURRENCY", "3"))
 MAX_COMMENT_BYTES  = 245_000 # Bitbucket ~256KB limit; leave headroom
 JFROG_MAX_BODY_BYTES = int(os.environ.get("JFROG_MAX_BODY_BYTES", "65536"))  # 64 KB — reject oversized bodies before HMAC
 
@@ -125,6 +131,12 @@ PATH_MAP_TTL            = 300   # seconds
 # the same `argocd app list` call. Used to warm the repo-server chart cache once
 # per chart before fanning out parallel diffs (mass version bump support).
 _app_chart_map: dict   = {}
+# app full_name -> agent / destination cluster (spec.destination.name, e.g.
+# "gcp-dev-cl-ap1-a"). All apps on one spoke share a single argocd-agent and its
+# redis/resource proxy connection, so diffing too many of them at once saturates
+# that agent (redis_timeout / "resource response not tracked"). Used to cap
+# concurrency PER agent while keeping high total concurrency across agents.
+_app_agent_map: dict   = {}
 
 # GCE access token cache: token valid ~3600s, no reason to refetch each PR.
 _gcp_token:     str   = ""
@@ -447,7 +459,7 @@ def discover_path_app_map():
     Result is cached for PATH_MAP_TTL seconds. Cache is invalidated on
     argocd_login() so a re-login (session expiry) picks up new apps.
     """
-    global _path_map_cache, _path_map_ts, _path_map_count, _app_chart_map
+    global _path_map_cache, _path_map_ts, _path_map_count, _app_chart_map, _app_agent_map
     if _path_map_cache and (time.monotonic() - _path_map_ts) < PATH_MAP_TTL:
         # Also check app count hasn't changed (new env added mid-TTL)
         if len(_path_map_cache) == _path_map_count:
@@ -463,6 +475,7 @@ def discover_path_app_map():
         raise RuntimeError(f"argocd app list: invalid JSON: {e}")
     path_map = {}
     chart_map = {}
+    agent_map = {}
     for app in apps:
         name = app["metadata"]["name"]
         ns   = app["metadata"].get("namespace", "")
@@ -473,6 +486,9 @@ def discover_path_app_map():
         chart = _extract_app_chart(app)
         if chart:
             chart_map[full_name] = chart
+        agent = app.get("spec", {}).get("destination", {}).get("name")
+        if agent:
+            agent_map[full_name] = agent
         ann  = app.get("metadata", {}).get("annotations", {})
         raw  = ann.get("argocd.argoproj.io/manifest-generate-paths", "")
         if not raw:
@@ -485,6 +501,7 @@ def discover_path_app_map():
                     path_map[p].append(full_name)
     _path_map_cache = path_map
     _app_chart_map  = chart_map
+    _app_agent_map  = agent_map
     _path_map_ts    = time.monotonic()
     _path_map_count = len(path_map)
     return path_map
@@ -546,6 +563,28 @@ def _select_warm_apps(affected):
         else:
             rest.extend(group)
     return warm, rest
+
+
+def _interleave_by_agent(apps):
+    """Round-robin apps across their target agent so the worker pool spreads load.
+
+    Submitting all apps of one agent back-to-back would make the first workers
+    pile onto a single spoke (and block on its per-agent semaphore) while other
+    agents sit idle. Interleaving keeps every agent busy at its own safe rate.
+    """
+    buckets = {}
+    for app in apps:
+        buckets.setdefault(_app_agent_map.get(app, "_"), []).append(app)
+    order, queues = [], list(buckets.values())
+    i = 0
+    while queues:
+        q = queues[i % len(queues)]
+        order.append(q.pop(0))
+        if not q:
+            queues.remove(q)
+        else:
+            i += 1
+    return order
 
 # ── ArgoCD diff ───────────────────────────────────────────────────────
 def argocd_login():
@@ -1463,17 +1502,36 @@ def process_pr(pr, path_map):
         any_unknown    = False   # OUT_INDETERMINATE — diff not computable
         outcome_counts = Counter()
         reason_counts  = Counter()
+        # Per-agent semaphores: cap concurrent diffs hitting any single spoke.
+        _agent_sems   = {}
+        _agent_sems_lock = threading.Lock()
+        def _agent_sem(app):
+            agent = _app_agent_map.get(app, "_")
+            with _agent_sems_lock:
+                sem = _agent_sems.get(agent)
+                if sem is None:
+                    sem = threading.Semaphore(AGENT_MAX_CONCURRENCY)
+                    _agent_sems[agent] = sem
+            return sem
         def run_diff(app):
             t0 = time.monotonic()
-            result = argocd_diff(app, pr_sha)
+            sem = _agent_sem(app)
+            with sem:
+                result = argocd_diff(app, pr_sha)
             elapsed = round(time.monotonic() - t0, 1)
             return app, result, elapsed
 
         def process_batch(apps, workers):
-            """Diff a list of apps with a bounded pool, accumulating results."""
+            """Diff a list of apps with a bounded pool, accumulating results.
+
+            Apps are interleaved by agent so the pool spreads across spokes
+            instead of piling onto one; the per-agent semaphore then caps how
+            many diffs hit each spoke at once.
+            """
             nonlocal any_hard_error, any_unknown
             if not apps:
                 return
+            apps = _interleave_by_agent(apps)
             with ThreadPoolExecutor(max_workers=max(1, min(workers, len(apps)))) as ex:
                 futures = {ex.submit(run_diff, app): app for app in apps}
                 for fut in as_completed(futures):
@@ -1657,6 +1715,7 @@ def main():
         bb_repo=BB_REPO, diff_workers=DIFF_WORKERS, pr_workers=MAX_PR_WORKERS,
         max_apps_per_run=MAX_APPS_PER_RUN, diff_timeout=DIFF_TIMEOUT,
         diff_retries=DIFF_RETRIES, warm_workers=WARM_WORKERS,
+        agent_max_concurrency=AGENT_MAX_CONCURRENCY,
         log_level=LOG_LEVEL, vertex_model=VERTEX_MODEL)
     _start_health_server()
 
