@@ -1,5 +1,6 @@
 """Unit tests for diff_preview.py — syntax, key functions, and bug-regression checks."""
 import ast
+import importlib
 import os
 import sys
 
@@ -13,6 +14,21 @@ def _source():
 
 def _tree():
     return ast.parse(_source())
+
+
+def _import_module():
+    """Import diff_preview with the env vars it reads at module load.
+
+    The module reads BB_USER / BB_TOKEN / ARGOCD_PASS via os.environ[...] at
+    import time, so they must be present before importing for the functional
+    tests (classification, naming constants).
+    """
+    os.environ.setdefault("BB_USER", "test-user")
+    os.environ.setdefault("BB_TOKEN", "test-token")
+    os.environ.setdefault("ARGOCD_PASS", "test-pass")
+    sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
+    mod = importlib.import_module("diff_preview")
+    return importlib.reload(mod)
 
 
 # ── Basic checks ────────────────────────────────────────────────────────────
@@ -83,33 +99,6 @@ def test_seen_eviction_uses_integer_ids():
     )
 
 
-def test_redis_timeout_not_in_managed_mode_errors():
-    """BUG: Redis i/o timeout must NOT be silently treated as no-diff.
-
-    'error getting cached app managed resources' without 'i/o timeout' is a
-    true argocd-agent managed-mode error (no-diff is correct).
-
-    'error getting cached app managed resources' WITH 'i/o timeout' is a Redis
-    infrastructure failure — the diff is indeterminate, must report as error
-    so the retry logic fires on the next iteration.
-    """
-    src = _source()
-    # The i/o timeout branch must exist
-    assert "i/o timeout" in src, (
-        "Fix missing: 'i/o timeout' must be checked to separate Redis failures "
-        "from managed-mode no-diff."
-    )
-    # Redis timeout must return an error message, not None
-    assert "Redis timeout" in src, (
-        "Fix missing: Redis timeout must produce an error string (not None) "
-        "so the comment gets ❌ and the retry logic fires."
-    )
-    # The error getting cached... string must still be handled (not removed)
-    assert "error getting cached app managed resources" in src, (
-        "managed-mode error handling must still be present."
-    )
-
-
 def test_seen_not_cached_on_error():
     """BUG: _seen must NOT be set when any_error=True.
 
@@ -123,22 +112,107 @@ def test_seen_not_cached_on_error():
     )
 
 
-def test_managed_mode_errors_list_intact():
-    """The MANAGED_MODE_ERRORS list must still contain expected entries.
+# ── Diff classification (functional) ─────────────────────────────────────────
+# These import the module and call classify_diff_error / argocd_diff helpers
+# directly, so they verify real behaviour rather than source-string presence.
 
-    Fixing the Redis timeout bug must not accidentally remove legitimate
-    managed-mode error patterns that should produce silent no-diff.
+def test_classify_oci_login_is_indeterminate():
+    """OCI 'helm registry login' failure must be indeterminate, NOT no-diff.
+
+    This is the core bug: a repo-server cache miss + bad OCI credential made the
+    diff fail, but it was reported as a green 'no manifest changes'.
     """
-    src = _source()
-    for pattern in [
-        "error getting server version",
+    mod = _import_module()
+    stderr = ('{"level":"fatal","msg":"rpc error: code = Unknown desc = error '
+              'logging into OCI registry: failed to login to registry: failed '
+              'running helm: `helm registry login helm-oci-dev.repo.appspace.com '
+              '--username ****** --password ******` failed exit status 1: '
+              'response status code 401: : Bad Credentials"}')
+    outcome, reason, _ = mod.classify_diff_error(stderr)
+    assert outcome == mod.OUT_INDETERMINATE
+    assert reason == "oci_login"
+
+
+def test_classify_502_getmanifests_is_indeterminate():
+    """A 502 on GetManifests must be indeterminate, NOT silently no-diff."""
+    mod = _import_module()
+    stderr = ('{"level":"fatal","msg":"rpc error: code = Unknown desc = POST '
+              'https://argocd.appspace.com/application.ApplicationService/'
+              'GetManifests failed with status code 502"}')
+    outcome, reason, _ = mod.classify_diff_error(stderr)
+    assert outcome == mod.OUT_INDETERMINATE
+    assert reason == "manifests_5xx"
+
+
+def test_classify_redis_timeout_vs_managed_no_cache():
+    """Cached-managed-resources error splits into redis_timeout vs managed_no_cache.
+
+    Both are indeterminate (never no-diff): a failed live-state read means the
+    diff is unknown, not 'no changes'.
+    """
+    mod = _import_module()
+    base = "rpc error: error getting cached app managed resources"
+    o1, r1, _ = mod.classify_diff_error(base + ": i/o timeout")
+    assert (o1, r1) == (mod.OUT_INDETERMINATE, "redis_timeout")
+    o2, r2, _ = mod.classify_diff_error(base)
+    assert (o2, r2) == (mod.OUT_INDETERMINATE, "managed_no_cache")
+
+
+def test_classify_auth_is_indeterminate():
+    """Expired/invalid session is indeterminate and recognised for re-login."""
+    mod = _import_module()
+    outcome, reason, _ = mod.classify_diff_error("rpc error: invalid session token")
+    assert outcome == mod.OUT_INDETERMINATE
+    assert reason == "auth"
+
+
+def test_classify_managed_mode_patterns_indeterminate():
+    """Server-busy / permission / canceled patterns map to indeterminate.
+
+    These were previously swallowed as silent no-diff. They must now surface as
+    'diff could not be computed' so a failed evaluation is never shown as green.
+    """
+    mod = _import_module()
+    cases = {
+        "the server is not currently accepting requests": "server_unavailable",
+        "error getting server version": "server_unavailable",
+        "rpc error: code = PermissionDenied desc=x": "permission",
+        "context canceled": "canceled",
+    }
+    for stderr, expected_reason in cases.items():
+        outcome, reason, _ = mod.classify_diff_error(stderr)
+        assert outcome == mod.OUT_INDETERMINATE, stderr
+        assert reason == expected_reason, (stderr, reason)
+
+
+def test_classify_unknown_is_error():
+    """Genuinely unrecognised output is a hard error, not indeterminate."""
+    mod = _import_module()
+    outcome, reason, _ = mod.classify_diff_error("totally unexpected boom")
+    assert outcome == mod.OUT_ERROR
+    assert reason == "unknown"
+
+
+def test_no_failure_is_classified_as_no_diff():
+    """Regression guard: no known failure pattern may resolve to OUT_NO_DIFF.
+
+    OUT_NO_DIFF must only come from a clean exit 0. classify_diff_error never
+    returns it — it only returns INDETERMINATE or ERROR.
+    """
+    mod = _import_module()
+    failure_samples = [
+        "error logging into OCI registry",
+        "GetManifests failed with status code 502",
+        "error getting cached app managed resources: i/o timeout",
+        "error getting cached app managed resources",
         "the server is not currently accepting requests",
-        "rpc error: code = PermissionDenied",
-        "context canceled",
-    ]:
-        assert pattern in src, (
-            f"REGRESSION: managed-mode error pattern missing: {pattern!r}"
-        )
+        "permission denied",
+        "invalid session",
+        "random unknown failure",
+    ]
+    for s in failure_samples:
+        outcome, _, _ = mod.classify_diff_error(s)
+        assert outcome != mod.OUT_NO_DIFF, f"{s!r} must never be reported as no-diff"
 
 
 # ── Retry and resilience tests ───────────────────────────────────────────────
@@ -392,3 +466,71 @@ def test_parallel_refresh():
     func_body  = src[func_start:next_def] if next_def > 0 else src[func_start:]
     assert "ThreadPoolExecutor" in func_body or "_TPE" in func_body, \
         "_jfrog_hard_refresh must parallelize with ThreadPoolExecutor"
+
+
+# ── Rebrand: ArgoCD Diff Preview -> ACME Diff Preview ────────────────────────
+
+def test_status_name_is_acme():
+    """The Bitbucket-visible status name and comment header must say ACME."""
+    mod = _import_module()
+    assert mod.STATUS_NAME == "ACME Diff Preview"
+    src = _source()
+    # No leftover 'ArgoCD Diff Preview' display string (the product was renamed).
+    assert "ArgoCD Diff Preview" not in src, (
+        "Leftover 'ArgoCD Diff Preview' display string — rename to 'ACME Diff Preview'"
+    )
+
+
+def test_build_status_name_uses_status_name():
+    """post_build_status must send STATUS_NAME, not a hardcoded ArgoCD label."""
+    src = _source()
+    assert '"name": STATUS_NAME' in src, (
+        "Build status must use STATUS_NAME so the PR shows 'ACME Diff Preview'"
+    )
+
+
+def test_build_key_is_stable():
+    """BUILD_KEY must stay 'argocd-diff-preview' so existing PR statuses are reused.
+
+    The key identifies the build-status row in Bitbucket; changing it would
+    orphan the old status and create a duplicate row on every open PR.
+    """
+    mod = _import_module()
+    assert mod.BUILD_KEY == "argocd-diff-preview"
+
+
+def test_comment_marker_matches_legacy():
+    """find_existing_comment must match the new and the legacy marker.
+
+    During rollout, comments written by old pods carry 'argocd-diff-preview';
+    they must still be found and updated in place (no duplicate comment).
+    """
+    mod = _import_module()
+    assert mod.COMMENT_MARKER == "acme-diff-preview"
+    assert "argocd-diff-preview" in mod._COMMENT_MARKERS
+    assert "acme-diff-preview" in mod._COMMENT_MARKERS
+
+
+def test_comment_header_renders_acme():
+    """format_comment output must carry the ACME header and footer marker."""
+    mod = _import_module()
+    # A clean no-diff result for one app.
+    results = {"env-a-ms": mod.DiffResult("", False, None, mod.OUT_NO_DIFF, "clean")}
+    body = mod.format_comment("abcdef1234567890", results)
+    assert "ACME Diff Preview" in body
+    assert "acme-diff-preview" in body  # footer marker
+    assert "No manifest changes" in body
+
+
+def test_indeterminate_comment_is_not_green():
+    """An indeterminate result must NOT render as 'No manifest changes'."""
+    mod = _import_module()
+    results = {
+        "env-a-glb": mod.DiffResult("", False, "401 Bad Credentials",
+                                    mod.OUT_INDETERMINATE, "oci_login"),
+    }
+    body = mod.format_comment("abcdef1234567890", results)
+    assert "diff unavailable" in body.lower()
+    assert "Diff incomplete" in body
+    # Must not falsely claim the app is unchanged.
+    assert "No manifest changes" not in body

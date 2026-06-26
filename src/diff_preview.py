@@ -1,13 +1,28 @@
 #!/usr/bin/env python3
-"""ArgoCD Diff Preview - dynamic discovery, robust error handling, SHA dedup.
+"""ACME Diff Preview - dynamic discovery, robust error handling, SHA dedup.
 
 All apps are multi-source: source-1 = acme-config-dev, source-2 = Helm OCI.
 --source-positions 1 is correct for all apps in this setup.
 
+Diff outcome model (see classify_diff_error):
+- diff          : argocd produced a real manifest diff (exit 1 + stdout)
+- no_diff       : argocd confirmed the manifests match (clean exit 0)
+- indeterminate : the diff could NOT be computed (OCI login 401, repo-server
+                  502 on GetManifests, spoke Redis timeout, managed-mode live
+                  state unavailable, ArgoCD busy, ...). This is NOT "no changes"
+                  and must never be shown as a green check.
+- error         : an unexpected / unknown failure.
+
+Why indeterminate matters: ArgoCD renders each multi-source app from the Helm
+OCI registry. On a manifest cache miss the repo-server runs `helm registry
+login`; if that fails (bad OCI credential) or the agent/proxy/Redis path is
+slow, the diff fails. Previously those failures were swallowed as "no manifest
+changes", hiding real changes from reviewers. They are now surfaced explicitly.
+
 Error handling:
 - argocd app list failure: FAILED on all open main-targeting PRs, clean exit
 - Bitbucket API 429/503/network: retry with exponential backoff (3 attempts)
-- diff timeout (120s): caught per-app, reported as error in comment
+- diff timeout (60s): caught per-app, reported as indeterminate in comment
 - diff with no === sections: fallback to raw diff block in comment
 - large comment (>245KB): truncated with note, still posted
 - upsert_comment failure: fallback minimal note attempted
@@ -20,6 +35,7 @@ SHA dedup:
 - Cross-pod: compares comment SHA; skips and fixes stuck INPROGRESS if needed
 """
 import json, os, posixpath, re, signal, ssl, sys, subprocess, time, threading, urllib.error, urllib.request
+from collections import Counter, namedtuple
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone
@@ -40,8 +56,21 @@ JFROG_WEBHOOK_SECRET = os.environ.get("JFROG_WEBHOOK_SECRET", "")
 # Deduplication window: skip hard-refresh if same chart:version was processed
 # within this many seconds. Handles JFrog retries and rapid successive pushes.
 JFROG_DEDUP_WINDOW   = int(os.environ.get("JFROG_DEDUP_WINDOW", "15"))
-COMMENT_MARKER     = "argocd-diff-preview"
+# Human-readable name shown on the Bitbucket PR build status and comment header.
+STATUS_NAME        = "ACME Diff Preview"
+# Marker written into the footer of every comment we post. find_existing_comment
+# also matches the legacy "argocd-diff-preview" marker so comments created by
+# older pods are still updated in place (no duplicate comment) during rollout.
+COMMENT_MARKER     = "acme-diff-preview"
+_COMMENT_MARKERS   = ("acme-diff-preview", "argocd-diff-preview")
+# BUILD_KEY is the STABLE Bitbucket build-status key. It MUST NOT change: the
+# key identifies the status row, so renaming it would leave the old status
+# orphaned and create a second row on every existing PR. Only STATUS_NAME (the
+# display label) changes for the rename.
 BUILD_KEY          = "argocd-diff-preview"
+# Verbose per-app / full-stderr logging. Set LOG_LEVEL=DEBUG to enable.
+LOG_LEVEL          = os.environ.get("LOG_LEVEL", "INFO").upper()
+DEBUG              = LOG_LEVEL == "DEBUG"
 MAX_RESOURCES_FULL = 5       # resources shown with full diff block
 MAX_DIFF_CHARS     = 2000    # chars per resource diff block
 MAX_APPS_PER_RUN   = 30      # safety cap
@@ -96,11 +125,21 @@ def log(msg: str, severity: str = "INFO", **labels) -> None:
         "severity":  severity,
         "message":   msg,
         "time":      datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%fZ"),
-        "component": "argocd-diff-preview",
+        "component": "acme-diff-preview",
     }
     if labels:
         entry["labels"] = {k: str(v) for k, v in labels.items()}
     print(json.dumps(entry), flush=True)
+
+def debug(msg: str, **labels) -> None:
+    """Emit a DEBUG log line only when LOG_LEVEL=DEBUG.
+
+    Used for the verbose diagnostics that help explain *why* a diff failed:
+    full ArgoCD stderr, per-attempt classification, repo-server error category,
+    etc. Kept off by default so normal INFO logs stay readable.
+    """
+    if DEBUG:
+        log(msg, "DEBUG", **labels)
 
 def _handle_sigterm(signum, frame) -> None:
     """Mark shutdown so the main loop exits after the current iteration."""
@@ -499,14 +538,40 @@ def _filter_diff_sections(sections: list) -> list:
         result.append((header, body))
     return result
 
-# Errors that are worth retrying quickly — they typically resolve within 2-5s.
-# - i/o timeout: spoke Redis temporarily unreachable via argocd-agent-redis-proxy
-# - connection refused: transient connectivity blip to ArgoCD server or proxy
+# ── Diff outcome model ────────────────────────────────────────────────
+# Every diff resolves to exactly one outcome. Only DIFF and NO_DIFF are
+# trustworthy answers; INDETERMINATE means "we could not compute the diff"
+# and is shown distinctly so a failed render is never mistaken for "no change".
+OUT_DIFF          = "diff"
+OUT_NO_DIFF       = "no_diff"
+OUT_INDETERMINATE = "indeterminate"
+OUT_ERROR         = "error"
+
+# Structured result of a single argocd_diff() call.
+#   text     : reconstructed diff text (only for OUT_DIFF)
+#   has_diff : True only for OUT_DIFF (kept for readability at call sites)
+#   error    : human-readable detail for INDETERMINATE / ERROR, else None
+#   outcome  : one of the OUT_* constants
+#   reason   : short machine code for logs/metrics (e.g. "oci_login_401")
+DiffResult = namedtuple("DiffResult", ["text", "has_diff", "error", "outcome", "reason"])
+
+# Errors that are worth retrying quickly within the same diff call — they often
+# clear within 2-5s (a concurrent render populates the cache, the proxy/Redis
+# hiccup passes, or the busy repo-server frees up).
+# - i/o timeout / connection refused: spoke Redis via argocd-agent-redis-proxy
 # - context deadline exceeded: short deadline expired, usually recovers fast
+# - error logging into OCI registry / failed running helm: repo-server cache
+#   miss + helm registry login; a retry may hit a now-cached manifest
+# - GetManifests ... 502 / 503 / 504: repo-server briefly overloaded behind ingress
 _RETRYABLE_DIFF_ERRORS = (
     "i/o timeout",
     "connection refused",
     "context deadline exceeded",
+    "error logging into OCI registry",
+    "failed running helm",
+    "GetManifests failed with status code 502",
+    "GetManifests failed with status code 503",
+    "GetManifests failed with status code 504",
 )
 
 # Auth-failure patterns that should trigger an ArgoCD re-login.
@@ -517,6 +582,81 @@ _AUTH_ERROR_PATTERNS = (
     "unauthenticated",
     "unauthorized",
 )
+
+# ── Diff error classification ─────────────────────────────────────────
+# Each tuple is (substring patterns, reason code). Checked in order; the first
+# matching group wins. All of these are INDETERMINATE: the diff could not be
+# computed, so the result is unknown (NOT "no changes"). The previous code
+# silently mapped several of these to no-diff, which hid real changes from
+# reviewers — that masking is removed here.
+_DIFF_ERROR_RULES = (
+    # OCI Helm chart could not be pulled/rendered (repo-server cache miss +
+    # `helm registry login` failure, e.g. 401 Bad Credentials on the registry).
+    (("error logging into OCI registry", "failed running helm",
+      "helm registry login"), "oci_login"),
+    # Spoke Redis unreachable through argocd-agent-redis-proxy while reading the
+    # app's cached managed (live) resources.
+    (("error getting cached app managed resources",), "managed_resources"),
+    # Manifest generation failed at the repo-server / ingress (often the visible
+    # symptom of an OCI render that exceeded the request deadline).
+    (("GetManifests failed with status code 5", "code = Unknown desc = POST",
+      "status code 502", "status code 503", "status code 504"), "manifests_5xx"),
+    # ArgoCD server / app-controller temporarily unavailable or restarting.
+    (("the server is not currently accepting requests",
+      "error getting server version"), "server_unavailable"),
+    # Request cancelled or deadline hit (transient).
+    (("context canceled", "code = Canceled",
+      "context deadline exceeded"), "canceled"),
+    # diff-preview account lacks RBAC for this app (config issue, not no-diff).
+    (("rpc error: code = PermissionDenied", "permission denied"), "permission"),
+)
+
+# Subset of managed_resources that is specifically a Redis/proxy timeout rather
+# than a plain "resources not cached" state. Kept separate for clearer metrics.
+_REDIS_TIMEOUT_HINTS = ("i/o timeout", "connection refused")
+
+# Operator-friendly one-liners shown in the PR comment for each indeterminate
+# reason. Keep these short — the full ArgoCD stderr is in the pod logs (DEBUG).
+_REASON_HINTS = {
+    "oci_login":          "Helm OCI registry login failed on the repo-server",
+    "redis_timeout":      "spoke Redis timed out via argocd-agent proxy",
+    "managed_no_cache":   "live state not cached for this agent-managed app",
+    "manifests_5xx":      "repo-server returned 5xx while generating manifests",
+    "server_unavailable": "ArgoCD server temporarily unavailable",
+    "canceled":           "request cancelled / deadline exceeded",
+    "permission":         "diff-preview account lacks RBAC for this app",
+    "auth":               "ArgoCD session expired (re-login triggered)",
+    "timeout":            "diff command timed out after 60s",
+    "retry_exhausted":    "still failing after retry",
+    "legacy":             "diff could not be computed",
+}
+
+
+def classify_diff_error(stderr_text: str) -> tuple:
+    """Map an `argocd app diff` failure (exit >= 2, or exit 1 with empty stdout)
+    to (outcome, reason, detail).
+
+    Pure function — no subprocess, no globals — so it is unit-testable without
+    ArgoCD. Every recognised failure is INDETERMINATE (diff not computable);
+    only genuinely unknown output is OUT_ERROR.
+    """
+    text = stderr_text or "unknown error"
+    lower = text.lower()
+
+    # Auth first: an expired/invalid session also needs a background re-login.
+    if any(p in lower for p in _AUTH_ERROR_PATTERNS):
+        return OUT_INDETERMINATE, "auth", text
+
+    for patterns, reason in _DIFF_ERROR_RULES:
+        if any(p in text for p in patterns):
+            if reason == "managed_resources":
+                # Distinguish a Redis/proxy timeout from a plain uncached state.
+                if any(h in text for h in _REDIS_TIMEOUT_HINTS):
+                    return OUT_INDETERMINATE, "redis_timeout", text
+                return OUT_INDETERMINATE, "managed_no_cache", text
+            return OUT_INDETERMINATE, reason, text
+
+    return OUT_ERROR, "unknown", text
 
 def _async_relogin():
     """Re-login to ArgoCD in a background thread when auth errors are detected.
@@ -545,65 +685,76 @@ def _run_one_diff(app, pr_sha):
         return None, True
 
 
-def argocd_diff(app, pr_sha):
-    """Returns (diff_text, has_diff, error_msg). Never raises.
+def _indeterminate(reason, detail):
+    """Build an INDETERMINATE DiffResult (diff could not be computed)."""
+    return DiffResult("", False, detail[:400], OUT_INDETERMINATE, reason)
 
-    Exit codes: 0=no diff, 1=diff found (or auth error with empty stdout),
-    2+=error.
+
+def argocd_diff(app, pr_sha):
+    """Run `argocd app diff` for one app and classify the result.
+
+    Returns a DiffResult. Never raises.
+
+    Exit codes: 0 = no diff, 1 = diff found (or auth error with empty stdout),
+    2+ = error.
 
     Retry policy:
-      - Fast retryable errors (i/o timeout, connection refused, context deadline):
-        one immediate retry after a 3s pause. This makes brief spoke-Redis hiccups
-        (2-5s) transparent to the user without waiting for the next 60s loop.
-      - Persistent errors: reported via error_msg so the cross-iteration retry fires.
-      - Command timeout (60s): not retried per-diff; let cross-iteration handle it.
+      - Retryable errors (Redis hiccup, OCI cache-miss render, repo-server 5xx):
+        one immediate retry after a 3s pause so brief blips (2-5s) are
+        transparent without waiting for the next loop.
+      - Persistent failures: returned as INDETERMINATE so the cross-iteration
+        retry fires and the comment shows "diff unavailable" (never a green check).
+      - Command timeout (60s): INDETERMINATE; let the next loop retry.
     """
+    last_detail = ""
     for attempt in range(2):
         r, timed_out = _run_one_diff(app, pr_sha)
         if timed_out:
-            return "", False, "diff timed out after 60s"
+            debug(f"diff timed out after 60s", app=app, attempt=attempt + 1)
+            # A timeout on the first attempt is worth one quick retry.
+            if attempt == 0:
+                time.sleep(3)
+                continue
+            return _indeterminate("timeout", "diff timed out after 60s")
+
+        # Clean exit 0 — manifests match, genuinely no changes.
         if r.returncode == 0:
-            return "", False, None
-        if r.returncode == 1:
-            if not r.stdout and r.stderr:
-                # Auth error: trigger re-login so the next diff call succeeds.
-                err_text = r.stderr[:400]
-                if any(p in err_text.lower() for p in _AUTH_ERROR_PATTERNS):
-                    threading.Thread(target=_async_relogin, daemon=True).start()
-                return "", False, err_text
+            return DiffResult("", False, None, OUT_NO_DIFF, "clean")
+
+        # Exit 1 with stdout = real diff. Exit 1 with only stderr = auth/other.
+        if r.returncode == 1 and not r.stdout and r.stderr:
+            outcome, reason, detail = classify_diff_error(r.stderr)
+            last_detail = detail
+            if reason == "auth":
+                # Refresh the JWT in the background so the next call succeeds.
+                threading.Thread(target=_async_relogin, daemon=True).start()
+            debug(f"diff exit 1 (no stdout): {reason}", app=app,
+                  attempt=attempt + 1, stderr=detail[:800])
+            if attempt == 0 and any(p in detail for p in _RETRYABLE_DIFF_ERRORS):
+                print(f"    [{app}] transient error on attempt 1, retrying in 3s: "
+                      f"{detail[:80]}", flush=True)
+                time.sleep(3)
+                continue
+            return _indeterminate(reason, detail)
 
         if r.returncode >= 2:
             err_out = (r.stderr or r.stdout or "unknown error")
+            last_detail = err_out
+            outcome, reason, detail = classify_diff_error(err_out)
+            debug(f"diff exit {r.returncode}: {reason}", app=app,
+                  attempt=attempt + 1, stderr=err_out[:800])
 
-            # Retryable fast errors — brief spoke-Redis or connectivity hiccup.
+            # Retryable fast errors — brief Redis / OCI cache-miss / 5xx hiccup.
             if attempt == 0 and any(p in err_out for p in _RETRYABLE_DIFF_ERRORS):
                 print(f"    [{app}] transient error on attempt 1, retrying in 3s: "
                       f"{err_out[:80]}", flush=True)
                 time.sleep(3)
                 continue  # → attempt 1 (the second and final attempt)
 
-            # "error getting cached app managed resources" — two distinct cases:
-            if "error getting cached app managed resources" in err_out:
-                if "i/o timeout" in err_out or "connection refused" in err_out:
-                    # Spoke Redis unreachable (persisted past retry) — diff indeterminate.
-                    return "", False, f"Redis timeout — could not determine diff: {err_out[:300]}"
-                # True managed-mode (argocd-agent resource proxy limitation) — expected.
-                return "", False, None
-
-            # Other managed-mode / transient errors treated as silent no-diff.
-            MANAGED_MODE_ERRORS = [
-                "error getting server version",
-                "the server is not currently accepting requests",
-                "rpc error: code = PermissionDenied",
-                "permission denied",
-                "context canceled",
-                "code = Canceled",
-                "502",
-                "code = Unknown desc = POST",
-            ]
-            if any(e in err_out for e in MANAGED_MODE_ERRORS):
-                return "", False, None
-            return "", False, err_out[:400]
+            if outcome == OUT_INDETERMINATE:
+                return _indeterminate(reason, detail)
+            # Genuinely unknown failure — surface as a hard error.
+            return DiffResult("", False, detail[:400], OUT_ERROR, reason)
 
         # returncode == 1 with stdout (actual diff output) — fall through.
         # Apply section filter: remove micro-versions-info and checksum-only
@@ -612,15 +763,15 @@ def argocd_diff(app, pr_sha):
         filtered_sections = _filter_diff_sections(parse_diff_sections(raw))
         if not filtered_sections:
             # All sections were noise — treat as no meaningful diff
-            return "", False, None
+            return DiffResult("", False, None, OUT_NO_DIFF, "noise_only")
         # Reconstruct diff text from remaining sections
         diff_text = "\n".join(
             f"===== {hdr} =====\n{body}"
             for hdr, body in filtered_sections
         )
-        return diff_text, True, None
-    # Should not be reached — loop always returns or continues.
-    return "", False, "unexpected: argocd_diff loop exhausted"
+        return DiffResult(diff_text, True, None, OUT_DIFF, "changes")
+    # Loop exhausted after a retry that still failed — report what we last saw.
+    return _indeterminate("retry_exhausted", last_detail or "unknown error")
 
 
 def parse_diff_sections(diff_text):
@@ -647,7 +798,7 @@ def post_build_status(pr_sha, state, description):
     try:
         bb("POST", f"commit/{pr_sha}/statuses/build", body={
             "state": state, "key": BUILD_KEY,
-            "name": "ArgoCD Diff Preview",
+            "name": STATUS_NAME,
             "url": f"https://{ARGOCD_SERVER}",
             "description": description[:255],
         })
@@ -692,7 +843,9 @@ def find_existing_comment(pr_id):
             return None, "", ""
         for c in data.get("values", []):
             raw = c.get("content", {}).get("raw", "")
-            if COMMENT_MARKER in raw:
+            # Match the current marker AND the legacy one so comments written by
+            # older pods are updated in place instead of duplicated during rollout.
+            if any(mk in raw for mk in _COMMENT_MARKERS):
                 m = re.search(r'Commit `([0-9a-f]{8})`', raw)
                 return c["id"], (m.group(1) if m else ""), raw
         next_url = data.get("next", "")
@@ -749,6 +902,8 @@ def fix_stuck_inprogress(pr_sha, pr_id, comment_raw):
             m = re.search(r"(\d+) resource\(s\) will change", comment_raw)
             n = m.group(1) if m else "?"
             state, desc = "SUCCESSFUL", f"{n} resource(s) will change - review comment"
+        elif "Diff incomplete" in comment_raw:
+            state, desc = "SUCCESSFUL", "Diff unavailable - review comment"
         else:
             state, desc = "SUCCESSFUL", "No manifest changes"
         post_build_status(pr_sha, state, desc)
@@ -831,15 +986,17 @@ def generate_ai_summary(app_results: dict) -> str | None:
       LAST:    critical flag line
     """
     try:
+        results = {app: _result(v) for app, v in app_results.items()}
         changed = {
-            app: parse_diff_sections(diff)
-            for app, (diff, hd, _) in app_results.items()
-            if hd
+            app: parse_diff_sections(r.text)
+            for app, r in results.items()
+            if r.outcome == OUT_DIFF
         }
+        # Apps whose diff could not be computed (indeterminate) or errored.
         errors = {
-            app: err
-            for app, (_, _, err) in app_results.items()
-            if err
+            app: (r.error or r.reason)
+            for app, r in results.items()
+            if r.outcome in (OUT_INDETERMINATE, OUT_ERROR)
         }
         if not changed and not errors:
             print("      [AI] No changed apps — skipping AI call")
@@ -861,7 +1018,8 @@ def generate_ai_summary(app_results: dict) -> str | None:
         error_note = ""
         if errors:
             error_note = (
-                f"\n\nFailed apps (diff error): {', '.join(errors.keys())}"
+                "\n\nApps whose diff could NOT be computed (treat as unknown, "
+                f"not unchanged): {', '.join(errors.keys())}"
             )
 
         prompt = (
@@ -941,14 +1099,33 @@ def generate_ai_summary(app_results: dict) -> str | None:
         return None
 
 # ── Comment format ────────────────────────────────────────────────────
+def _result(value):
+    """Coerce an app_results value into a DiffResult.
+
+    Accepts both DiffResult and the legacy (text, has_diff, error) tuple so the
+    function stays usable from tests that pass plain tuples.
+    """
+    if isinstance(value, DiffResult):
+        return value
+    text, has_diff, error = value
+    if has_diff:
+        return DiffResult(text, True, None, OUT_DIFF, "changes")
+    if error:
+        return DiffResult("", False, error, OUT_INDETERMINATE, "legacy")
+    return DiffResult("", False, None, OUT_NO_DIFF, "clean")
+
+
 def format_comment(pr_sha, app_results, skipped_apps=None):
     skipped_apps  = skipped_apps or []
+    results       = {app: _result(v) for app, v in app_results.items()}
     any_change    = False
     any_error     = False
+    any_unknown   = False   # diff could not be computed (indeterminate)
     total_changed = 0
+    unknown_apps  = []
 
     # Calculate changeset size to pick display mode.
-    changed_apps      = [(app, diff) for app, (diff, hd, _) in app_results.items() if hd]
+    changed_apps      = [(app, r.text) for app, r in results.items() if r.outcome == OUT_DIFF]
     total_diff_bytes  = sum(len(d) for _, d in changed_apps)
     is_large          = (
         len(changed_apps) > LARGE_PR_APP_THRESHOLD
@@ -968,7 +1145,7 @@ def format_comment(pr_sha, app_results, skipped_apps=None):
     # ── Header ──────────────────────────────────────────────────────
     large_label = f" | \U0001f4e6 Large changeset ({len(changed_apps)} apps)" if is_large else ""
     lines = [
-        "## \U0001f52d ArgoCD Diff Preview", "",
+        f"## \U0001f52d {STATUS_NAME}", "",
         f"**Commit** `{pr_sha[:8]}` \u2192 `main` | `{BB_REPO}`{large_label}", "",
     ]
 
@@ -991,10 +1168,21 @@ def format_comment(pr_sha, app_results, skipped_apps=None):
     lines += ["---", ""]
 
     # ── Per-app sections ─────────────────────────────────────────────
-    for app, (diff_text, has_diff, error) in app_results.items():
-        if error:
+    for app, r in results.items():
+        diff_text, has_diff, error = r.text, (r.outcome == OUT_DIFF), r.error
+        if r.outcome == OUT_ERROR:
             any_error = True
-            lines += [f"\u274c **`{app}`** \u2014 error: {error[:200]}", ""]
+            lines += [f"\u274c **`{app}`** \u2014 error: {(error or '')[:200]}", ""]
+
+        elif r.outcome == OUT_INDETERMINATE:
+            # The diff could NOT be computed — do not imply "no changes".
+            any_unknown = True
+            unknown_apps.append(app)
+            hint = _REASON_HINTS.get(r.reason, "diff could not be computed")
+            lines += [
+                f"\u2754 **`{app}`** \u2014 diff unavailable ({hint})",
+                "",
+            ]
 
         elif has_diff:
             any_change = True
@@ -1060,10 +1248,22 @@ def format_comment(pr_sha, app_results, skipped_apps=None):
             f"{', '.join(skipped_apps[:5])}{'...' if len(skipped_apps) > 5 else ''}*", ""]
 
     # ── Footer ───────────────────────────────────────────────────────
+    # Priority: hard error > real changes > indeterminate > clean. The
+    # indeterminate ("Diff incomplete") wording is also what the cross-iteration
+    # retry in process_pr looks for, so these PRs are re-evaluated next loop.
+    unknown_note = ""
+    if any_unknown:
+        unknown_note = (
+            f" \u2014 \u2754 {len(unknown_apps)} app(s) could not be evaluated "
+            f"(diff unavailable, NOT confirmed unchanged)"
+        )
     if any_error:
         status = "\u274c Error running diff"
     elif any_change:
-        status = f"\u26a0\ufe0f {total_changed} resource(s) will change"
+        status = f"\u26a0\ufe0f {total_changed} resource(s) will change{unknown_note}"
+    elif any_unknown:
+        status = (f"\u2754 Diff incomplete \u2014 {len(unknown_apps)} app(s) could not "
+                  f"be evaluated (NOT confirmed unchanged)")
     else:
         status = "\u2705 No manifest changes"
 
@@ -1094,11 +1294,21 @@ def process_pr(pr, path_map):
     # Cross-pod dedup: existing comment already covers this exact SHA
     existing_id, comment_sha, comment_raw = find_existing_comment(pr_id)
     if comment_sha == pr_sha[:8]:
-        # If the existing comment has errors (invalid session, timeout, etc.)
-        # re-run the diff now that ArgoCD is available again.
-        # A previous pod may have failed mid-flight and left a stale error comment.
-        if ("\u274c" in comment_raw and ("Error running diff" in comment_raw or "invalid session" in comment_raw or "error:" in comment_raw)) or "no-diff ERR:" in comment_raw:
-            print(f"    Re-running: previous comment for SHA {pr_sha[:8]} had errors, retrying diff")
+        # If the existing comment was not a clean result (hard error, or a diff
+        # that could not be computed) re-run now — the OCI/Redis/agent path may
+        # have recovered since. "Diff incomplete" is the indeterminate footer
+        # marker; the ❌ checks catch hard errors and legacy comments.
+        rerun = (
+            "Diff incomplete" in comment_raw
+            or "diff unavailable" in comment_raw
+            or "Error running diff" in comment_raw
+            or "Error processing diff" in comment_raw
+            or ("\u274c" in comment_raw and ("invalid session" in comment_raw
+                                             or "error:" in comment_raw))
+            or "no-diff ERR:" in comment_raw
+        )
+        if rerun:
+            print(f"    Re-running: previous comment for SHA {pr_sha[:8]} was not clean, retrying diff")
             existing_id = existing_id  # keep existing_id so we update (not create) the comment
         else:
             with _seen_lock:
@@ -1121,7 +1331,7 @@ def process_pr(pr, path_map):
             post_build_status(pr_sha, "SUCCESSFUL",
                 "No ArgoCD apps affected by this PR")
             no_apps_body = (
-                f"## \U0001f52d ArgoCD Diff Preview\n\n"
+                f"## \U0001f52d {STATUS_NAME}\n\n"
                 f"Commit `{pr_sha[:8]}` vs `main` | `{BB_REPO}`\n\n"
                 f"\u2705 **No ArgoCD apps are currently affected by the files "
                 f"changed in this commit.**\n\n"
@@ -1148,8 +1358,11 @@ def process_pr(pr, path_map):
             print(f"    Capped to {MAX_APPS_PER_RUN} apps "
                   f"({len(skipped_apps)} skipped)")
 
-        app_results = {}
-        any_error   = False
+        app_results   = {}
+        any_hard_error = False   # OUT_ERROR — unexpected failure
+        any_unknown    = False   # OUT_INDETERMINATE — diff not computable
+        outcome_counts = Counter()
+        reason_counts  = Counter()
         def run_diff(app):
             t0 = time.monotonic()
             result = argocd_diff(app, pr_sha)
@@ -1160,16 +1373,28 @@ def process_pr(pr, path_map):
             for fut in as_completed(futures):
                 app, result, elapsed = fut.result()
                 app_results[app] = result
-                diff_text, has_diff, err = result
-                if err:
-                    any_error = True
-                n_sections = len(parse_diff_sections(diff_text)) if has_diff else 0
-                status = (
-                    f"diff ({n_sections} resource(s))" if has_diff
-                    else ("no-diff" if not err else "error")
-                )
-                print(f"    {app}: {status} [{elapsed}s]"
-                      f"{' | ERR: '+err[:80] if err else ''}")
+                outcome_counts[result.outcome] += 1
+                if result.outcome == OUT_ERROR:
+                    any_hard_error = True
+                    reason_counts[result.reason] += 1
+                elif result.outcome == OUT_INDETERMINATE:
+                    any_unknown = True
+                    reason_counts[result.reason] += 1
+                n_sections = (len(parse_diff_sections(result.text))
+                              if result.outcome == OUT_DIFF else 0)
+                # Structured per-app line so failures are queryable in logs.
+                log(f"diff {result.outcome}/{result.reason} for {app} [{elapsed}s]"
+                    + (f" | {result.error[:120]}" if result.error else ""),
+                    severity=("WARNING" if result.outcome in (OUT_INDETERMINATE, OUT_ERROR) else "INFO"),
+                    pr=pr_id, app=app, outcome=result.outcome, reason=result.reason,
+                    elapsed_s=elapsed, resources=n_sections)
+
+        # Per-PR breakdown — at a glance, how many apps failed and why.
+        breakdown = ", ".join(f"{k}={v}" for k, v in sorted(outcome_counts.items()))
+        reasons   = ", ".join(f"{k}={v}" for k, v in sorted(reason_counts.items()))
+        log(f"PR #{pr_id} diff summary: {breakdown}"
+            + (f" | reasons: {reasons}" if reasons else ""),
+            pr=pr_id, **{f"n_{k}": v for k, v in outcome_counts.items()})
 
         body = format_comment(pr_sha, app_results, skipped_apps)
         comment_kb = round(len(body.encode()) / 1024, 1)
@@ -1179,24 +1404,33 @@ def process_pr(pr, path_map):
 
         # Count changed resources for build status description
         sections_total = sum(
-            max(len(parse_diff_sections(dt)), (1 if hd else 0))
-            for dt, hd, _ in app_results.values() if hd)
-        if any_error:
+            max(len(parse_diff_sections(r.text)), 1)
+            for r in app_results.values() if r.outcome == OUT_DIFF)
+        n_unknown = outcome_counts[OUT_INDETERMINATE]
+        if any_hard_error:
             post_build_status(pr_sha, "FAILED", "Diff failed - check PR comment")
         elif sections_total > 0:
+            extra = f" ({n_unknown} unavailable)" if any_unknown else ""
             post_build_status(pr_sha, "SUCCESSFUL",
-                f"{sections_total} resource(s) will change - review comment")
+                f"{sections_total} resource(s) will change - review comment{extra}")
+        elif any_unknown:
+            # Non-blocking, but clearly NOT a clean pass: the diff is unknown.
+            post_build_status(pr_sha, "SUCCESSFUL",
+                f"Diff unavailable for {n_unknown} app(s) - review comment")
         else:
             post_build_status(pr_sha, "SUCCESSFUL", "No manifest changes")
 
-        # Only mark as seen when the run was fully clean (no errors).
-        # If any app had a transient error (Redis timeout, auth failure, etc.)
-        # we leave _seen empty for this PR so the next iteration retries it.
-        # The existing-comment retry logic (find_existing_comment -> ❌ check)
-        # will then pick it up and re-run the diff automatically.
+        # Only mark as seen when the run was fully clean (no hard error, no
+        # indeterminate). If any app failed or could not be evaluated we leave
+        # _seen empty so the next iteration retries it — important so that once
+        # the OCI credential / Redis path recovers the diff is recomputed and the
+        # comment stops saying "unavailable". any_error keeps the historical name
+        # the tests look for; it now also covers indeterminate results.
+        any_error = any_hard_error or any_unknown
         if not any_error:
             with _seen_lock:
                 _seen[pr_id] = pr_sha
+        return outcome_counts
 
     except Exception as e:
         print(f"    [ERROR] PR #{pr_id}: {e}", file=sys.stderr)
@@ -1205,7 +1439,7 @@ def process_pr(pr, path_map):
         except Exception:
             pass
         err_body = (
-            f"## \U0001f52d ArgoCD Diff Preview\n\n"
+            f"## \U0001f52d {STATUS_NAME}\n\n"
             f"Commit `{pr_sha[:8]}` vs `main` | `{BB_REPO}`\n\n"
             f"\u274c **Error processing diff:** {str(e)[:400]}\n\n"
             f"---\n**Status:** \u274c Error running diff\n"
@@ -1219,7 +1453,7 @@ def process_pr(pr, path_map):
 # ── Main iteration (one poll cycle) ───────────────────────────────────
 def main_iteration():
     """Run one complete poll cycle: discover apps, get open PRs, process each."""
-    log("ArgoCD diff preview iteration starting")
+    log("ACME diff preview iteration starting")
 
     try:
         path_map = discover_path_app_map()
@@ -1269,23 +1503,39 @@ def main_iteration():
         pr for pr in prs
         if pr["source"]["commit"]["hash"] != base_sha
     ]
+    totals = Counter()
     if pending:
         with ThreadPoolExecutor(max_workers=MAX_PR_WORKERS) as executor:
             futs = {executor.submit(process_pr, pr, path_map): pr for pr in pending}
             for fut in as_completed(futs):
                 try:
-                    fut.result()
+                    counts = fut.result()
+                    if counts:
+                        totals.update(counts)
                 except Exception as exc:
                     pr = futs[fut]
                     log(f"Unhandled error processing PR #{pr['id']}: {exc}", "ERROR")
 
-    log("Iteration done")
+    # Iteration-level rollup across all PRs: a single line that shows whether
+    # this cycle was healthy or how many app diffs could not be computed.
+    if totals:
+        rollup = ", ".join(f"{k}={v}" for k, v in sorted(totals.items()))
+        unhealthy = totals.get(OUT_INDETERMINATE, 0) + totals.get(OUT_ERROR, 0)
+        log(f"Iteration done — diff outcomes: {rollup}"
+            + (f" | {unhealthy} app diff(s) could not be computed" if unhealthy else ""),
+            severity=("WARNING" if unhealthy else "INFO"),
+            **{f"n_{k}": v for k, v in totals.items()})
+    else:
+        log("Iteration done")
 
 # ── Main entry point (long-running Deployment mode) ───────────────────
 def main():
     """Start health server, login to ArgoCD, then run poll loop until SIGTERM."""
     global _last_ok
-    log("argocd-diff-preview starting (Deployment mode)")
+    log("acme-diff-preview starting (Deployment mode)",
+        argocd_server=ARGOCD_SERVER, argocd_user=ARGOCD_USER,
+        bb_repo=BB_REPO, diff_workers=DIFF_WORKERS, pr_workers=MAX_PR_WORKERS,
+        log_level=LOG_LEVEL, vertex_model=VERTEX_MODEL)
     _start_health_server()
 
     # Initial login — raises on failure so the container restarts immediately.

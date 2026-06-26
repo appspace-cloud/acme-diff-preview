@@ -7,8 +7,13 @@ fullnameOverride: "acme-diff-preview"
 
 image:
   repository: us-central1-docker.pkg.dev/appspace-devops/artifact/acme-diff-preview
-  tag: "1.3.4"
+  tag: "1.4.0"
   pullPolicy: IfNotPresent
+
+# Log verbosity for the diff-preview service. Set to DEBUG to emit the full
+# ArgoCD stderr and per-attempt diff classification (useful when diffs come
+# back "unavailable" and you need to see why).
+logLevel: INFO
 
 # ArgoCD server (hub cluster ingress)
 argocd:

@@ -45,6 +45,8 @@ spec:
             # argocd login writes ~/.argocd/config. HOME=/tmp redirects to emptyDir.
             - name: HOME
               value: /tmp
+            - name: LOG_LEVEL
+              value: {{ .Values.logLevel | default "INFO" | quote }}
           envFrom:
             - secretRef:
                 name: {{ include "acme-diff-preview.fullname" . }}-creds
