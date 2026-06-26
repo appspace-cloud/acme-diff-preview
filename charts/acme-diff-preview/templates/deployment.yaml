@@ -46,6 +46,36 @@ spec:
               value: /tmp
             - name: LOG_LEVEL
               value: {{ .Values.logLevel | default "INFO" | quote }}
+            {{- with .Values.diff }}
+            {{- if .maxAppsPerRun }}
+            - name: MAX_APPS_PER_RUN
+              value: {{ .maxAppsPerRun | quote }}
+            {{- end }}
+            {{- if .workers }}
+            - name: DIFF_WORKERS
+              value: {{ .workers | quote }}
+            {{- end }}
+            {{- if .prWorkers }}
+            - name: PR_WORKERS
+              value: {{ .prWorkers | quote }}
+            {{- end }}
+            {{- if .timeout }}
+            - name: DIFF_TIMEOUT
+              value: {{ .timeout | quote }}
+            {{- end }}
+            {{- if .retries }}
+            - name: DIFF_RETRIES
+              value: {{ .retries | quote }}
+            {{- end }}
+            {{- if .warmWorkers }}
+            - name: WARM_WORKERS
+              value: {{ .warmWorkers | quote }}
+            {{- end }}
+            {{- if .warmThreshold }}
+            - name: WARM_THRESHOLD
+              value: {{ .warmThreshold | quote }}
+            {{- end }}
+            {{- end }}
           envFrom:
             - secretRef:
                 name: {{ include "acme-diff-preview.fullname" . }}-creds
