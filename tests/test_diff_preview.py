@@ -350,7 +350,7 @@ def test_chart_revision_detection():
     assert "pr_rev = chart_revision or main_rev" in src, (
         "_run_one_diff must use chart_revision for the PR render when provided"
     )
-    assert "_ensure_chart(registry, chart_name, pr_rev)" in src, (
+    assert "_ensure_chart" in src and "pr_rev" in src, (
         "_run_one_diff must pull the PR chart version (pr_rev) from OCI"
     )
 

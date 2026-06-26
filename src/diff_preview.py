@@ -50,6 +50,7 @@ SHA dedup:
 import json, os, posixpath, random, re, signal, ssl, sys, subprocess, time, threading, urllib.error, urllib.request
 from collections import Counter, namedtuple
 from http.server import HTTPServer, BaseHTTPRequestHandler
+import concurrent.futures
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone
 
@@ -983,24 +984,43 @@ def _ensure_chart(registry: str, chart: str, version: str) -> str:
                 _helm_chart_cache[key] = _find_chart_subdir(chart_dir)
             return _helm_chart_cache[key]
 
-        # Pull into a temp dir and atomically rename to avoid partial state
+        # Pull into a temp dir and atomically rename to avoid partial state.
+        # Retry up to 3 times on transient network failures; don't retry on
+        # permanent errors (chart not found).
         import tempfile
         os.makedirs(HELM_CACHE_DIR, exist_ok=True)
         tmp_dir = tempfile.mkdtemp(dir=HELM_CACHE_DIR, prefix=f"{chart}-{version}-")
+        last_err = ""
         try:
-            r = subprocess.run(
-                [HELM_BIN, "pull", f"oci://{registry}/{chart}",
-                 "--version", version, "--untar", "-d", tmp_dir],
-                capture_output=True, text=True, timeout=120)
+            for pull_attempt in range(3):
+                r = subprocess.run(
+                    [HELM_BIN, "pull", f"oci://{registry}/{chart}",
+                     "--version", version, "--untar", "-d", tmp_dir],
+                    capture_output=True, text=True, timeout=120)
 
-            if r.returncode != 0:
+                if r.returncode == 0:
+                    break  # success
+
                 err = (r.stderr or r.stdout or "").lower()
+                last_err = r.stderr[:200]
+
                 if any(p in err for p in ("not found", "404", "does not exist",
                                            "no such file", "unexpected status code: 404")):
                     raise OciChartNotFound(
                         f"Chart {chart}:{version} not found in {registry}. "
                         f"Check that the version exists in the OCI registry.")
-                log(f"helm pull failed for {chart}:{version}: {r.stderr[:200]}", "WARNING")
+
+                if pull_attempt < 2:
+                    wait = (pull_attempt + 1) * 5  # 5s, 10s
+                    log(f"helm pull transient error ({chart}:{version}), "
+                        f"retry {pull_attempt+1}/2 in {wait}s: {last_err[:80]}", "WARNING")
+                    time.sleep(wait)
+                else:
+                    log(f"helm pull failed for {chart}:{version}: {last_err}", "WARNING")
+                    return None
+            else:
+                # Loop ran without break (shouldn't happen but handle it)
+                log(f"helm pull failed for {chart}:{version}: {last_err}", "WARNING")
                 return None
 
             # Move from tmp to final location atomically
@@ -1032,6 +1052,12 @@ def _find_chart_subdir(chart_dir: str) -> str:
         return chart_dir
 
 
+# Value file cache: {(sha, path) -> content}. Shared across all apps in one PR
+# iteration. Main sha files (same across all apps) are fetched once and reused.
+_vf_cache: dict = {}
+_vf_cache_lock  = threading.Lock()
+
+
 def _fetch_value_files(value_files: list, sha: str) -> dict:
     """Fetch all helm value files from Bitbucket at a specific commit sha.
 
@@ -1041,13 +1067,27 @@ def _fetch_value_files(value_files: list, sha: str) -> dict:
 
     Returns {original_path: file_content} for files that were fetched successfully.
     Files that return 404 (e.g. new clusters not yet in main) are silently skipped.
+
+    Fetches all files in parallel (typically 7 files × ~300ms = ~300ms total
+    instead of ~2.1s sequential). Results are cached by (sha, path) so the main
+    sha value files are fetched only once across all apps in a PR iteration.
     """
-    result = {}
-    for vf in value_files:
+    def _fetch_one(vf):
         clean = vf.replace("$config/", "").lstrip("/")
+        cache_key = (sha, clean)
+        with _vf_cache_lock:
+            if cache_key in _vf_cache:
+                return vf, _vf_cache[cache_key]
         content = _bb_fetch_file_at_sha(clean, sha)
-        if content:
-            result[vf] = content
+        with _vf_cache_lock:
+            _vf_cache[cache_key] = content
+        return vf, content
+
+    result = {}
+    with ThreadPoolExecutor(max_workers=max(1, len(value_files))) as ex:
+        for vf, content in ex.map(_fetch_one, value_files):
+            if content:
+                result[vf] = content
     return result
 
 
@@ -1220,13 +1260,24 @@ def _run_one_diff(app, pr_sha, main_sha, chart_revision=None):
 
     pr_rev = chart_revision or main_rev
 
+    # Pull both chart versions in parallel (each is per-key locked to prevent
+    # concurrent downloads of the same version).
     try:
-        pr_chart   = _ensure_chart(registry, chart_name, pr_rev)
-        main_chart = _ensure_chart(registry, chart_name, main_rev)
+        with ThreadPoolExecutor(max_workers=2) as ex:
+            pr_fut   = ex.submit(_ensure_chart, registry, chart_name, pr_rev)
+            main_fut = ex.submit(_ensure_chart, registry, chart_name, main_rev)
+            pr_chart   = pr_fut.result(timeout=DIFF_TIMEOUT)
+            main_chart = main_fut.result(timeout=DIFF_TIMEOUT)
     except OciChartNotFound as e:
         return None, False, str(e)
-    except subprocess.TimeoutExpired:
+    except concurrent.futures.TimeoutError:
         return None, True, None
+    except Exception as e:
+        # Re-raise OciChartNotFound even when wrapped by executor
+        cause = getattr(e, "__cause__", None) or getattr(e, "__context__", None)
+        if isinstance(cause, OciChartNotFound) or isinstance(e, OciChartNotFound):
+            return None, False, str(cause or e)
+        return None, False, str(e)[:200]
 
     if not pr_chart:
         return None, False, f"helm pull failed for {chart_name}:{pr_rev}"
@@ -1234,13 +1285,24 @@ def _run_one_diff(app, pr_sha, main_sha, chart_revision=None):
         return None, False, f"helm pull failed for {chart_name}:{main_rev}"
 
     try:
-        pr_vals   = _fetch_value_files(value_files, pr_sha)
-        main_vals = _fetch_value_files(value_files, main_sha)
+        # Fetch PR and main value files in parallel — each set takes ~300ms
+        # (7 parallel Bitbucket API calls) vs ~2.1s sequential.
+        with ThreadPoolExecutor(max_workers=2) as ex:
+            pr_vf_fut   = ex.submit(_fetch_value_files, value_files, pr_sha)
+            main_vf_fut = ex.submit(_fetch_value_files, value_files, main_sha)
+            pr_vals   = pr_vf_fut.result(timeout=DIFF_TIMEOUT)
+            main_vals = main_vf_fut.result(timeout=DIFF_TIMEOUT)
 
-        pr_yaml,   pr_err   = _helm_template(pr_chart,   release, namespace, pr_vals)
-        main_yaml, main_err = _helm_template(main_chart, release, namespace, main_vals)
+        # Render both chart versions in parallel
+        with ThreadPoolExecutor(max_workers=2) as ex:
+            pr_fut   = ex.submit(_helm_template, pr_chart,   release, namespace, pr_vals)
+            main_fut = ex.submit(_helm_template, main_chart, release, namespace, main_vals)
+            pr_yaml,   pr_err   = pr_fut.result(timeout=DIFF_TIMEOUT)
+            main_yaml, main_err = main_fut.result(timeout=DIFF_TIMEOUT)
     except subprocess.TimeoutExpired:
         return None, True, None
+    except Exception as e:
+        return None, False, str(e)[:200]
 
     if pr_err:
         return None, False, pr_err
@@ -1630,7 +1692,7 @@ def generate_ai_summary(app_results: dict) -> str | None:
         )
         prompt_chars = len(prompt)
         print(f"      [AI] Calling {VERTEX_MODEL} | prompt={prompt_chars} chars | "
-              f"maxTokens={1200}")
+              f"maxTokens={2000}")
         import time as _time; _t0 = _time.monotonic()
         resp = http(
             "POST",
@@ -1945,6 +2007,12 @@ def process_pr(pr, path_map, base_sha=""):
         any_unknown    = False   # OUT_INDETERMINATE — diff not computable
         outcome_counts = Counter()
         reason_counts  = Counter()
+
+        # Clear the value-file cache at the start of each PR so stale entries
+        # from a previous iteration don't mask a mid-run config update.
+        # Within a PR iteration, main-sha files are cached and reused across apps.
+        with _vf_cache_lock:
+            _vf_cache.clear()
 
         # For each affected app, detect whether the PR changes the OCI chart
         # targetRevision (appspace.version bump). If so, we pass a second
