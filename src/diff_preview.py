@@ -830,12 +830,18 @@ def _bb_fetch_file_at_sha(filepath, sha):
     Returns the decoded string content, or None on any error (missing file,
     network error, auth failure). Used to read the new chart version from a
     PR config file before running argocd app diff.
+
+    Uses a direct urllib call instead of bb()/http() because those helpers
+    always call json.loads() on the response, which fails for YAML/text files.
     """
+    import base64
+    url = (f"https://api.bitbucket.org/2.0/repositories/"
+           f"{BB_WORKSPACE}/{BB_REPO}/src/{sha}/{filepath}")
+    creds = base64.b64encode(f"{BB_USER}:{BB_TOKEN}".encode()).decode()
+    req = urllib.request.Request(url, headers={"Authorization": f"Basic {creds}"})
     try:
-        raw = bb("GET", f"src/{sha}/{filepath}")
-        if isinstance(raw, bytes):
-            return raw.decode("utf-8", errors="replace")
-        return raw
+        with urllib.request.urlopen(req, context=_ssl, timeout=20) as r:
+            return r.read().decode("utf-8", errors="replace")
     except Exception:
         return None
 
