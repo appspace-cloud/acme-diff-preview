@@ -2,11 +2,16 @@
 """ACME Diff Preview - dynamic discovery, robust error handling, SHA dedup.
 
 All apps are multi-source: source-1 = acme-config-dev, source-2 = Helm OCI.
-When the PR does NOT change the chart version, --source-positions 1 is enough.
-When the PR bumps appspace.version (= the chart targetRevision), both positions
-are overridden: --source-positions 1 --source-positions 2 with the new version
-fetched from the PR config file via Bitbucket API. Without this the old chart
-is rendered and version-bump PRs incorrectly show "no changes".
+
+Diff strategy: manifest-based (PR render vs main render), NOT live-state comparison.
+Uses `argocd app manifests` twice (PR sha + main sha) and diffs the YAML locally.
+This avoids fetching live resources from spoke agents, making each diff 10-30x
+faster (2-10s vs 20-360s per app). No per-agent serialization needed; all apps
+can be diffed in parallel.
+
+When the PR bumps appspace.version (the OCI chart targetRevision), both sources
+are overridden for the PR render: --source-positions 1 (git) and 2 (OCI chart).
+The chart version is detected by reading the PR config file via Bitbucket API.
 
 Diff outcome model (see classify_diff_error):
 - diff          : argocd produced a real manifest diff (exit 1 + stdout)
@@ -889,31 +894,113 @@ def _pr_chart_revision(app, changed_files, pr_sha):
     return None
 
 
-def _run_one_diff(app, pr_sha, chart_revision=None):
-    """Single subprocess call. Returns (proc, timed_out).
-
-    If chart_revision is provided (new OCI targetRevision for this PR), both
-    source positions are overridden so argocd renders the new chart version:
-      --revisions <pr_sha> --revisions <chart_revision>
-      --source-positions 1 --source-positions 2
-    Without chart_revision only the git config source is overridden (legacy
-    behaviour, correct for PRs that don't change the chart version).
-    """
+def _manifests_cmd(app, sha, chart_revision=None):
+    """Build `argocd app manifests` command for a given git sha (and optional chart version)."""
+    cmd = [ARGOCD_BIN, "app", "manifests", app,
+           "--revisions", sha, "--source-positions", "1"]
     if chart_revision:
-        cmd = [ARGOCD_BIN, "app", "diff", app,
-               "--revisions", pr_sha,
-               "--revisions", chart_revision,
-               "--source-positions", "1",
-               "--source-positions", "2"] + _auth_flags()
-    else:
-        cmd = [ARGOCD_BIN, "app", "diff", app,
-               "--revisions", pr_sha,
-               "--source-positions", "1"] + _auth_flags()
+        cmd += ["--revisions", chart_revision, "--source-positions", "2"]
+    return cmd + _auth_flags()
+
+
+def _fetch_manifests(app, sha, chart_revision=None):
+    """Return (yaml_text, error_str). Raises SubprocessTimeoutExpired on timeout."""
+    cmd = _manifests_cmd(app, sha, chart_revision)
+    r = subprocess.run(cmd, capture_output=True, text=True, timeout=DIFF_TIMEOUT)
+    if r.returncode != 0:
+        return None, (r.stderr or r.stdout or "manifests command failed")
+    return r.stdout, None
+
+
+def _parse_manifest_resources(yaml_text):
+    """Split a multi-document YAML string into a dict keyed by (group/Kind, ns/name).
+
+    Each value is the normalized document text (stripped, consistent trailing newline).
+    Documents without kind/metadata are skipped.
+    """
+    import re as _re
+    resources = {}
+    for doc in _re.split(r'\n---\s*\n|^---\s*\n', yaml_text, flags=_re.MULTILINE):
+        doc = doc.strip()
+        if not doc:
+            continue
+        kind = ns = name = api = ""
+        in_meta = False
+        for line in doc.splitlines():
+            if line.startswith("apiVersion:"):
+                api = line.split(":", 1)[1].strip()
+            elif line.startswith("kind:"):
+                kind = line.split(":", 1)[1].strip()
+            elif line.startswith("metadata:"):
+                in_meta = True
+            elif in_meta:
+                if line.startswith("  namespace:"):
+                    ns = line.split(":", 1)[1].strip()
+                elif line.startswith("  name:"):
+                    name = line.split(":", 1)[1].strip()
+                elif line and not line.startswith(" "):
+                    in_meta = False
+        if not (kind and name):
+            continue
+        # Use ArgoCD-style key: /Kind ns/name (group prefix for non-core)
+        grp = api.split("/")[0] if "/" in api else ""
+        type_key = f"{grp}/{kind}" if grp and grp not in ("v1", "") else kind
+        key = (type_key, ns or "", name)
+        resources[key] = doc + "\n"
+    return resources
+
+
+def _diff_manifests(main_yaml, pr_yaml):
+    """Diff two multi-doc YAML strings resource by resource.
+
+    Returns a diff string in the ArgoCD `===== /Kind ns/name =====` format so the
+    rest of the pipeline (parse_diff_sections, format_comment) works unchanged.
+    Returns empty string if there are no differences.
+    """
+    import difflib
+    main_res = _parse_manifest_resources(main_yaml)
+    pr_res   = _parse_manifest_resources(pr_yaml)
+
+    all_keys = sorted(set(main_res) | set(pr_res),
+                      key=lambda k: (k[0], k[1], k[2]))
+    parts = []
+    for key in all_keys:
+        type_key, ns, name = key
+        a_text = main_res.get(key, "")
+        b_text = pr_res.get(key, "")
+        if a_text == b_text:
+            continue
+        a_lines = a_text.splitlines(keepends=True)
+        b_lines = b_text.splitlines(keepends=True)
+        delta = list(difflib.unified_diff(a_lines, b_lines, lineterm="\n"))
+        if not delta:
+            continue
+        # Header format ArgoCD uses: ===== /Kind ns/name ======
+        hdr = f"/{type_key} {ns}/{name}" if ns else f"/{type_key} {name}"
+        parts.append(f"===== {hdr} ======\n" + "".join(delta))
+    return "\n".join(parts)
+
+
+def _run_one_diff(app, pr_sha, main_sha, chart_revision=None):
+    """Fetch rendered manifests for PR sha and main sha, diff locally.
+
+    Returns (diff_text_or_None, timed_out_bool, error_str_or_None).
+    No live cluster access - uses repo-server rendering only, so there is no
+    per-agent serialization needed and the whole fleet can be diffed in parallel.
+    """
     try:
-        r = subprocess.run(cmd, capture_output=True, text=True, timeout=DIFF_TIMEOUT)
-        return r, False
+        pr_yaml,   pr_err   = _fetch_manifests(app, pr_sha,   chart_revision)
+        main_yaml, main_err = _fetch_manifests(app, main_sha, None)
     except subprocess.TimeoutExpired:
-        return None, True
+        return None, True, None
+
+    if pr_err:
+        return None, False, pr_err
+    if main_err:
+        return None, False, main_err
+
+    diff_text = _diff_manifests(main_yaml, pr_yaml)
+    return diff_text, False, None
 
 
 def _indeterminate(reason, detail):
@@ -941,97 +1028,65 @@ def _diff_backoff(attempt):
     return base + random.uniform(0, base * 0.5)
 
 
-def argocd_diff(app, pr_sha, chart_revision=None):
-    """Run `argocd app diff` for one app and classify the result.
+def argocd_diff(app, pr_sha, main_sha, chart_revision=None):
+    """Compute the manifest diff between PR sha and main sha for one app.
 
     Returns a DiffResult. Never raises.
 
-    chart_revision: when provided, also overrides source-position 2 (the OCI
-    Helm chart) so the diff renders the new chart version rather than the
-    current one stored in the ArgoCD app spec. Required for version-bump PRs
-    where appspace.version changes: without this the old chart is rendered
-    and the diff incorrectly shows "no changes".
+    Uses `argocd app manifests` (repo-server rendering only) to get the rendered
+    YAML for both the PR revision and the current main revision, then diffs them
+    locally in Python. This avoids fetching live resources from spoke agents so:
+    - Each diff takes 2-15s instead of 20-360s
+    - No per-agent serialization (cap) is needed
+    - The whole fleet can be diffed in parallel
 
-    Exit codes: 0 = no diff, 1 = diff found (or auth error with empty stdout),
-    2+ = error.
-
-    Retry policy:
-      - Retryable errors (Redis hiccup, OCI cache-miss render, repo-server 5xx,
-        agent gRPC blip during a mass bump): up to DIFF_RETRIES attempts with
-        exponential backoff + jitter, so bursts that clear in a few seconds are
-        transparent without waiting for the next loop.
-      - Persistent failures: returned as INDETERMINATE so the cross-iteration
-        retry fires and the comment shows "diff unavailable" (never a green check).
-      - Command timeout (DIFF_TIMEOUT): retried with backoff, then INDETERMINATE.
+    Retry policy: OCI cache-miss renders on the first pass are retried with
+    backoff. Persistent failures (OCI not found, auth) surface as INDETERMINATE.
     """
     last_detail = ""
     last_attempt = DIFF_RETRIES - 1
     for attempt in range(DIFF_RETRIES):
-        r, timed_out = _run_one_diff(app, pr_sha, chart_revision=chart_revision)
+        diff_text, timed_out, err = _run_one_diff(
+            app, pr_sha, main_sha, chart_revision=chart_revision)
+
         if timed_out:
-            debug(f"diff timed out after {DIFF_TIMEOUT}s", app=app, attempt=attempt + 1)
-            # Timeouts under burst are worth retrying with backoff.
+            debug(f"manifests timed out after {DIFF_TIMEOUT}s", app=app, attempt=attempt + 1)
             if attempt < last_attempt:
                 time.sleep(_diff_backoff(attempt))
                 continue
-            return _indeterminate("timeout", f"diff timed out after {DIFF_TIMEOUT}s")
+            return _indeterminate("timeout", f"manifests timed out after {DIFF_TIMEOUT}s")
 
-        # Clean exit 0 — manifests match, genuinely no changes.
-        if r.returncode == 0:
-            return DiffResult("", False, None, OUT_NO_DIFF, "clean")
-
-        # Exit 1 with stdout = real diff. Exit 1 with only stderr = auth/other.
-        if r.returncode == 1 and not r.stdout and r.stderr:
-            outcome, reason, detail = classify_diff_error(r.stderr)
-            last_detail = detail
+        if err:
+            last_detail = err
+            outcome, reason, detail = classify_diff_error(err)
+            debug(f"manifests error: {reason}", app=app, attempt=attempt + 1, stderr=detail[:800])
             if reason == "auth":
-                # Refresh the JWT in the background so the next call succeeds.
                 threading.Thread(target=_async_relogin, daemon=True).start()
-            debug(f"diff exit 1 (no stdout): {reason}", app=app,
-                  attempt=attempt + 1, stderr=detail[:800])
-            if attempt < last_attempt and any(p in detail for p in _RETRYABLE_DIFF_ERRORS):
+            if attempt < last_attempt and any(p in err for p in _RETRYABLE_DIFF_ERRORS):
                 delay = _diff_backoff(attempt)
                 print(f"    [{app}] transient error (attempt {attempt + 1}/{DIFF_RETRIES}), "
-                      f"retrying in {delay:.0f}s: {detail[:80]}", flush=True)
+                      f"retrying in {delay:.0f}s: {err[:80]}", flush=True)
                 time.sleep(delay)
                 continue
-            return _indeterminate(reason, detail)
-
-        if r.returncode >= 2:
-            err_out = (r.stderr or r.stdout or "unknown error")
-            last_detail = err_out
-            outcome, reason, detail = classify_diff_error(err_out)
-            debug(f"diff exit {r.returncode}: {reason}", app=app,
-                  attempt=attempt + 1, stderr=err_out[:800])
-
-            # Retryable transient errors — Redis / OCI cache-miss / 5xx / agent blip.
-            if attempt < last_attempt and any(p in err_out for p in _RETRYABLE_DIFF_ERRORS):
-                delay = _diff_backoff(attempt)
-                print(f"    [{app}] transient error (attempt {attempt + 1}/{DIFF_RETRIES}), "
-                      f"retrying in {delay:.0f}s: {err_out[:80]}", flush=True)
-                time.sleep(delay)
-                continue
-
             if outcome == OUT_INDETERMINATE:
                 return _indeterminate(reason, detail)
-            # Genuinely unknown failure — surface as a hard error.
             return DiffResult("", False, detail[:400], OUT_ERROR, reason)
 
-        # returncode == 1 with stdout (actual diff output) — fall through.
-        # Apply section filter: remove micro-versions-info and checksum-only
-        # noise before the diff reaches both the comment and the AI analysis.
-        raw = r.stdout
-        filtered_sections = _filter_diff_sections(parse_diff_sections(raw))
+        # diff_text == "" means manifests are identical
+        if not diff_text:
+            return DiffResult("", False, None, OUT_NO_DIFF, "clean")
+
+        # Filter noise sections (checksums, version annotations that always drift)
+        filtered_sections = _filter_diff_sections(parse_diff_sections(diff_text))
         if not filtered_sections:
-            # All sections were noise — treat as no meaningful diff
             return DiffResult("", False, None, OUT_NO_DIFF, "noise_only")
-        # Reconstruct diff text from remaining sections
-        diff_text = "\n".join(
+
+        clean_diff = "\n".join(
             f"===== {hdr} =====\n{body}"
             for hdr, body in filtered_sections
         )
-        return DiffResult(diff_text, True, None, OUT_DIFF, "changes")
-    # Loop exhausted after a retry that still failed — report what we last saw.
+        return DiffResult(clean_diff, True, None, OUT_DIFF, "changes")
+    # Exhausted retries
     return _indeterminate("retry_exhausted", last_detail or "unknown error")
 
 
@@ -1536,7 +1591,7 @@ def format_comment(pr_sha, app_results, skipped_apps=None):
     return "\n".join(lines)
 
 # ── Per-PR processing (isolated) ──────────────────────────────────────
-def process_pr(pr, path_map):
+def process_pr(pr, path_map, base_sha=""):
     """Process one PR. All exceptions are caught so other PRs are not affected."""
     pr_id  = pr["id"]
     pr_sha = pr["source"]["commit"]["hash"]
@@ -1643,23 +1698,18 @@ def process_pr(pr, path_map):
         def run_diff(app):
             t0 = time.monotonic()
             chart_rev = pr_chart_revisions.get(app)
-            # Shared per-agent cap across all PRs (see _agent_semaphore).
-            with _agent_semaphore(app):
-                result = argocd_diff(app, pr_sha, chart_revision=chart_rev)
+            # No per-agent cap needed: manifests-based diff uses repo-server only,
+            # no live resource fetching from agents. Run all apps in parallel freely.
+            result = argocd_diff(app, pr_sha, main_sha=base_sha,
+                                 chart_revision=chart_rev)
             elapsed = round(time.monotonic() - t0, 1)
             return app, result, elapsed
 
         def process_batch(apps, workers):
-            """Diff a list of apps with a bounded pool, accumulating results.
-
-            Apps are interleaved by agent so the pool spreads across spokes
-            instead of piling onto one; the per-agent semaphore then caps how
-            many diffs hit each spoke at once.
-            """
+            """Diff a list of apps with a bounded pool, accumulating results."""
             nonlocal any_hard_error, any_unknown
             if not apps:
                 return
-            apps = _interleave_by_agent(apps)
             with ThreadPoolExecutor(max_workers=max(1, min(workers, len(apps)))) as ex:
                 futures = {ex.submit(run_diff, app): app for app in apps}
                 for fut in as_completed(futures):
@@ -1812,7 +1862,7 @@ def main_iteration():
     totals = Counter()
     if pending:
         with ThreadPoolExecutor(max_workers=MAX_PR_WORKERS) as executor:
-            futs = {executor.submit(process_pr, pr, path_map): pr for pr in pending}
+            futs = {executor.submit(process_pr, pr, path_map, base_sha): pr for pr in pending}
             for fut in as_completed(futs):
                 try:
                     counts = fut.result()
@@ -1838,12 +1888,11 @@ def main_iteration():
 def main():
     """Start health server, login to ArgoCD, then run poll loop until SIGTERM."""
     global _last_ok
-    log("acme-diff-preview starting (Deployment mode)",
+    log("acme-diff-preview starting (Deployment mode, manifest-based diff)",
         argocd_server=ARGOCD_SERVER, argocd_user=ARGOCD_USER,
         bb_repo=BB_REPO, diff_workers=DIFF_WORKERS, pr_workers=MAX_PR_WORKERS,
         max_apps_per_run=MAX_APPS_PER_RUN, diff_timeout=DIFF_TIMEOUT,
         diff_retries=DIFF_RETRIES, warm_workers=WARM_WORKERS,
-        agent_max_concurrency=AGENT_MAX_CONCURRENCY,
         log_level=LOG_LEVEL, vertex_model=VERTEX_MODEL)
     _start_health_server()
 

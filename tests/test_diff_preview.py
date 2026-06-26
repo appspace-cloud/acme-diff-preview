@@ -320,15 +320,18 @@ def test_cache_warm_selection():
     assert set(warm) | set(rest) == set(apps), "no app may be dropped"
 
 
-def test_per_agent_concurrency_cap():
-    """AGENT_MAX_CONCURRENCY must exist and the per-agent semaphore must wrap diffs."""
+def test_manifest_based_diff():
+    """Diff engine must use argocd app manifests (not app diff) to avoid live state fetching."""
     src = _source()
-    assert 'AGENT_MAX_CONCURRENCY = int(os.environ.get("AGENT_MAX_CONCURRENCY", "1"))' in src, (
-        "AGENT_MAX_CONCURRENCY must be env-configurable (default 1 = serialize per spoke)"
+    assert "_fetch_manifests" in src, "missing _fetch_manifests function"
+    assert "_diff_manifests" in src, "missing _diff_manifests function"
+    assert "_parse_manifest_resources" in src, "missing YAML resource parser"
+    assert '"app", "manifests"' in src, (
+        "_run_one_diff must use 'argocd app manifests', not 'argocd app diff'"
     )
-    assert "_app_agent_map" in src, "must track app -> agent mapping"
-    assert "threading.Semaphore(AGENT_MAX_CONCURRENCY)" in src, (
-        "diffs must be gated by a per-agent semaphore"
+    # The old live-state approach (argocd app diff) must no longer be the primary path
+    assert '"app", "diff"' not in src, (
+        "argocd app diff should not be used - use manifests for speed"
     )
 
 
