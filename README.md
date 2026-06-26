@@ -1,6 +1,6 @@
 # acme-diff-preview
 
-ArgoCD Diff Preview service for Appspace. A long-running Kubernetes Deployment
+ACME Diff Preview service for Appspace. A long-running Kubernetes Deployment
 that does two distinct jobs:
 
 1. **PR diff comments** — watches `acme-config-dev` Bitbucket PRs, runs
@@ -13,6 +13,47 @@ that does two distinct jobs:
 
 A CronJob runs a full hard-refresh of all dev/QA apps every 30 minutes as a
 fallback safety net.
+
+---
+
+## Diff outcomes and debugging
+
+Every `argocd app diff` call resolves to one of four outcomes
+(see `classify_diff_error` in `src/diff_preview.py`):
+
+| Outcome | Meaning | PR comment |
+|---|---|---|
+| `diff` | A real manifest diff was produced | ⚠️ N resource(s) will change |
+| `no_diff` | Clean exit 0 — manifests match | ✅ No manifest changes |
+| `indeterminate` | The diff could **not** be computed | ❔ diff unavailable (reason) |
+| `error` | Unexpected / unknown failure | ❌ error |
+
+`indeterminate` is the important one: it is **never** rendered as a green
+"no changes". It covers the failures that come from the ArgoCD-agent / proxy /
+Redis / OCI topology, with a short reason in the comment and the full ArgoCD
+stderr in the pod logs at `LOG_LEVEL=DEBUG`:
+
+| Reason | Cause |
+|---|---|
+| `oci_login` | repo-server `helm registry login` to the OCI registry failed (e.g. 401 Bad Credentials) on a manifest cache miss |
+| `manifests_5xx` | repo-server returned 5xx (often the visible symptom of a failed/slow OCI render) on `GetManifests` |
+| `redis_timeout` | spoke Redis unreachable via `argocd-agent-redis-proxy` |
+| `managed_no_cache` | live state not cached for an agent-managed app |
+| `server_unavailable` | ArgoCD server / app-controller restarting or busy |
+| `canceled` | request cancelled / deadline exceeded |
+| `permission` | the `diff-preview` account lacks RBAC for the app |
+| `auth` | ArgoCD session expired (a background re-login is triggered) |
+
+PRs with any `indeterminate` or `error` app are **not** marked "seen", so the
+next loop re-evaluates them — once the underlying OCI / Redis path recovers the
+comment automatically flips from "diff unavailable" to the real diff.
+
+To see exactly why a diff failed:
+
+```bash
+kubectl -n argocd logs deploy/acme-diff-preview | grep '"outcome"'
+# or, for full ArgoCD stderr, set logLevel: DEBUG in the Helm values
+```
 
 ---
 
@@ -140,7 +181,10 @@ Key Helm values configured from `acme-infrastructure`:
 ```yaml
 image:
   repository: us-central1-docker.pkg.dev/appspace-devops/artifact/acme-diff-preview
-  tag: "1.3.4"
+  tag: "1.4.0"
+
+# Set to DEBUG to log full ArgoCD stderr + per-attempt diff classification.
+logLevel: INFO
 
 argocd:
   server: argocd.appspace.com
