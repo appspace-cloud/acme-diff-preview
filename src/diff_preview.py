@@ -981,6 +981,7 @@ def _ensure_chart(registry: str, chart: str, version: str) -> str:
 
         # Pull into a temp dir and atomically rename to avoid partial state
         import tempfile
+        os.makedirs(HELM_CACHE_DIR, exist_ok=True)
         tmp_dir = tempfile.mkdtemp(dir=HELM_CACHE_DIR, prefix=f"{chart}-{version}-")
         try:
             r = subprocess.run(
