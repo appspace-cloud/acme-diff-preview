@@ -83,11 +83,14 @@ DIFF_TIMEOUT       = int(os.environ.get("DIFF_TIMEOUT", "120"))       # seconds 
 WARM_WORKERS       = int(os.environ.get("WARM_WORKERS", "4"))         # parallel chart-cache warm-up diffs
 WARM_THRESHOLD     = int(os.environ.get("WARM_THRESHOLD", "8"))       # only warm when a PR fans out to more apps than this
 # Max concurrent diffs targeting a SINGLE agent / spoke cluster. All apps on one
-# spoke share one argocd-agent + redis/resource proxy connection, so this is the
-# real saturation limit (not total concurrency). Total stays high across agents;
-# per-agent stays gentle so a mass bump that lands many apps on the same cluster
-# does not overwhelm that one agent (redis_timeout / "resource response not tracked").
-AGENT_MAX_CONCURRENCY = int(os.environ.get("AGENT_MAX_CONCURRENCY", "3"))
+# spoke share one argocd-agent + the principal resource-proxy connection to it.
+# A single `argocd app diff` of a large app fans out into hundreds of live-resource
+# requests to that one agent, so several diffs at once overrun the agent's response
+# window and the principal drops the late responses ("resource response not tracked"),
+# which surfaces as redis_timeout. Default 1 = serialize per spoke; throughput still
+# scales by parallelizing ACROSS spokes (DIFF_WORKERS). Measured on a 24-app bump:
+# 1 -> 26/27 clean, 0 principal panics; 3 -> 11 failures + send-on-closed-channel panics.
+AGENT_MAX_CONCURRENCY = int(os.environ.get("AGENT_MAX_CONCURRENCY", "1"))
 # Global per-agent semaphores, shared across ALL concurrently processed PRs.
 # Must be module-level (not per-PR): two PRs that both touch the same spoke would
 # otherwise each get their own cap and double the load on that one agent.
@@ -825,7 +828,7 @@ def _indeterminate(reason, detail):
 # saturated, so a transient 5xx/timeout on the first try is normal and clears
 # within a few seconds once the chart cache warms. More attempts with growing
 # backoff make the diff transparent to reviewers instead of "diff unavailable".
-DIFF_RETRIES       = int(os.environ.get("DIFF_RETRIES", "3"))   # total attempts per diff
+DIFF_RETRIES       = int(os.environ.get("DIFF_RETRIES", "5"))   # total attempts per diff
 DIFF_BACKOFF_BASE  = float(os.environ.get("DIFF_BACKOFF_BASE", "3"))   # seconds
 DIFF_BACKOFF_CAP   = float(os.environ.get("DIFF_BACKOFF_CAP", "30"))   # seconds
 

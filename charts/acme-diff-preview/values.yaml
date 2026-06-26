@@ -28,17 +28,24 @@ diff:
   # Seconds per diff attempt (OCI cache-miss renders can exceed a minute).
   timeout: 120
   # Retry attempts per diff with exponential backoff + jitter on transient errors.
-  retries: 3
+  # 5 attempts absorb the occasional late resource-proxy response on a single app.
+  retries: 5
   # Parallel chart-cache warm-up diffs (one representative per distinct OCI chart
   # is diffed first to warm the repo-server cache before the big fan-out).
   warmWorkers: 4
   # Only warm when a PR fans out to more apps than this.
   warmThreshold: 8
   # Max concurrent diffs per agent / spoke cluster. All apps on one spoke share a
-  # single argocd-agent + proxy, so this caps per-spoke load while total
-  # concurrency stays high across spokes. Keeps a mass bump that lands many apps
-  # on the same cluster from saturating that agent.
-  agentMaxConcurrency: 3
+  # single argocd-agent and the principal resource-proxy connection to it. A single
+  # `argocd app diff` of a large app (hundreds of resources) fans out into hundreds
+  # of live-resource requests to that one agent; running several diffs at once on
+  # the same spoke overruns the agent's response window and the principal drops the
+  # late responses ("resource response not tracked"), which surfaces as redis_timeout.
+  # Serializing per agent (1) and parallelizing ACROSS agents (workers) keeps every
+  # request inside the proxy window while total throughput still scales with the
+  # number of spokes. Validated on a 24-app mass bump: 1 -> 26/27 clean, 0 principal
+  # panics; 3 -> 11 failures + channel-close panics.
+  agentMaxConcurrency: 1
 
 # ArgoCD server (hub cluster ingress)
 argocd:

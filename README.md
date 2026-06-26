@@ -63,13 +63,18 @@ cache miss racing to pull and render the same OCI chart, which saturates the
 repo-server (5xx / `manifests_5xx`) and floods the argocd-agent principal. Two
 mechanisms keep this reliable:
 
-1. **Per-agent concurrency cap.** Every app on a spoke shares one argocd-agent
-   and its redis/resource proxy, so the real saturation limit is per spoke, not
-   total. Diffs are gated by a per-agent semaphore (`AGENT_MAX_CONCURRENCY`) and
-   interleaved across agents, so total concurrency stays high across many spokes
-   while any single spoke stays gentle. This is what keeps a bump that lands many
-   apps on the same cluster from timing out that agent (`redis_timeout` /
-   "resource response not tracked").
+1. **Per-agent concurrency cap (serialize per spoke, parallelize across spokes).**
+   Every app on a spoke shares one argocd-agent and the principal's resource-proxy
+   connection to it. A single `argocd app diff` of a large app (hundreds of
+   resources) fans out into hundreds of live-resource requests to that one agent,
+   so running several diffs at once on the same spoke overruns the agent's response
+   window; the principal then drops the late responses ("resource response not
+   tracked") and the diff fails as `redis_timeout`. Diffs are gated by a global
+   per-agent semaphore (`AGENT_MAX_CONCURRENCY`, default `1`) and interleaved across
+   agents, so each spoke is hit one diff at a time while total throughput still
+   scales with the number of spokes. Measured on a 24-app mass bump: `1` -> 26/27
+   clean and 0 principal panics; `3` -> 11 failures plus `send on closed channel`
+   panics on the principal.
 2. **Chart-cache warm-up.** Before the parallel fan-out, one representative app
    per distinct OCI chart is diffed first (`_select_warm_apps`). That single
    render warms the repo-server chart cache so the remaining apps reuse the pull
@@ -90,10 +95,10 @@ This is paired with hub-side capacity in `acme-infrastructure`
 | `DIFF_WORKERS` | `diff.workers` | `16` | Parallel diffs within one PR |
 | `PR_WORKERS` | `diff.prWorkers` | `3` | PRs processed in parallel |
 | `DIFF_TIMEOUT` | `diff.timeout` | `120` | Seconds per diff attempt |
-| `DIFF_RETRIES` | `diff.retries` | `3` | Attempts per diff (backoff + jitter) |
+| `DIFF_RETRIES` | `diff.retries` | `5` | Attempts per diff (backoff + jitter) |
 | `WARM_WORKERS` | `diff.warmWorkers` | `4` | Parallel chart warm-up diffs |
 | `WARM_THRESHOLD` | `diff.warmThreshold` | `8` | Min apps before warm-up kicks in |
-| `AGENT_MAX_CONCURRENCY` | `diff.agentMaxConcurrency` | `3` | Max concurrent diffs per agent/spoke |
+| `AGENT_MAX_CONCURRENCY` | `diff.agentMaxConcurrency` | `1` | Max concurrent diffs per agent/spoke (serialize per spoke) |
 
 ---
 

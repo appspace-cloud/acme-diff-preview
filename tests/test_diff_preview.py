@@ -276,8 +276,8 @@ def test_retry_loop_with_backoff():
     assert "for attempt in range(DIFF_RETRIES):" in src, (
         "argocd_diff must loop over DIFF_RETRIES attempts"
     )
-    assert 'DIFF_RETRIES       = int(os.environ.get("DIFF_RETRIES", "3"))' in src, (
-        "DIFF_RETRIES must be env-configurable (default 3)"
+    assert 'DIFF_RETRIES       = int(os.environ.get("DIFF_RETRIES", "5"))' in src, (
+        "DIFF_RETRIES must be env-configurable (default 5)"
     )
     assert "def _diff_backoff(" in src, "Missing exponential backoff helper"
     assert "random.uniform" in src, "Backoff must add jitter (random.uniform)"
@@ -323,8 +323,8 @@ def test_cache_warm_selection():
 def test_per_agent_concurrency_cap():
     """AGENT_MAX_CONCURRENCY must exist and the per-agent semaphore must wrap diffs."""
     src = _source()
-    assert 'AGENT_MAX_CONCURRENCY = int(os.environ.get("AGENT_MAX_CONCURRENCY", "3"))' in src, (
-        "AGENT_MAX_CONCURRENCY must be env-configurable (default 3)"
+    assert 'AGENT_MAX_CONCURRENCY = int(os.environ.get("AGENT_MAX_CONCURRENCY", "1"))' in src, (
+        "AGENT_MAX_CONCURRENCY must be env-configurable (default 1 = serialize per spoke)"
     )
     assert "_app_agent_map" in src, "must track app -> agent mapping"
     assert "threading.Semaphore(AGENT_MAX_CONCURRENCY)" in src, (
