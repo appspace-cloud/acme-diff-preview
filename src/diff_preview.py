@@ -3,15 +3,19 @@
 
 All apps are multi-source: source-1 = acme-config-dev, source-2 = Helm OCI.
 
-Diff strategy: manifest-based (PR render vs main render), NOT live-state comparison.
-Uses `argocd app manifests` twice (PR sha + main sha) and diffs the YAML locally.
-This avoids fetching live resources from spoke agents, making each diff 10-30x
-faster (2-10s vs 20-360s per app). No per-agent serialization needed; all apps
-can be diffed in parallel.
+Diff strategy: pure helm template (no ArgoCD agent calls during diff).
+At startup, `argocd app list` is called once (cached 5 min) to discover chart
+metadata (name, version, registry, value files, namespace). The diff itself uses:
+  1. `helm pull oci://registry/chart --version X --untar` (cached locally)
+  2. Bitbucket API to fetch value files at PR sha and main sha
+  3. `helm template` to render both, then Python YAML diff
 
-When the PR bumps appspace.version (the OCI chart targetRevision), both sources
-are overridden for the PR render: --source-positions 1 (git) and 2 (OCI chart).
-The chart version is detected by reading the PR config file via Bitbucket API.
+This is entirely local — no argocd app diff, no argocd app manifests, no spoke
+agents. Typical latency: 4-6s/app with warm chart cache vs 20-360s with ArgoCD.
+
+When the PR bumps appspace.version (= the OCI chart targetRevision), the new
+version is detected from the PR config file via Bitbucket API and used for the
+PR render while main render uses the current stored targetRevision.
 
 Diff outcome model (see classify_diff_error):
 - diff          : argocd produced a real manifest diff (exit 1 + stdout)
@@ -1112,23 +1116,6 @@ def _pr_chart_revision(app, changed_files, pr_sha):
     return None
 
 
-def _manifests_cmd(app, sha, chart_revision=None):
-    """Build `argocd app manifests` command for a given git sha (and optional chart version)."""
-    cmd = [ARGOCD_BIN, "app", "manifests", app,
-           "--revisions", sha, "--source-positions", "1"]
-    if chart_revision:
-        cmd += ["--revisions", chart_revision, "--source-positions", "2"]
-    return cmd + _auth_flags()
-
-
-def _fetch_manifests(app, sha, chart_revision=None):
-    """Return (yaml_text, error_str). Raises SubprocessTimeoutExpired on timeout."""
-    cmd = _manifests_cmd(app, sha, chart_revision)
-    r = subprocess.run(cmd, capture_output=True, text=True, timeout=DIFF_TIMEOUT)
-    if r.returncode != 0:
-        return None, (r.stderr or r.stdout or "manifests command failed")
-    return r.stdout, None
-
 
 def _parse_manifest_resources(yaml_text):
     """Split a multi-document YAML string into a dict keyed by (group/Kind, ns/name).
@@ -1200,12 +1187,23 @@ def _diff_manifests(main_yaml, pr_yaml):
 
 
 def _run_one_diff(app, pr_sha, main_sha, chart_revision=None):
-    """Diff PR vs main manifests locally using helm template (fast, no agent access).
+    """Diff PR vs main using pure helm template — no ArgoCD agent access at all.
 
-    Falls back to argocd app manifests when helm is not configured (no OCI_PASS).
+    Strategy:
+      1. Resolve chart metadata from the in-memory app cache (populated at startup
+         from `argocd app list`, refreshed every 5 min).
+      2. Pull the OCI chart tarball for both the PR version and the current main
+         version to the local HELM_CACHE_DIR (first pull only; reused thereafter).
+      3. Fetch value files (Bitbucket API) at both PR sha and main sha.
+      4. Run `helm template` for each set, diff the YAML output resource-by-resource.
+
+    No `argocd app diff`, no `argocd app manifests`, no spoke-agent round-trips.
 
     Returns (diff_text_or_None, timed_out_bool, error_str_or_None).
-    OciChartNotFound is surfaced as a clear error string so it shows in the PR comment.
+    OciChartNotFound surfaces as a permanent error (no retry) with a clear message.
+    chart_not_configured is returned when app metadata is missing from the cache
+    (e.g. the app was not yet in `argocd app list` when the cache was built); the
+    outer retry loop will re-attempt after backoff.
     """
     chart_name  = _app_chart_map.get(app)
     main_rev    = _app_chart_revision_map.get(app)
@@ -1214,42 +1212,33 @@ def _run_one_diff(app, pr_sha, main_sha, chart_revision=None):
     namespace   = _app_namespace_map.get(app, "")
     release     = app.split("/")[-1]   # strip "namespace/" prefix if present
 
+    if not (chart_name and main_rev and value_files and registry):
+        missing = [k for k, v in [("chart", chart_name), ("revision", main_rev),
+                                   ("value_files", value_files), ("registry", registry)] if not v]
+        return None, False, (f"app metadata not yet in cache ({', '.join(missing)}); "
+                             f"will retry after cache refresh")
+
     pr_rev = chart_revision or main_rev
 
-    # ── Helm-template path (fast - no agent, purely local rendering) ──────────
-    if (HELM_BIN and OCI_PASS and chart_name and main_rev
-            and value_files and registry):
-        try:
-            # Download both chart versions (cached after first pull)
-            pr_chart   = _ensure_chart(registry, chart_name, pr_rev)
-            main_chart = _ensure_chart(registry, chart_name, main_rev)
-        except OciChartNotFound as e:
-            return None, False, str(e)
-        except subprocess.TimeoutExpired:
-            return None, True, None
-
-        if pr_chart and main_chart:
-            try:
-                pr_vals   = _fetch_value_files(value_files, pr_sha)
-                main_vals = _fetch_value_files(value_files, main_sha)
-
-                pr_yaml,   pr_err   = _helm_template(pr_chart,   release, namespace, pr_vals)
-                main_yaml, main_err = _helm_template(main_chart, release, namespace, main_vals)
-            except subprocess.TimeoutExpired:
-                return None, True, None
-
-            if pr_err:
-                return None, False, pr_err
-            if main_err:
-                return None, False, main_err
-
-            return _diff_manifests(main_yaml, pr_yaml), False, None
-        # If chart pull failed for non-OCI-not-found reason, fall through to argocd
-
-    # ── Fallback: argocd app manifests (slower, requires ArgoCD API) ──────────
     try:
-        pr_yaml,   pr_err   = _fetch_manifests(app, pr_sha,   chart_revision)
-        main_yaml, main_err = _fetch_manifests(app, main_sha, None)
+        pr_chart   = _ensure_chart(registry, chart_name, pr_rev)
+        main_chart = _ensure_chart(registry, chart_name, main_rev)
+    except OciChartNotFound as e:
+        return None, False, str(e)
+    except subprocess.TimeoutExpired:
+        return None, True, None
+
+    if not pr_chart:
+        return None, False, f"helm pull failed for {chart_name}:{pr_rev}"
+    if not main_chart:
+        return None, False, f"helm pull failed for {chart_name}:{main_rev}"
+
+    try:
+        pr_vals   = _fetch_value_files(value_files, pr_sha)
+        main_vals = _fetch_value_files(value_files, main_sha)
+
+        pr_yaml,   pr_err   = _helm_template(pr_chart,   release, namespace, pr_vals)
+        main_yaml, main_err = _helm_template(main_chart, release, namespace, main_vals)
     except subprocess.TimeoutExpired:
         return None, True, None
 

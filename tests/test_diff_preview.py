@@ -320,34 +320,38 @@ def test_cache_warm_selection():
     assert set(warm) | set(rest) == set(apps), "no app may be dropped"
 
 
-def test_manifest_based_diff():
-    """Diff engine must use argocd app manifests (not app diff) to avoid live state fetching."""
+def test_pure_helm_diff():
+    """Diff engine must use pure helm template — no argocd app diff or manifests calls."""
     src = _source()
-    assert "_fetch_manifests" in src, "missing _fetch_manifests function"
+    assert "_helm_template" in src, "missing _helm_template function"
+    assert "_ensure_chart" in src, "missing _ensure_chart function"
+    assert "_fetch_value_files" in src, "missing _fetch_value_files function"
     assert "_diff_manifests" in src, "missing _diff_manifests function"
-    assert "_parse_manifest_resources" in src, "missing YAML resource parser"
-    assert '"app", "manifests"' in src, (
-        "_run_one_diff must use 'argocd app manifests', not 'argocd app diff'"
-    )
-    # The old live-state approach (argocd app diff) must no longer be the primary path
+    # No live cluster access: argocd app diff and argocd app manifests must NOT be
+    # called during the diff path
     assert '"app", "diff"' not in src, (
-        "argocd app diff should not be used - use manifests for speed"
+        "argocd app diff must not be used - causes agent load and is slow"
     )
+    assert '"app", "manifests"' not in src, (
+        "argocd app manifests must not be called during diff (still uses agents in our setup)"
+    )
+    # argocd is still used for app discovery (app list) and auth (login) only
+    assert '"app", "list"' in src, "argocd app list needed for app discovery at startup"
 
 
 def test_chart_revision_detection():
-    """_pr_chart_revision must detect version bumps and _run_one_diff must use dual source-positions."""
+    """_pr_chart_revision must detect version bumps; helm template must use the new version."""
     src = _source()
-    # The fix: fetch PR config file and detect appspace.version change
     assert "_pr_chart_revision" in src, "missing _pr_chart_revision function"
     assert "_app_chart_revision_map" in src, "missing chart revision cache"
     assert "_bb_fetch_file_at_sha" in src, "missing Bitbucket file fetch helper"
-    # When chart_revision is set, both source positions must be overridden
-    assert '"--source-positions", "2"' in src, (
-        "_run_one_diff must pass --source-positions 2 for chart version bumps"
+    # With pure helm path, the new chart version is passed to _ensure_chart / _helm_template.
+    # The pr_rev variable in _run_one_diff must use chart_revision when provided.
+    assert "pr_rev = chart_revision or main_rev" in src, (
+        "_run_one_diff must use chart_revision for the PR render when provided"
     )
-    assert '"--revisions", chart_revision' in src, (
-        "_run_one_diff must pass the new chart revision as second --revisions"
+    assert "_ensure_chart(registry, chart_name, pr_rev)" in src, (
+        "_run_one_diff must pull the PR chart version (pr_rev) from OCI"
     )
 
 
