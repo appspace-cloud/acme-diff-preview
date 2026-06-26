@@ -332,6 +332,22 @@ def test_per_agent_concurrency_cap():
     )
 
 
+def test_chart_revision_detection():
+    """_pr_chart_revision must detect version bumps and _run_one_diff must use dual source-positions."""
+    src = _source()
+    # The fix: fetch PR config file and detect appspace.version change
+    assert "_pr_chart_revision" in src, "missing _pr_chart_revision function"
+    assert "_app_chart_revision_map" in src, "missing chart revision cache"
+    assert "_bb_fetch_file_at_sha" in src, "missing Bitbucket file fetch helper"
+    # When chart_revision is set, both source positions must be overridden
+    assert '"--source-positions", "2"' in src, (
+        "_run_one_diff must pass --source-positions 2 for chart version bumps"
+    )
+    assert '"--revisions", chart_revision' in src, (
+        "_run_one_diff must pass the new chart revision as second --revisions"
+    )
+
+
 def test_interleave_by_agent():
     """_interleave_by_agent round-robins apps across agents, dropping none."""
     mod = _import_module()

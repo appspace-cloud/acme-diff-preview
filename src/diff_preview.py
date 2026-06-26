@@ -2,7 +2,11 @@
 """ACME Diff Preview - dynamic discovery, robust error handling, SHA dedup.
 
 All apps are multi-source: source-1 = acme-config-dev, source-2 = Helm OCI.
---source-positions 1 is correct for all apps in this setup.
+When the PR does NOT change the chart version, --source-positions 1 is enough.
+When the PR bumps appspace.version (= the chart targetRevision), both positions
+are overridden: --source-positions 1 --source-positions 2 with the new version
+fetched from the PR config file via Bitbucket API. Without this the old chart
+is rendered and version-bump PRs incorrectly show "no changes".
 
 Diff outcome model (see classify_diff_error):
 - diff          : argocd produced a real manifest diff (exit 1 + stdout)
@@ -150,6 +154,11 @@ PATH_MAP_TTL            = 300   # seconds
 # the same `argocd app list` call. Used to warm the repo-server chart cache once
 # per chart before fanning out parallel diffs (mass version bump support).
 _app_chart_map: dict   = {}
+# app full_name -> current OCI chart targetRevision (e.g. "2602.4.1-dev").
+# When a PR bumps appspace.version the ApplicationSet will change source[2]'s
+# targetRevision to the new version. We need this to detect the change and pass
+# --source-positions 2 to argocd app diff so the new chart is rendered.
+_app_chart_revision_map: dict = {}
 # app full_name -> agent / destination cluster (spec.destination.name, e.g.
 # "gcp-dev-cl-ap1-a"). All apps on one spoke share a single argocd-agent and its
 # redis/resource proxy connection, so diffing too many of them at once saturates
@@ -478,7 +487,7 @@ def discover_path_app_map():
     Result is cached for PATH_MAP_TTL seconds. Cache is invalidated on
     argocd_login() so a re-login (session expiry) picks up new apps.
     """
-    global _path_map_cache, _path_map_ts, _path_map_count, _app_chart_map, _app_agent_map
+    global _path_map_cache, _path_map_ts, _path_map_count, _app_chart_map, _app_chart_revision_map, _app_agent_map
     if _path_map_cache and (time.monotonic() - _path_map_ts) < PATH_MAP_TTL:
         # Also check app count hasn't changed (new env added mid-TTL)
         if len(_path_map_cache) == _path_map_count:
@@ -494,6 +503,7 @@ def discover_path_app_map():
         raise RuntimeError(f"argocd app list: invalid JSON: {e}")
     path_map = {}
     chart_map = {}
+    chart_rev_map = {}
     agent_map = {}
     for app in apps:
         name = app["metadata"]["name"]
@@ -502,9 +512,11 @@ def discover_path_app_map():
         # Apps in managed-mode agent namespaces (e.g. gcp-qa-pv-ap1-a/pv-qa88-a-ms)
         # are no longer in the default 'argocd' namespace in managed-mode agent clusters.
         full_name = f"{ns}/{name}" if ns and ns != "argocd" else name
-        chart = _extract_app_chart(app)
+        chart, chart_rev = _extract_app_chart_info(app)
         if chart:
             chart_map[full_name] = chart
+        if chart_rev:
+            chart_rev_map[full_name] = chart_rev
         agent = app.get("spec", {}).get("destination", {}).get("name")
         if agent:
             agent_map[full_name] = agent
@@ -518,29 +530,34 @@ def discover_path_app_map():
                 path_map.setdefault(p, [])
                 if full_name not in path_map[p]:
                     path_map[p].append(full_name)
-    _path_map_cache = path_map
-    _app_chart_map  = chart_map
-    _app_agent_map  = agent_map
+    _path_map_cache          = path_map
+    _app_chart_map           = chart_map
+    _app_chart_revision_map  = chart_rev_map
+    _app_agent_map           = agent_map
     _path_map_ts    = time.monotonic()
     _path_map_count = len(path_map)
     return path_map
 
 
-def _extract_app_chart(app):
-    """Best-effort OCI chart name for an app, from spec.source or spec.sources.
+def _extract_app_chart_info(app):
+    """Return (chart_name, chart_targetRevision) for an app's OCI Helm source.
 
-    Apps are multi-source (acme-config-dev as source-1, the OCI Helm chart as
-    another source). The chart name (e.g. "appspace-micro-services") is the cache
-    key the repo-server uses for the OCI pull, so apps sharing a chart share the
-    expensive pull once it is warm.
+    Apps are multi-source (acme-config-dev as source-1, OCI Helm as source-2).
+    Returns (None, None) when no OCI source is found.
     """
     spec = app.get("spec", {})
     srcs = spec.get("sources") or ([spec["source"]] if spec.get("source") else [])
     for s in srcs:
         chart = s.get("chart")
         if chart:
-            return chart
-    return None
+            return chart, s.get("targetRevision")
+    return None, None
+
+
+def _extract_app_chart(app):
+    """Backward-compat wrapper: return chart name only."""
+    chart, _ = _extract_app_chart_info(app)
+    return chart
 
 def get_affected_apps(changed_files, path_map):
     """Return sorted app names whose manifest-generate-paths overlap with changed files."""
@@ -807,13 +824,87 @@ def _async_relogin():
         print(f"  [auth] background re-login failed: {e}", flush=True)
 
 
-def _run_one_diff(app, pr_sha):
-    """Single subprocess call. Returns (proc, timed_out)."""
+def _bb_fetch_file_at_sha(filepath, sha):
+    """Fetch raw file content from acme-config-dev at a specific commit SHA.
+
+    Returns the decoded string content, or None on any error (missing file,
+    network error, auth failure). Used to read the new chart version from a
+    PR config file before running argocd app diff.
+    """
     try:
-        r = subprocess.run(
-            [ARGOCD_BIN, "app", "diff", app,
-             "--revisions", pr_sha, "--source-positions", "1"] + _auth_flags(),
-            capture_output=True, text=True, timeout=DIFF_TIMEOUT)
+        raw = bb("GET", f"src/{sha}/{filepath}")
+        if isinstance(raw, bytes):
+            return raw.decode("utf-8", errors="replace")
+        return raw
+    except Exception:
+        return None
+
+
+_yaml_version_re = re.compile(r"^\s{0,8}version:\s*([^\s#]+)", re.MULTILINE)
+
+
+def _pr_chart_revision(app, changed_files, pr_sha):
+    """Return the new OCI chart targetRevision for an app if the PR changes it.
+
+    Strategy: look at the changed config files that affect this app, fetch each
+    one from Bitbucket at pr_sha, and search for an `appspace.version` YAML key.
+    That value is the new helm chart targetRevision (the ApplicationSet sets
+    spec.sources[1].targetRevision = appspace.version).
+
+    Returns the new revision string if it differs from the current one cached in
+    _app_chart_revision_map, otherwise returns None.
+    """
+    current_rev = _app_chart_revision_map.get(app)
+    if not current_rev:
+        return None
+    # Find config files that (a) changed in this PR and (b) feed this app.
+    path_map = _path_map_cache
+    candidate_files = []
+    for f in changed_files:
+        apps_for_file = path_map.get(f, [])
+        if app in apps_for_file:
+            candidate_files.append(f)
+        else:
+            for p, app_list in path_map.items():
+                if (f.startswith(p + "/") or p.startswith(f + "/")) and app in app_list:
+                    candidate_files.append(f)
+                    break
+    for filepath in candidate_files:
+        content = _bb_fetch_file_at_sha(filepath, pr_sha)
+        if not content:
+            continue
+        m = _yaml_version_re.search(content)
+        if m:
+            new_rev = m.group(1).strip("'\"")
+            if new_rev and new_rev != current_rev:
+                debug(f"chart version override: {current_rev} -> {new_rev}",
+                      app=app, file=filepath)
+                return new_rev
+    return None
+
+
+def _run_one_diff(app, pr_sha, chart_revision=None):
+    """Single subprocess call. Returns (proc, timed_out).
+
+    If chart_revision is provided (new OCI targetRevision for this PR), both
+    source positions are overridden so argocd renders the new chart version:
+      --revisions <pr_sha> --revisions <chart_revision>
+      --source-positions 1 --source-positions 2
+    Without chart_revision only the git config source is overridden (legacy
+    behaviour, correct for PRs that don't change the chart version).
+    """
+    if chart_revision:
+        cmd = [ARGOCD_BIN, "app", "diff", app,
+               "--revisions", pr_sha,
+               "--revisions", chart_revision,
+               "--source-positions", "1",
+               "--source-positions", "2"] + _auth_flags()
+    else:
+        cmd = [ARGOCD_BIN, "app", "diff", app,
+               "--revisions", pr_sha,
+               "--source-positions", "1"] + _auth_flags()
+    try:
+        r = subprocess.run(cmd, capture_output=True, text=True, timeout=DIFF_TIMEOUT)
         return r, False
     except subprocess.TimeoutExpired:
         return None, True
@@ -844,10 +935,16 @@ def _diff_backoff(attempt):
     return base + random.uniform(0, base * 0.5)
 
 
-def argocd_diff(app, pr_sha):
+def argocd_diff(app, pr_sha, chart_revision=None):
     """Run `argocd app diff` for one app and classify the result.
 
     Returns a DiffResult. Never raises.
+
+    chart_revision: when provided, also overrides source-position 2 (the OCI
+    Helm chart) so the diff renders the new chart version rather than the
+    current one stored in the ArgoCD app spec. Required for version-bump PRs
+    where appspace.version changes: without this the old chart is rendered
+    and the diff incorrectly shows "no changes".
 
     Exit codes: 0 = no diff, 1 = diff found (or auth error with empty stdout),
     2+ = error.
@@ -864,7 +961,7 @@ def argocd_diff(app, pr_sha):
     last_detail = ""
     last_attempt = DIFF_RETRIES - 1
     for attempt in range(DIFF_RETRIES):
-        r, timed_out = _run_one_diff(app, pr_sha)
+        r, timed_out = _run_one_diff(app, pr_sha, chart_revision=chart_revision)
         if timed_out:
             debug(f"diff timed out after {DIFF_TIMEOUT}s", app=app, attempt=attempt + 1)
             # Timeouts under burst are worth retrying with backoff.
@@ -1521,11 +1618,28 @@ def process_pr(pr, path_map):
         any_unknown    = False   # OUT_INDETERMINATE — diff not computable
         outcome_counts = Counter()
         reason_counts  = Counter()
+
+        # For each affected app, detect whether the PR changes the OCI chart
+        # targetRevision (appspace.version bump). If so, we pass a second
+        # --revisions / --source-positions override so argocd renders the new
+        # chart, making the diff show the actual image changes that will happen.
+        pr_chart_revisions = {}
+        for app in affected:
+            new_rev = _pr_chart_revision(app, changed_files, pr_sha)
+            if new_rev:
+                pr_chart_revisions[app] = new_rev
+        if pr_chart_revisions:
+            unique_bumps = sorted(set(pr_chart_revisions.values()))
+            log(f"PR #{pr_id}: chart version bumps detected for "
+                f"{len(pr_chart_revisions)} app(s) -> {unique_bumps}",
+                pr=pr_id)
+
         def run_diff(app):
             t0 = time.monotonic()
+            chart_rev = pr_chart_revisions.get(app)
             # Shared per-agent cap across all PRs (see _agent_semaphore).
             with _agent_semaphore(app):
-                result = argocd_diff(app, pr_sha)
+                result = argocd_diff(app, pr_sha, chart_revision=chart_rev)
             elapsed = round(time.monotonic() - t0, 1)
             return app, result, elapsed
 
