@@ -1077,17 +1077,22 @@ def _fetch_value_files(value_files: list, sha: str) -> dict:
         cache_key = (sha, clean)
         with _vf_cache_lock:
             if cache_key in _vf_cache:
-                return vf, _vf_cache[cache_key]
+                return vf, _vf_cache[cache_key], True   # (path, content, from_cache)
         content = _bb_fetch_file_at_sha(clean, sha)
         with _vf_cache_lock:
             _vf_cache[cache_key] = content
-        return vf, content
+        return vf, content, False
 
     result = {}
+    missing = []
     with ThreadPoolExecutor(max_workers=max(1, len(value_files))) as ex:
-        for vf, content in ex.map(_fetch_one, value_files):
+        for vf, content, _ in ex.map(_fetch_one, value_files):
             if content:
                 result[vf] = content
+            else:
+                missing.append(vf.replace("$config/", ""))
+    if missing:
+        debug(f"value files not found at sha {sha[:8]}: {missing}")
     return result
 
 
@@ -2067,10 +2072,9 @@ def process_pr(pr, path_map, base_sha=""):
                         pr=pr_id, app=app, outcome=result.outcome, reason=result.reason,
                         elapsed_s=elapsed, resources=n_sections)
 
-        # Helm chart pre-warm: when using helm-template diff, pull all needed chart
-        # versions (both PR version and current main version) before diffing starts.
-        # This avoids the race condition where multiple parallel diffs try to pull
-        # the same chart into the same directory at the same time.
+        # Helm chart pre-warm: pull all needed chart versions before diffing.
+        # Skip versions that are already in the on-disk HELM_CACHE_DIR to avoid
+        # unnecessary OCI calls when the pod has already downloaded them.
         if HELM_BIN and OCI_PASS:
             unique_chart_pulls = set()
             for app in affected:
@@ -2083,12 +2087,23 @@ def process_pr(pr, path_map, base_sha=""):
                         unique_chart_pulls.add((reg, chart, main_rv))
                     if pr_rv and pr_rv != main_rv:
                         unique_chart_pulls.add((reg, chart, pr_rv))
-            if unique_chart_pulls:
-                print(f"    Helm pre-warm: pulling {len(unique_chart_pulls)} "
-                      f"chart version(s) before diff fan-out...", flush=True)
-                with ThreadPoolExecutor(max_workers=max(1, min(WARM_WORKERS, len(unique_chart_pulls)))) as ex:
+
+            # Filter out versions already cached on disk (pod restart preserves /tmp)
+            pulls_needed = {
+                (reg, chart, ver) for reg, chart, ver in unique_chart_pulls
+                if not os.path.isdir(os.path.join(HELM_CACHE_DIR, reg, chart, ver))
+                and f"{reg}/{chart}:{ver}" not in _helm_chart_cache
+            }
+            already_cached = len(unique_chart_pulls) - len(pulls_needed)
+            if pulls_needed or already_cached:
+                msg = f"    Helm pre-warm: {len(pulls_needed)} to pull"
+                if already_cached:
+                    msg += f", {already_cached} already cached"
+                print(msg, flush=True)
+            if pulls_needed:
+                with ThreadPoolExecutor(max_workers=max(1, min(WARM_WORKERS, len(pulls_needed)))) as ex:
                     futures = [ex.submit(_ensure_chart, reg, chart, ver)
-                               for reg, chart, ver in unique_chart_pulls]
+                               for reg, chart, ver in pulls_needed]
                     for fut in as_completed(futures):
                         try:
                             fut.result()
