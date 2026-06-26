@@ -75,6 +75,10 @@ spec:
             - name: WARM_THRESHOLD
               value: {{ .warmThreshold | quote }}
             {{- end }}
+            {{- if .agentMaxConcurrency }}
+            - name: AGENT_MAX_CONCURRENCY
+              value: {{ .agentMaxConcurrency | quote }}
+            {{- end }}
             {{- end }}
           envFrom:
             - secretRef:

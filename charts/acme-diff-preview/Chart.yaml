@@ -2,8 +2,8 @@ apiVersion: v2
 name: acme-diff-preview
 description: ACME Diff Preview — posts Kubernetes manifest diffs as Bitbucket PR comments with AI-generated summaries via Vertex AI Gemini.
 type: application
-version: 1.4.0
-appVersion: "1.5.0"
+version: 1.4.1
+appVersion: "1.5.1"
 home: https://github.com/appspace-cloud/acme-diff-preview
 sources:
   - https://github.com/appspace-cloud/acme-diff-preview

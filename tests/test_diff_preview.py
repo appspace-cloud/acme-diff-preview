@@ -320,6 +320,33 @@ def test_cache_warm_selection():
     assert set(warm) | set(rest) == set(apps), "no app may be dropped"
 
 
+def test_per_agent_concurrency_cap():
+    """AGENT_MAX_CONCURRENCY must exist and the per-agent semaphore must wrap diffs."""
+    src = _source()
+    assert 'AGENT_MAX_CONCURRENCY = int(os.environ.get("AGENT_MAX_CONCURRENCY", "3"))' in src, (
+        "AGENT_MAX_CONCURRENCY must be env-configurable (default 3)"
+    )
+    assert "_app_agent_map" in src, "must track app -> agent mapping"
+    assert "threading.Semaphore(AGENT_MAX_CONCURRENCY)" in src, (
+        "diffs must be gated by a per-agent semaphore"
+    )
+
+
+def test_interleave_by_agent():
+    """_interleave_by_agent round-robins apps across agents, dropping none."""
+    mod = _import_module()
+    mod._app_agent_map = {
+        "a1": "agentA", "a2": "agentA", "a3": "agentA",
+        "b1": "agentB", "b2": "agentB",
+    }
+    order = mod._interleave_by_agent(["a1", "a2", "a3", "b1", "b2"])
+    assert set(order) == {"a1", "a2", "a3", "b1", "b2"}, "no app dropped/duplicated"
+    # First two must be from different agents (spread, not piled on agentA).
+    assert mod._app_agent_map[order[0]] != mod._app_agent_map[order[1]], (
+        "interleave must alternate agents, not group them"
+    )
+
+
 # ── JFrog webhook + dedicated account ────────────────────────────────────────
 
 def test_argocd_uses_diff_preview_account():

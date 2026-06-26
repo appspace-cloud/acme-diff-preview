@@ -63,11 +63,18 @@ cache miss racing to pull and render the same OCI chart, which saturates the
 repo-server (5xx / `manifests_5xx`) and floods the argocd-agent principal. Two
 mechanisms keep this reliable:
 
-1. **Chart-cache warm-up.** Before the parallel fan-out, one representative app
+1. **Per-agent concurrency cap.** Every app on a spoke shares one argocd-agent
+   and its redis/resource proxy, so the real saturation limit is per spoke, not
+   total. Diffs are gated by a per-agent semaphore (`AGENT_MAX_CONCURRENCY`) and
+   interleaved across agents, so total concurrency stays high across many spokes
+   while any single spoke stays gentle. This is what keeps a bump that lands many
+   apps on the same cluster from timing out that agent (`redis_timeout` /
+   "resource response not tracked").
+2. **Chart-cache warm-up.** Before the parallel fan-out, one representative app
    per distinct OCI chart is diffed first (`_select_warm_apps`). That single
    render warms the repo-server chart cache so the remaining apps reuse the pull
    instead of stampeding it. Controlled by `WARM_WORKERS` / `WARM_THRESHOLD`.
-2. **Retry with exponential backoff + jitter.** Transient burst errors
+3. **Retry with exponential backoff + jitter.** Transient burst errors
    (`manifests_5xx`, `code = Unknown desc = POST`, redis-proxy timeouts) are
    retried in-process up to `DIFF_RETRIES` times so a brief blip during the
    burst never surfaces as "diff unavailable".
@@ -86,6 +93,7 @@ This is paired with hub-side capacity in `acme-infrastructure`
 | `DIFF_RETRIES` | `diff.retries` | `3` | Attempts per diff (backoff + jitter) |
 | `WARM_WORKERS` | `diff.warmWorkers` | `4` | Parallel chart warm-up diffs |
 | `WARM_THRESHOLD` | `diff.warmThreshold` | `8` | Min apps before warm-up kicks in |
+| `AGENT_MAX_CONCURRENCY` | `diff.agentMaxConcurrency` | `3` | Max concurrent diffs per agent/spoke |
 
 ---
 
