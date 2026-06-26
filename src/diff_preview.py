@@ -910,6 +910,11 @@ _helm_login_lock     = threading.Lock()
 # Local chart path cache: "{registry}/{chart}:{version}" -> "/tmp/.../chart_dir"
 _helm_chart_cache: dict = {}
 _helm_cache_lock        = threading.Lock()
+# Per-chart-version pull locks: prevent multiple threads pulling the same chart at once.
+# Without this, concurrent diffs trigger parallel helm pulls to the same directory,
+# causing "failed to untar: a file or directory already exists" errors.
+_helm_pull_locks: dict  = {}
+_helm_pull_locks_lock   = threading.Lock()
 
 
 class OciChartNotFound(Exception):
@@ -955,40 +960,71 @@ def _ensure_chart(registry: str, chart: str, version: str) -> str:
     if not _helm_login(registry):
         return None
 
-    os.makedirs(chart_dir, exist_ok=True)
-    r = subprocess.run(
-        [HELM_BIN, "pull", f"oci://{registry}/{chart}",
-         "--version", version, "--untar", "-d", chart_dir],
-        capture_output=True, text=True, timeout=120)
+    # Acquire a per-chart-version lock so concurrent diff threads don't all try
+    # to pull and untar the same chart into the same directory simultaneously
+    # (helm fails with "failed to untar: a file or directory already exists").
+    with _helm_pull_locks_lock:
+        if key not in _helm_pull_locks:
+            _helm_pull_locks[key] = threading.Lock()
+        pull_lock = _helm_pull_locks[key]
 
-    if r.returncode != 0:
-        err = (r.stderr or r.stdout or "").lower()
-        # Remove empty cache dir
+    with pull_lock:
+        # Re-check cache after acquiring the per-key lock (another thread may have
+        # finished the pull while we were waiting)
+        with _helm_cache_lock:
+            if key in _helm_chart_cache:
+                return _helm_chart_cache[key]
+        if os.path.isdir(chart_dir) and os.listdir(chart_dir):
+            with _helm_cache_lock:
+                _helm_chart_cache[key] = _find_chart_subdir(chart_dir)
+            return _helm_chart_cache[key]
+
+        # Pull into a temp dir and atomically rename to avoid partial state
+        import tempfile
+        tmp_dir = tempfile.mkdtemp(dir=HELM_CACHE_DIR, prefix=f"{chart}-{version}-")
         try:
-            if not os.listdir(chart_dir):
-                os.rmdir(chart_dir)
-        except OSError:
-            pass
-        # Detect "not found" vs other errors so callers can surface the right message
-        if any(p in err for p in ("not found", "404", "does not exist",
-                                   "no such file", "unexpected status code: 404")):
-            raise OciChartNotFound(
-                f"Chart {chart}:{version} not found in {registry}. "
-                f"Check that the version exists in the OCI registry.")
-        log(f"helm pull failed for {chart}:{version}: {r.stderr[:200]}", "WARNING")
-        return None
+            r = subprocess.run(
+                [HELM_BIN, "pull", f"oci://{registry}/{chart}",
+                 "--version", version, "--untar", "-d", tmp_dir],
+                capture_output=True, text=True, timeout=120)
 
-    # Find the extracted chart directory (helm --untar creates a subdirectory)
+            if r.returncode != 0:
+                err = (r.stderr or r.stdout or "").lower()
+                if any(p in err for p in ("not found", "404", "does not exist",
+                                           "no such file", "unexpected status code: 404")):
+                    raise OciChartNotFound(
+                        f"Chart {chart}:{version} not found in {registry}. "
+                        f"Check that the version exists in the OCI registry.")
+                log(f"helm pull failed for {chart}:{version}: {r.stderr[:200]}", "WARNING")
+                return None
+
+            # Move from tmp to final location atomically
+            os.makedirs(os.path.dirname(chart_dir), exist_ok=True)
+            if not os.path.exists(chart_dir):
+                os.rename(tmp_dir, chart_dir)
+            else:
+                # Another thread beat us to it; remove our tmp copy
+                import shutil
+                shutil.rmtree(tmp_dir, ignore_errors=True)
+        except Exception:
+            import shutil
+            shutil.rmtree(tmp_dir, ignore_errors=True)
+            raise
+
+        path = _find_chart_subdir(chart_dir)
+        with _helm_cache_lock:
+            _helm_chart_cache[key] = path
+        return path
+
+
+def _find_chart_subdir(chart_dir: str) -> str:
+    """Return the chart directory inside chart_dir (helm --untar creates a subdir)."""
     try:
         subdirs = [d for d in os.listdir(chart_dir)
                    if os.path.isdir(os.path.join(chart_dir, d))]
-        path = os.path.join(chart_dir, subdirs[0]) if subdirs else chart_dir
+        return os.path.join(chart_dir, subdirs[0]) if subdirs else chart_dir
     except OSError:
-        path = chart_dir
-
-    with _helm_cache_lock:
-        _helm_chart_cache[key] = path
-    return path
+        return chart_dir
 
 
 def _fetch_value_files(value_files: list, sha: str) -> dict:
@@ -1615,7 +1651,7 @@ def generate_ai_summary(app_results: dict) -> str | None:
                     {"role": "user", "parts": [{"text": prompt}]}
                 ],
                 "generationConfig": {
-                    "maxOutputTokens": 600,
+                    "maxOutputTokens": 2000,
                     "temperature": 0.1,
                     # Disable thinking tokens in gemini-2.5-flash.
                     # Without this, the model uses ~1100 thinking tokens
@@ -1971,13 +2007,37 @@ def process_pr(pr, path_map, base_sha=""):
                         pr=pr_id, app=app, outcome=result.outcome, reason=result.reason,
                         elapsed_s=elapsed, resources=n_sections)
 
-        # Cache-warm phase: on a large fan-out (a chart version bump rolled out to
-        # many apps), diffing every app at once means every app is a repo-server
-        # cache miss that races to pull and render the same OCI chart, saturating
-        # the repo-server and triggering 5xx. Instead, diff ONE representative per
-        # distinct OCI chart first (these can warm concurrently across charts).
-        # That pull populates the repo-server chart cache, so the big parallel
-        # fan-out for the rest of the apps reuses it and stays fast.
+        # Helm chart pre-warm: when using helm-template diff, pull all needed chart
+        # versions (both PR version and current main version) before diffing starts.
+        # This avoids the race condition where multiple parallel diffs try to pull
+        # the same chart into the same directory at the same time.
+        if HELM_BIN and OCI_PASS:
+            unique_chart_pulls = set()
+            for app in affected:
+                chart   = _app_chart_map.get(app)
+                reg     = _app_chart_registry_map.get(app)
+                main_rv = _app_chart_revision_map.get(app)
+                pr_rv   = pr_chart_revisions.get(app, main_rv)
+                if chart and reg:
+                    if main_rv:
+                        unique_chart_pulls.add((reg, chart, main_rv))
+                    if pr_rv and pr_rv != main_rv:
+                        unique_chart_pulls.add((reg, chart, pr_rv))
+            if unique_chart_pulls:
+                print(f"    Helm pre-warm: pulling {len(unique_chart_pulls)} "
+                      f"chart version(s) before diff fan-out...", flush=True)
+                with ThreadPoolExecutor(max_workers=max(1, min(WARM_WORKERS, len(unique_chart_pulls)))) as ex:
+                    futures = [ex.submit(_ensure_chart, reg, chart, ver)
+                               for reg, chart, ver in unique_chart_pulls]
+                    for fut in as_completed(futures):
+                        try:
+                            fut.result()
+                        except OciChartNotFound as e:
+                            log(str(e), "WARNING")
+                        except Exception:
+                            pass
+
+        # Cache-warm diff phase: one representative per chart to warm repo-server cache.
         warm_apps, rest_apps = _select_warm_apps(affected)
         if warm_apps:
             print(f"    Cache-warm: {len(warm_apps)} chart representative(s) "
