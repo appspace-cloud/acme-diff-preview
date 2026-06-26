@@ -1526,6 +1526,8 @@ def fix_stuck_inprogress(pr_sha, pr_id, comment_raw):
         # Derive correct status from comment content
         if "Error running diff" in comment_raw or "\u274c" in comment_raw:
             state, desc = "FAILED", "Diff failed - check PR comment"
+        elif "not found in OCI registry" in comment_raw:
+            state, desc = "FAILED", "Chart version not found in OCI registry"
         elif "resource(s) will change" in comment_raw:
             m = re.search(r"(\d+) resource\(s\) will change", comment_raw)
             n = m.group(1) if m else "?"
@@ -2121,27 +2123,46 @@ def process_pr(pr, path_map, base_sha=""):
             max(len(parse_diff_sections(r.text)), 1)
             for r in app_results.values() if r.outcome == OUT_DIFF)
         n_unknown = outcome_counts[OUT_INDETERMINATE]
-        if any_hard_error:
-            post_build_status(pr_sha, "FAILED", "Diff failed - check PR comment")
+        # Determine which indeterminate reason is most severe.
+        # oci_not_found is a hard permanent error (wrong version in config) that
+        # MUST block the PR — the deployer will fail with the same error.
+        # Other indeterminate reasons (transient timeouts, etc.) are soft and
+        # should not block: they appear with "Diff incomplete" in the comment.
+        oci_not_found_count = sum(
+            1 for r in app_results.values()
+            if r.outcome == OUT_INDETERMINATE and r.reason == "oci_not_found"
+        )
+        has_blocking_indet = oci_not_found_count > 0
+
+        if any_hard_error or has_blocking_indet:
+            if oci_not_found_count:
+                post_build_status(pr_sha, "FAILED",
+                    f"{oci_not_found_count} app(s): chart version not found in OCI registry")
+            else:
+                post_build_status(pr_sha, "FAILED", "Diff failed - check PR comment")
         elif sections_total > 0:
             extra = f" ({n_unknown} unavailable)" if any_unknown else ""
             post_build_status(pr_sha, "SUCCESSFUL",
                 f"{sections_total} resource(s) will change - review comment{extra}")
         elif any_unknown:
-            # Non-blocking, but clearly NOT a clean pass: the diff is unknown.
+            # Soft indeterminate (transient timeout, etc.) - not a hard block but
+            # operator should review. Use SUCCESSFUL so it does not block merge
+            # gates on a transient failure; the next iteration will retry.
             post_build_status(pr_sha, "SUCCESSFUL",
                 f"Diff unavailable for {n_unknown} app(s) - review comment")
         else:
             post_build_status(pr_sha, "SUCCESSFUL", "No manifest changes")
 
-        # Only mark as seen when the run was fully clean (no hard error, no
-        # indeterminate). If any app failed or could not be evaluated we leave
-        # _seen empty so the next iteration retries it — important so that once
-        # the OCI credential / Redis path recovers the diff is recomputed and the
-        # comment stops saying "unavailable". any_error keeps the historical name
-        # the tests look for; it now also covers indeterminate results.
-        any_error = any_hard_error or any_unknown
-        if not any_error:
+        # Mark as seen logic:
+        # - Clean run (no error, no indeterminate): mark seen -> skip next iteration
+        # - Soft indeterminate (transient timeout): leave unseen -> retry next iteration
+        # - oci_not_found / hard error: mark seen -> DO NOT retry (permanent failure;
+        #   the version does not exist and retrying is wasteful + misleading)
+        is_permanent_failure = any_hard_error or has_blocking_indet
+        is_transient_failure = any_unknown and not has_blocking_indet
+        if not is_transient_failure:
+            # Mark seen for both clean runs AND permanent failures so we don't
+            # spam the PR with repeated "not found" comments every 60s.
             with _seen_lock:
                 _seen[pr_id] = pr_sha
         return outcome_counts

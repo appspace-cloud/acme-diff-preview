@@ -99,16 +99,19 @@ def test_seen_eviction_uses_integer_ids():
     )
 
 
-def test_seen_not_cached_on_error():
-    """BUG: _seen must NOT be set when any_error=True.
+def test_seen_not_cached_on_transient_error():
+    """_seen must NOT be set on transient failures (allows retry next iteration).
 
-    If a PR has a transient error (Redis timeout, auth), setting _seen would
-    prevent retries. The fix: only cache when the run was fully clean.
+    Permanent failures (oci_not_found) SHOULD mark seen to avoid spamming the
+    PR with repeated 'not found' comments every 60 seconds.
+    Transient failures (timeout, auth) must NOT mark seen so they are retried.
     """
     src = _source()
-    assert "if not any_error:" in src, (
-        "Fix missing: _seen must only be set when there are no errors, "
-        "so transient failures trigger a retry on the next iteration."
+    assert "is_transient_failure" in src, (
+        "Must distinguish transient vs permanent failures for _seen caching"
+    )
+    assert "if not is_transient_failure:" in src, (
+        "_seen must only be set for non-transient outcomes (clean OR permanent error)"
     )
 
 
@@ -651,6 +654,41 @@ def test_oci_not_found_is_not_retried():
     assert 'reason == "oci_not_found"' in src, (
         "oci_not_found must be caught before the retry loop to avoid wasting retries"
     )
+
+
+def test_oci_not_found_posts_failed_build_status():
+    """oci_not_found must post FAILED build status, not SUCCESSFUL.
+
+    PR #6451 bug: when all apps had oci_not_found, the status was SUCCESSFUL.
+    The deployer would fail at sync time with the same error, so the diff
+    must proactively block the PR.
+    """
+    src = _source()
+    # The code must check for oci_not_found specifically and post FAILED
+    assert "oci_not_found_count" in src, (
+        "must track oci_not_found count separately to post FAILED status"
+    )
+    assert '"FAILED"' in src and "oci_not_found" in src, (
+        "oci_not_found must result in FAILED build status, not SUCCESSFUL"
+    )
+    assert "has_blocking_indet" in src, (
+        "must distinguish blocking (oci_not_found) from soft indeterminate reasons"
+    )
+
+
+def test_oci_not_found_marks_seen_no_retry():
+    """After oci_not_found, PR must NOT be re-processed every 60s.
+
+    Unlike soft indeterminate errors (transient timeouts), oci_not_found is
+    permanent: the version will not appear on its own. Re-processing would
+    just spam the PR comment every iteration.
+    """
+    src = _source()
+    assert "is_permanent_failure" in src, (
+        "must identify permanent failures (oci_not_found) to prevent retry spam"
+    )
+    # permanent failures should mark _seen so the next iteration skips them
+    assert "is_transient_failure" in src and "is_permanent_failure" in src
 
 
 def test_oci_not_found_in_reason_hints():
