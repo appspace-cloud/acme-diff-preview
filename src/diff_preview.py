@@ -88,6 +88,22 @@ WARM_THRESHOLD     = int(os.environ.get("WARM_THRESHOLD", "8"))       # only war
 # per-agent stays gentle so a mass bump that lands many apps on the same cluster
 # does not overwhelm that one agent (redis_timeout / "resource response not tracked").
 AGENT_MAX_CONCURRENCY = int(os.environ.get("AGENT_MAX_CONCURRENCY", "3"))
+# Global per-agent semaphores, shared across ALL concurrently processed PRs.
+# Must be module-level (not per-PR): two PRs that both touch the same spoke would
+# otherwise each get their own cap and double the load on that one agent.
+_agent_sems: dict          = {}
+_agent_sems_lock: threading.Lock = threading.Lock()
+
+
+def _agent_semaphore(app):
+    """Return the shared semaphore for an app's target agent (created on demand)."""
+    agent = _app_agent_map.get(app, "_")
+    with _agent_sems_lock:
+        sem = _agent_sems.get(agent)
+        if sem is None:
+            sem = threading.Semaphore(AGENT_MAX_CONCURRENCY)
+            _agent_sems[agent] = sem
+        return sem
 MAX_COMMENT_BYTES  = 245_000 # Bitbucket ~256KB limit; leave headroom
 JFROG_MAX_BODY_BYTES = int(os.environ.get("JFROG_MAX_BODY_BYTES", "65536"))  # 64 KB — reject oversized bodies before HMAC
 
@@ -1502,21 +1518,10 @@ def process_pr(pr, path_map):
         any_unknown    = False   # OUT_INDETERMINATE — diff not computable
         outcome_counts = Counter()
         reason_counts  = Counter()
-        # Per-agent semaphores: cap concurrent diffs hitting any single spoke.
-        _agent_sems   = {}
-        _agent_sems_lock = threading.Lock()
-        def _agent_sem(app):
-            agent = _app_agent_map.get(app, "_")
-            with _agent_sems_lock:
-                sem = _agent_sems.get(agent)
-                if sem is None:
-                    sem = threading.Semaphore(AGENT_MAX_CONCURRENCY)
-                    _agent_sems[agent] = sem
-            return sem
         def run_diff(app):
             t0 = time.monotonic()
-            sem = _agent_sem(app)
-            with sem:
+            # Shared per-agent cap across all PRs (see _agent_semaphore).
+            with _agent_semaphore(app):
                 result = argocd_diff(app, pr_sha)
             elapsed = round(time.monotonic() - t0, 1)
             return app, result, elapsed
