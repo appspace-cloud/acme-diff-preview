@@ -156,14 +156,19 @@ _path_map_ts:    float = 0.0
 _path_map_count: int   = 0    # extra invalidation: rebuild if app count changes
 PATH_MAP_TTL            = 300   # seconds
 # app full_name -> OCI chart name (e.g. "appspace-micro-services"), built from
-# the same `argocd app list` call. Used to warm the repo-server chart cache once
-# per chart before fanning out parallel diffs (mass version bump support).
+# the same `argocd app list` call.
 _app_chart_map: dict   = {}
 # app full_name -> current OCI chart targetRevision (e.g. "2602.4.1-dev").
-# When a PR bumps appspace.version the ApplicationSet will change source[2]'s
-# targetRevision to the new version. We need this to detect the change and pass
-# --source-positions 2 to argocd app diff so the new chart is rendered.
 _app_chart_revision_map: dict = {}
+# app full_name -> OCI registry hostname (e.g. "helm-oci-dev.repo.appspace.com").
+# There are two registries: -dev (dev charts) and -release (stable released charts).
+# Both use the same credentials but must be logged into separately.
+_app_chart_registry_map: dict = {}
+# app full_name -> helm value file paths (from spec.sources[1].helm.valueFiles).
+# Used by the helm-template diff path to fetch value files from Bitbucket.
+_app_value_files_map: dict = {}
+# app full_name -> destination namespace.
+_app_namespace_map: dict = {}
 # app full_name -> agent / destination cluster (spec.destination.name, e.g.
 # "gcp-dev-cl-ap1-a"). All apps on one spoke share a single argocd-agent and its
 # redis/resource proxy connection, so diffing too many of them at once saturates
@@ -492,7 +497,9 @@ def discover_path_app_map():
     Result is cached for PATH_MAP_TTL seconds. Cache is invalidated on
     argocd_login() so a re-login (session expiry) picks up new apps.
     """
-    global _path_map_cache, _path_map_ts, _path_map_count, _app_chart_map, _app_chart_revision_map, _app_agent_map
+    global _path_map_cache, _path_map_ts, _path_map_count, _app_chart_map, \
+           _app_chart_revision_map, _app_chart_registry_map, \
+           _app_value_files_map, _app_namespace_map, _app_agent_map
     if _path_map_cache and (time.monotonic() - _path_map_ts) < PATH_MAP_TTL:
         # Also check app count hasn't changed (new env added mid-TTL)
         if len(_path_map_cache) == _path_map_count:
@@ -509,22 +516,28 @@ def discover_path_app_map():
     path_map = {}
     chart_map = {}
     chart_rev_map = {}
+    chart_reg_map = {}
+    value_files_map = {}
+    namespace_map = {}
     agent_map = {}
     for app in apps:
         name = app["metadata"]["name"]
         ns   = app["metadata"].get("namespace", "")
-        # Use namespace/name so argocd CLI resolves the app in the correct namespace.
-        # Apps in managed-mode agent namespaces (e.g. gcp-qa-pv-ap1-a/pv-qa88-a-ms)
-        # are no longer in the default 'argocd' namespace in managed-mode agent clusters.
         full_name = f"{ns}/{name}" if ns and ns != "argocd" else name
-        chart, chart_rev = _extract_app_chart_info(app)
+        chart, chart_rev, chart_reg, value_files = _extract_app_chart_info(app)
         if chart:
             chart_map[full_name] = chart
         if chart_rev:
             chart_rev_map[full_name] = chart_rev
-        agent = app.get("spec", {}).get("destination", {}).get("name")
-        if agent:
-            agent_map[full_name] = agent
+        if chart_reg:
+            chart_reg_map[full_name] = chart_reg
+        if value_files:
+            value_files_map[full_name] = value_files
+        dest = app.get("spec", {}).get("destination", {})
+        if dest.get("name"):
+            agent_map[full_name] = dest["name"]
+        if dest.get("namespace"):
+            namespace_map[full_name] = dest["namespace"]
         ann  = app.get("metadata", {}).get("annotations", {})
         raw  = ann.get("argocd.argoproj.io/manifest-generate-paths", "")
         if not raw:
@@ -538,6 +551,9 @@ def discover_path_app_map():
     _path_map_cache          = path_map
     _app_chart_map           = chart_map
     _app_chart_revision_map  = chart_rev_map
+    _app_chart_registry_map  = chart_reg_map
+    _app_value_files_map     = value_files_map
+    _app_namespace_map       = namespace_map
     _app_agent_map           = agent_map
     _path_map_ts    = time.monotonic()
     _path_map_count = len(path_map)
@@ -545,23 +561,32 @@ def discover_path_app_map():
 
 
 def _extract_app_chart_info(app):
-    """Return (chart_name, chart_targetRevision) for an app's OCI Helm source.
+    """Return (chart_name, targetRevision, registry_host, value_files) for an app's OCI source.
 
-    Apps are multi-source (acme-config-dev as source-1, OCI Helm as source-2).
-    Returns (None, None) when no OCI source is found.
+    Apps are multi-source: source-1 is the git config repo (provides value files via $config
+    alias), source-2 is the OCI Helm chart. There are two registries:
+      helm-oci-dev.repo.appspace.com     — dev charts
+      helm-oci-release.repo.appspace.com — released/stable charts (stage, prod)
+    Both use the same credentials (OCI_USER / OCI_PASS env vars).
+
+    Returns (None, None, None, []) when no OCI source is found.
     """
     spec = app.get("spec", {})
     srcs = spec.get("sources") or ([spec["source"]] if spec.get("source") else [])
     for s in srcs:
         chart = s.get("chart")
         if chart:
-            return chart, s.get("targetRevision")
-    return None, None
+            repo_url = s.get("repoURL", "")
+            # Strip scheme if present (repoURL may be bare hostname or oci:// URL)
+            registry = repo_url.replace("oci://", "").split("/")[0]
+            value_files = s.get("helm", {}).get("valueFiles", [])
+            return chart, s.get("targetRevision"), registry, value_files
+    return None, None, None, []
 
 
 def _extract_app_chart(app):
     """Backward-compat wrapper: return chart name only."""
-    chart, _ = _extract_app_chart_info(app)
+    chart, _, _, _ = _extract_app_chart_info(app)
     return chart
 
 def get_affected_apps(changed_files, path_map):
@@ -652,16 +677,29 @@ DIFF_IGNORE_RESOURCE_PATTERNS = [
 ]
 
 def _is_checksum_only_section(body: str) -> bool:
-    """True when every changed line in the diff body is a checksum annotation.
+    """True when every changed line is a checksum/tracking annotation only.
 
-    These sections appear in Deployments as a cascading side-effect whenever
-    a referenced ConfigMap changes. They carry no operator-useful information.
+    These sections appear in Deployments as cascading side-effects of ConfigMap
+    changes. They carry no operator-useful information. Extended to cover helm
+    template output which includes argocd.argoproj.io/tracking-id and similar
+    annotations that always drift between renders.
     """
+    _ANNOTATION_NOISE = (
+        "checksum/",
+        "argocd.argoproj.io/tracking-id",
+        "kubectl.kubernetes.io/last-applied-configuration",
+        "deployment.kubernetes.io/revision",
+        "meta.helm.sh/release-",
+        "helm.sh/resource-policy",
+    )
     changed = [
-        l for l in body.splitlines()
-        if l.startswith("< ") or l.startswith("> ")
+        l.lstrip("+-< >").strip()
+        for l in body.splitlines()
+        if l.startswith("< ") or l.startswith("> ") or l.startswith("-") or l.startswith("+")
     ]
-    return bool(changed) and all("checksum/" in l for l in changed)
+    return bool(changed) and all(
+        any(noise in l for noise in _ANNOTATION_NOISE) for l in changed
+    )
 
 def _filter_diff_sections(sections: list) -> list:
     """Remove noisy sections from a parsed diff section list.
@@ -746,6 +784,10 @@ _AUTH_ERROR_PATTERNS = (
 # silently mapped several of these to no-diff, which hid real changes from
 # reviewers — that masking is removed here.
 _DIFF_ERROR_RULES = (
+    # OCI chart version does not exist in the registry (someone bumped appspace.version
+    # to a version that was never published). Surface a clear, actionable message.
+    (("not found in", "chart not found", "unexpected status code: 404",
+      "does not exist in oci registry"), "oci_not_found"),
     # OCI Helm chart could not be pulled/rendered (repo-server cache miss +
     # `helm registry login` failure, e.g. 401 Bad Credentials on the registry).
     (("error logging into OCI registry", "failed running helm",
@@ -774,6 +816,7 @@ _REDIS_TIMEOUT_HINTS = ("i/o timeout", "connection refused")
 # Operator-friendly one-liners shown in the PR comment for each indeterminate
 # reason. Keep these short — the full ArgoCD stderr is in the pod logs (DEBUG).
 _REASON_HINTS = {
+    "oci_not_found":      "Chart version not found in OCI registry — check that the version exists",
     "oci_login":          "Helm OCI registry login failed on the repo-server",
     "redis_timeout":      "spoke Redis timed out via argocd-agent proxy",
     "managed_no_cache":   "live state not cached for this agent-managed app",
@@ -852,6 +895,144 @@ def _bb_fetch_file_at_sha(filepath, sha):
 
 
 _yaml_version_re = re.compile(r"^\s{0,8}version:\s*([^\s#]+)", re.MULTILINE)
+
+
+# ── Helm-template local diff ─────────────────────────────────────────────────
+# Credentials and config read from environment (added to pod via ExternalSecret).
+HELM_BIN        = os.environ.get("HELM_BIN", "/usr/local/bin/helm")
+OCI_USER        = os.environ.get("OCI_USER", "acme-repo")
+OCI_PASS        = os.environ.get("OCI_PASS", "")
+HELM_CACHE_DIR  = os.environ.get("HELM_CACHE_DIR", "/tmp/acme-helm-cache")
+
+# Registries that have been successfully authenticated this pod lifetime.
+_helm_logged_in: set = set()
+_helm_login_lock     = threading.Lock()
+# Local chart path cache: "{registry}/{chart}:{version}" -> "/tmp/.../chart_dir"
+_helm_chart_cache: dict = {}
+_helm_cache_lock        = threading.Lock()
+
+
+class OciChartNotFound(Exception):
+    """Raised when an OCI chart version does not exist in the registry."""
+
+
+def _helm_login(registry: str) -> bool:
+    """Login to an OCI registry once per pod lifetime. Thread-safe."""
+    with _helm_login_lock:
+        if registry in _helm_logged_in:
+            return True
+        if not OCI_PASS:
+            return False
+        r = subprocess.run(
+            [HELM_BIN, "registry", "login", registry,
+             "--username", OCI_USER, "--password-stdin"],
+            input=OCI_PASS, capture_output=True, text=True, timeout=30)
+        if r.returncode == 0:
+            _helm_logged_in.add(registry)
+            log(f"Helm OCI login OK: {registry}")
+            return True
+        log(f"Helm OCI login failed for {registry}: {r.stderr[:200]}", "WARNING")
+        return False
+
+
+def _ensure_chart(registry: str, chart: str, version: str) -> str:
+    """Pull an OCI chart to the local cache and return the extracted chart directory.
+
+    Raises OciChartNotFound if the version does not exist in the registry.
+    Returns None on other pull failures (network, auth).
+    """
+    key = f"{registry}/{chart}:{version}"
+    with _helm_cache_lock:
+        if key in _helm_chart_cache:
+            return _helm_chart_cache[key]
+
+    chart_dir = os.path.join(HELM_CACHE_DIR, registry, chart, version)
+    if os.path.isdir(chart_dir) and os.listdir(chart_dir):
+        with _helm_cache_lock:
+            _helm_chart_cache[key] = chart_dir
+        return chart_dir
+
+    if not _helm_login(registry):
+        return None
+
+    os.makedirs(chart_dir, exist_ok=True)
+    r = subprocess.run(
+        [HELM_BIN, "pull", f"oci://{registry}/{chart}",
+         "--version", version, "--untar", "-d", chart_dir],
+        capture_output=True, text=True, timeout=120)
+
+    if r.returncode != 0:
+        err = (r.stderr or r.stdout or "").lower()
+        # Remove empty cache dir
+        try:
+            if not os.listdir(chart_dir):
+                os.rmdir(chart_dir)
+        except OSError:
+            pass
+        # Detect "not found" vs other errors so callers can surface the right message
+        if any(p in err for p in ("not found", "404", "does not exist",
+                                   "no such file", "unexpected status code: 404")):
+            raise OciChartNotFound(
+                f"Chart {chart}:{version} not found in {registry}. "
+                f"Check that the version exists in the OCI registry.")
+        log(f"helm pull failed for {chart}:{version}: {r.stderr[:200]}", "WARNING")
+        return None
+
+    # Find the extracted chart directory (helm --untar creates a subdirectory)
+    try:
+        subdirs = [d for d in os.listdir(chart_dir)
+                   if os.path.isdir(os.path.join(chart_dir, d))]
+        path = os.path.join(chart_dir, subdirs[0]) if subdirs else chart_dir
+    except OSError:
+        path = chart_dir
+
+    with _helm_cache_lock:
+        _helm_chart_cache[key] = path
+    return path
+
+
+def _fetch_value_files(value_files: list, sha: str) -> dict:
+    """Fetch all helm value files from Bitbucket at a specific commit sha.
+
+    value_files is a list of paths like '$config/gcp/dev/.../config.yaml'.
+    The '$config/' prefix is the git source alias; we strip it to get the
+    actual path in acme-config-dev.
+
+    Returns {original_path: file_content} for files that were fetched successfully.
+    Files that return 404 (e.g. new clusters not yet in main) are silently skipped.
+    """
+    result = {}
+    for vf in value_files:
+        clean = vf.replace("$config/", "").lstrip("/")
+        content = _bb_fetch_file_at_sha(clean, sha)
+        if content:
+            result[vf] = content
+    return result
+
+
+def _helm_template(chart_path: str, release: str, namespace: str,
+                   value_files_content: dict) -> tuple:
+    """Run `helm template` locally with the given value files.
+
+    Returns (manifests_yaml: str, error: str|None).
+    value_files_content: {path_label: yaml_content} dict (order matters for overrides).
+    """
+    import tempfile
+    with tempfile.TemporaryDirectory(prefix="acme-diff-helm-") as tmpdir:
+        value_args = []
+        for idx, (label, content) in enumerate(value_files_content.items()):
+            fname = os.path.join(tmpdir, f"values_{idx:03d}.yaml")
+            with open(fname, "w") as f:
+                f.write(content)
+            value_args += ["-f", fname]
+
+        cmd = ([HELM_BIN, "template", release, chart_path,
+                "--namespace", namespace or release,
+                "--include-crds"] + value_args)
+        r = subprocess.run(cmd, capture_output=True, text=True, timeout=DIFF_TIMEOUT)
+        if r.returncode != 0:
+            return None, (r.stderr or r.stdout or "helm template failed")[:400]
+        return r.stdout, None
 
 
 def _pr_chart_revision(app, changed_files, pr_sha):
@@ -982,12 +1163,53 @@ def _diff_manifests(main_yaml, pr_yaml):
 
 
 def _run_one_diff(app, pr_sha, main_sha, chart_revision=None):
-    """Fetch rendered manifests for PR sha and main sha, diff locally.
+    """Diff PR vs main manifests locally using helm template (fast, no agent access).
+
+    Falls back to argocd app manifests when helm is not configured (no OCI_PASS).
 
     Returns (diff_text_or_None, timed_out_bool, error_str_or_None).
-    No live cluster access - uses repo-server rendering only, so there is no
-    per-agent serialization needed and the whole fleet can be diffed in parallel.
+    OciChartNotFound is surfaced as a clear error string so it shows in the PR comment.
     """
+    chart_name  = _app_chart_map.get(app)
+    main_rev    = _app_chart_revision_map.get(app)
+    registry    = _app_chart_registry_map.get(app, "")
+    value_files = _app_value_files_map.get(app, [])
+    namespace   = _app_namespace_map.get(app, "")
+    release     = app.split("/")[-1]   # strip "namespace/" prefix if present
+
+    pr_rev = chart_revision or main_rev
+
+    # ── Helm-template path (fast - no agent, purely local rendering) ──────────
+    if (HELM_BIN and OCI_PASS and chart_name and main_rev
+            and value_files and registry):
+        try:
+            # Download both chart versions (cached after first pull)
+            pr_chart   = _ensure_chart(registry, chart_name, pr_rev)
+            main_chart = _ensure_chart(registry, chart_name, main_rev)
+        except OciChartNotFound as e:
+            return None, False, str(e)
+        except subprocess.TimeoutExpired:
+            return None, True, None
+
+        if pr_chart and main_chart:
+            try:
+                pr_vals   = _fetch_value_files(value_files, pr_sha)
+                main_vals = _fetch_value_files(value_files, main_sha)
+
+                pr_yaml,   pr_err   = _helm_template(pr_chart,   release, namespace, pr_vals)
+                main_yaml, main_err = _helm_template(main_chart, release, namespace, main_vals)
+            except subprocess.TimeoutExpired:
+                return None, True, None
+
+            if pr_err:
+                return None, False, pr_err
+            if main_err:
+                return None, False, main_err
+
+            return _diff_manifests(main_yaml, pr_yaml), False, None
+        # If chart pull failed for non-OCI-not-found reason, fall through to argocd
+
+    # ── Fallback: argocd app manifests (slower, requires ArgoCD API) ──────────
     try:
         pr_yaml,   pr_err   = _fetch_manifests(app, pr_sha,   chart_revision)
         main_yaml, main_err = _fetch_manifests(app, main_sha, None)
@@ -999,8 +1221,7 @@ def _run_one_diff(app, pr_sha, main_sha, chart_revision=None):
     if main_err:
         return None, False, main_err
 
-    diff_text = _diff_manifests(main_yaml, pr_yaml)
-    return diff_text, False, None
+    return _diff_manifests(main_yaml, pr_yaml), False, None
 
 
 def _indeterminate(reason, detail):
@@ -1062,6 +1283,9 @@ def argocd_diff(app, pr_sha, main_sha, chart_revision=None):
             debug(f"manifests error: {reason}", app=app, attempt=attempt + 1, stderr=detail[:800])
             if reason == "auth":
                 threading.Thread(target=_async_relogin, daemon=True).start()
+            # OCI not-found is permanent: the version does not exist. Never retry.
+            if reason == "oci_not_found":
+                return _indeterminate(reason, detail)
             if attempt < last_attempt and any(p in err for p in _RETRYABLE_DIFF_ERRORS):
                 delay = _diff_backoff(attempt)
                 print(f"    [{app}] transient error (attempt {attempt + 1}/{DIFF_RETRIES}), "
@@ -1339,18 +1563,34 @@ def generate_ai_summary(app_results: dict) -> str | None:
             )
 
         prompt = (
-            "You are a Cloud Platform Engineer reviewing a Kubernetes GitOps diff.\n"
-            f"Changeset: {len(changed)} app(s), {total_resources} resource(s).\n\n"
-            "Respond in EXACTLY this format — no preamble, no extra commentary:\n\n"
-            f"**{len(changed)} app(s) updated \u00b7 {total_resources} resource(s) changed**\n\n"
-            "Then a flat bullet list, one bullet per changed resource (skip unchanged):\n"
-            "- `<env/service>`: <old-image-tag> \u2192 <new-image-tag>  (or: config annotation updated)\n"
-            "  Add \u26a0\ufe0f CRITICAL after the bullet if: image version is lower semver, "
-            "date suffix regresses, replica drops to 0, or liveness/readiness probe removed.\n\n"
-            "Then a final line (mandatory):\n"
-            "\u26a0\ufe0f **Critical:** <short description> OR \u2705 **Critical:** None detected\n\n"
-            "Rules: image as `old` \u2192 `new`. Skip checksum-only Deployments (say nothing). "
-            "ConfigMap listing multiple images: list each image change. Max 250 words.\n\n"
+            "You are a Senior SRE reviewing a Kubernetes GitOps diff from a Helm-based platform.\n"
+            f"Changeset: {len(changed)} app(s), {total_resources} resource section(s).\n\n"
+            "ANALYSIS REQUIREMENTS:\n"
+            "- Only analyse what is explicitly shown in the diff below.\n"
+            "- Helm shows changes as '-' (old) and '+' (new) — this is normal for updates.\n"
+            "- VERSION COMPARISON: only report a downgrade when the full version string actually "
+            "decreases (e.g. 1.93.1 → 1.93.0 is a downgrade; 1.93.1-rc1 → 1.93.1-rc2 is NOT).\n"
+            "- Skip checksum-only changes and annotation noise (argocd.argoproj.io/tracking-id, "
+            "helm.sh/chart, kubectl.kubernetes.io/last-applied-configuration).\n"
+            "- For new Deployments/StatefulSets being added to the cluster, say 'new service'.\n"
+            "- For removed ones say 'service removed'.\n\n"
+            "Respond in EXACTLY this format (use the emoji headers):\n\n"
+            f"**{len(changed)} app(s) updated · {total_resources} resource(s) changed**\n\n"
+            "1. 🌍 **AFFECTED ENVIRONMENTS:**\n"
+            "   • List each affected cluster/environment (e.g. cl-dev11-a, pv-dev-05-a)\n"
+            "   • Total count\n\n"
+            "2. 📊 **SUMMARY:**\n"
+            "   • One sentence overview of the change type\n"
+            "   • Flat bullet list of key service changes: "
+            "`env/service`: `old-version` → `new-version`\n"
+            "   • Omit checksum-only or annotation-only changes\n\n"
+            "3. ⚠️ **CRITICAL CHANGES:**\n"
+            "   • Version downgrades — only report when full version string decreases\n"
+            "   • Replicas dropping to 0 (potential service disruption)\n"
+            "   • Services being removed (resource deletion)\n"
+            "   • Liveness/readiness probe removed\n"
+            "   • If none: say 'No critical changes detected'\n\n"
+            "Max 300 words. Be concise. Prioritise critical changes for human review.\n\n"
             "DIFF DATA:\n"
             + "\n".join(sections_parts)
             + error_note

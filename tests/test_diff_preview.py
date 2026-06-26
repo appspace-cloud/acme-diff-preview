@@ -612,3 +612,138 @@ def test_indeterminate_comment_is_not_green():
     assert "Diff incomplete" in body
     # Must not falsely claim the app is unchanged.
     assert "No manifest changes" not in body
+
+
+# ── Helm-template diff + OCI error handling ───────────────────────────────────
+
+def test_helm_diff_architecture():
+    """Helm template diff must be the primary path; argocd manifests is fallback."""
+    src = _source()
+    assert "_helm_template" in src, "missing _helm_template function"
+    assert "_ensure_chart" in src, "missing _ensure_chart (chart caching) function"
+    assert "_fetch_value_files" in src, "missing _fetch_value_files function"
+    assert "_helm_login" in src, "missing _helm_login (OCI registry auth) function"
+    assert "OciChartNotFound" in src, "missing OciChartNotFound exception class"
+    # Both dev and release registries must be handled via the same credential pair
+    assert "_app_chart_registry_map" in src, "must track per-app OCI registry URL"
+    assert "OCI_USER" in src, "OCI_USER env var not wired"
+    assert "OCI_PASS" in src, "OCI_PASS env var not wired"
+
+
+def test_oci_not_found_error_classification():
+    """OCI chart version not found must surface as oci_not_found, not a generic error."""
+    mod = _import_module()
+    for pattern in ("not found in", "chart not found",
+                    "unexpected status code: 404", "does not exist in oci registry"):
+        outcome, reason, detail = mod.classify_diff_error(pattern)
+        assert reason == "oci_not_found", (
+            f"Pattern {pattern!r} should map to oci_not_found, got {reason}")
+        assert outcome == mod.OUT_INDETERMINATE
+
+
+def test_oci_not_found_is_not_retried():
+    """OciChartNotFound must not be retried (it is permanent, not transient)."""
+    src = _source()
+    assert 'reason == "oci_not_found"' in src, (
+        "oci_not_found must be caught before the retry loop to avoid wasting retries"
+    )
+
+
+def test_oci_not_found_in_reason_hints():
+    """oci_not_found must have a human-readable hint for the PR comment."""
+    mod = _import_module()
+    assert "oci_not_found" in mod._REASON_HINTS, "missing hint for oci_not_found reason"
+    hint = mod._REASON_HINTS["oci_not_found"]
+    assert "OCI" in hint or "oci" in hint.lower() or "registry" in hint.lower(), (
+        f"Hint should mention the OCI registry: {hint!r}")
+
+
+def test_parse_manifest_resources():
+    """_parse_manifest_resources must split multi-doc YAML by kind/namespace/name."""
+    mod = _import_module()
+    yaml_text = """---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: my-service
+  namespace: test-ns
+spec: {}
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: my-config
+  namespace: test-ns
+data: {}
+"""
+    resources = mod._parse_manifest_resources(yaml_text)
+    assert len(resources) == 2, f"expected 2 resources, got {len(resources)}"
+    keys = set(k[2] for k in resources)
+    assert "my-service" in keys
+    assert "my-config" in keys
+
+
+def test_diff_manifests_detects_change():
+    """_diff_manifests must return non-empty string when resource content differs."""
+    mod = _import_module()
+    main_yaml = """---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: svc
+  namespace: env-a
+spec:
+  image: myapp:1.0.0
+"""
+    pr_yaml = """---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: svc
+  namespace: env-a
+spec:
+  image: myapp:2.0.0
+"""
+    diff = mod._diff_manifests(main_yaml, pr_yaml)
+    assert diff, "diff should be non-empty when resource content changed"
+    assert "===== " in diff, "diff output must use ArgoCD header format"
+    assert "1.0.0" in diff or "2.0.0" in diff, "diff must contain the version strings"
+
+
+def test_diff_manifests_no_change():
+    """_diff_manifests must return empty string when manifests are identical."""
+    mod = _import_module()
+    yaml = """---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: cfg
+  namespace: ns
+data:
+  key: value
+"""
+    diff = mod._diff_manifests(yaml, yaml)
+    assert diff == "", "identical manifests must produce empty diff"
+
+
+def test_diff_manifests_new_resource():
+    """_diff_manifests must detect a brand new resource added in PR."""
+    mod = _import_module()
+    main_yaml = "---\napiVersion: v1\nkind: ConfigMap\nmetadata:\n  name: old\n  namespace: ns\n"
+    pr_yaml = (main_yaml +
+               "---\napiVersion: apps/v1\nkind: Deployment\nmetadata:\n  name: new-svc\n  namespace: ns\n")
+    diff = mod._diff_manifests(main_yaml, pr_yaml)
+    assert diff, "new resource in PR must produce a diff"
+    assert "new-svc" in diff
+
+
+def test_ai_prompt_sre_format():
+    """AI prompt must use the SRE format with 🌍/📊/⚠️ sections."""
+    src = _source()
+    assert "Senior SRE" in src, "AI prompt must reference Senior SRE role"
+    assert "AFFECTED ENVIRONMENTS" in src, "AI prompt must have environments section"
+    assert "SUMMARY" in src, "AI prompt must have summary section"
+    assert "CRITICAL CHANGES" in src, "AI prompt must have critical changes section"
+    assert "Version downgrade" in src or "downgrade" in src, (
+        "AI prompt must instruct model to flag version downgrades"
+    )
