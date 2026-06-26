@@ -34,7 +34,7 @@ SHA dedup:
 - In-memory: skips same PR SHA within this pod's loop iterations
 - Cross-pod: compares comment SHA; skips and fixes stuck INPROGRESS if needed
 """
-import json, os, posixpath, re, signal, ssl, sys, subprocess, time, threading, urllib.error, urllib.request
+import json, os, posixpath, random, re, signal, ssl, sys, subprocess, time, threading, urllib.error, urllib.request
 from collections import Counter, namedtuple
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -73,8 +73,15 @@ LOG_LEVEL          = os.environ.get("LOG_LEVEL", "INFO").upper()
 DEBUG              = LOG_LEVEL == "DEBUG"
 MAX_RESOURCES_FULL = 5       # resources shown with full diff block
 MAX_DIFF_CHARS     = 2000    # chars per resource diff block
-MAX_APPS_PER_RUN   = 30      # safety cap
-DIFF_WORKERS       = 3       # parallel argocd app diff calls (reduced to limit gRPC load on ArgoCD)
+# Capacity knobs (env-overridable). Defaults sized for a single PR that diffs
+# hundreds of apps (a chart version bump rolled out to many clusters at once).
+# The hub is protected by reposerver.parallelism.limit (per-pod render queue)
+# and a 100-processor principal, so the client can fan out wider safely.
+MAX_APPS_PER_RUN   = int(os.environ.get("MAX_APPS_PER_RUN", "800"))   # cover 600+ apps/PR with headroom
+DIFF_WORKERS       = int(os.environ.get("DIFF_WORKERS", "16"))        # parallel argocd app diff calls
+DIFF_TIMEOUT       = int(os.environ.get("DIFF_TIMEOUT", "120"))       # seconds per argocd app diff (OCI cache-miss renders are slow)
+WARM_WORKERS       = int(os.environ.get("WARM_WORKERS", "4"))         # parallel chart-cache warm-up diffs
+WARM_THRESHOLD     = int(os.environ.get("WARM_THRESHOLD", "8"))       # only warm when a PR fans out to more apps than this
 MAX_COMMENT_BYTES  = 245_000 # Bitbucket ~256KB limit; leave headroom
 JFROG_MAX_BODY_BYTES = int(os.environ.get("JFROG_MAX_BODY_BYTES", "65536"))  # 64 KB — reject oversized bodies before HMAC
 
@@ -102,10 +109,10 @@ _ready: bool    = False   # set True after first successful argocd_login()
 _wake           = threading.Event()  # set by POST /diff-preview/webhook
 _seen_lock      = threading.Lock()   # guards _seen for concurrent PR processing
 
-# Max parallel PR processing workers. Each worker runs 4 argocd app diff
-# subprocesses internally, so the effective subprocess pool is
-# MAX_PR_WORKERS × DIFF_WORKERS.
-MAX_PR_WORKERS  = 3
+# Max parallel PR processing workers. Each worker fans out up to DIFF_WORKERS
+# argocd app diff subprocesses internally, so the effective subprocess pool is
+# MAX_PR_WORKERS × DIFF_WORKERS. Env-overridable via PR_WORKERS.
+MAX_PR_WORKERS  = int(os.environ.get("PR_WORKERS", "3"))
 
 # Path map TTL cache: argocd app list is ~350ms and downloads ~50KB.
 # The map only changes when apps are added/removed (rare).
@@ -114,6 +121,10 @@ _path_map_cache: dict  = {}
 _path_map_ts:    float = 0.0
 _path_map_count: int   = 0    # extra invalidation: rebuild if app count changes
 PATH_MAP_TTL            = 300   # seconds
+# app full_name -> OCI chart name (e.g. "appspace-micro-services"), built from
+# the same `argocd app list` call. Used to warm the repo-server chart cache once
+# per chart before fanning out parallel diffs (mass version bump support).
+_app_chart_map: dict   = {}
 
 # GCE access token cache: token valid ~3600s, no reason to refetch each PR.
 _gcp_token:     str   = ""
@@ -436,7 +447,7 @@ def discover_path_app_map():
     Result is cached for PATH_MAP_TTL seconds. Cache is invalidated on
     argocd_login() so a re-login (session expiry) picks up new apps.
     """
-    global _path_map_cache, _path_map_ts, _path_map_count
+    global _path_map_cache, _path_map_ts, _path_map_count, _app_chart_map
     if _path_map_cache and (time.monotonic() - _path_map_ts) < PATH_MAP_TTL:
         # Also check app count hasn't changed (new env added mid-TTL)
         if len(_path_map_cache) == _path_map_count:
@@ -451,6 +462,7 @@ def discover_path_app_map():
     except json.JSONDecodeError as e:
         raise RuntimeError(f"argocd app list: invalid JSON: {e}")
     path_map = {}
+    chart_map = {}
     for app in apps:
         name = app["metadata"]["name"]
         ns   = app["metadata"].get("namespace", "")
@@ -458,6 +470,9 @@ def discover_path_app_map():
         # Apps in managed-mode agent namespaces (e.g. gcp-qa-pv-ap1-a/pv-qa88-a-ms)
         # are no longer in the default 'argocd' namespace in managed-mode agent clusters.
         full_name = f"{ns}/{name}" if ns and ns != "argocd" else name
+        chart = _extract_app_chart(app)
+        if chart:
+            chart_map[full_name] = chart
         ann  = app.get("metadata", {}).get("annotations", {})
         raw  = ann.get("argocd.argoproj.io/manifest-generate-paths", "")
         if not raw:
@@ -469,9 +484,27 @@ def discover_path_app_map():
                 if full_name not in path_map[p]:
                     path_map[p].append(full_name)
     _path_map_cache = path_map
+    _app_chart_map  = chart_map
     _path_map_ts    = time.monotonic()
     _path_map_count = len(path_map)
     return path_map
+
+
+def _extract_app_chart(app):
+    """Best-effort OCI chart name for an app, from spec.source or spec.sources.
+
+    Apps are multi-source (acme-config-dev as source-1, the OCI Helm chart as
+    another source). The chart name (e.g. "appspace-micro-services") is the cache
+    key the repo-server uses for the OCI pull, so apps sharing a chart share the
+    expensive pull once it is warm.
+    """
+    spec = app.get("spec", {})
+    srcs = spec.get("sources") or ([spec["source"]] if spec.get("source") else [])
+    for s in srcs:
+        chart = s.get("chart")
+        if chart:
+            return chart
+    return None
 
 def get_affected_apps(changed_files, path_map):
     """Return sorted app names whose manifest-generate-paths overlap with changed files."""
@@ -484,6 +517,35 @@ def get_affected_apps(changed_files, path_map):
                 if f.startswith(p + "/") or p.startswith(f + "/"):
                     apps.update(app_list)
     return sorted(apps)
+
+
+def _select_warm_apps(affected):
+    """Split affected apps into (warm_reps, rest) for chart-cache warm-up.
+
+    Returns one representative app per distinct OCI chart that has more than one
+    affected app (the followers reuse the warmed chart pull). Charts with a
+    single affected app, and apps with an unknown chart, are left in `rest` since
+    warming them separately only adds latency. Below WARM_THRESHOLD apps the
+    whole PR fans out directly (warm_reps is empty).
+    """
+    if len(affected) <= WARM_THRESHOLD:
+        return [], list(affected)
+    by_chart = {}
+    unknown  = []
+    for app in affected:
+        chart = _app_chart_map.get(app)
+        if chart:
+            by_chart.setdefault(chart, []).append(app)
+        else:
+            unknown.append(app)
+    warm, rest = [], list(unknown)
+    for chart, group in by_chart.items():
+        if len(group) > 1:
+            warm.append(group[0])
+            rest.extend(group[1:])
+        else:
+            rest.extend(group)
+    return warm, rest
 
 # ── ArgoCD diff ───────────────────────────────────────────────────────
 def argocd_login():
@@ -572,6 +634,20 @@ _RETRYABLE_DIFF_ERRORS = (
     "GetManifests failed with status code 502",
     "GetManifests failed with status code 503",
     "GetManifests failed with status code 504",
+    # Burst-transient failures during a mass version bump: the repo-server is
+    # busy doing parallel OCI cache-miss renders and briefly returns 5xx, or the
+    # request to the spoke agent through the redis/resource proxy times out under
+    # load. These clear once the chart cache warms and the load subsides, so
+    # retry them in-process with backoff instead of waiting a whole loop.
+    "GetManifests failed with status code 5",
+    "code = Unknown desc = POST",
+    "status code 502",
+    "status code 503",
+    "status code 504",
+    "error getting cached app managed resources",
+    "the server is not currently accepting requests",
+    "code = Canceled",
+    "context canceled",
 )
 
 # Auth-failure patterns that should trigger an ArgoCD re-login.
@@ -679,7 +755,7 @@ def _run_one_diff(app, pr_sha):
         r = subprocess.run(
             [ARGOCD_BIN, "app", "diff", app,
              "--revisions", pr_sha, "--source-positions", "1"] + _auth_flags(),
-            capture_output=True, text=True, timeout=60)
+            capture_output=True, text=True, timeout=DIFF_TIMEOUT)
         return r, False
     except subprocess.TimeoutExpired:
         return None, True
@@ -688,6 +764,26 @@ def _run_one_diff(app, pr_sha):
 def _indeterminate(reason, detail):
     """Build an INDETERMINATE DiffResult (diff could not be computed)."""
     return DiffResult("", False, detail[:400], OUT_INDETERMINATE, reason)
+
+
+# Retry budget for a single diff. During a mass version bump the hub is briefly
+# saturated, so a transient 5xx/timeout on the first try is normal and clears
+# within a few seconds once the chart cache warms. More attempts with growing
+# backoff make the diff transparent to reviewers instead of "diff unavailable".
+DIFF_RETRIES       = int(os.environ.get("DIFF_RETRIES", "3"))   # total attempts per diff
+DIFF_BACKOFF_BASE  = float(os.environ.get("DIFF_BACKOFF_BASE", "3"))   # seconds
+DIFF_BACKOFF_CAP   = float(os.environ.get("DIFF_BACKOFF_CAP", "30"))   # seconds
+
+
+def _diff_backoff(attempt):
+    """Exponential backoff with full jitter for retry number `attempt` (0-based).
+
+    attempt 0 -> ~3s, attempt 1 -> ~6s, attempt 2 -> ~12s ... capped, plus
+    jitter so concurrent retries of many apps do not thunder back in lockstep
+    against the repo-server / agent.
+    """
+    base = min(DIFF_BACKOFF_BASE * (2 ** attempt), DIFF_BACKOFF_CAP)
+    return base + random.uniform(0, base * 0.5)
 
 
 def argocd_diff(app, pr_sha):
@@ -699,23 +795,25 @@ def argocd_diff(app, pr_sha):
     2+ = error.
 
     Retry policy:
-      - Retryable errors (Redis hiccup, OCI cache-miss render, repo-server 5xx):
-        one immediate retry after a 3s pause so brief blips (2-5s) are
+      - Retryable errors (Redis hiccup, OCI cache-miss render, repo-server 5xx,
+        agent gRPC blip during a mass bump): up to DIFF_RETRIES attempts with
+        exponential backoff + jitter, so bursts that clear in a few seconds are
         transparent without waiting for the next loop.
       - Persistent failures: returned as INDETERMINATE so the cross-iteration
         retry fires and the comment shows "diff unavailable" (never a green check).
-      - Command timeout (60s): INDETERMINATE; let the next loop retry.
+      - Command timeout (DIFF_TIMEOUT): retried with backoff, then INDETERMINATE.
     """
     last_detail = ""
-    for attempt in range(2):
+    last_attempt = DIFF_RETRIES - 1
+    for attempt in range(DIFF_RETRIES):
         r, timed_out = _run_one_diff(app, pr_sha)
         if timed_out:
-            debug(f"diff timed out after 60s", app=app, attempt=attempt + 1)
-            # A timeout on the first attempt is worth one quick retry.
-            if attempt == 0:
-                time.sleep(3)
+            debug(f"diff timed out after {DIFF_TIMEOUT}s", app=app, attempt=attempt + 1)
+            # Timeouts under burst are worth retrying with backoff.
+            if attempt < last_attempt:
+                time.sleep(_diff_backoff(attempt))
                 continue
-            return _indeterminate("timeout", "diff timed out after 60s")
+            return _indeterminate("timeout", f"diff timed out after {DIFF_TIMEOUT}s")
 
         # Clean exit 0 — manifests match, genuinely no changes.
         if r.returncode == 0:
@@ -730,10 +828,11 @@ def argocd_diff(app, pr_sha):
                 threading.Thread(target=_async_relogin, daemon=True).start()
             debug(f"diff exit 1 (no stdout): {reason}", app=app,
                   attempt=attempt + 1, stderr=detail[:800])
-            if attempt == 0 and any(p in detail for p in _RETRYABLE_DIFF_ERRORS):
-                print(f"    [{app}] transient error on attempt 1, retrying in 3s: "
-                      f"{detail[:80]}", flush=True)
-                time.sleep(3)
+            if attempt < last_attempt and any(p in detail for p in _RETRYABLE_DIFF_ERRORS):
+                delay = _diff_backoff(attempt)
+                print(f"    [{app}] transient error (attempt {attempt + 1}/{DIFF_RETRIES}), "
+                      f"retrying in {delay:.0f}s: {detail[:80]}", flush=True)
+                time.sleep(delay)
                 continue
             return _indeterminate(reason, detail)
 
@@ -744,12 +843,13 @@ def argocd_diff(app, pr_sha):
             debug(f"diff exit {r.returncode}: {reason}", app=app,
                   attempt=attempt + 1, stderr=err_out[:800])
 
-            # Retryable fast errors — brief Redis / OCI cache-miss / 5xx hiccup.
-            if attempt == 0 and any(p in err_out for p in _RETRYABLE_DIFF_ERRORS):
-                print(f"    [{app}] transient error on attempt 1, retrying in 3s: "
-                      f"{err_out[:80]}", flush=True)
-                time.sleep(3)
-                continue  # → attempt 1 (the second and final attempt)
+            # Retryable transient errors — Redis / OCI cache-miss / 5xx / agent blip.
+            if attempt < last_attempt and any(p in err_out for p in _RETRYABLE_DIFF_ERRORS):
+                delay = _diff_backoff(attempt)
+                print(f"    [{app}] transient error (attempt {attempt + 1}/{DIFF_RETRIES}), "
+                      f"retrying in {delay:.0f}s: {err_out[:80]}", flush=True)
+                time.sleep(delay)
+                continue
 
             if outcome == OUT_INDETERMINATE:
                 return _indeterminate(reason, detail)
@@ -1368,26 +1468,46 @@ def process_pr(pr, path_map):
             result = argocd_diff(app, pr_sha)
             elapsed = round(time.monotonic() - t0, 1)
             return app, result, elapsed
-        with ThreadPoolExecutor(max_workers=DIFF_WORKERS) as ex:
-            futures = {ex.submit(run_diff, app): app for app in affected}
-            for fut in as_completed(futures):
-                app, result, elapsed = fut.result()
-                app_results[app] = result
-                outcome_counts[result.outcome] += 1
-                if result.outcome == OUT_ERROR:
-                    any_hard_error = True
-                    reason_counts[result.reason] += 1
-                elif result.outcome == OUT_INDETERMINATE:
-                    any_unknown = True
-                    reason_counts[result.reason] += 1
-                n_sections = (len(parse_diff_sections(result.text))
-                              if result.outcome == OUT_DIFF else 0)
-                # Structured per-app line so failures are queryable in logs.
-                log(f"diff {result.outcome}/{result.reason} for {app} [{elapsed}s]"
-                    + (f" | {result.error[:120]}" if result.error else ""),
-                    severity=("WARNING" if result.outcome in (OUT_INDETERMINATE, OUT_ERROR) else "INFO"),
-                    pr=pr_id, app=app, outcome=result.outcome, reason=result.reason,
-                    elapsed_s=elapsed, resources=n_sections)
+
+        def process_batch(apps, workers):
+            """Diff a list of apps with a bounded pool, accumulating results."""
+            nonlocal any_hard_error, any_unknown
+            if not apps:
+                return
+            with ThreadPoolExecutor(max_workers=max(1, min(workers, len(apps)))) as ex:
+                futures = {ex.submit(run_diff, app): app for app in apps}
+                for fut in as_completed(futures):
+                    app, result, elapsed = fut.result()
+                    app_results[app] = result
+                    outcome_counts[result.outcome] += 1
+                    if result.outcome == OUT_ERROR:
+                        any_hard_error = True
+                        reason_counts[result.reason] += 1
+                    elif result.outcome == OUT_INDETERMINATE:
+                        any_unknown = True
+                        reason_counts[result.reason] += 1
+                    n_sections = (len(parse_diff_sections(result.text))
+                                  if result.outcome == OUT_DIFF else 0)
+                    # Structured per-app line so failures are queryable in logs.
+                    log(f"diff {result.outcome}/{result.reason} for {app} [{elapsed}s]"
+                        + (f" | {result.error[:120]}" if result.error else ""),
+                        severity=("WARNING" if result.outcome in (OUT_INDETERMINATE, OUT_ERROR) else "INFO"),
+                        pr=pr_id, app=app, outcome=result.outcome, reason=result.reason,
+                        elapsed_s=elapsed, resources=n_sections)
+
+        # Cache-warm phase: on a large fan-out (a chart version bump rolled out to
+        # many apps), diffing every app at once means every app is a repo-server
+        # cache miss that races to pull and render the same OCI chart, saturating
+        # the repo-server and triggering 5xx. Instead, diff ONE representative per
+        # distinct OCI chart first (these can warm concurrently across charts).
+        # That pull populates the repo-server chart cache, so the big parallel
+        # fan-out for the rest of the apps reuses it and stays fast.
+        warm_apps, rest_apps = _select_warm_apps(affected)
+        if warm_apps:
+            print(f"    Cache-warm: {len(warm_apps)} chart representative(s) "
+                  f"before fanning out {len(rest_apps)} more", flush=True)
+            process_batch(warm_apps, WARM_WORKERS)
+        process_batch(rest_apps, DIFF_WORKERS)
 
         # Per-PR breakdown — at a glance, how many apps failed and why.
         breakdown = ", ".join(f"{k}={v}" for k, v in sorted(outcome_counts.items()))
@@ -1535,6 +1655,8 @@ def main():
     log("acme-diff-preview starting (Deployment mode)",
         argocd_server=ARGOCD_SERVER, argocd_user=ARGOCD_USER,
         bb_repo=BB_REPO, diff_workers=DIFF_WORKERS, pr_workers=MAX_PR_WORKERS,
+        max_apps_per_run=MAX_APPS_PER_RUN, diff_timeout=DIFF_TIMEOUT,
+        diff_retries=DIFF_RETRIES, warm_workers=WARM_WORKERS,
         log_level=LOG_LEVEL, vertex_model=VERTEX_MODEL)
     _start_health_server()
 

@@ -240,52 +240,84 @@ def test_async_relogin_function_exists():
     assert "argocd_login()" in src, "_async_relogin must call argocd_login()"
 
 
-def test_diff_timeout_reduced():
-    """Per-attempt diff timeout must be 60s not 120s.
+def test_diff_timeout_configurable():
+    """Per-attempt diff timeout is env-configurable with a 120s default.
 
-    120s was too long — a diff command that hasn't finished in 60s is unlikely
-    to succeed. Shorter timeout means faster failure detection and faster retries.
+    Mass version bumps force OCI cache-miss renders that can legitimately take
+    over a minute under burst, so the default was raised to 120s and exposed as
+    DIFF_TIMEOUT for tuning.
     """
     src = _source()
-    assert "timeout=60" in src, "Per-attempt diff timeout must be 60s"
-    assert "timeout=120" not in src, (
-        "REGRESSION: 120s timeout still present — must use 60s per attempt"
+    assert 'DIFF_TIMEOUT       = int(os.environ.get("DIFF_TIMEOUT", "120"))' in src, (
+        "DIFF_TIMEOUT must be env-configurable with default 120"
+    )
+    assert "timeout=DIFF_TIMEOUT" in src, (
+        "_run_one_diff must use DIFF_TIMEOUT, not a hardcoded timeout"
     )
 
 
-def test_diff_workers_reduced():
-    """DIFF_WORKERS must be 3, not 4.
+def test_capacity_knobs_configurable():
+    """Worker/cap knobs must be env-overridable for mass-app PRs (600+ apps)."""
+    src = _source()
+    assert 'DIFF_WORKERS       = int(os.environ.get("DIFF_WORKERS", "16"))' in src, (
+        "DIFF_WORKERS must be env-configurable (default 16)"
+    )
+    assert 'MAX_APPS_PER_RUN   = int(os.environ.get("MAX_APPS_PER_RUN", "800"))' in src, (
+        "MAX_APPS_PER_RUN must be env-configurable (default 800) to cover 600+ apps"
+    )
+    assert 'MAX_PR_WORKERS  = int(os.environ.get("PR_WORKERS", "3"))' in src, (
+        "MAX_PR_WORKERS must be env-configurable via PR_WORKERS"
+    )
 
-    Reduced to limit concurrent gRPC connections to ArgoCD server under load.
-    With MAX_PR_WORKERS=3: max concurrent diffs = 3 * 3 = 9 (down from 12).
+
+def test_retry_loop_with_backoff():
+    """argocd_diff must retry transient errors with exponential backoff + jitter."""
+    src = _source()
+    assert "for attempt in range(DIFF_RETRIES):" in src, (
+        "argocd_diff must loop over DIFF_RETRIES attempts"
+    )
+    assert 'DIFF_RETRIES       = int(os.environ.get("DIFF_RETRIES", "3"))' in src, (
+        "DIFF_RETRIES must be env-configurable (default 3)"
+    )
+    assert "def _diff_backoff(" in src, "Missing exponential backoff helper"
+    assert "random.uniform" in src, "Backoff must add jitter (random.uniform)"
+
+
+def test_manifests_5xx_is_retryable():
+    """Burst 5xx / agent gRPC blips must be retried in-process, not surfaced raw.
+
+    Before this change 'code = Unknown desc = POST' (the gRPC symptom of a
+    mass-bump repo-server overload) was not in _RETRYABLE_DIFF_ERRORS, so it was
+    reported as indeterminate on the first try instead of being retried.
     """
     src = _source()
-    assert "DIFF_WORKERS       = 3" in src, (
-        "DIFF_WORKERS must be 3 to limit concurrent ArgoCD gRPC load"
-    )
+    start = src.index("_RETRYABLE_DIFF_ERRORS = (")
+    end   = src.index(")", start)
+    block = src[start:end]
+    for needle in ("code = Unknown desc = POST",
+                   "GetManifests failed with status code 5",
+                   "error getting cached app managed resources"):
+        assert needle in block, f"5xx/burst pattern missing from retryable: {needle!r}"
 
 
-def test_retry_loop_in_argocd_diff():
-    """argocd_diff must use a retry loop, not a single subprocess call."""
-    src = _source()
-    # The loop exists
-    assert "for attempt in range(2):" in src, (
-        "argocd_diff must use 'for attempt in range(2)' retry loop"
-    )
-    # Retry on transient errors
-    assert "retrying in 3s" in src, (
-        "Retry log message missing — 3s backoff between attempts"
-    )
-    # argocd_diff loop is exactly 2 attempts
-    # (range(3) at file level is the Bitbucket http() helper, separate function)
-    fn_start = src.index("def argocd_diff(")
-    fn_end   = src.index("\ndef parse_diff_sections", fn_start)
-    fn_body  = src[fn_start:fn_end]
-    import re
-    loops = re.findall(r"for attempt in range\((\d+)\)", fn_body)
-    assert loops and int(loops[0]) == 2, (
-        f"argocd_diff retry loop must be 2 attempts, found: {loops}"
-    )
+def test_cache_warm_selection():
+    """_select_warm_apps groups by chart and warms one rep per multi-app chart."""
+    mod = _import_module()
+
+    # Below threshold: no warm-up, everything fans out directly.
+    small = [f"app{i}" for i in range(3)]
+    warm, rest = mod._select_warm_apps(small)
+    assert warm == [] and rest == small
+
+    # Above threshold with a shared chart: one representative is warmed.
+    mod._app_chart_map = {f"ms{i}": "appspace-micro-services" for i in range(10)}
+    mod._app_chart_map["solo"] = "other-chart"
+    apps = [f"ms{i}" for i in range(10)] + ["solo"]
+    warm, rest = mod._select_warm_apps(apps)
+    assert len(warm) == 1, "exactly one rep for the shared multi-app chart"
+    assert warm[0].startswith("ms"), "warm rep must come from the shared chart group"
+    assert "solo" in rest, "single-app charts stay in the fan-out batch"
+    assert set(warm) | set(rest) == set(apps), "no app may be dropped"
 
 
 # ── JFrog webhook + dedicated account ────────────────────────────────────────

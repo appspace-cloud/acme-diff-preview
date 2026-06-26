@@ -55,6 +55,38 @@ kubectl -n argocd logs deploy/acme-diff-preview | grep '"outcome"'
 # or, for full ArgoCD stderr, set logLevel: DEBUG in the Helm values
 ```
 
+### Handling mass version bumps (hundreds of apps in one PR)
+
+Bumping a chart `version:` across many clusters in a single PR is a normal
+operation. Naively diffing every app at once means every app is a repo-server
+cache miss racing to pull and render the same OCI chart, which saturates the
+repo-server (5xx / `manifests_5xx`) and floods the argocd-agent principal. Two
+mechanisms keep this reliable:
+
+1. **Chart-cache warm-up.** Before the parallel fan-out, one representative app
+   per distinct OCI chart is diffed first (`_select_warm_apps`). That single
+   render warms the repo-server chart cache so the remaining apps reuse the pull
+   instead of stampeding it. Controlled by `WARM_WORKERS` / `WARM_THRESHOLD`.
+2. **Retry with exponential backoff + jitter.** Transient burst errors
+   (`manifests_5xx`, `code = Unknown desc = POST`, redis-proxy timeouts) are
+   retried in-process up to `DIFF_RETRIES` times so a brief blip during the
+   burst never surfaces as "diff unavailable".
+
+This is paired with hub-side capacity in `acme-infrastructure`
+(`reposerver.parallelism.limit`, a 100-processor principal, redis-ha headroom).
+
+### Tuning knobs (env vars / Helm `diff.*` values)
+
+| Env | Helm value | Default | Purpose |
+|---|---|---|---|
+| `MAX_APPS_PER_RUN` | `diff.maxAppsPerRun` | `800` | Hard cap on apps diffed per PR |
+| `DIFF_WORKERS` | `diff.workers` | `16` | Parallel diffs within one PR |
+| `PR_WORKERS` | `diff.prWorkers` | `3` | PRs processed in parallel |
+| `DIFF_TIMEOUT` | `diff.timeout` | `120` | Seconds per diff attempt |
+| `DIFF_RETRIES` | `diff.retries` | `3` | Attempts per diff (backoff + jitter) |
+| `WARM_WORKERS` | `diff.warmWorkers` | `4` | Parallel chart warm-up diffs |
+| `WARM_THRESHOLD` | `diff.warmThreshold` | `8` | Min apps before warm-up kicks in |
+
 ---
 
 ## Repository layout

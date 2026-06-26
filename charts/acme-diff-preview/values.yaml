@@ -7,13 +7,33 @@ fullnameOverride: "acme-diff-preview"
 
 image:
   repository: us-central1-docker.pkg.dev/appspace-devops/artifact/acme-diff-preview
-  tag: "1.4.0"
+  tag: "1.5.0"
   pullPolicy: IfNotPresent
 
 # Log verbosity for the diff-preview service. Set to DEBUG to emit the full
 # ArgoCD stderr and per-attempt diff classification (useful when diffs come
 # back "unavailable" and you need to see why).
 logLevel: INFO
+
+# Diff engine tuning. Defaults are sized for a single PR that diffs hundreds of
+# apps at once (a chart version bump rolled out to many clusters). Leave unset to
+# use the in-code defaults; override here only to tune for a specific load.
+diff:
+  # Hard cap on apps diffed per PR (was 30; raised to cover 600+ apps/PR).
+  maxAppsPerRun: 800
+  # Parallel `argocd app diff` calls within one PR.
+  workers: 16
+  # Parallel PR processing workers (effective subprocess pool = prWorkers * workers).
+  prWorkers: 3
+  # Seconds per diff attempt (OCI cache-miss renders can exceed a minute).
+  timeout: 120
+  # Retry attempts per diff with exponential backoff + jitter on transient errors.
+  retries: 3
+  # Parallel chart-cache warm-up diffs (one representative per distinct OCI chart
+  # is diffed first to warm the repo-server cache before the big fan-out).
+  warmWorkers: 4
+  # Only warm when a PR fans out to more apps than this.
+  warmThreshold: 8
 
 # ArgoCD server (hub cluster ingress)
 argocd:
@@ -55,13 +75,15 @@ serviceAccount:
   annotations:
     iam.gke.io/gcp-service-account: argocd@appspace-devops.iam.gserviceaccount.com
 
-# Deployment resource requests / limits
+# Deployment resource requests / limits.
+# Sized for bursty fan-out: up to workers*prWorkers concurrent argocd CLI
+# subprocesses (each ~50-100Mi) plus the warm-up pool during a 600+ app PR.
 resources:
   requests:
-    cpu: 150m
-    memory: 128Mi
-  limits:
+    cpu: 500m
     memory: 512Mi
+  limits:
+    memory: 2Gi
 
 # Hard-refresh CronJob — hard-refreshes all dev/QA apps every 2 hours
 hardRefresh:
