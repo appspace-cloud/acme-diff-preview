@@ -456,7 +456,7 @@ def discover_path_app_map():
         ns   = app["metadata"].get("namespace", "")
         # Use namespace/name so argocd CLI resolves the app in the correct namespace.
         # Apps in managed-mode agent namespaces (e.g. gcp-qa-pv-ap1-a/pv-qa88-a-ms)
-        # are no longer in the default 'argocd' namespace after the COPS-2474 migration.
+        # are no longer in the default 'argocd' namespace in managed-mode agent clusters.
         full_name = f"{ns}/{name}" if ns and ns != "argocd" else name
         ann  = app.get("metadata", {}).get("annotations", {})
         raw  = ann.get("argocd.argoproj.io/manifest-generate-paths", "")
@@ -912,7 +912,7 @@ def fix_stuck_inprogress(pr_sha, pr_id, comment_raw):
         print(f"    [fix_stuck_inprogress] PR #{pr_id}: {e}", file=sys.stderr)
 
 # ── Vertex AI (Gemini) summary ─────────────────────────────────────────
-# COPS-2496: AI-powered diff summary using Vertex AI Gemini.
+# AI-powered diff summary using Vertex AI Gemini.
 # Auth: GCE metadata server token via Workload Identity (no API key).
 # Prerequisite: roles/aiplatform.user on argocd@appspace-devops GSA.
 #

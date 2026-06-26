@@ -6,7 +6,6 @@ metadata:
   labels:
     {{- include "acme-diff-preview.labels" . | nindent 4 }}
   annotations:
-    cops.appspace.com/ticket: COPS-2498
     # Restart pod when acme-diff-preview-creds Secret changes (ESO rotation).
     reloader.stakater.com/auto: "true"
 spec:

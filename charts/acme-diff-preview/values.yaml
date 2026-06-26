@@ -25,7 +25,7 @@ bitbucket:
   workspace: appspace-cloud
   repo: acme-config-dev
 
-# Vertex AI for diff summaries (COPS-2496)
+# Vertex AI for diff summaries
 vertex:
   project: appspace-devops
   location: us-central1
@@ -38,7 +38,7 @@ secrets:
   bbUserKey: acme-diff-preview-bb-user
   bbTokenKey: acme-diff-preview-bb-token
   argocdPassKey: argocd-diff-preview-admin-pass
-  # GCP SM secret name for the JFrog webhook HMAC shared secret (COPS-2500)
+  # GCP SM secret name for the JFrog webhook HMAC shared secret
   jfrogWebhookSecretKey: argocd-jfrog-webhook-shared-secret
 
 # Webhook endpoint exposed via the ArgoCD Ingress extraPaths
@@ -65,7 +65,7 @@ resources:
 
 # Hard-refresh CronJob — hard-refreshes all dev/QA apps every 2 hours
 hardRefresh:
-  schedule: "*/30 * * * *"  # reduced from 2h — JFrog webhook is primary trigger (COPS-2500)
+  schedule: "*/30 * * * *"  # JFrog webhook is primary trigger; cron is a fallback
   resources:
     requests:
       cpu: 50m

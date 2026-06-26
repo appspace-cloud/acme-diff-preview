@@ -50,7 +50,7 @@ def test_key_functions_defined():
 
 
 def test_wake_event_defined():
-    """_wake threading.Event must be present (COPS-2497 webhook support)."""
+    """_wake threading.Event must be present for webhook wakeup support."""
     src = _source()
     assert "_wake" in src
     assert "threading.Event" in src
@@ -288,7 +288,7 @@ def test_retry_loop_in_argocd_diff():
     )
 
 
-# ── COPS-2500: JFrog webhook + account fix ───────────────────────────────────
+# ── JFrog webhook + dedicated account ────────────────────────────────────────
 
 def test_argocd_uses_diff_preview_account():
     """argocd_login must use ARGOCD_USER (diff-preview), never hardcoded admin.
