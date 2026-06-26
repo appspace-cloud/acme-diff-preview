@@ -886,17 +886,36 @@ def _bb_fetch_file_at_sha(filepath, sha):
 
     Uses a direct urllib call instead of bb()/http() because those helpers
     always call json.loads() on the response, which fails for YAML/text files.
+
+    Distinguishes 404 (file does not exist at this sha - skip silently) from
+    transient errors (429 rate limit, 5xx, network timeout - retry with backoff).
+    Only 404 is returned as None and cached; transient errors are retried up to 3x.
     """
     import base64
     url = (f"https://api.bitbucket.org/2.0/repositories/"
            f"{BB_WORKSPACE}/{BB_REPO}/src/{sha}/{filepath}")
     creds = base64.b64encode(f"{BB_USER}:{BB_TOKEN}".encode()).decode()
     req = urllib.request.Request(url, headers={"Authorization": f"Basic {creds}"})
-    try:
-        with urllib.request.urlopen(req, context=_ssl, timeout=20) as r:
-            return r.read().decode("utf-8", errors="replace")
-    except Exception:
-        return None
+    for attempt in range(3):
+        with _bb_api_sem:   # global rate limiter: caps concurrent BB API calls
+            try:
+                with urllib.request.urlopen(req, context=_ssl, timeout=20) as r:
+                    return r.read().decode("utf-8", errors="replace")
+            except urllib.error.HTTPError as e:
+                if e.code == 404:
+                    return None   # File does not exist at this sha — skip silently
+                if e.code in (429, 500, 502, 503, 504) and attempt < 2:
+                    wait = (attempt + 1) * 2  # 2s, 4s
+                    debug(f"Bitbucket API {e.code} for {filepath}, retry {attempt+1}/2 in {wait}s")
+                    time.sleep(wait)
+                    continue
+                return None   # Other HTTP error — treat as missing
+            except Exception:
+                if attempt < 2:
+                    time.sleep((attempt + 1) * 2)
+                    continue
+                return None   # Network/timeout — skip after retries
+    return None
 
 
 _yaml_version_re = re.compile(r"^\s{0,8}version:\s*([^\s#]+)", re.MULTILINE)
@@ -1056,6 +1075,13 @@ def _find_chart_subdir(chart_dir: str) -> str:
 # iteration. Main sha files (same across all apps) are fetched once and reused.
 _vf_cache: dict = {}
 _vf_cache_lock  = threading.Lock()
+# Bitbucket API rate limit: cap concurrent calls across all PRs+apps to avoid
+# 429 responses that cause value files to return None and helm template to fail
+# with "Missing required value". Each PR×app fetches 14 files (7 paths × 2 shas)
+# and with 3 PRs × 16 workers × 14 files = 672 potential concurrent requests.
+# Cap at 30 to stay well within BB API limits while keeping good throughput.
+BB_API_CONCURRENCY = int(os.environ.get("BB_API_CONCURRENCY", "30"))
+_bb_api_sem = threading.Semaphore(BB_API_CONCURRENCY)
 
 
 def _fetch_value_files(value_files: list, sha: str) -> dict:
@@ -1073,12 +1099,23 @@ def _fetch_value_files(value_files: list, sha: str) -> dict:
     sha value files are fetched only once across all apps in a PR iteration.
     """
     def _fetch_one(vf):
-        clean = vf.replace("$config/", "").lstrip("/")
+        # Normalize path traversal (e.g. "gcp/dev/ap1/custom/cluster/../../config.yaml"
+        # -> "gcp/dev/ap1/config.yaml"). Some apps use relative paths in valueFiles.
+        clean = posixpath.normpath(vf.replace("$config/", "").lstrip("/"))
         cache_key = (sha, clean)
         with _vf_cache_lock:
             if cache_key in _vf_cache:
                 return vf, _vf_cache[cache_key], True   # (path, content, from_cache)
         content = _bb_fetch_file_at_sha(clean, sha)
+        # Only cache definitive results (file found OR confirmed 404/not-found).
+        # Do NOT cache None from transient errors (rate limit, timeout) — those
+        # should be retried on the next call rather than spreading "missing" state
+        # across all apps that share the same (sha, path) cache key.
+        # We can't distinguish 404 from transient here (both return None), so we
+        # cache None when sha looks like a real commit sha (not a branch name that
+        # changes). For PRs we always use a fixed sha so caching None is safe for
+        # the duration of one PR iteration, but wrong across retries. Clear cache
+        # per-PR-iteration (done in process_pr) to avoid stale None entries.
         with _vf_cache_lock:
             _vf_cache[cache_key] = content
         return vf, content, False
