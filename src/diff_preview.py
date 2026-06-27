@@ -735,12 +735,18 @@ OUT_INDETERMINATE = "indeterminate"
 OUT_ERROR         = "error"
 
 # Structured result of a single argocd_diff() call.
-#   text     : reconstructed diff text (only for OUT_DIFF)
+#   text     : reconstructed diff text, already truncated to MAX_RESOURCES_FULL
+#              sections and MAX_DIFF_CHARS per section (only for OUT_DIFF)
+#   sections : pre-parsed filtered sections [(header, body)] — computed once
+#              in argocd_diff and reused everywhere (never call parse_diff_sections
+#              on result.text again).
+#   n_res    : total number of differing resources (including ones not in text)
 #   has_diff : True only for OUT_DIFF (kept for readability at call sites)
 #   error    : human-readable detail for INDETERMINATE / ERROR, else None
 #   outcome  : one of the OUT_* constants
-#   reason   : short machine code for logs/metrics (e.g. "oci_login_401")
-DiffResult = namedtuple("DiffResult", ["text", "has_diff", "error", "outcome", "reason"])
+#   reason   : short machine code for logs/metrics
+DiffResult = namedtuple("DiffResult",
+                        ["text", "sections", "n_res", "has_diff", "error", "outcome", "reason"])
 
 # ── Diff failure reasons (helm-template architecture) ─────────────────
 # The diff is a pure local `helm pull` + `helm template` + Python YAML diff.
@@ -867,6 +873,14 @@ HELM_CACHE_DIR  = os.environ.get("HELM_CACHE_DIR", "/tmp/acme-helm-cache")
 # the main and PR renders use the same value, so the diff stays consistent.
 KUBE_VERSION    = os.environ.get("KUBE_VERSION", "1.30.0")
 
+# Dev OCI registries may republish charts with the same tag (CI fast-loop). Cache
+# dev-registry chart versions for at most this many seconds before re-pulling.
+# Release registry charts are immutable, so we skip the TTL check for them.
+DEV_CHART_TTL        = int(os.environ.get("DEV_CHART_TTL", "600"))   # 10 min default
+_DEV_REGISTRY_PATTERN = "helm-oci-dev."           # hostname prefix identifying dev registries
+# Timestamp of each cached chart version's last pull, for dev-TTL eviction.
+_helm_chart_pull_ts: dict = {}   # key -> monotonic time of last successful pull
+
 # Registries that have been successfully authenticated this pod lifetime.
 _helm_logged_in: set = set()
 _helm_login_lock     = threading.Lock()
@@ -882,6 +896,41 @@ _helm_cache_lock        = threading.Lock()
 # causing "failed to untar: a file or directory already exists" errors.
 _helm_pull_locks: dict  = {}
 _helm_pull_locks_lock   = threading.Lock()
+
+# ── Shared thread pool for sub-tasks inside _run_one_diff (#6) ───────────────
+# Creating/destroying a ThreadPoolExecutor per diff call (3× per call) causes
+# hundreds of thread spawns per PR. A module-level pool is cheaper: workers are
+# reused and the pool lives for the pod lifetime.
+# Size: enough for concurrent (pull PR + pull main + fetch PR vf + fetch main vf
+# + render PR + render main) across DIFF_WORKERS parallel diffs.
+_SUBTASK_POOL_WORKERS = max(8, DIFF_WORKERS * 2)  # default 32
+_subtask_pool: ThreadPoolExecutor = None           # created lazily in main()
+
+def _get_subtask_pool() -> ThreadPoolExecutor:
+    """Return (or create) the module-level sub-task pool."""
+    global _subtask_pool
+    if _subtask_pool is None:
+        _subtask_pool = ThreadPoolExecutor(
+            max_workers=_SUBTASK_POOL_WORKERS,
+            thread_name_prefix="diff-subtask")
+    return _subtask_pool
+
+# ── Singleflight for value-file fetches (#1) ─────────────────────────────────
+# Prevents N concurrent diffs from all fetching the same (sha, path) when the
+# cache is cold (the common case at the start of a PR burst).
+# Pattern: first thread to miss cache creates an Event; others wait on it.
+_vf_inflight: dict = {}
+_vf_inflight_lock   = threading.Lock()
+
+# ── Main-side render cache (#3) ───────────────────────────────────────────────
+# The main-sha render of an app is identical for every diff that runs within the
+# same loop iteration (same base_sha). Cache the parsed resource dict so
+# concurrent and sequential diffs on the same app skip re-fetching + re-rendering.
+# Key: (app, main_sha)   Value: dict of parsed manifest resources
+# Cleared when the base_sha changes (detected in main_iteration).
+_main_render_cache: dict = {}
+_main_render_lock        = threading.Lock()
+_main_render_sha: str    = ""   # the main_sha the cache is valid for
 
 
 class OciChartNotFound(Exception):
@@ -925,14 +974,25 @@ def _ensure_chart(registry: str, chart: str, version: str) -> str:
             return _helm_chart_cache[key]
 
     chart_dir = os.path.join(HELM_CACHE_DIR, registry, chart, version)
+    # Dev registries can republish charts under the same tag. Treat the disk
+    # cache as stale after DEV_CHART_TTL seconds and re-pull to pick up updates.
+    _is_dev = _DEV_REGISTRY_PATTERN in registry
+    _now = time.monotonic()
     if os.path.isdir(chart_dir) and os.listdir(chart_dir):
-        # Always resolve the chart subdirectory (helm --untar creates a subdir).
-        # A previous code path stored chart_dir directly; _find_chart_subdir is
-        # idempotent and harmless when called on an already-resolved path.
-        path = _find_chart_subdir(chart_dir)
+        pull_ts = _helm_chart_pull_ts.get(key, 0)
+        is_fresh = (not _is_dev) or (_now - pull_ts < DEV_CHART_TTL)
+        if is_fresh:
+            path = _find_chart_subdir(chart_dir)
+            with _helm_cache_lock:
+                _helm_chart_cache[key] = path
+            return path
+        # Dev chart is stale — evict and re-pull below.
+        debug(f"Dev chart cache stale ({version} in {registry}), re-pulling")
         with _helm_cache_lock:
-            _helm_chart_cache[key] = path
-        return path
+            _helm_chart_cache.pop(key, None)
+        with _helm_pull_locks_lock:
+            _helm_pull_locks.pop(key, None)
+        shutil.rmtree(chart_dir, ignore_errors=True)
 
     if not _helm_login(registry):
         return None
@@ -1005,6 +1065,7 @@ def _ensure_chart(registry: str, chart: str, version: str) -> str:
         path = _find_chart_subdir(chart_dir)
         with _helm_cache_lock:
             _helm_chart_cache[key] = path
+        _helm_chart_pull_ts[key] = time.monotonic()
         return path
 
 
@@ -1109,23 +1170,39 @@ def _fetch_value_files(value_files: list, sha: str) -> dict:
     sha value files are fetched only once across all apps in a PR iteration.
     """
     def _fetch_one(vf):
-        # Normalize path traversal (e.g. "gcp/dev/ap1/custom/cluster/../../config.yaml"
-        # -> "gcp/dev/ap1/config.yaml"). Some apps use relative paths in valueFiles.
-        clean = posixpath.normpath(vf.replace("$config/", "").lstrip("/"))
+        clean     = posixpath.normpath(vf.replace("$config/", "").lstrip("/"))
         cache_key = (sha, clean)
+
+        # Fast path: already in cache.
         with _vf_cache_lock:
             if cache_key in _vf_cache:
                 return vf, _vf_cache[cache_key]
-        content, status = _bb_fetch_status(clean, sha)
-        # Cache ONLY definitive results: a fetched file (BB_OK) or a confirmed
-        # 404 (BB_NOT_FOUND, a stable fact for this immutable sha). NEVER cache a
-        # transient BB_ERROR as None — that would poison every app sharing this
-        # (sha, path) key and surface as a false "missing value" on the render.
-        # Leaving it uncached lets the next app/iteration re-fetch it.
-        if status in (BB_OK, BB_NOT_FOUND):
+            # Singleflight: if another thread is already fetching this key, join it
+            # instead of making a duplicate Bitbucket API call.
+            if cache_key in _vf_inflight:
+                evt     = _vf_inflight[cache_key]
+                fetcher = False
+            else:
+                evt = threading.Event()
+                _vf_inflight[cache_key] = evt
+                fetcher = True
+
+        if not fetcher:
+            evt.wait(timeout=30)
             with _vf_cache_lock:
-                _vf_cache[cache_key] = content
-        return vf, content
+                return vf, _vf_cache.get(cache_key)
+
+        # We are the fetcher for this cache key.
+        try:
+            content, status = _bb_fetch_status(clean, sha)
+            if status in (BB_OK, BB_NOT_FOUND):
+                with _vf_cache_lock:
+                    _vf_cache[cache_key] = content
+            return vf, content
+        finally:
+            with _vf_inflight_lock:
+                _vf_inflight.pop(cache_key, None)
+            evt.set()
 
     result = {}
     missing = []
@@ -1257,17 +1334,13 @@ def _parse_manifest_resources(yaml_text):
     return resources
 
 
-def _diff_manifests(main_yaml, pr_yaml):
-    """Diff two multi-doc YAML strings resource by resource.
+def _diff_resources(main_res: dict, pr_res: dict) -> str:
+    """Diff two pre-parsed resource dicts (from _parse_manifest_resources).
 
-    Returns a diff string in the ArgoCD `===== /Kind ns/name =====` format so the
-    rest of the pipeline (parse_diff_sections, format_comment) works unchanged.
+    Returns a diff string in the ArgoCD `===== /Kind ns/name =====` format.
     Returns empty string if there are no differences.
     """
-    import difflib  # stdlib, lazy import acceptable here (one per diff call)
-    main_res = _parse_manifest_resources(main_yaml)
-    pr_res   = _parse_manifest_resources(pr_yaml)
-
+    import difflib
     all_keys = sorted(set(main_res) | set(pr_res),
                       key=lambda k: (k[0], k[1], k[2]))
     parts = []
@@ -1282,13 +1355,20 @@ def _diff_manifests(main_yaml, pr_yaml):
         delta = list(difflib.unified_diff(a_lines, b_lines, lineterm="\n"))
         if not delta:
             continue
-        # Header format ArgoCD uses: ===== /Kind ns/name ======
         hdr = f"/{type_key} {ns}/{name}" if ns else f"/{type_key} {name}"
         parts.append(f"===== {hdr} ======\n" + "".join(delta))
     return "\n".join(parts)
 
 
-def _run_one_diff(app, pr_sha, main_sha, chart_revision=None):
+def _diff_manifests(main_yaml: str, pr_yaml: str) -> str:
+    """Convenience wrapper: parse both YAML strings then diff. Used only in tests."""
+    return _diff_resources(
+        _parse_manifest_resources(main_yaml),
+        _parse_manifest_resources(pr_yaml)
+    )
+
+
+def _run_one_diff(app, pr_sha, main_sha, chart_revision=None, changed_paths=None):
     """Diff PR vs main using pure helm template — no ArgoCD agent access at all.
 
     Strategy:
@@ -1347,36 +1427,79 @@ def _run_one_diff(app, pr_sha, main_sha, chart_revision=None):
         return None, REASON_OCI_PULL, f"helm pull failed for {chart_name}:{main_rev}"
 
     try:
-        # Fetch PR and main value files in parallel — each set takes ~300ms
-        # (7 parallel Bitbucket API calls) vs ~2.1s sequential.
-        with ThreadPoolExecutor(max_workers=2) as ex:
-            pr_vf_fut   = ex.submit(_fetch_value_files, value_files, pr_sha)
-            main_vf_fut = ex.submit(_fetch_value_files, value_files, main_sha)
-            pr_vals   = pr_vf_fut.result(timeout=DIFF_TIMEOUT)
+        # Optimization: value files not changed in this PR are byte-identical at
+        # pr_sha and main_sha. Fetch them only once (at main_sha) and reuse for
+        # the PR side. Only files that appear in the PR's changed_paths need a
+        # fresh fetch at pr_sha. This halves Bitbucket API calls for the common
+        # case of a version-only bump where a single config.yaml changes.
+        pool = _get_subtask_pool()
+        main_vf_fut = pool.submit(_fetch_value_files, value_files, main_sha)
+
+        if changed_paths:
+            # Split: files touched by this PR fetch fresh at pr_sha; others reuse.
+            changed_clean = {
+                posixpath.normpath(p.lstrip("/")) for p in changed_paths}
+            pr_changed_vf = [
+                vf for vf in value_files
+                if posixpath.normpath(vf.replace("$config/", "").lstrip("/"))
+                   in changed_clean
+            ]
+            unchanged_vf  = [vf for vf in value_files if vf not in pr_changed_vf]
+
+            pr_changed_fut = pool.submit(_fetch_value_files, pr_changed_vf, pr_sha) \
+                             if pr_changed_vf else None
+
             main_vals = main_vf_fut.result(timeout=DIFF_TIMEOUT)
 
-        # Render both chart versions in parallel
-        with ThreadPoolExecutor(max_workers=2) as ex:
-            pr_fut   = ex.submit(_helm_template, pr_chart,   release, namespace, pr_vals)
-            main_fut = ex.submit(_helm_template, main_chart, release, namespace, main_vals)
-            pr_yaml,   pr_err   = pr_fut.result(timeout=DIFF_TIMEOUT)
+            # Build pr_vals: fresh fetch for changed files, reuse main_vals for rest.
+            pr_vals = dict(main_vals)   # start with the main-side values
+            if pr_changed_fut:
+                pr_vals.update(pr_changed_fut.result(timeout=DIFF_TIMEOUT))
+        else:
+            # No changed_paths info — fall back to fetching both sides in full.
+            pr_vf_fut = pool.submit(_fetch_value_files, value_files, pr_sha)
+            main_vals = main_vf_fut.result(timeout=DIFF_TIMEOUT)
+            pr_vals   = pr_vf_fut.result(timeout=DIFF_TIMEOUT)
+
+        # Main-side render cache: reuse parsed resources if we already rendered
+        # this app at main_sha (common when the same app appears in multiple PRs
+        # or when a retry loop re-runs the diff).
+        main_cache_key = (app, main_sha)
+        with _main_render_lock:
+            main_resources = _main_render_cache.get(main_cache_key)
+        needs_main_render = main_resources is None
+
+        pool     = _get_subtask_pool()
+        pr_fut   = pool.submit(_helm_template, pr_chart, release, namespace, pr_vals)
+        main_fut = pool.submit(_helm_template, main_chart, release, namespace, main_vals) \
+                   if needs_main_render else None
+
+        pr_yaml, pr_err = pr_fut.result(timeout=DIFF_TIMEOUT)
+        if pr_err:
+            if main_fut:
+                main_fut.cancel()
+            return None, REASON_RENDER, pr_err
+
+        if needs_main_render:
             main_yaml, main_err = main_fut.result(timeout=DIFF_TIMEOUT)
+            if main_err:
+                return None, REASON_RENDER, main_err
+            main_resources = _parse_manifest_resources(main_yaml)
+            with _main_render_lock:
+                _main_render_cache[main_cache_key] = main_resources
+
     except (subprocess.TimeoutExpired, concurrent.futures.TimeoutError):
         return None, REASON_TIMEOUT, f"render exceeded {DIFF_TIMEOUT}s"
     except Exception as e:
         return None, REASON_RENDER, str(e)[:200]
 
-    if pr_err:
-        return None, REASON_RENDER, pr_err
-    if main_err:
-        return None, REASON_RENDER, main_err
-
-    return _diff_manifests(main_yaml, pr_yaml), None, None
+    pr_resources = _parse_manifest_resources(pr_yaml)
+    return _diff_resources(main_resources, pr_resources), None, None
 
 
 def _indeterminate(reason, detail):
     """Build an INDETERMINATE DiffResult (diff could not be computed)."""
-    return DiffResult("", False, detail[:400], OUT_INDETERMINATE, reason)
+    return DiffResult("", [], 0, False, detail[:400], OUT_INDETERMINATE, reason)
 
 
 # Retry budget for a single diff. During a mass version bump the hub is briefly
@@ -1399,7 +1522,7 @@ def _diff_backoff(attempt):
     return base + random.uniform(0, base * 0.5)
 
 
-def argocd_diff(app, pr_sha, main_sha, chart_revision=None):
+def argocd_diff(app, pr_sha, main_sha, chart_revision=None, changed_paths=None):
     """Compute the manifest diff between PR sha and main sha for one app.
 
     Returns a DiffResult. Never raises.
@@ -1419,7 +1542,8 @@ def argocd_diff(app, pr_sha, main_sha, chart_revision=None):
     last_attempt = DIFF_RETRIES - 1
     for attempt in range(DIFF_RETRIES):
         diff_text, reason, detail = _run_one_diff(
-            app, pr_sha, main_sha, chart_revision=chart_revision)
+            app, pr_sha, main_sha,
+            chart_revision=chart_revision, changed_paths=changed_paths)
 
         if reason is not None:
             last_detail, last_reason = detail or reason, reason
@@ -1440,18 +1564,24 @@ def argocd_diff(app, pr_sha, main_sha, chart_revision=None):
 
         # diff_text == "" means manifests are identical
         if not diff_text:
-            return DiffResult("", False, None, OUT_NO_DIFF, "clean")
+            return DiffResult("", [], 0, False, None, OUT_NO_DIFF, "clean")
 
         # Filter noise sections (checksums, version annotations that always drift)
         filtered_sections = _filter_diff_sections(parse_diff_sections(diff_text))
         if not filtered_sections:
-            return DiffResult("", False, None, OUT_NO_DIFF, "noise_only")
+            return DiffResult("", [], 0, False, None, OUT_NO_DIFF, "noise_only")
 
-        clean_diff = "\n".join(
-            f"===== {hdr} =====\n{body}"
-            for hdr, body in filtered_sections
-        )
-        return DiffResult(clean_diff, True, None, OUT_DIFF, "changes")
+        n_res = len(filtered_sections)
+        # Truncate to display budget NOW so we never hold the full YAML in memory.
+        # format_comment and generate_ai_summary use result.sections directly.
+        display_secs = filtered_sections[:MAX_RESOURCES_FULL]
+        truncated_parts = []
+        for hdr, body in display_secs:
+            body_t = body[:MAX_DIFF_CHARS] + "\n... (truncated)" if len(body) > MAX_DIFF_CHARS else body
+            truncated_parts.append(f"===== {hdr} =====\n{body_t}")
+        clean_diff = "\n".join(truncated_parts)
+        return DiffResult(clean_diff, filtered_sections[:AI_MAX_SECTIONS_PER_APP],
+                          n_res, True, None, OUT_DIFF, "changes")
     # Exhausted retries
     return _indeterminate(last_reason, last_detail or "unknown error")
 
@@ -1698,8 +1828,9 @@ def generate_ai_summary(app_results: dict) -> str | None:
     """
     try:
         results = {app: _result(v) for app, v in app_results.items()}
+        # Use pre-parsed sections from DiffResult — never re-parse.
         changed = {
-            app: parse_diff_sections(r.text)
+            app: r.sections
             for app, r in results.items()
             if r.outcome == OUT_DIFF
         }
@@ -1836,16 +1967,18 @@ def _result(value):
         return value
     text, has_diff, error = value
     if has_diff:
-        return DiffResult(text, True, None, OUT_DIFF, "changes")
+        secs = parse_diff_sections(text) if text else []
+        return DiffResult(text, secs, len(secs), True, None, OUT_DIFF, "changes")
     if error:
-        return DiffResult("", False, error, OUT_INDETERMINATE, "legacy")
-    return DiffResult("", False, None, OUT_NO_DIFF, "clean")
+        return DiffResult("", [], 0, False, error, OUT_INDETERMINATE, "legacy")
+    return DiffResult("", [], 0, False, None, OUT_NO_DIFF, "clean")
 
 
 def _format_app_diff_block(app, sections, diff_text, show_diff=True):
     """Return a list of markdown lines for one app's diff block.
 
-    show_diff=False outputs just the header line (for large-mode table overflow).
+    sections is DiffResult.sections — already truncated to display budget.
+    show_diff=False outputs just the header line (large-mode table overflow).
     Bitbucket does NOT render HTML <details>/<summary>, so we never use them.
     """
     n = len(sections) if sections else 1
@@ -1853,18 +1986,11 @@ def _format_app_diff_block(app, sections, diff_text, show_diff=True):
     if not show_diff:
         return out
     if sections:
-        for hdr, body in sections[:MAX_RESOURCES_FULL]:
-            truncated = body[:MAX_DIFF_CHARS]
-            if len(body) > MAX_DIFF_CHARS:
-                truncated += "\n... (truncated)"
-            out += [f"**`{hdr}`**", "", "```diff", truncated.rstrip(), "```", ""]
-        if len(sections) > MAX_RESOURCES_FULL:
-            out += [f"*\u2026 and {len(sections) - MAX_RESOURCES_FULL} more resource(s)*", ""]
-    else:
-        raw = diff_text[:MAX_DIFF_CHARS * 2]
-        if len(diff_text) > MAX_DIFF_CHARS * 2:
-            raw += "\n... (truncated)"
-        out += ["```diff", raw.rstrip(), "```", ""]
+        for hdr, body in sections:
+            # body is already truncated at DiffResult creation time
+            out += [f"**`{hdr}`**", "", "```diff", body.rstrip(), "```", ""]
+    elif diff_text:
+        out += ["```diff", diff_text.rstrip(), "```", ""]
     return out
 
 
@@ -1929,8 +2055,7 @@ def format_comment(pr_sha, app_results, skipped_apps=None):
         ]
         for app, r in results.items():
             if r.outcome == OUT_DIFF:
-                n = len(parse_diff_sections(r.text)) if r.text else 1
-                lines.append(f"| `{app}` | \u26a0\ufe0f changed | {n} |")
+                lines.append(f"| `{app}` | \u26a0\ufe0f changed | {r.n_res} |")
             elif r.outcome == OUT_INDETERMINATE:
                 lines.append(f"| `{app}` | \u2754 diff unavailable | \u2014 |")
             elif r.outcome == OUT_ERROR:
@@ -1940,13 +2065,13 @@ def format_comment(pr_sha, app_results, skipped_apps=None):
         lines += [""]
 
     # ── Per-app diff sections ─────────────────────────────────────────
-    # For large PRs: show inline diffs for top-N most-changed apps only.
-    # Sort by resource count descending so the most impactful diffs appear first.
+    # Use r.n_res (total resource count, pre-computed) for sorting — no
+    # re-parsing of diff text needed.
     if is_large and changed_apps:
         inline_set = {
-            app for app, _ in sorted(
+            app for app, r in sorted(
                 changed_apps,
-                key=lambda x: len(parse_diff_sections(x[1].text) or []),
+                key=lambda x: x[1].n_res,
                 reverse=True,
             )[:LARGE_PR_INLINE_APPS]
         }
@@ -1958,10 +2083,9 @@ def format_comment(pr_sha, app_results, skipped_apps=None):
                 "",
             ]
     else:
-        inline_set = None   # show all inline
+        inline_set = None
 
     for app, r in results.items():
-        diff_text = r.text
         if r.outcome == OUT_ERROR:
             any_error = True
             lines += [f"\u274c **`{app}`** \u2014 error: {(r.error or '')[:200]}", ""]
@@ -1977,11 +2101,10 @@ def format_comment(pr_sha, app_results, skipped_apps=None):
 
         elif r.outcome == OUT_DIFF:
             any_change = True
-            sections   = parse_diff_sections(diff_text)
-            n          = len(sections) if sections else 1
-            total_changed += n
+            total_changed += r.n_res
             show_diff = (inline_set is None) or (app in inline_set)
-            lines += _format_app_diff_block(app, sections, diff_text, show_diff=show_diff)
+            # sections are already truncated in DiffResult — no re-parsing
+            lines += _format_app_diff_block(app, r.sections, r.text, show_diff=show_diff)
 
         else:
             lines += [f"\u2705 **`{app}`** \u2014 no manifest changes", ""]
@@ -2159,11 +2282,14 @@ def process_pr(pr, path_map, base_sha=""):
                 f"{len(pr_chart_revisions)} app(s) -> {unique_bumps}",
                 pr=pr_id)
 
+        _changed_paths_set = set(changed)   # for value-file skip optimization
+
         def run_diff(app):
             t0 = time.monotonic()
             chart_rev = pr_chart_revisions.get(app)
             result = argocd_diff(app, pr_sha, main_sha=base_sha,
-                                 chart_revision=chart_rev)
+                                 chart_revision=chart_rev,
+                                 changed_paths=_changed_paths_set)
             elapsed = round(time.monotonic() - t0, 1)
             return app, result, elapsed
 
@@ -2184,8 +2310,7 @@ def process_pr(pr, path_map, base_sha=""):
                     elif result.outcome == OUT_INDETERMINATE:
                         any_unknown = True
                         reason_counts[result.reason] += 1
-                    n_sections = (len(parse_diff_sections(result.text))
-                                  if result.outcome == OUT_DIFF else 0)
+                    n_sections = result.n_res if result.outcome == OUT_DIFF else 0
                     # Structured per-app line so failures are queryable in logs.
                     log(f"diff {result.outcome}/{result.reason} for {app} [{elapsed}s]"
                         + (f" | {result.error[:120]}" if result.error else ""),
@@ -2256,8 +2381,7 @@ def process_pr(pr, path_map, base_sha=""):
         # then update stats and build status (oci_not_found_count must be defined
         # before the stats block references it — bug fix for UnboundLocalError).
         sections_total = sum(
-            max(len(parse_diff_sections(r.text)), 1)
-            for r in app_results.values() if r.outcome == OUT_DIFF)
+            max(r.n_res, 1) for r in app_results.values() if r.outcome == OUT_DIFF)
         n_unknown = outcome_counts[OUT_INDETERMINATE]
         # oci_not_found is a hard permanent error (wrong version in config) that
         # MUST block the PR — the deployer will fail the same way.
@@ -2365,6 +2489,12 @@ def main_iteration():
             "/refs/branches/main", auth=(BB_USER, BB_TOKEN))
         base_sha = main_info["target"]["hash"]
         log(f"Base SHA (main): {base_sha[:8]}")
+        # Invalidate the main-side render cache whenever main moves.
+        global _main_render_sha
+        if base_sha != _main_render_sha:
+            with _main_render_lock:
+                _main_render_cache.clear()
+            _main_render_sha = base_sha
         prs = get_open_prs()
     except Exception as e:
         log(f"Bitbucket API error: {e}", "ERROR")
@@ -2434,6 +2564,8 @@ def main():
         log(f"OCI credentials present (user={OCI_USER})")
 
     _start_health_server()
+    _get_subtask_pool()   # warm the shared thread pool before the first iteration
+    log(f"Sub-task pool ready ({_SUBTASK_POOL_WORKERS} workers)")
 
     # Initial login — raises on failure so the container restarts immediately.
     argocd_login()

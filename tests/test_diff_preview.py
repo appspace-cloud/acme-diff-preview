@@ -146,7 +146,7 @@ def test_oci_not_found_is_permanent_indeterminate():
     """oci_not_found must resolve to INDETERMINATE/oci_not_found with no retry."""
     mod = _import_module()
     calls = {"n": 0}
-    def _stub(app, pr_sha, main_sha, chart_revision=None):
+    def _stub(app, pr_sha, main_sha, chart_revision=None, **_kw):
         calls["n"] += 1
         return None, mod.REASON_OCI_NOT_FOUND, "Chart x:9.9.9 not found in registry"
     mod._run_one_diff = _stub
@@ -164,7 +164,7 @@ def test_transient_reason_retries_then_indeterminate():
     """
     mod = _import_module()
     calls = {"n": 0}
-    def _stub(app, pr_sha, main_sha, chart_revision=None):
+    def _stub(app, pr_sha, main_sha, chart_revision=None, **_kw):
         calls["n"] += 1
         return None, mod.REASON_OCI_PULL, "helm pull failed"
     mod._run_one_diff = _stub
@@ -179,7 +179,7 @@ def test_render_failed_is_soft_no_retry():
     """render_failed is indeterminate but must not be retried (not transient)."""
     mod = _import_module()
     calls = {"n": 0}
-    def _stub(app, pr_sha, main_sha, chart_revision=None):
+    def _stub(app, pr_sha, main_sha, chart_revision=None, **_kw):
         calls["n"] += 1
         return None, mod.REASON_RENDER, "Error: execution error: missing value"
     mod._run_one_diff = _stub
@@ -538,7 +538,7 @@ def test_comment_header_renders_acme():
     """format_comment output must carry the ACME header and footer marker."""
     mod = _import_module()
     # A clean no-diff result for one app.
-    results = {"env-a-ms": mod.DiffResult("", False, None, mod.OUT_NO_DIFF, "clean")}
+    results = {"env-a-ms": mod.DiffResult("", [], 0, False, None, mod.OUT_NO_DIFF, "clean")}
     body = mod.format_comment("abcdef1234567890", results)
     assert "ACME Diff Preview" in body
     assert "acme-diff-preview" in body  # footer marker
@@ -549,7 +549,7 @@ def test_indeterminate_comment_is_not_green():
     """An indeterminate result must NOT render as 'No manifest changes'."""
     mod = _import_module()
     results = {
-        "env-a-glb": mod.DiffResult("", False, "401 Bad Credentials",
+        "env-a-glb": mod.DiffResult("", [], 0, False, "401 Bad Credentials",
                                     mod.OUT_INDETERMINATE, "oci_login"),
     }
     body = mod.format_comment("abcdef1234567890", results)
@@ -877,18 +877,18 @@ def test_helm_login_ttl():
 def test_status_token_in_comment_footer():
     """format_comment must embed [clean|permanent|transient] token in footer."""
     mod = _import_module()
-    results_clean = {"env-a-ms": mod.DiffResult("", False, None, mod.OUT_NO_DIFF, "clean")}
+    results_clean = {"env-a-ms": mod.DiffResult("", [], 0, False, None, mod.OUT_NO_DIFF, "clean")}
     body_clean = mod.format_comment("abc1234", results_clean)
     assert "[clean]" in body_clean, "clean run must embed [clean] token"
 
     results_indet = {
-        "env-a-ms": mod.DiffResult("", False, "oci err", mod.OUT_INDETERMINATE, mod.REASON_OCI_NOT_FOUND)
+        "env-a-ms": mod.DiffResult("", [], 0, False, "oci err", mod.OUT_INDETERMINATE, mod.REASON_OCI_NOT_FOUND)
     }
     body_indet = mod.format_comment("abc1234", results_indet)
     assert "[permanent]" in body_indet, "oci_not_found must embed [permanent] token"
 
     results_transient = {
-        "env-a-ms": mod.DiffResult("", False, "timeout", mod.OUT_INDETERMINATE, mod.REASON_TIMEOUT)
+        "env-a-ms": mod.DiffResult("", [], 0, False, "timeout", mod.OUT_INDETERMINATE, mod.REASON_TIMEOUT)
     }
     body_transient = mod.format_comment("abc1234", results_transient)
     assert "[transient]" in body_transient, "transient reason must embed [transient] token"
