@@ -1798,7 +1798,7 @@ def generate_ai_summary(app_results: dict) -> str | None:
         candidate = resp["candidates"][0]
         finish    = candidate.get("finishReason", "UNKNOWN")
         ai_text   = candidate["content"]["parts"][0]["text"].strip()
-        elapsed   = round((_time.monotonic() - _t0) * 1000)
+        elapsed   = round((time.monotonic() - _t0) * 1000)
         usage     = resp.get("usageMetadata", {})
         in_tok    = usage.get("promptTokenCount", "?")
         out_tok   = usage.get("candidatesTokenCount", "?")
