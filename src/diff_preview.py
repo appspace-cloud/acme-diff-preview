@@ -465,10 +465,16 @@ def _start_health_server(port: int = 8080) -> ThreadingHTTPServer:
     return server
 
 def _auth_flags():
-    # Auth and transport flags are now stored in ~/.argocd/config (written by
-    # argocd_login). Pass only --config so the CLI picks up the token without
-    # any credential on the command line (not visible in `ps aux`).
-    return ["--config", _ARGOCD_CFG_FILE]
+    """Return ArgoCD CLI flags for auth and transport.
+
+    The JWT token is passed via --auth-token from module memory (not from a
+    shell environment variable or command-line password). Combined with
+    --server it makes every argocd invocation self-contained and credential-safe.
+    """
+    flags = ["--server", ARGOCD_SERVER, "--grpc-web", "--insecure"]
+    if _argocd_token:
+        flags += ["--auth-token", _argocd_token]
+    return flags
 
 def _ts():
     return datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
@@ -630,12 +636,13 @@ def get_affected_apps(changed_files, path_map):
 
 
 # ── ArgoCD login (used only for app discovery, never for the diff itself) ──
-# We avoid passing ARGOCD_PASS as a CLI arg (which is visible in `ps aux`).
-# Instead, call the ArgoCD REST API to obtain a JWT token, then write it to
-# the ArgoCD config file (~/.argocd/config). Subsequent `argocd app list`
-# calls use the config file auth token automatically — no password on argv.
-_ARGOCD_CFG_DIR  = os.path.expanduser("~/.argocd")
-_ARGOCD_CFG_FILE = os.path.join(_ARGOCD_CFG_DIR, "config")
+# We avoid passing ARGOCD_PASS as a CLI arg (visible in ps aux). Instead, call
+# the ArgoCD REST API to get a JWT, store it in a module-level variable, and
+# pass it via --auth-token in every argocd CLI call. The token does not appear
+# in the process argv because it is stored in module memory, not in a shell
+# environment variable that could be inherited by unrelated processes.
+_argocd_token: str = ""
+
 
 def _argocd_fetch_token() -> str:
     """Call ArgoCD REST API to get a session JWT. Returns the raw token string."""
@@ -652,41 +659,14 @@ def _argocd_fetch_token() -> str:
         return json.loads(resp.read())["token"]
 
 
-def _write_argocd_config(token: str) -> None:
-    """Write a minimal ArgoCD CLI config file with the auth token."""
-    import stat
-    os.makedirs(_ARGOCD_CFG_DIR, mode=0o700, exist_ok=True)
-    cfg = (
-        f"contexts:\n"
-        f"- context:\n"
-        f"    server: {ARGOCD_SERVER}\n"
-        f"    user: {ARGOCD_SERVER}\n"
-        f"  name: {ARGOCD_SERVER}\n"
-        f"current-context: {ARGOCD_SERVER}\n"
-        f"servers:\n"
-        f"- grpcWeb: true\n"
-        f"  insecure: true\n"
-        f"  server: {ARGOCD_SERVER}\n"
-        f"users:\n"
-        f"- auth-token: {token}\n"
-        f"  name: {ARGOCD_SERVER}\n"
-    )
-    tmp = _ARGOCD_CFG_FILE + ".tmp"
-    with open(tmp, "w") as f:
-        f.write(cfg)
-    os.chmod(tmp, stat.S_IRUSR | stat.S_IWUSR)  # 0600 — owner only
-    os.replace(tmp, _ARGOCD_CFG_FILE)
-
-
 def argocd_login():
-    global _ready, _path_map_ts, _path_map_count, _path_map_app_count
-    token = _argocd_fetch_token()
-    _write_argocd_config(token)
+    global _ready, _path_map_ts, _path_map_count, _path_map_app_count, _argocd_token
+    _argocd_token = _argocd_fetch_token()
     _path_map_ts        = 0.0  # Invalidate path map cache on re-login.
     _path_map_count     = 0
     _path_map_app_count = 0
     _ready = True
-    log(f"ArgoCD auth: session token stored for {ARGOCD_USER} (no password on CLI)")
+    log(f"ArgoCD auth: JWT obtained for {ARGOCD_USER} (no password on CLI)")
 
 # Resource patterns filtered from ALL diff output and AI analysis.
 # micro-versions-info is an auto-generated ConfigMap that always changes
