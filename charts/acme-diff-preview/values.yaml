@@ -7,7 +7,7 @@ fullnameOverride: "acme-diff-preview"
 
 image:
   repository: us-central1-docker.pkg.dev/appspace-devops/artifact/acme-diff-preview
-  tag: "1.9.1"
+  tag: "1.9.2"
   pullPolicy: IfNotPresent
 
 # Log verbosity for the diff-preview service. Set to DEBUG to emit the full

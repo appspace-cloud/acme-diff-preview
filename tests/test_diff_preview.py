@@ -596,7 +596,9 @@ def test_ensure_chart_raises_on_missing_version():
         stdout = ""
         stderr = "Error: chart not found: unexpected status code: 404"
 
-    mod._helm_logged_in.add("reg.example.com")          # skip real login
+    import time as _time
+    mod._helm_logged_in.add("reg.example.com")
+    mod._helm_login_ts["reg.example.com"] = _time.monotonic()   # mark as recently logged in
     orig_run = _sp.run
     _sp.run = lambda *a, **k: _R()
     try:
@@ -868,4 +870,61 @@ def test_no_per_pr_vf_cache_clear():
     src = _source()
     assert "_vf_cache.clear()" not in src, (
         "value cache must not be cleared per PR (keys are immutable shas)"
+    )
+
+
+# ── New behaviours (1.9.1+) ──────────────────────────────────────────────────
+
+def test_helm_login_ttl():
+    """_helm_login must re-login after HELM_LOGIN_TTL for credential rotation."""
+    src = _source()
+    assert "HELM_LOGIN_TTL" in src, "missing HELM_LOGIN_TTL constant"
+    assert "_helm_login_ts" in src, "missing login timestamp tracker"
+
+
+def test_status_token_in_comment_footer():
+    """format_comment must embed [clean|permanent|transient] token in footer."""
+    mod = _import_module()
+    results_clean = {"env-a-ms": mod.DiffResult("", False, None, mod.OUT_NO_DIFF, "clean")}
+    body_clean = mod.format_comment("abc1234", results_clean)
+    assert "[clean]" in body_clean, "clean run must embed [clean] token"
+
+    results_indet = {
+        "env-a-ms": mod.DiffResult("", False, "oci err", mod.OUT_INDETERMINATE, mod.REASON_OCI_NOT_FOUND)
+    }
+    body_indet = mod.format_comment("abc1234", results_indet)
+    assert "[permanent]" in body_indet, "oci_not_found must embed [permanent] token"
+
+    results_transient = {
+        "env-a-ms": mod.DiffResult("", False, "timeout", mod.OUT_INDETERMINATE, mod.REASON_TIMEOUT)
+    }
+    body_transient = mod.format_comment("abc1234", results_transient)
+    assert "[transient]" in body_transient, "transient reason must embed [transient] token"
+
+
+def test_diff_stats_endpoint():
+    """GET /diff-preview/stats endpoint must expose diff operation counters."""
+    src = _source()
+    assert '"/diff-preview/stats"' in src, "missing /diff-preview/stats route"
+    assert "_diff_stats" in src, "missing _diff_stats counter dict"
+    assert '"prs_processed"' in src
+    assert '"apps_oci_not_found"' in src
+
+
+def test_no_warm_diff_pass():
+    """_select_warm_apps warm-diff pass must be gone (charts are pre-pulled)."""
+    src = _source()
+    # The warm_apps/rest_apps split must no longer drive process_batch
+    assert "process_batch(warm_apps" not in src, (
+        "warm diff pass must be removed — charts are pre-pulled before the fan-out"
+    )
+
+
+def test_pr_chart_revision_uses_vf_cache():
+    """_pr_chart_revision must route file fetches through _vf_cache."""
+    src = _source()
+    # _pr_chart_revision should use _bb_fetch_status + _vf_cache, not
+    # calling _bb_fetch_file_at_sha directly (which bypasses the cache).
+    assert "_bb_fetch_status(clean, pr_sha)" in src, (
+        "_pr_chart_revision must call _bb_fetch_status for cache-routed fetches"
     )

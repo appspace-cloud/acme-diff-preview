@@ -120,6 +120,18 @@ _jfrog_stats:      dict          = {
 }
 _jfrog_stats_lock: threading.Lock = threading.Lock()
 
+# Diff operation counters — exposed at GET /diff-preview/stats
+_diff_stats:      dict          = {
+    "prs_processed": 0,      # PRs where we ran at least one diff
+    "apps_diff": 0,          # apps with real changes
+    "apps_no_diff": 0,       # apps confirmed unchanged
+    "apps_indeterminate": 0, # diffs that could not be computed
+    "apps_oci_not_found": 0, # permanent OCI version missing
+    "last_iteration_s": None,# seconds taken by most recent iteration
+    "last_iteration_at": None,
+}
+_diff_stats_lock: threading.Lock = threading.Lock()
+
 # In-memory SHA dedup: avoids reprocessing same PR SHA within this pod run
 _seen: dict    = {}
 _shutdown: bool = False   # set True by SIGTERM handler
@@ -199,6 +211,17 @@ class _HealthHandler(BaseHTTPRequestHandler):
             # JSON counters for the JFrog webhook — useful for monitoring
             with _jfrog_stats_lock:
                 payload = dict(_jfrog_stats)
+            data = json.dumps(payload, indent=2).encode()
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(data)))
+            self.end_headers()
+            self.wfile.write(data)
+
+        elif self.path == "/diff-preview/stats":
+            # JSON counters for diff operations — useful for dashboards and alerts
+            with _diff_stats_lock:
+                payload = dict(_diff_stats)
             data = json.dumps(payload, indent=2).encode()
             self.send_response(200)
             self.send_header("Content-Type", "application/json")
@@ -837,6 +860,10 @@ KUBE_VERSION    = os.environ.get("KUBE_VERSION", "1.30.0")
 # Registries that have been successfully authenticated this pod lifetime.
 _helm_logged_in: set = set()
 _helm_login_lock     = threading.Lock()
+# Timestamp of the last successful login per registry. Re-login after this many
+# seconds so a secret rotation (new OCI_PASS) is picked up without a pod restart.
+HELM_LOGIN_TTL       = int(os.environ.get("HELM_LOGIN_TTL", str(6 * 3600)))  # 6h default
+_helm_login_ts: dict = {}   # registry -> monotonic timestamp of last successful login
 # Local chart path cache: "{registry}/{chart}:{version}" -> "/tmp/.../chart_dir"
 _helm_chart_cache: dict = {}
 _helm_cache_lock        = threading.Lock()
@@ -852,9 +879,12 @@ class OciChartNotFound(Exception):
 
 
 def _helm_login(registry: str) -> bool:
-    """Login to an OCI registry once per pod lifetime. Thread-safe."""
+    """Login to an OCI registry. Re-logs after HELM_LOGIN_TTL so a credential
+    rotation (new OCI_PASS in the pod's secret) is picked up without a restart.
+    Thread-safe — only one login per registry runs at a time."""
     with _helm_login_lock:
-        if registry in _helm_logged_in:
+        ts = _helm_login_ts.get(registry, 0)
+        if registry in _helm_logged_in and (time.monotonic() - ts) < HELM_LOGIN_TTL:
             return True
         if not OCI_PASS:
             return False
@@ -864,8 +894,11 @@ def _helm_login(registry: str) -> bool:
             input=OCI_PASS, capture_output=True, text=True, timeout=30)
         if r.returncode == 0:
             _helm_logged_in.add(registry)
+            _helm_login_ts[registry] = time.monotonic()
             log(f"Helm OCI login OK: {registry}")
             return True
+        # Login failure: clear the cached state so the next call retries.
+        _helm_logged_in.discard(registry)
         log(f"Helm OCI login failed for {registry}: {r.stderr[:200]}", "WARNING")
         return False
 
@@ -1148,7 +1181,22 @@ def _pr_chart_revision(app, changed_files, pr_sha):
                     candidate_files.append(f)
                     break
     for filepath in candidate_files:
-        content = _bb_fetch_file_at_sha(filepath, pr_sha)
+        # Route through _vf_cache so parallel calls for the same (pr_sha, path)
+        # from different apps share one Bitbucket API call instead of all fetching
+        # in parallel. The cache key is (sha, clean_path) same as _fetch_value_files.
+        clean = posixpath.normpath(filepath.lstrip("/"))
+        cache_key = (pr_sha, clean)
+        with _vf_cache_lock:
+            cached = _vf_cache.get(cache_key, ...)   # use ... as sentinel for "absent"
+        if cached is ...:
+            # Not yet in cache — fetch and store (only definitive results)
+            raw, status = _bb_fetch_status(clean, pr_sha)
+            if status in (BB_OK, BB_NOT_FOUND):
+                with _vf_cache_lock:
+                    _vf_cache[cache_key] = raw
+            content = raw
+        else:
+            content = cached
         if not content:
             continue
         new_rev = _extract_chart_version(content)
@@ -1518,8 +1566,22 @@ def fix_stuck_inprogress(pr_sha, pr_id, comment_raw):
             auth=(BB_USER, BB_TOKEN))
         if st.get("state") != "INPROGRESS":
             return
-        # Derive correct status from comment content
-        if "Error running diff" in comment_raw or "\u274c" in comment_raw:
+        # Derive correct state from the machine-readable token first (1.9.1+),
+        # then fall back to parsing the human-readable comment text.
+        _token_m = re.search(r'\[' + re.escape(COMMENT_MARKER) + r'\s+\[(clean|permanent|transient)\]',
+                              comment_raw)
+        if _token_m and _token_m.group(1) in ("permanent",):
+            state, desc = "FAILED", "Diff failed - check PR comment"
+        elif _token_m and _token_m.group(1) in ("clean",):
+            if "resource(s) will change" in comment_raw:
+                m = re.search(r"(\d+) resource\(s\) will change", comment_raw)
+                n = m.group(1) if m else "?"
+                state, desc = "SUCCESSFUL", f"{n} resource(s) will change - review comment"
+            else:
+                state, desc = "SUCCESSFUL", "No manifest changes"
+        elif _token_m and _token_m.group(1) == "transient":
+            state, desc = "SUCCESSFUL", "Diff unavailable - review comment"
+        elif "Error running diff" in comment_raw or "\u274c" in comment_raw:
             state, desc = "FAILED", "Diff failed - check PR comment"
         elif "not found in OCI registry" in comment_raw:
             state, desc = "FAILED", "Chart version not found in OCI registry"
@@ -1929,10 +1991,27 @@ def format_comment(pr_sha, app_results, skipped_apps=None):
     else:
         status = "\u2705 No manifest changes"
 
+    # Machine-readable token embedded in the footer. Used by process_pr to decide
+    # whether to re-run without parsing the human-readable status string.
+    # Tokens: clean | permanent | transient
+    # - clean     : all apps diffed successfully (no retry, mark seen)
+    # - permanent : oci_not_found or hard error (no retry, mark seen)
+    # - transient : diff unavailable on transient blip (retry next loop)
+    if any_error:
+        _status_token = "permanent"
+    elif any_unknown:
+        # Distinguish oci_not_found (permanent) from soft indeterminate (transient)
+        resolved = [_result(v) for v in app_results.values()]
+        indet    = [r for r in resolved if r.outcome == OUT_INDETERMINATE]
+        all_permanent = bool(indet) and all(r.reason in PERMANENT_REASONS for r in indet)
+        _status_token = "permanent" if all_permanent else "transient"
+    else:
+        _status_token = "clean"
+
     lines += [
         "---",
         f"**Status:** {status}",
-        f"*{_ts()} \u2014 {COMMENT_MARKER}*",
+        f"*{_ts()} \u2014 {COMMENT_MARKER} [{_status_token}]*",
     ]
     return "\n".join(lines)
 
@@ -1956,19 +2035,25 @@ def process_pr(pr, path_map, base_sha=""):
     # Cross-pod dedup: existing comment already covers this exact SHA
     existing_id, comment_sha, comment_raw = find_existing_comment(pr_id)
     if comment_sha == pr_sha[:8]:
-        # If the existing comment was not a clean result (hard error, or a diff
-        # that could not be computed) re-run now — the OCI/Redis/agent path may
-        # have recovered since. "Diff incomplete" is the indeterminate footer
-        # marker; the ❌ checks catch hard errors and legacy comments.
-        rerun = (
-            "Diff incomplete" in comment_raw
-            or "diff unavailable" in comment_raw
-            or "Error running diff" in comment_raw
-            or "Error processing diff" in comment_raw
-            or ("\u274c" in comment_raw and ("invalid session" in comment_raw
-                                             or "error:" in comment_raw))
-            or "no-diff ERR:" in comment_raw
-        )
+        # Use the machine-readable [token] embedded in the comment footer (1.9.1+)
+        # to decide if a re-run is needed. For legacy comments that lack the token
+        # fall back to string matching on human-readable text.
+        _token_match = re.search(r'\[' + re.escape(COMMENT_MARKER) + r'\s+\[(clean|permanent|transient)\]',
+                                 comment_raw)
+        if _token_match:
+            _token = _token_match.group(1)
+            rerun = (_token == "transient")
+        else:
+            # Legacy fallback: parse human-readable strings.
+            rerun = (
+                "Diff incomplete" in comment_raw
+                or "diff unavailable" in comment_raw
+                or "Error running diff" in comment_raw
+                or "Error processing diff" in comment_raw
+                or ("\u274c" in comment_raw and ("invalid session" in comment_raw
+                                                 or "error:" in comment_raw))
+                or "no-diff ERR:" in comment_raw
+            )
         if rerun:
             print(f"    Re-running: previous comment for SHA {pr_sha[:8]} was not clean, retrying diff")
             existing_id = existing_id  # keep existing_id so we update (not create) the comment
@@ -2059,8 +2144,6 @@ def process_pr(pr, path_map, base_sha=""):
         def run_diff(app):
             t0 = time.monotonic()
             chart_rev = pr_chart_revisions.get(app)
-            # No per-agent cap needed: manifests-based diff uses repo-server only,
-            # no live resource fetching from agents. Run all apps in parallel freely.
             result = argocd_diff(app, pr_sha, main_sha=base_sha,
                                  chart_revision=chart_rev)
             elapsed = round(time.monotonic() - t0, 1)
@@ -2132,13 +2215,11 @@ def process_pr(pr, path_map, base_sha=""):
                         except Exception:
                             pass
 
-        # Cache-warm diff phase: one representative per chart to warm repo-server cache.
-        warm_apps, rest_apps = _select_warm_apps(affected)
-        if warm_apps:
-            print(f"    Cache-warm: {len(warm_apps)} chart representative(s) "
-                  f"before fanning out {len(rest_apps)} more", flush=True)
-            process_batch(warm_apps, WARM_WORKERS)
-        process_batch(rest_apps, DIFF_WORKERS)
+        # Fan-out: diff all affected apps. The chart pre-pull phase above already
+        # has the tarball for every needed version on disk, so _run_one_diff will
+        # skip the pull step and go straight to helm template. No separate warm-up
+        # diff pass is needed (the old ArgoCD repo-server warm-up no longer applies).
+        process_batch(affected, DIFF_WORKERS)
 
         # Per-PR breakdown — at a glance, how many apps failed and why.
         breakdown = ", ".join(f"{k}={v}" for k, v in sorted(outcome_counts.items()))
@@ -2152,6 +2233,14 @@ def process_pr(pr, path_map, base_sha=""):
         upsert_comment(pr_id, body, existing_id)
         action = "updated" if existing_id else "posted"
         print(f"    Comment {action} on PR #{pr_id} ({comment_kb}KB)")
+
+        # Update global diff counters for /diff-preview/stats
+        with _diff_stats_lock:
+            _diff_stats["prs_processed"] += 1
+            _diff_stats["apps_diff"] += outcome_counts.get(OUT_DIFF, 0)
+            _diff_stats["apps_no_diff"] += outcome_counts.get(OUT_NO_DIFF, 0)
+            _diff_stats["apps_indeterminate"] += outcome_counts.get(OUT_INDETERMINATE, 0)
+            _diff_stats["apps_oci_not_found"] += oci_not_found_count
 
         # Count changed resources for build status description
         sections_total = sum(
@@ -2223,6 +2312,7 @@ def process_pr(pr, path_map, base_sha=""):
 # ── Main iteration (one poll cycle) ───────────────────────────────────
 def main_iteration():
     """Run one complete poll cycle: discover apps, get open PRs, process each."""
+    _iter_start = time.monotonic()
     log("ACME diff preview iteration starting")
 
     # Trim the on-disk chart cache before any diffs so it never races a pull.
@@ -2291,15 +2381,20 @@ def main_iteration():
 
     # Iteration-level rollup across all PRs: a single line that shows whether
     # this cycle was healthy or how many app diffs could not be computed.
+    elapsed_s = round(time.monotonic() - _iter_start, 1)
+    with _diff_stats_lock:
+        _diff_stats["last_iteration_s"] = elapsed_s
+        import datetime as _dt
+        _diff_stats["last_iteration_at"] = _dt.datetime.utcnow().isoformat() + "Z"
     if totals:
         rollup = ", ".join(f"{k}={v}" for k, v in sorted(totals.items()))
         unhealthy = totals.get(OUT_INDETERMINATE, 0) + totals.get(OUT_ERROR, 0)
-        log(f"Iteration done — diff outcomes: {rollup}"
+        log(f"Iteration done [{elapsed_s}s] — diff outcomes: {rollup}"
             + (f" | {unhealthy} app diff(s) could not be computed" if unhealthy else ""),
             severity=("WARNING" if unhealthy else "INFO"),
             **{f"n_{k}": v for k, v in totals.items()})
     else:
-        log("Iteration done")
+        log(f"Iteration done [{elapsed_s}s]")
 
 # ── Main entry point (long-running Deployment mode) ───────────────────
 def main():
