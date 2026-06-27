@@ -51,9 +51,9 @@ SHA dedup:
 - In-memory: skips same PR SHA within this pod's loop iterations
 - Cross-pod: compares comment SHA; skips and fixes stuck INPROGRESS if needed
 """
-import json, os, posixpath, random, re, signal, ssl, sys, subprocess, time, threading, urllib.error, urllib.request
+import json, os, posixpath, random, re, shutil, signal, ssl, sys, subprocess, time, threading, urllib.error, urllib.request
 from collections import Counter, namedtuple
-from http.server import HTTPServer, BaseHTTPRequestHandler
+from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
 import concurrent.futures
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone
@@ -62,6 +62,11 @@ BB_WORKSPACE       = "appspace-cloud"
 BB_REPO            = "acme-config-dev"
 BB_USER            = os.environ["BB_USER"]
 BB_TOKEN           = os.environ["BB_TOKEN"]
+# Pre-encoded Basic auth header value computed once at startup.
+# Avoids repeated base64 encoding on every Bitbucket API call.
+import base64 as _base64
+_BB_AUTH_HEADER    = "Basic " + _base64.b64encode(
+    f"{os.environ['BB_USER']}:{os.environ['BB_TOKEN']}".encode()).decode()
 ARGOCD_SERVER      = "argocd.appspace.com"
 ARGOCD_BIN         = os.environ.get("ARGOCD_BIN", "/usr/local/bin/argocd")
 # Configurable via environment variables — set via ExternalSecret.
@@ -166,6 +171,10 @@ _app_chart_registry_map: dict = {}
 _app_value_files_map: dict = {}
 # app full_name -> destination namespace.
 _app_namespace_map: dict = {}
+# Total app-reference count across all path entries. Used to detect when a new
+# app appears under an *existing* path key (which would not change len(path_map)
+# and would be missed by the old key-count invalidation check).
+_path_map_app_count: int = 0
 
 # GCE access token cache: token valid ~3600s, no reason to refetch each PR.
 _gcp_token:     str   = ""
@@ -250,8 +259,17 @@ class _HealthHandler(BaseHTTPRequestHandler):
 # HTTP POST handler — receives Bitbucket webhook events
     def do_POST(self):
         if self.path == "/diff-preview/webhook":
-            # Bitbucket PR webhook — wake the diff loop immediately
-            length = int(self.headers.get("Content-Length", 0))
+            # Bitbucket PR webhook — wake the diff loop immediately.
+            # Cap body size (same guard as the JFrog webhook) so a large
+            # malformed request cannot exhaust pod memory.
+            try:
+                length = int(self.headers.get("Content-Length", 0))
+            except (ValueError, TypeError):
+                length = 0
+            if length > JFROG_MAX_BODY_BYTES:
+                self.send_response(413)
+                self.end_headers()
+                return
             if length:
                 self.rfile.read(length)
             event_key = self.headers.get("X-Event-Key", "")
@@ -352,11 +370,11 @@ def _verify_jfrog_hmac(body: bytes, header: str) -> bool:
     Administration -> Webhooks. The signature is the hex digest of the HMAC,
     sent in the X-JFrog-Event-Auth header.
     """
-    import hmac as _hmac, hashlib as _hashlib
+    import hmac, hashlib
     if not JFROG_WEBHOOK_SECRET or not header:
         return False
-    expected = _hmac.new(JFROG_WEBHOOK_SECRET.encode(), body, _hashlib.sha256).hexdigest()
-    return _hmac.compare_digest(header, expected)
+    expected = hmac.new(JFROG_WEBHOOK_SECRET.encode(), body, hashlib.sha256).hexdigest()
+    return hmac.compare_digest(header, expected)
 
 
 def _jfrog_hard_refresh(chart_name: str, chart_version: str) -> None:
@@ -418,11 +436,10 @@ def _jfrog_hard_refresh(chart_name: str, chart_version: str) -> None:
             log(f"  hard-refresh timed out: {app_name}", "WARNING")
             return False
 
-    from concurrent.futures import ThreadPoolExecutor as _TPE, as_completed as _asc
     ok = failed = 0
-    with _TPE(max_workers=REFRESH_WORKERS) as pool:
+    with ThreadPoolExecutor(max_workers=REFRESH_WORKERS) as pool:
         futures = {pool.submit(_do_refresh, app): app for app in matching}
-        for fut in _asc(futures):
+        for fut in as_completed(futures):
             if fut.result():
                 ok += 1
             else:
@@ -435,16 +452,23 @@ def _jfrog_hard_refresh(chart_name: str, chart_version: str) -> None:
     log(f"JFrog webhook: done — {ok} refreshed, {failed} failed")
 
 
-def _start_health_server(port: int = 8080) -> HTTPServer:
-    """Start the health server in a daemon thread and handle webhook POSTs."""
-    server = HTTPServer(("", port), _HealthHandler)
+def _start_health_server(port: int = 8080) -> ThreadingHTTPServer:
+    """Start the health server in a daemon thread and handle webhook POSTs.
+
+    Uses ThreadingHTTPServer so health probes (GET /healthz) are never blocked
+    by a concurrent JFrog or Bitbucket webhook request.
+    """
+    server = ThreadingHTTPServer(("", port), _HealthHandler)
     t = threading.Thread(target=server.serve_forever, daemon=True, name="health-server")
     t.start()
     log(f"Health server listening on :{port}")
     return server
 
 def _auth_flags():
-    return ["--grpc-web", "--insecure"]
+    # Auth and transport flags are now stored in ~/.argocd/config (written by
+    # argocd_login). Pass only --config so the CLI picks up the token without
+    # any credential on the command line (not visible in `ps aux`).
+    return ["--config", _ARGOCD_CFG_FILE]
 
 def _ts():
     return datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
@@ -457,10 +481,9 @@ _ssl = ssl.create_default_context()
 
 def http(method, url, body=None, headers=None, auth=None):
     """HTTP call with exponential backoff on 429/503/network errors."""
-    import base64
     hdrs = dict(headers or {})
     if auth:
-        hdrs["Authorization"] = "Basic " + base64.b64encode(
+        hdrs["Authorization"] = "Basic " + _base64.b64encode(
             f"{auth[0]}:{auth[1]}".encode()).decode()
     data = json.dumps(body).encode() if body else None
     if data:
@@ -505,12 +528,16 @@ def discover_path_app_map():
     Result is cached for PATH_MAP_TTL seconds. Cache is invalidated on
     argocd_login() so a re-login (session expiry) picks up new apps.
     """
-    global _path_map_cache, _path_map_ts, _path_map_count, _app_chart_map, \
-           _app_chart_revision_map, _app_chart_registry_map, \
+    global _path_map_cache, _path_map_ts, _path_map_count, _path_map_app_count, \
+           _app_chart_map, _app_chart_revision_map, _app_chart_registry_map, \
            _app_value_files_map, _app_namespace_map
     if _path_map_cache and (time.monotonic() - _path_map_ts) < PATH_MAP_TTL:
-        # Also check app count hasn't changed (new env added mid-TTL)
-        if len(_path_map_cache) == _path_map_count:
+        # Invalidate if either the number of path keys OR the total app-reference
+        # count has changed (a new app under an existing path changes app count
+        # without changing key count, so key count alone is insufficient).
+        current_app_count = sum(len(v) for v in _path_map_cache.values())
+        if (len(_path_map_cache) == _path_map_count
+                and current_app_count == _path_map_app_count):
             return _path_map_cache
     r = subprocess.run(
         [ARGOCD_BIN, "app", "list", "-o", "json"] + _auth_flags(),
@@ -559,8 +586,9 @@ def discover_path_app_map():
     _app_chart_registry_map  = chart_reg_map
     _app_value_files_map     = value_files_map
     _app_namespace_map       = namespace_map
-    _path_map_ts    = time.monotonic()
-    _path_map_count = len(path_map)
+    _path_map_ts        = time.monotonic()
+    _path_map_count     = len(path_map)
+    _path_map_app_count = sum(len(v) for v in path_map.values())
     return path_map
 
 
@@ -588,11 +616,6 @@ def _extract_app_chart_info(app):
     return None, None, None, []
 
 
-def _extract_app_chart(app):
-    """Backward-compat wrapper: return chart name only."""
-    chart, _, _, _ = _extract_app_chart_info(app)
-    return chart
-
 def get_affected_apps(changed_files, path_map):
     """Return sorted app names whose manifest-generate-paths overlap with changed files."""
     apps = set()
@@ -606,49 +629,64 @@ def get_affected_apps(changed_files, path_map):
     return sorted(apps)
 
 
-def _select_warm_apps(affected):
-    """Split affected apps into (warm_reps, rest) for chart-cache warm-up.
-
-    Returns one representative app per distinct OCI chart that has more than one
-    affected app (the followers reuse the warmed chart pull). Charts with a
-    single affected app, and apps with an unknown chart, are left in `rest` since
-    warming them separately only adds latency. Below WARM_THRESHOLD apps the
-    whole PR fans out directly (warm_reps is empty).
-    """
-    if len(affected) <= WARM_THRESHOLD:
-        return [], list(affected)
-    by_chart = {}
-    unknown  = []
-    for app in affected:
-        chart = _app_chart_map.get(app)
-        if chart:
-            by_chart.setdefault(chart, []).append(app)
-        else:
-            unknown.append(app)
-    warm, rest = [], list(unknown)
-    for chart, group in by_chart.items():
-        if len(group) > 1:
-            warm.append(group[0])
-            rest.extend(group[1:])
-        else:
-            rest.extend(group)
-    return warm, rest
-
-
 # ── ArgoCD login (used only for app discovery, never for the diff itself) ──
+# We avoid passing ARGOCD_PASS as a CLI arg (which is visible in `ps aux`).
+# Instead, call the ArgoCD REST API to obtain a JWT token, then write it to
+# the ArgoCD config file (~/.argocd/config). Subsequent `argocd app list`
+# calls use the config file auth token automatically — no password on argv.
+_ARGOCD_CFG_DIR  = os.path.expanduser("~/.argocd")
+_ARGOCD_CFG_FILE = os.path.join(_ARGOCD_CFG_DIR, "config")
+
+def _argocd_fetch_token() -> str:
+    """Call ArgoCD REST API to get a session JWT. Returns the raw token string."""
+    url  = f"https://{ARGOCD_SERVER}/api/v1/session"
+    data = json.dumps({"username": ARGOCD_USER, "password": ARGOCD_PASS}).encode()
+    req  = urllib.request.Request(
+        url, data=data,
+        headers={"Content-Type": "application/json"},
+        method="POST")
+    ssl_ctx = ssl.create_default_context()
+    ssl_ctx.check_hostname = False
+    ssl_ctx.verify_mode    = ssl.CERT_NONE
+    with urllib.request.urlopen(req, context=ssl_ctx, timeout=30) as resp:
+        return json.loads(resp.read())["token"]
+
+
+def _write_argocd_config(token: str) -> None:
+    """Write a minimal ArgoCD CLI config file with the auth token."""
+    import stat
+    os.makedirs(_ARGOCD_CFG_DIR, mode=0o700, exist_ok=True)
+    cfg = (
+        f"contexts:\n"
+        f"- context:\n"
+        f"    server: {ARGOCD_SERVER}\n"
+        f"    user: {ARGOCD_SERVER}\n"
+        f"  name: {ARGOCD_SERVER}\n"
+        f"current-context: {ARGOCD_SERVER}\n"
+        f"servers:\n"
+        f"- grpcWeb: true\n"
+        f"  insecure: true\n"
+        f"  server: {ARGOCD_SERVER}\n"
+        f"users:\n"
+        f"- auth-token: {token}\n"
+        f"  name: {ARGOCD_SERVER}\n"
+    )
+    tmp = _ARGOCD_CFG_FILE + ".tmp"
+    with open(tmp, "w") as f:
+        f.write(cfg)
+    os.chmod(tmp, stat.S_IRUSR | stat.S_IWUSR)  # 0600 — owner only
+    os.replace(tmp, _ARGOCD_CFG_FILE)
+
+
 def argocd_login():
-    global _ready, _path_map_ts
-    r = subprocess.run(
-        [ARGOCD_BIN, "login", ARGOCD_SERVER,
-         "--username", ARGOCD_USER, "--password", ARGOCD_PASS,
-         "--grpc-web", "--insecure"],
-        capture_output=True, text=True, timeout=60)
-    if r.returncode != 0:
-        raise RuntimeError(f"argocd login failed: {r.stderr[:200]}")
-    _path_map_ts    = 0.0  # Invalidate path map cache on re-login.
-    _path_map_count = 0
+    global _ready, _path_map_ts, _path_map_count, _path_map_app_count
+    token = _argocd_fetch_token()
+    _write_argocd_config(token)
+    _path_map_ts        = 0.0  # Invalidate path map cache on re-login.
+    _path_map_count     = 0
+    _path_map_app_count = 0
     _ready = True
-    log(f"ArgoCD auth: logged in as {ARGOCD_USER}")
+    log(f"ArgoCD auth: session token stored for {ARGOCD_USER} (no password on CLI)")
 
 # Resource patterns filtered from ALL diff output and AI analysis.
 # micro-versions-info is an auto-generated ConfigMap that always changes
@@ -772,11 +810,9 @@ def _bb_fetch_status(filepath, sha):
     Uses a direct urllib call instead of bb()/http() because those helpers always
     json.loads() the response, which fails for YAML/text files.
     """
-    import base64
     url = (f"https://api.bitbucket.org/2.0/repositories/"
            f"{BB_WORKSPACE}/{BB_REPO}/src/{sha}/{filepath}")
-    creds = base64.b64encode(f"{BB_USER}:{BB_TOKEN}".encode()).decode()
-    req = urllib.request.Request(url, headers={"Authorization": f"Basic {creds}"})
+    req = urllib.request.Request(url, headers={"Authorization": _BB_AUTH_HEADER})
     for attempt in range(3):
         with _bb_api_sem:   # global rate limiter: caps concurrent BB API calls
             try:
@@ -797,12 +833,6 @@ def _bb_fetch_status(filepath, sha):
                     continue
                 return None, BB_ERROR   # network/timeout after retries — transient
     return None, BB_ERROR
-
-
-def _bb_fetch_file_at_sha(filepath, sha):
-    """Back-compat wrapper: return content string or None (missing OR error)."""
-    content, _status = _bb_fetch_status(filepath, sha)
-    return content
 
 
 _appspace_key_re = re.compile(r"^\s*appspace:\s*(#.*)?$")
@@ -916,9 +946,13 @@ def _ensure_chart(registry: str, chart: str, version: str) -> str:
 
     chart_dir = os.path.join(HELM_CACHE_DIR, registry, chart, version)
     if os.path.isdir(chart_dir) and os.listdir(chart_dir):
+        # Always resolve the chart subdirectory (helm --untar creates a subdir).
+        # A previous code path stored chart_dir directly; _find_chart_subdir is
+        # idempotent and harmless when called on an already-resolved path.
+        path = _find_chart_subdir(chart_dir)
         with _helm_cache_lock:
-            _helm_chart_cache[key] = chart_dir
-        return chart_dir
+            _helm_chart_cache[key] = path
+        return path
 
     if not _helm_login(registry):
         return None
@@ -945,9 +979,9 @@ def _ensure_chart(registry: str, chart: str, version: str) -> str:
         # Pull into a temp dir and atomically rename to avoid partial state.
         # Retry up to 3 times on transient network failures; don't retry on
         # permanent errors (chart not found).
-        import tempfile
+        import tempfile as _tf
         os.makedirs(HELM_CACHE_DIR, exist_ok=True)
-        tmp_dir = tempfile.mkdtemp(dir=HELM_CACHE_DIR, prefix=f"{chart}-{version}-")
+        tmp_dir = _tf.mkdtemp(dir=HELM_CACHE_DIR, prefix=f"{chart}-{version}-")
         last_err = ""
         try:
             for pull_attempt in range(3):
@@ -976,10 +1010,6 @@ def _ensure_chart(registry: str, chart: str, version: str) -> str:
                 else:
                     log(f"helm pull failed for {chart}:{version}: {last_err}", "WARNING")
                     return None
-            else:
-                # Loop ran without break (shouldn't happen but handle it)
-                log(f"helm pull failed for {chart}:{version}: {last_err}", "WARNING")
-                return None
 
             # Move from tmp to final location atomically
             os.makedirs(os.path.dirname(chart_dir), exist_ok=True)
@@ -987,10 +1017,8 @@ def _ensure_chart(registry: str, chart: str, version: str) -> str:
                 os.rename(tmp_dir, chart_dir)
             else:
                 # Another thread beat us to it; remove our tmp copy
-                import shutil
                 shutil.rmtree(tmp_dir, ignore_errors=True)
         except Exception:
-            import shutil
             shutil.rmtree(tmp_dir, ignore_errors=True)
             raise
 
@@ -1044,12 +1072,16 @@ def _prune_helm_cache():
     if len(version_dirs) <= HELM_CACHE_MAX_CHARTS:
         return
     version_dirs.sort(reverse=True)  # newest first
-    import shutil
     removed = 0
     for _mtime, registry, chart, version, vpath in version_dirs[HELM_CACHE_MAX_CHARTS:]:
         shutil.rmtree(vpath, ignore_errors=True)
+        key = f"{registry}/{chart}:{version}"
         with _helm_cache_lock:
-            _helm_chart_cache.pop(f"{registry}/{chart}:{version}", None)
+            _helm_chart_cache.pop(key, None)
+        # Also remove the per-version pull lock: once the chart dir is gone
+        # there is nothing to protect, and the Lock object would leak otherwise.
+        with _helm_pull_locks_lock:
+            _helm_pull_locks.pop(key, None)
         removed += 1
     if removed:
         log(f"Helm cache prune: removed {removed} old chart version(s)")
@@ -1135,8 +1167,8 @@ def _helm_template(chart_path: str, release: str, namespace: str,
     Returns (manifests_yaml: str, error: str|None).
     value_files_content: {path_label: yaml_content} dict (order matters for overrides).
     """
-    import tempfile
-    with tempfile.TemporaryDirectory(prefix="acme-diff-helm-") as tmpdir:
+    import tempfile as _tempfile
+    with _tempfile.TemporaryDirectory(prefix="acme-diff-helm-") as tmpdir:
         value_args = []
         for idx, (label, content) in enumerate(value_files_content.items()):
             fname = os.path.join(tmpdir, f"values_{idx:03d}.yaml")
@@ -1214,9 +1246,8 @@ def _parse_manifest_resources(yaml_text):
     Each value is the normalized document text (stripped, consistent trailing newline).
     Documents without kind/metadata are skipped.
     """
-    import re as _re
     resources = {}
-    for doc in _re.split(r'\n---\s*\n|^---\s*\n', yaml_text, flags=_re.MULTILINE):
+    for doc in re.split(r'\n---\s*\n|^---\s*\n', yaml_text, flags=re.MULTILINE):
         doc = doc.strip()
         if not doc:
             continue
@@ -1253,7 +1284,7 @@ def _diff_manifests(main_yaml, pr_yaml):
     rest of the pipeline (parse_diff_sections, format_comment) works unchanged.
     Returns empty string if there are no differences.
     """
-    import difflib
+    import difflib  # stdlib, lazy import acceptable here (one per diff call)
     main_res = _parse_manifest_resources(main_yaml)
     pr_res   = _parse_manifest_resources(pr_yaml)
 
@@ -1476,27 +1507,35 @@ def post_build_status(pr_sha, state, description):
     except Exception as e:
         print(f"    [build status] failed to set {state}: {e}", file=sys.stderr)
 
+_BB_API_BASE = f"https://api.bitbucket.org/2.0/repositories/{BB_WORKSPACE}/{BB_REPO}"
+_BB_MAX_PAGES = 100   # safety guard: prevents infinite loops on malformed next-links
+
+
 def get_open_prs():
-    url = (f"https://api.bitbucket.org/2.0/repositories/{BB_WORKSPACE}/{BB_REPO}"
-           "/pullrequests?state=OPEN&pagelen=50")
-    prs, nxt = [], url
-    while nxt:
+    url = f"{_BB_API_BASE}/pullrequests?state=OPEN&pagelen=50"
+    prs, nxt, pages = [], url, 0
+    while nxt and pages < _BB_MAX_PAGES:
         data = http("GET", nxt, auth=(BB_USER, BB_TOKEN))
         prs += data.get("values", [])
         nxt  = data.get("next")
+        pages += 1
+    if pages >= _BB_MAX_PAGES:
+        log(f"get_open_prs: hit page limit ({_BB_MAX_PAGES}), results may be incomplete",
+            "WARNING")
     return prs
 
+
 def get_pr_changed_files(pr_id):
-    files, path = [], f"pullrequests/{pr_id}/diffstat?pagelen=100"
-    while path:
+    files, path, pages = [], f"pullrequests/{pr_id}/diffstat?pagelen=100", 0
+    while path and pages < _BB_MAX_PAGES:
         data = bb("GET", path)
         for item in data.get("values", []):
             p = (item.get("new") or item.get("old") or {}).get("path", "")
             if p:
                 files.append(p)
         nxt  = data.get("next", "")
-        path = nxt.replace(
-            f"https://api.bitbucket.org/2.0/repositories/{BB_WORKSPACE}/{BB_REPO}/", "")
+        path = nxt.replace(f"{_BB_API_BASE}/", "") if nxt else ""
+        pages += 1
     return files
 
 def find_existing_comment(pr_id):
@@ -1506,8 +1545,8 @@ def find_existing_comment(pr_id):
     sha_8 is 8-char hex or '' if not found in comment.
     Paginates through all pages so >100-comment PRs are handled correctly.
     """
-    nxt = f"pullrequests/{pr_id}/comments?pagelen=100"
-    while nxt:
+    nxt, pages = f"pullrequests/{pr_id}/comments?pagelen=100", 0
+    while nxt and pages < _BB_MAX_PAGES:
         try:
             data = bb("GET", nxt)
         except Exception:
@@ -1520,9 +1559,8 @@ def find_existing_comment(pr_id):
                 m = re.search(r'Commit `([0-9a-f]{8})`', raw)
                 return c["id"], (m.group(1) if m else ""), raw
         next_url = data.get("next", "")
-        nxt = next_url.replace(
-            f"https://api.bitbucket.org/2.0/repositories/{BB_WORKSPACE}/{BB_REPO}/", ""
-        ) if next_url else ""
+        nxt = next_url.replace(f"{_BB_API_BASE}/", "") if next_url else ""
+        pages += 1
     return None, "", ""
 
 def upsert_comment(pr_id, body, existing_id=None):
@@ -1758,7 +1796,7 @@ def generate_ai_summary(app_results: dict) -> str | None:
         prompt_chars = len(prompt)
         print(f"      [AI] Calling {VERTEX_MODEL} | prompt={prompt_chars} chars | "
               f"maxTokens={2000}")
-        import time as _time; _t0 = _time.monotonic()
+        _t0 = time.monotonic()
         resp = http(
             "POST",
             endpoint,
@@ -2056,7 +2094,7 @@ def process_pr(pr, path_map, base_sha=""):
             )
         if rerun:
             print(f"    Re-running: previous comment for SHA {pr_sha[:8]} was not clean, retrying diff")
-            existing_id = existing_id  # keep existing_id so we update (not create) the comment
+            # existing_id is kept — the comment will be updated in place, not duplicated.
         else:
             with _seen_lock:
                 _seen[pr_id] = pr_sha
@@ -2088,7 +2126,7 @@ def process_pr(pr, path_map, base_sha=""):
                 f"one automatically once this PR is merged to `main`. "
                 f"Subsequent PRs for this environment will show a normal diff.\n\n"
                 f"---\n**Status:** \u2705 No manifest changes\n"
-                f"*{_ts()} \u2014 {COMMENT_MARKER}*"
+                f"*{_ts()} \u2014 {COMMENT_MARKER} [clean]*"
             )
             upsert_comment(pr_id, no_apps_body, existing_id)
             with _seen_lock:
@@ -2234,6 +2272,21 @@ def process_pr(pr, path_map, base_sha=""):
         action = "updated" if existing_id else "posted"
         print(f"    Comment {action} on PR #{pr_id} ({comment_kb}KB)")
 
+        # Count changed resources and classify indeterminate reasons FIRST,
+        # then update stats and build status (oci_not_found_count must be defined
+        # before the stats block references it — bug fix for UnboundLocalError).
+        sections_total = sum(
+            max(len(parse_diff_sections(r.text)), 1)
+            for r in app_results.values() if r.outcome == OUT_DIFF)
+        n_unknown = outcome_counts[OUT_INDETERMINATE]
+        # oci_not_found is a hard permanent error (wrong version in config) that
+        # MUST block the PR — the deployer will fail the same way.
+        oci_not_found_count = sum(
+            1 for r in app_results.values()
+            if r.outcome == OUT_INDETERMINATE and r.reason == REASON_OCI_NOT_FOUND
+        )
+        has_blocking_indet = oci_not_found_count > 0
+
         # Update global diff counters for /diff-preview/stats
         with _diff_stats_lock:
             _diff_stats["prs_processed"] += 1
@@ -2241,22 +2294,6 @@ def process_pr(pr, path_map, base_sha=""):
             _diff_stats["apps_no_diff"] += outcome_counts.get(OUT_NO_DIFF, 0)
             _diff_stats["apps_indeterminate"] += outcome_counts.get(OUT_INDETERMINATE, 0)
             _diff_stats["apps_oci_not_found"] += oci_not_found_count
-
-        # Count changed resources for build status description
-        sections_total = sum(
-            max(len(parse_diff_sections(r.text)), 1)
-            for r in app_results.values() if r.outcome == OUT_DIFF)
-        n_unknown = outcome_counts[OUT_INDETERMINATE]
-        # Determine which indeterminate reason is most severe.
-        # oci_not_found is a hard permanent error (wrong version in config) that
-        # MUST block the PR — the deployer will fail with the same error.
-        # Other indeterminate reasons (transient timeouts, etc.) are soft and
-        # should not block: they appear with "Diff incomplete" in the comment.
-        oci_not_found_count = sum(
-            1 for r in app_results.values()
-            if r.outcome == OUT_INDETERMINATE and r.reason == "oci_not_found"
-        )
-        has_blocking_indet = oci_not_found_count > 0
 
         if any_hard_error or has_blocking_indet:
             if oci_not_found_count:
@@ -2302,7 +2339,7 @@ def process_pr(pr, path_map, base_sha=""):
             f"Commit `{pr_sha[:8]}` vs `main` | `{BB_REPO}`\n\n"
             f"\u274c **Error processing diff:** {str(e)[:400]}\n\n"
             f"---\n**Status:** \u274c Error running diff\n"
-            f"*{_ts()} \u2014 {COMMENT_MARKER}*"
+            f"*{_ts()} \u2014 {COMMENT_MARKER} [permanent]*"
         )
         try:
             upsert_comment(pr_id, err_body, existing_id)
@@ -2358,8 +2395,8 @@ def main_iteration():
     # is declined and immediately reopened with the same SHA would be silently
     # skipped because the old SHA is still in _seen.
     open_ids = {pr["id"] for pr in prs}
-    for stale_id in list(_seen.keys()):
-        if stale_id not in open_ids:
+    with _seen_lock:
+        for stale_id in [k for k in _seen if k not in open_ids]:
             del _seen[stale_id]
 
     pending = [
@@ -2384,8 +2421,7 @@ def main_iteration():
     elapsed_s = round(time.monotonic() - _iter_start, 1)
     with _diff_stats_lock:
         _diff_stats["last_iteration_s"] = elapsed_s
-        import datetime as _dt
-        _diff_stats["last_iteration_at"] = _dt.datetime.utcnow().isoformat() + "Z"
+        _diff_stats["last_iteration_at"] = datetime.now(timezone.utc).isoformat()
     if totals:
         rollup = ", ".join(f"{k}={v}" for k, v in sorted(totals.items()))
         unhealthy = totals.get(OUT_INDETERMINATE, 0) + totals.get(OUT_ERROR, 0)
@@ -2426,9 +2462,10 @@ def main():
     while not _shutdown:
         try:
             main_iteration()
-            _last_ok = time.monotonic()
+            _last_ok = time.monotonic()  # only bumped on a clean iteration
         except Exception as e:
             log(f"Unhandled error in main loop: {e}", "ERROR")
+            # Do NOT bump _last_ok here — /healthz must reflect real staleness.
         if not _shutdown:
             # Webhook wakes the loop instantly (<1s). The 60s timeout is
             # just a safety net in case webhook delivery is ever unavailable.

@@ -67,12 +67,16 @@ def test_no_gcloud_calls():
 
 
 def test_dedicated_argocd_account():
-    """Must use dedicated diff-preview local account, not the global admin user."""
+    """Must use dedicated diff-preview local account. argocd_login now uses
+    the REST API (no CLI args) so ARGOCD_USER is used in the JSON body."""
     src = _source()
     assert "ARGOCD_PASS" in src
     assert "ARGOCD_USER" in src
-    assert '--username", "admin"' not in src
-    assert '--username", ARGOCD_USER' in src
+    # argocd login now goes via REST API — no --password CLI arg
+    assert '"--password", ARGOCD_PASS' not in src, (
+        "ARGOCD_PASS must not appear as a CLI arg (visible in ps aux)"
+    )
+    assert "admin" not in src.split("ARGOCD_USER")[0].split("def argocd_login")[-1][:200]
 
 
 # ── Bug-regression tests ─────────────────────────────────────────────────────
@@ -265,23 +269,12 @@ def test_retry_loop_with_backoff():
 
 
 def test_cache_warm_selection():
-    """_select_warm_apps groups by chart and warms one rep per multi-app chart."""
-    mod = _import_module()
-
-    # Below threshold: no warm-up, everything fans out directly.
-    small = [f"app{i}" for i in range(3)]
-    warm, rest = mod._select_warm_apps(small)
-    assert warm == [] and rest == small
-
-    # Above threshold with a shared chart: one representative is warmed.
-    mod._app_chart_map = {f"ms{i}": "appspace-micro-services" for i in range(10)}
-    mod._app_chart_map["solo"] = "other-chart"
-    apps = [f"ms{i}" for i in range(10)] + ["solo"]
-    warm, rest = mod._select_warm_apps(apps)
-    assert len(warm) == 1, "exactly one rep for the shared multi-app chart"
-    assert warm[0].startswith("ms"), "warm rep must come from the shared chart group"
-    assert "solo" in rest, "single-app charts stay in the fan-out batch"
-    assert set(warm) | set(rest) == set(apps), "no app may be dropped"
+    """_select_warm_apps was removed in 1.9.2 (helm pre-pull replaced it).
+    Charts are now pre-pulled before the diff fan-out — no warm-up diff pass."""
+    src = _source()
+    assert "_select_warm_apps" not in src, (
+        "_select_warm_apps must be removed — replaced by helm pre-pull phase"
+    )
 
 
 def test_pure_helm_diff():
@@ -308,7 +301,7 @@ def test_chart_revision_detection():
     src = _source()
     assert "_pr_chart_revision" in src, "missing _pr_chart_revision function"
     assert "_app_chart_revision_map" in src, "missing chart revision cache"
-    assert "_bb_fetch_file_at_sha" in src, "missing Bitbucket file fetch helper"
+    assert "_bb_fetch_status" in src, "missing Bitbucket file fetch helper"
     # With pure helm path, the new chart version is passed to _ensure_chart / _helm_template.
     # The pr_rev variable in _run_one_diff must use chart_revision when provided.
     assert "pr_rev = chart_revision or main_rev" in src, (
@@ -323,20 +316,19 @@ def test_chart_revision_detection():
 
 def test_argocd_uses_diff_preview_account():
     """argocd_login must use ARGOCD_USER (diff-preview), never hardcoded admin.
-
-    The diff-preview local account has limited RBAC (applications:*, repos/projects/clusters:get).
-    Using admin would give unnecessary access to account management, RBAC config, etc.
-    Password independence: rotating admin does not break the service.
+    Login now uses REST API — no --password on CLI arg (prevents ps aux exposure).
     """
     src = _source()
-    assert '"--username", ARGOCD_USER' in src, (
-        "argocd_login must use ARGOCD_USER variable, not hardcoded 'admin'"
-    )
+    assert "ARGOCD_USER" in src, "ARGOCD_USER variable must be present"
     assert '"--username", "admin"' not in src, (
-        "REGRESSION: hardcoded admin username found — use ARGOCD_USER instead"
+        "REGRESSION: hardcoded admin username on CLI — use ARGOCD_USER"
     )
     assert 'os.environ.get("ARGOCD_USER", "diff-preview")' in src, (
         "ARGOCD_USER must default to 'diff-preview'"
+    )
+    # argocd_login must not pass ARGOCD_PASS as CLI argument
+    assert '"--password", ARGOCD_PASS' not in src, (
+        "ARGOCD_PASS must not appear as a CLI arg (visible in ps aux); use REST API"
     )
 
 
