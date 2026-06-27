@@ -1556,8 +1556,14 @@ VERTEX_LOCATION          = os.environ.get("VERTEX_LOCATION", "us-central1")
 VERTEX_MODEL             = "gemini-2.5-flash"
 
 # Thresholds for switching between inline and collapsed diff display.
+# Bitbucket does NOT render HTML <details>/<summary> tags, so there is no
+# real "collapse" available. For large PRs we show a compact summary table +
+# truncated inline diffs instead of trying to use <details>.
 LARGE_PR_APP_THRESHOLD   = 5       # changed apps above this -> large mode
 LARGE_PR_DIFF_BYTES      = 40_000  # total diff bytes above this -> large mode
+# In large mode, show the diff for the top N most-changed apps inline.
+# Others get a table row only (no diff block) to stay within the 245KB limit.
+LARGE_PR_INLINE_APPS     = int(os.environ.get("LARGE_PR_INLINE_APPS", "6"))
 
 # Limits for what we send to the model.
 AI_MAX_SECTIONS_PER_APP  = 10
@@ -1652,30 +1658,30 @@ def generate_ai_summary(app_results: dict) -> str | None:
             f"Changeset: {len(changed)} app(s), {total_resources} resource section(s).\n\n"
             "ANALYSIS REQUIREMENTS:\n"
             "- Only analyse what is explicitly shown in the diff below.\n"
-            "- Helm shows changes as '-' (old) and '+' (new) — this is normal for updates.\n"
+            "- Helm shows changes as '-' (old) and '+' (new) lines — this is normal for updates.\n"
             "- VERSION COMPARISON: only report a downgrade when the full version string actually "
             "decreases (e.g. 1.93.1 → 1.93.0 is a downgrade; 1.93.1-rc1 → 1.93.1-rc2 is NOT).\n"
-            "- Skip checksum-only changes and annotation noise (argocd.argoproj.io/tracking-id, "
-            "helm.sh/chart, kubectl.kubernetes.io/last-applied-configuration).\n"
-            "- For new Deployments/StatefulSets being added to the cluster, say 'new service'.\n"
-            "- For removed ones say 'service removed'.\n\n"
-            "Respond in EXACTLY this format (use the emoji headers):\n\n"
+            "- Skip annotation-only changes (argocd.argoproj.io/tracking-id, "
+            "helm.sh/chart, kubectl.kubernetes.io/last-applied-configuration, checksum/).\n"
+            "- For new Deployments/StatefulSets: say 'new service'.\n"
+            "- For removed ones: say 'removed'.\n\n"
+            "Respond in EXACTLY this format (no extra sections, no prose outside these headers):\n\n"
             f"**{len(changed)} app(s) updated · {total_resources} resource(s) changed**\n\n"
-            "1. 🌍 **AFFECTED ENVIRONMENTS:**\n"
-            "   • List each affected cluster/environment (e.g. cl-dev11-a, pv-dev-05-a)\n"
-            "   • Total count\n\n"
+            "1. 🌍 **AFFECTED ENVIRONMENTS:** `cl-env1-a`, `cl-env2-a` (N total)\n\n"
             "2. 📊 **SUMMARY:**\n"
-            "   • One sentence overview of the change type\n"
-            "   • Flat bullet list of key service changes: "
-            "`env/service`: `old-version` → `new-version`\n"
-            "   • Omit checksum-only or annotation-only changes\n\n"
+            "   One sentence overview of the change type (e.g. 'Version bump from X to Y across N envs').\n"
+            "   Key service changes (max 8 entries, group similar ones):\n"
+            "   - `service-name`: `old-ver` → `new-ver`\n"
+            "   - `service-name`: new service added\n"
+            "   - `service-name`: removed\n\n"
             "3. ⚠️ **CRITICAL CHANGES:**\n"
-            "   • Version downgrades — only report when full version string decreases\n"
-            "   • Replicas dropping to 0 (potential service disruption)\n"
-            "   • Services being removed (resource deletion)\n"
-            "   • Liveness/readiness probe removed\n"
-            "   • If none: say 'No critical changes detected'\n\n"
-            "Max 300 words. Be concise. Prioritise critical changes for human review.\n\n"
+            "   - Version downgrades (full version string decreasing only)\n"
+            "   - Replicas dropping to 0\n"
+            "   - Services removed\n"
+            "   - Liveness/readiness probes removed\n"
+            "   If none: `No critical changes detected`\n\n"
+            "Rules: max 250 words total. Do NOT repeat the environments list in the summary. "
+            "Group similar changes with '+N more'. Be terse — operators scan, they do not read.\n\n"
             "DIFF DATA:\n"
             + "\n".join(sections_parts)
             + error_note
@@ -1756,24 +1762,52 @@ def _result(value):
     return DiffResult("", False, None, OUT_NO_DIFF, "clean")
 
 
+def _format_app_diff_block(app, sections, diff_text, show_diff=True):
+    """Return a list of markdown lines for one app's diff block.
+
+    show_diff=False outputs just the header line (for large-mode table overflow).
+    Bitbucket does NOT render HTML <details>/<summary>, so we never use them.
+    """
+    n = len(sections) if sections else 1
+    out = [f"\u26a0\ufe0f **`{app}`** \u2014 {n} resource(s) changed", ""]
+    if not show_diff:
+        return out
+    if sections:
+        for hdr, body in sections[:MAX_RESOURCES_FULL]:
+            truncated = body[:MAX_DIFF_CHARS]
+            if len(body) > MAX_DIFF_CHARS:
+                truncated += "\n... (truncated)"
+            out += [f"**`{hdr}`**", "", "```diff", truncated.rstrip(), "```", ""]
+        if len(sections) > MAX_RESOURCES_FULL:
+            out += [f"*\u2026 and {len(sections) - MAX_RESOURCES_FULL} more resource(s)*", ""]
+    else:
+        raw = diff_text[:MAX_DIFF_CHARS * 2]
+        if len(diff_text) > MAX_DIFF_CHARS * 2:
+            raw += "\n... (truncated)"
+        out += ["```diff", raw.rstrip(), "```", ""]
+    return out
+
+
 def format_comment(pr_sha, app_results, skipped_apps=None):
+    """Format the full PR comment. Never uses <details>/<summary> — Bitbucket
+    does not render them. Large changesets get a compact summary table at the
+    top (all apps, one row each) and inline diffs for the top-N most-changed
+    apps only to stay well inside the 245KB comment limit."""
     skipped_apps  = skipped_apps or []
     results       = {app: _result(v) for app, v in app_results.items()}
     any_change    = False
     any_error     = False
-    any_unknown   = False   # diff could not be computed (indeterminate)
+    any_unknown   = False
     total_changed = 0
     unknown_apps  = []
 
-    # Calculate changeset size to pick display mode.
-    changed_apps      = [(app, r.text) for app, r in results.items() if r.outcome == OUT_DIFF]
-    total_diff_bytes  = sum(len(d) for _, d in changed_apps)
+    changed_apps      = [(app, r) for app, r in results.items() if r.outcome == OUT_DIFF]
+    total_diff_bytes  = sum(len(r.text) for _, r in changed_apps)
     is_large          = (
         len(changed_apps) > LARGE_PR_APP_THRESHOLD
         or total_diff_bytes > LARGE_PR_DIFF_BYTES
     )
 
-    # AI summary (non-blocking — None means skip the block).
     mode_label = "large" if is_large else "small"
     print(f"    [comment] mode={mode_label} | changed_apps={len(changed_apps)} | "
           f"diff_bytes={total_diff_bytes}")
@@ -1800,23 +1834,59 @@ def format_comment(pr_sha, app_results, skipped_apps=None):
             ai_summary,
             "",
         ]
-        if is_large:
-            lines += [
-                "> \U0001f50d Full diffs collapsed below \u2014 expand per app to review.",
-                "",
-            ]
 
     lines += ["---", ""]
 
-    # ── Per-app sections ─────────────────────────────────────────────
+    # ── Large-PR summary table ────────────────────────────────────────
+    # For large changesets, show a compact overview table first so reviewers
+    # can scan all affected apps at a glance before reading the inline diffs.
+    if is_large:
+        lines += [
+            "#### Changeset overview",
+            "",
+            "| App | Status | Resources |",
+            "|-----|--------|-----------|",
+        ]
+        for app, r in results.items():
+            if r.outcome == OUT_DIFF:
+                n = len(parse_diff_sections(r.text)) if r.text else 1
+                lines.append(f"| `{app}` | \u26a0\ufe0f changed | {n} |")
+            elif r.outcome == OUT_INDETERMINATE:
+                lines.append(f"| `{app}` | \u2754 diff unavailable | \u2014 |")
+            elif r.outcome == OUT_ERROR:
+                lines.append(f"| `{app}` | \u274c error | \u2014 |")
+            else:
+                lines.append(f"| `{app}` | \u2705 no changes | 0 |")
+        lines += [""]
+
+    # ── Per-app diff sections ─────────────────────────────────────────
+    # For large PRs: show inline diffs for top-N most-changed apps only.
+    # Sort by resource count descending so the most impactful diffs appear first.
+    if is_large and changed_apps:
+        inline_set = {
+            app for app, _ in sorted(
+                changed_apps,
+                key=lambda x: len(parse_diff_sections(x[1].text) or []),
+                reverse=True,
+            )[:LARGE_PR_INLINE_APPS]
+        }
+        if len(changed_apps) > LARGE_PR_INLINE_APPS:
+            lines += [
+                f"> \U0001f50d Showing inline diffs for the {LARGE_PR_INLINE_APPS} "
+                f"most-changed apps. All {len(changed_apps)} changed apps listed in the "
+                f"table above.",
+                "",
+            ]
+    else:
+        inline_set = None   # show all inline
+
     for app, r in results.items():
-        diff_text, has_diff, error = r.text, (r.outcome == OUT_DIFF), r.error
+        diff_text = r.text
         if r.outcome == OUT_ERROR:
             any_error = True
-            lines += [f"\u274c **`{app}`** \u2014 error: {(error or '')[:200]}", ""]
+            lines += [f"\u274c **`{app}`** \u2014 error: {(r.error or '')[:200]}", ""]
 
         elif r.outcome == OUT_INDETERMINATE:
-            # The diff could NOT be computed — do not imply "no changes".
             any_unknown = True
             unknown_apps.append(app)
             hint = _REASON_HINTS.get(r.reason, "diff could not be computed")
@@ -1825,59 +1895,13 @@ def format_comment(pr_sha, app_results, skipped_apps=None):
                 "",
             ]
 
-        elif has_diff:
+        elif r.outcome == OUT_DIFF:
             any_change = True
             sections   = parse_diff_sections(diff_text)
             n          = len(sections) if sections else 1
             total_changed += n
-
-            if is_large:
-                # Collapsed: operators can expand if they need the raw diff.
-                lines += [
-                    "<details>",
-                    f"<summary>\u26a0\ufe0f <strong><code>{app}</code></strong>"
-                    f" \u2014 {n} resource(s) changed</summary>",
-                    "",
-                ]
-                if sections:
-                    for hdr, body in sections[:MAX_RESOURCES_FULL]:
-                        truncated = body[:MAX_DIFF_CHARS]
-                        if len(body) > MAX_DIFF_CHARS:
-                            truncated += "\n... (truncated)"
-                        lines += [
-                            f"**`{hdr}`**", "",
-                            "```diff", truncated.rstrip(), "```", "",
-                        ]
-                    if len(sections) > MAX_RESOURCES_FULL:
-                        lines += [
-                            f"*\u2026 and {len(sections) - MAX_RESOURCES_FULL} more resource(s)*", ""]
-                else:
-                    raw_block = diff_text[:MAX_DIFF_CHARS * 2]
-                    if len(diff_text) > MAX_DIFF_CHARS * 2:
-                        raw_block += "\n... (truncated)"
-                    lines += ["```diff", raw_block.rstrip(), "```", ""]
-                lines += ["</details>", ""]
-
-            else:
-                # Inline: full diff visible for small changesets.
-                lines += [f"\u26a0\ufe0f **`{app}`** \u2014 {n} resource(s) changed", ""]
-                if sections:
-                    for hdr, body in sections[:MAX_RESOURCES_FULL]:
-                        truncated = body[:MAX_DIFF_CHARS]
-                        if len(body) > MAX_DIFF_CHARS:
-                            truncated += "\n... (truncated)"
-                        lines += [
-                            f"**`{hdr}`**", "",
-                            "```diff", truncated.rstrip(), "```", "",
-                        ]
-                    if len(sections) > MAX_RESOURCES_FULL:
-                        lines += [
-                            f"*\u2026 and {len(sections) - MAX_RESOURCES_FULL} more resource(s)*", ""]
-                else:
-                    raw_block = diff_text[:MAX_DIFF_CHARS * 2]
-                    if len(diff_text) > MAX_DIFF_CHARS * 2:
-                        raw_block += "\n... (truncated)"
-                    lines += ["```diff", raw_block.rstrip(), "```", ""]
+            show_diff = (inline_set is None) or (app in inline_set)
+            lines += _format_app_diff_block(app, sections, diff_text, show_diff=show_diff)
 
         else:
             lines += [f"\u2705 **`{app}`** \u2014 no manifest changes", ""]
@@ -1889,9 +1913,6 @@ def format_comment(pr_sha, app_results, skipped_apps=None):
             f"{', '.join(skipped_apps[:5])}{'...' if len(skipped_apps) > 5 else ''}*", ""]
 
     # ── Footer ───────────────────────────────────────────────────────
-    # Priority: hard error > real changes > indeterminate > clean. The
-    # indeterminate ("Diff incomplete") wording is also what the cross-iteration
-    # retry in process_pr looks for, so these PRs are re-evaluated next loop.
     unknown_note = ""
     if any_unknown:
         unknown_note = (
