@@ -3,9 +3,10 @@
 ACME Diff Preview service for Appspace. A long-running Kubernetes Deployment
 that does two distinct jobs:
 
-1. **PR diff comments** — watches `acme-config-dev` Bitbucket PRs, runs
-   `argocd app diff` against every affected app, and posts a formatted diff
-   comment with a Vertex AI Gemini summary.
+1. **PR diff comments** — watches `acme-config-dev` Bitbucket PRs and, for every
+   affected app, renders the chart with `helm template` for both the PR and the
+   `main` revision, diffs the two locally, and posts a formatted comment with a
+   Vertex AI Gemini summary.
 
 2. **JFrog OCI webhook** — receives push events from JFrog when CI publishes
    a new Helm chart to `helm-oci-dev`, finds every dev/QA ArgoCD app tracking
@@ -16,89 +17,96 @@ fallback safety net.
 
 ---
 
+## How the diff works (pure helm template, no agent round-trips)
+
+ArgoCD is used **only** for discovery: at startup (and every 5 min) a single
+`argocd app list` builds an in-memory map of each app's chart name, target
+revision, OCI registry, value files and namespace. The diff itself never touches
+a spoke agent. For each affected app the service:
+
+1. `helm pull oci://<registry>/<chart> --version <X> --untar` for both the PR and
+   the `main` chart version (cached locally, pulled once per pod lifetime).
+2. Fetches the app's value files from Bitbucket at the PR sha and the main sha.
+3. Runs `helm template` for each side and diffs the rendered YAML resource by
+   resource in Python.
+
+This is entirely local. Typical latency is ~4-6s/app with a warm chart cache vs
+20-360s when diffs went through the agents. When the PR bumps `appspace.version`
+(the OCI chart `targetRevision`), the new version is read from the PR config file
+and used for the PR render so the diff shows the real image changes.
+
 ## Diff outcomes and debugging
 
-Every `argocd app diff` call resolves to one of four outcomes
-(see `classify_diff_error` in `src/diff_preview.py`):
+Every diff resolves to one of these outcomes:
 
 | Outcome | Meaning | PR comment |
 |---|---|---|
-| `diff` | A real manifest diff was produced | ⚠️ N resource(s) will change |
-| `no_diff` | Clean exit 0 — manifests match | ✅ No manifest changes |
+| `diff` | The rendered manifests differ | ⚠️ N resource(s) will change |
+| `no_diff` | Manifests match (or only noise/checksum changes) | ✅ No manifest changes |
 | `indeterminate` | The diff could **not** be computed | ❔ diff unavailable (reason) |
-| `error` | Unexpected / unknown failure | ❌ error |
+| `error` | Unexpected per-PR exception | ❌ error |
 
 `indeterminate` is the important one: it is **never** rendered as a green
-"no changes". It covers the failures that come from the ArgoCD-agent / proxy /
-Redis / OCI topology, with a short reason in the comment and the full ArgoCD
-stderr in the pod logs at `LOG_LEVEL=DEBUG`:
+"no changes". Each indeterminate carries a short reason (set directly by
+`_run_one_diff`, no stderr guessing). The full detail is in the pod logs at
+`LOG_LEVEL=DEBUG`:
 
-| Reason | Cause |
-|---|---|
-| `oci_login` | repo-server `helm registry login` to the OCI registry failed (e.g. 401 Bad Credentials) on a manifest cache miss |
-| `manifests_5xx` | repo-server returned 5xx (often the visible symptom of a failed/slow OCI render) on `GetManifests` |
-| `redis_timeout` | spoke Redis unreachable via `argocd-agent-redis-proxy` |
-| `managed_no_cache` | live state not cached for an agent-managed app |
-| `server_unavailable` | ArgoCD server / app-controller restarting or busy |
-| `canceled` | request cancelled / deadline exceeded |
-| `permission` | the `diff-preview` account lacks RBAC for the app |
-| `auth` | ArgoCD session expired (a background re-login is triggered) |
+| Reason | Retry? | Cause |
+|---|---|---|
+| `oci_not_found` | no (permanent) | the chart version does not exist in the registry — posts a **FAILED** build status because the deployer would fail the same way |
+| `oci_pull_failed` | yes | `helm pull` / `helm registry login` failed (network or credentials) |
+| `metadata_pending` | yes | the app was added since the last 5-min discovery refresh |
+| `render_failed` | no (soft) | `helm template` failed to render the chart with these values |
+| `timeout` | yes | a pull/fetch/render step exceeded `DIFF_TIMEOUT` |
 
-PRs with any `indeterminate` or `error` app are **not** marked "seen", so the
-next loop re-evaluates them — once the underlying OCI / Redis path recovers the
-comment automatically flips from "diff unavailable" to the real diff.
+Only `oci_not_found` blocks the PR. Every other reason is a soft "diff
+unavailable" (build status stays SUCCESSFUL so a transient blip never blocks a
+merge), and the PR is left **un-seen** so the next loop re-evaluates it — once
+the OCI/Bitbucket path recovers the comment flips to the real diff.
 
 To see exactly why a diff failed:
 
 ```bash
 kubectl -n argocd logs deploy/acme-diff-preview | grep '"outcome"'
-# or, for full ArgoCD stderr, set logLevel: DEBUG in the Helm values
+# or, for full per-step detail, set logLevel: DEBUG in the Helm values
 ```
 
 ### Handling mass version bumps (hundreds of apps in one PR)
 
 Bumping a chart `version:` across many clusters in a single PR is a normal
-operation. Naively diffing every app at once means every app is a repo-server
-cache miss racing to pull and render the same OCI chart, which saturates the
-repo-server (5xx / `manifests_5xx`) and floods the argocd-agent principal. Two
-mechanisms keep this reliable:
+operation. Because the diff is a local `helm template` render with no agent
+round-trips, the fan-out is cheap and the only shared resource is the Bitbucket
+API used to fetch value files. Three mechanisms keep it fast and reliable:
 
-1. **Per-agent concurrency cap (serialize per spoke, parallelize across spokes).**
-   Every app on a spoke shares one argocd-agent and the principal's resource-proxy
-   connection to it. A single `argocd app diff` of a large app (hundreds of
-   resources) fans out into hundreds of live-resource requests to that one agent,
-   so running several diffs at once on the same spoke overruns the agent's response
-   window; the principal then drops the late responses ("resource response not
-   tracked") and the diff fails as `redis_timeout`. Diffs are gated by a global
-   per-agent semaphore (`AGENT_MAX_CONCURRENCY`, default `1`) and interleaved across
-   agents, so each spoke is hit one diff at a time while total throughput still
-   scales with the number of spokes. Measured on a 24-app mass bump: `1` -> 26/27
-   clean and 0 principal panics; `3` -> 11 failures plus `send on closed channel`
-   panics on the principal.
-2. **Chart-cache warm-up.** Before the parallel fan-out, one representative app
-   per distinct OCI chart is diffed first (`_select_warm_apps`). That single
-   render warms the repo-server chart cache so the remaining apps reuse the pull
-   instead of stampeding it. Controlled by `WARM_WORKERS` / `WARM_THRESHOLD`.
-3. **Retry with exponential backoff + jitter.** Transient burst errors
-   (`manifests_5xx`, `code = Unknown desc = POST`, redis-proxy timeouts) are
-   retried in-process up to `DIFF_RETRIES` times so a brief blip during the
-   burst never surfaces as "diff unavailable".
+1. **Chart-cache warm-up.** Before the parallel fan-out, one representative app
+   per distinct OCI chart is pulled first (`_select_warm_apps`) so the remaining
+   apps reuse the local tarball instead of all pulling it at once. Controlled by
+   `WARM_WORKERS` / `WARM_THRESHOLD`.
+2. **Bitbucket API rate limiting + safe caching.** A global semaphore
+   (`BB_API_CONCURRENCY`, default 30) caps concurrent Bitbucket calls; value files
+   are cached by immutable `(commit_sha, path)` and transient errors are **never**
+   cached as "missing", so one app's rate-limit blip cannot poison the others.
+3. **Retry with exponential backoff + jitter.** Transient reasons
+   (`oci_pull_failed`, `metadata_pending`, `timeout`) are retried in-process up to
+   `DIFF_RETRIES` times so a brief blip never surfaces as "diff unavailable".
 
-This is paired with hub-side capacity in `acme-infrastructure`
-(`reposerver.parallelism.limit`, a 100-processor principal, redis-ha headroom).
+The on-disk chart cache is bounded (`HELM_CACHE_MAX_CHARTS`) and pruned at the
+start of each iteration so a long-lived pod cannot fill node ephemeral storage.
 
-### Tuning knobs (env vars / Helm `diff.*` values)
+### Tuning knobs (env vars / Helm values)
 
 | Env | Helm value | Default | Purpose |
 |---|---|---|---|
 | `MAX_APPS_PER_RUN` | `diff.maxAppsPerRun` | `800` | Hard cap on apps diffed per PR |
-| `DIFF_WORKERS` | `diff.workers` | `16` | Parallel diffs within one PR |
+| `DIFF_WORKERS` | `diff.workers` | `16` | Parallel per-app diffs within one PR |
 | `PR_WORKERS` | `diff.prWorkers` | `3` | PRs processed in parallel |
-| `DIFF_TIMEOUT` | `diff.timeout` | `120` | Seconds per diff attempt |
+| `DIFF_TIMEOUT` | `diff.timeout` | `120` | Seconds per diff step |
 | `DIFF_RETRIES` | `diff.retries` | `5` | Attempts per diff (backoff + jitter) |
-| `WARM_WORKERS` | `diff.warmWorkers` | `4` | Parallel chart warm-up diffs |
+| `WARM_WORKERS` | `diff.warmWorkers` | `4` | Parallel chart warm-up pulls |
 | `WARM_THRESHOLD` | `diff.warmThreshold` | `8` | Min apps before warm-up kicks in |
-| `AGENT_MAX_CONCURRENCY` | `diff.agentMaxConcurrency` | `1` | Max concurrent diffs per agent/spoke (serialize per spoke) |
+| `KUBE_VERSION` | `kubeVersion` | `1.30.0` | `--kube-version` passed to `helm template` |
+| `BB_API_CONCURRENCY` | — | `30` | Max concurrent Bitbucket API calls |
+| `HELM_CACHE_MAX_CHARTS` | — | `60` | Max pulled chart versions kept on disk |
 
 ---
 
@@ -124,7 +132,7 @@ acme-diff-preview/
 ├── docs/
 │   └── runbooks/
 │       └── jfrog-webhook-secret-rotation.md
-├── Dockerfile                 python:3.12-slim + argocd CLI
+├── Dockerfile                 python:3.12-slim + argocd CLI + helm CLI
 ├── RELEASING.md               How to cut a release (read before pushing tags)
 └── .github/workflows/
     ├── ci.yml                 PR gate: tests, helm lint, docker build (no push)
@@ -226,10 +234,13 @@ Key Helm values configured from `acme-infrastructure`:
 ```yaml
 image:
   repository: us-central1-docker.pkg.dev/appspace-devops/artifact/acme-diff-preview
-  tag: "1.4.0"
+  tag: "1.9.0"
 
-# Set to DEBUG to log full ArgoCD stderr + per-attempt diff classification.
+# Set to DEBUG to log full per-step diff detail.
 logLevel: INFO
+
+# Kubernetes version helm renders against (--kube-version).
+kubeVersion: "1.30.0"
 
 argocd:
   server: argocd.appspace.com
@@ -253,6 +264,9 @@ secrets:
   bbTokenKey: argocd-diff-preview-bb-token
   argocdPassKey: argocd-diff-preview-admin-pass
   jfrogWebhookSecretKey: argocd-jfrog-webhook-shared-secret
+  # OCI credentials are REQUIRED for the helm-template diff.
+  ociUserKey: acme-repo-username
+  ociPassKey: acme-repo-password
 
 serviceAccount:
   annotations:
@@ -275,8 +289,13 @@ All secrets are in the `appspace-devops` project.
 | `argocd-diff-preview-bb-token` | Bitbucket app password |
 | `argocd-diff-preview-admin-pass` | ArgoCD `diff-preview` account password (plaintext) |
 | `argocd-diff-preview-password` | Bcrypt hash for the ArgoCD accounts config |
-| `acme-repo-password` | JFrog pull credentials for GAR proxy and CI |
+| `acme-repo-username` | JFrog OCI username (`OCI_USER`) for `helm pull` |
+| `acme-repo-password` | JFrog OCI password (`OCI_PASS`) for `helm pull`, GAR proxy, CI |
 | `argocd-jfrog-webhook-shared-secret` | HMAC key for the JFrog webhook endpoint |
+
+`OCI_USER` / `OCI_PASS` are **required** for the diff to work: without them every
+`helm pull` fails and the comment shows "diff unavailable" for every app. The pod
+logs an ERROR at startup when `OCI_PASS` is empty.
 
 To rotate the JFrog webhook secret, follow the runbook at
 `docs/runbooks/jfrog-webhook-secret-rotation.md`.

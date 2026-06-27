@@ -17,31 +17,35 @@ When the PR bumps appspace.version (= the OCI chart targetRevision), the new
 version is detected from the PR config file via Bitbucket API and used for the
 PR render while main render uses the current stored targetRevision.
 
-Diff outcome model (see classify_diff_error):
-- diff          : argocd produced a real manifest diff (exit 1 + stdout)
-- no_diff       : argocd confirmed the manifests match (clean exit 0)
-- indeterminate : the diff could NOT be computed (OCI login 401, repo-server
-                  502 on GetManifests, spoke Redis timeout, managed-mode live
-                  state unavailable, ArgoCD busy, ...). This is NOT "no changes"
-                  and must never be shown as a green check.
-- error         : an unexpected / unknown failure.
+Diff outcome model:
+- diff          : a real manifest diff was produced (helm renders differ)
+- no_diff       : the rendered manifests match (or only noise/checksum changes)
+- indeterminate : the diff could NOT be computed. With the helm-template engine
+                  the only causes are: OCI chart pull/login failure, the chart
+                  version missing in the registry (oci_not_found), a value-file
+                  fetch issue, a failed local render, or a timeout. This is NOT
+                  "no changes" and must never be shown as a green check.
+- error         : reserved for unexpected per-PR exceptions (see process_pr).
 
-Why indeterminate matters: ArgoCD renders each multi-source app from the Helm
-OCI registry. On a manifest cache miss the repo-server runs `helm registry
-login`; if that fails (bad OCI credential) or the agent/proxy/Redis path is
-slow, the diff fails. Previously those failures were swallowed as "no manifest
-changes", hiding real changes from reviewers. They are now surfaced explicitly.
+Failure reasons (REASON_* codes set directly by _run_one_diff, no stderr regex):
+- oci_not_found  : version absent in the registry. PERMANENT -> FAILED build status
+                   (the deployer would fail the same way), no retry, PR marked seen.
+- oci_pull_failed: transient pull/login failure -> retried with backoff.
+- metadata_pending: app not yet in the 5-min discovery cache -> retried.
+- render_failed  : `helm template` failed (bad values/chart) -> soft indeterminate.
+- timeout        : a step exceeded DIFF_TIMEOUT -> retried.
+All non-permanent reasons end as indeterminate (never a hard error that fails a
+PR on a transient blip) and are left un-seen so the next loop re-evaluates them.
 
 Error handling:
 - argocd app list failure: FAILED on all open main-targeting PRs, clean exit
-- Bitbucket API 429/503/network: retry with exponential backoff (3 attempts)
-- diff timeout (60s): caught per-app, reported as indeterminate in comment
-- diff with no === sections: fallback to raw diff block in comment
+- Bitbucket API 429/5xx/network: retried with backoff; transient misses are
+  never cached as "missing" so they do not poison other apps
+- diff timeout (DIFF_TIMEOUT): caught per-app, retried, then indeterminate
 - large comment (>245KB): truncated with note, still posted
 - upsert_comment failure: fallback minimal note attempted
 - any per-PR exception: FAILED status + error comment, other PRs continue
-- 0 apps affected: SUCCESSFUL posted so merge
- gates don't block non-infra PRs
+- 0 apps affected: SUCCESSFUL posted so merge gates don't block non-infra PRs
 
 SHA dedup:
 - In-memory: skips same PR SHA within this pod's loop iterations
@@ -89,38 +93,14 @@ MAX_RESOURCES_FULL = 5       # resources shown with full diff block
 MAX_DIFF_CHARS     = 2000    # chars per resource diff block
 # Capacity knobs (env-overridable). Defaults sized for a single PR that diffs
 # hundreds of apps (a chart version bump rolled out to many clusters at once).
-# The hub is protected by reposerver.parallelism.limit (per-pod render queue)
-# and a 100-processor principal, so the client can fan out wider safely.
+# The diff is a pure local `helm template` render (no ArgoCD agent round-trips),
+# so the client can fan out wide: the only shared limit is the Bitbucket API
+# (BB_API_CONCURRENCY) used to fetch value files.
 MAX_APPS_PER_RUN   = int(os.environ.get("MAX_APPS_PER_RUN", "800"))   # cover 600+ apps/PR with headroom
-DIFF_WORKERS       = int(os.environ.get("DIFF_WORKERS", "16"))        # parallel argocd app diff calls
-DIFF_TIMEOUT       = int(os.environ.get("DIFF_TIMEOUT", "120"))       # seconds per argocd app diff (OCI cache-miss renders are slow)
-WARM_WORKERS       = int(os.environ.get("WARM_WORKERS", "4"))         # parallel chart-cache warm-up diffs
+DIFF_WORKERS       = int(os.environ.get("DIFF_WORKERS", "16"))        # parallel per-app helm-template diffs
+DIFF_TIMEOUT       = int(os.environ.get("DIFF_TIMEOUT", "120"))       # seconds per diff (OCI cache-miss pulls are slow)
+WARM_WORKERS       = int(os.environ.get("WARM_WORKERS", "4"))         # parallel chart-cache warm-up pulls
 WARM_THRESHOLD     = int(os.environ.get("WARM_THRESHOLD", "8"))       # only warm when a PR fans out to more apps than this
-# Max concurrent diffs targeting a SINGLE agent / spoke cluster. All apps on one
-# spoke share one argocd-agent + the principal resource-proxy connection to it.
-# A single `argocd app diff` of a large app fans out into hundreds of live-resource
-# requests to that one agent, so several diffs at once overrun the agent's response
-# window and the principal drops the late responses ("resource response not tracked"),
-# which surfaces as redis_timeout. Default 1 = serialize per spoke; throughput still
-# scales by parallelizing ACROSS spokes (DIFF_WORKERS). Measured on a 24-app bump:
-# 1 -> 26/27 clean, 0 principal panics; 3 -> 11 failures + send-on-closed-channel panics.
-AGENT_MAX_CONCURRENCY = int(os.environ.get("AGENT_MAX_CONCURRENCY", "1"))
-# Global per-agent semaphores, shared across ALL concurrently processed PRs.
-# Must be module-level (not per-PR): two PRs that both touch the same spoke would
-# otherwise each get their own cap and double the load on that one agent.
-_agent_sems: dict          = {}
-_agent_sems_lock: threading.Lock = threading.Lock()
-
-
-def _agent_semaphore(app):
-    """Return the shared semaphore for an app's target agent (created on demand)."""
-    agent = _app_agent_map.get(app, "_")
-    with _agent_sems_lock:
-        sem = _agent_sems.get(agent)
-        if sem is None:
-            sem = threading.Semaphore(AGENT_MAX_CONCURRENCY)
-            _agent_sems[agent] = sem
-        return sem
 MAX_COMMENT_BYTES  = 245_000 # Bitbucket ~256KB limit; leave headroom
 JFROG_MAX_BODY_BYTES = int(os.environ.get("JFROG_MAX_BODY_BYTES", "65536"))  # 64 KB — reject oversized bodies before HMAC
 
@@ -149,7 +129,7 @@ _wake           = threading.Event()  # set by POST /diff-preview/webhook
 _seen_lock      = threading.Lock()   # guards _seen for concurrent PR processing
 
 # Max parallel PR processing workers. Each worker fans out up to DIFF_WORKERS
-# argocd app diff subprocesses internally, so the effective subprocess pool is
+# per-app helm-template diffs internally, so the effective worker pool is
 # MAX_PR_WORKERS × DIFF_WORKERS. Env-overridable via PR_WORKERS.
 MAX_PR_WORKERS  = int(os.environ.get("PR_WORKERS", "3"))
 
@@ -174,12 +154,6 @@ _app_chart_registry_map: dict = {}
 _app_value_files_map: dict = {}
 # app full_name -> destination namespace.
 _app_namespace_map: dict = {}
-# app full_name -> agent / destination cluster (spec.destination.name, e.g.
-# "gcp-dev-cl-ap1-a"). All apps on one spoke share a single argocd-agent and its
-# redis/resource proxy connection, so diffing too many of them at once saturates
-# that agent (redis_timeout / "resource response not tracked"). Used to cap
-# concurrency PER agent while keeping high total concurrency across agents.
-_app_agent_map: dict   = {}
 
 # GCE access token cache: token valid ~3600s, no reason to refetch each PR.
 _gcp_token:     str   = ""
@@ -329,6 +303,12 @@ class _HealthHandler(BaseHTTPRequestHandler):
                         _jfrog_stats["dedup_skipped"] += 1
                     return
                 _jfrog_recent[dedup_key] = now
+                # Drop entries well outside the dedup window so this dict does not
+                # grow unbounded over a long pod lifetime (many chart:version pushes).
+                stale = [k for k, t in _jfrog_recent.items()
+                         if now - t > JFROG_DEDUP_WINDOW * 100]
+                for k in stale:
+                    del _jfrog_recent[k]
 
             log(f"JFrog webhook: push event for {chart_name}:{chart_ver} — triggering hard-refresh")
             threading.Thread(
@@ -504,7 +484,7 @@ def discover_path_app_map():
     """
     global _path_map_cache, _path_map_ts, _path_map_count, _app_chart_map, \
            _app_chart_revision_map, _app_chart_registry_map, \
-           _app_value_files_map, _app_namespace_map, _app_agent_map
+           _app_value_files_map, _app_namespace_map
     if _path_map_cache and (time.monotonic() - _path_map_ts) < PATH_MAP_TTL:
         # Also check app count hasn't changed (new env added mid-TTL)
         if len(_path_map_cache) == _path_map_count:
@@ -524,7 +504,6 @@ def discover_path_app_map():
     chart_reg_map = {}
     value_files_map = {}
     namespace_map = {}
-    agent_map = {}
     for app in apps:
         name = app["metadata"]["name"]
         ns   = app["metadata"].get("namespace", "")
@@ -539,8 +518,6 @@ def discover_path_app_map():
         if value_files:
             value_files_map[full_name] = value_files
         dest = app.get("spec", {}).get("destination", {})
-        if dest.get("name"):
-            agent_map[full_name] = dest["name"]
         if dest.get("namespace"):
             namespace_map[full_name] = dest["namespace"]
         ann  = app.get("metadata", {}).get("annotations", {})
@@ -559,7 +536,6 @@ def discover_path_app_map():
     _app_chart_registry_map  = chart_reg_map
     _app_value_files_map     = value_files_map
     _app_namespace_map       = namespace_map
-    _app_agent_map           = agent_map
     _path_map_ts    = time.monotonic()
     _path_map_count = len(path_map)
     return path_map
@@ -636,28 +612,7 @@ def _select_warm_apps(affected):
     return warm, rest
 
 
-def _interleave_by_agent(apps):
-    """Round-robin apps across their target agent so the worker pool spreads load.
-
-    Submitting all apps of one agent back-to-back would make the first workers
-    pile onto a single spoke (and block on its per-agent semaphore) while other
-    agents sit idle. Interleaving keeps every agent busy at its own safe rate.
-    """
-    buckets = {}
-    for app in apps:
-        buckets.setdefault(_app_agent_map.get(app, "_"), []).append(app)
-    order, queues = [], list(buckets.values())
-    i = 0
-    while queues:
-        q = queues[i % len(queues)]
-        order.append(q.pop(0))
-        if not q:
-            queues.remove(q)
-        else:
-            i += 1
-    return order
-
-# ── ArgoCD diff ───────────────────────────────────────────────────────
+# ── ArgoCD login (used only for app discovery, never for the diff itself) ──
 def argocd_login():
     global _ready, _path_map_ts
     r = subprocess.run(
@@ -696,12 +651,18 @@ def _is_checksum_only_section(body: str) -> bool:
         "deployment.kubernetes.io/revision",
         "meta.helm.sh/release-",
         "helm.sh/resource-policy",
+        "helm.sh/chart",
     )
-    changed = [
-        l.lstrip("+-< >").strip()
-        for l in body.splitlines()
-        if l.startswith("< ") or l.startswith("> ") or l.startswith("-") or l.startswith("+")
-    ]
+    changed = []
+    for l in body.splitlines():
+        # Skip difflib unified-diff structural lines (---, +++, @@ hunk headers);
+        # they start with -/+ but are not content changes.
+        if l.startswith("---") or l.startswith("+++") or l.startswith("@@"):
+            continue
+        if l.startswith("< ") or l.startswith("> ") or l.startswith("-") or l.startswith("+"):
+            stripped = l.lstrip("+-< >").strip()
+            if stripped:
+                changed.append(stripped)
     return bool(changed) and all(
         any(noise in l for noise in _ANNOTATION_NOISE) for l in changed
     )
@@ -740,156 +701,53 @@ OUT_ERROR         = "error"
 #   reason   : short machine code for logs/metrics (e.g. "oci_login_401")
 DiffResult = namedtuple("DiffResult", ["text", "has_diff", "error", "outcome", "reason"])
 
-# Errors that are worth retrying quickly within the same diff call — they often
-# clear within 2-5s (a concurrent render populates the cache, the proxy/Redis
-# hiccup passes, or the busy repo-server frees up).
-# - i/o timeout / connection refused: spoke Redis via argocd-agent-redis-proxy
-# - context deadline exceeded: short deadline expired, usually recovers fast
-# - error logging into OCI registry / failed running helm: repo-server cache
-#   miss + helm registry login; a retry may hit a now-cached manifest
-# - GetManifests ... 502 / 503 / 504: repo-server briefly overloaded behind ingress
-_RETRYABLE_DIFF_ERRORS = (
-    "i/o timeout",
-    "connection refused",
-    "context deadline exceeded",
-    "error logging into OCI registry",
-    "failed running helm",
-    "GetManifests failed with status code 502",
-    "GetManifests failed with status code 503",
-    "GetManifests failed with status code 504",
-    # Burst-transient failures during a mass version bump: the repo-server is
-    # busy doing parallel OCI cache-miss renders and briefly returns 5xx, or the
-    # request to the spoke agent through the redis/resource proxy times out under
-    # load. These clear once the chart cache warms and the load subsides, so
-    # retry them in-process with backoff instead of waiting a whole loop.
-    "GetManifests failed with status code 5",
-    "code = Unknown desc = POST",
-    "status code 502",
-    "status code 503",
-    "status code 504",
-    "error getting cached app managed resources",
-    "the server is not currently accepting requests",
-    "code = Canceled",
-    "context canceled",
-)
+# ── Diff failure reasons (helm-template architecture) ─────────────────
+# The diff is a pure local `helm pull` + `helm template` + Python YAML diff.
+# It never talks to a spoke agent, so the only failures are: OCI pull/login,
+# chart version missing, value-file fetch from Bitbucket, the local render, or
+# a timeout. Each is one of the codes below. The old argocd-agent reasons
+# (redis_timeout, managed_no_cache, manifests_5xx, server_unavailable, ...) can
+# no longer occur and were removed.
+REASON_OCI_NOT_FOUND = "oci_not_found"      # version absent in registry — PERMANENT, blocks PR
+REASON_OCI_PULL      = "oci_pull_failed"    # transient pull/login failure — retry
+REASON_METADATA      = "metadata_pending"   # app not yet in the 5-min app cache — retry
+REASON_RENDER        = "render_failed"      # `helm template` failed (bad values/chart) — soft
+REASON_TIMEOUT       = "timeout"            # a step exceeded DIFF_TIMEOUT — retry
 
-# Auth-failure patterns that should trigger an ArgoCD re-login.
-_AUTH_ERROR_PATTERNS = (
-    "invalid session",
-    "token has expired",
-    "token is expired",
-    "unauthenticated",
-    "unauthorized",
-)
+# Reasons worth retrying in-process with backoff (transient).
+RETRYABLE_REASONS = {REASON_OCI_PULL, REASON_METADATA, REASON_TIMEOUT}
+# Reasons that permanently block the PR (the deployer would fail the same way).
+PERMANENT_REASONS = {REASON_OCI_NOT_FOUND}
 
-# ── Diff error classification ─────────────────────────────────────────
-# Each tuple is (substring patterns, reason code). Checked in order; the first
-# matching group wins. All of these are INDETERMINATE: the diff could not be
-# computed, so the result is unknown (NOT "no changes"). The previous code
-# silently mapped several of these to no-diff, which hid real changes from
-# reviewers — that masking is removed here.
-_DIFF_ERROR_RULES = (
-    # OCI chart version does not exist in the registry (someone bumped appspace.version
-    # to a version that was never published). Surface a clear, actionable message.
-    (("not found in", "chart not found", "unexpected status code: 404",
-      "does not exist in oci registry"), "oci_not_found"),
-    # OCI Helm chart could not be pulled/rendered (repo-server cache miss +
-    # `helm registry login` failure, e.g. 401 Bad Credentials on the registry).
-    (("error logging into OCI registry", "failed running helm",
-      "helm registry login"), "oci_login"),
-    # Spoke Redis unreachable through argocd-agent-redis-proxy while reading the
-    # app's cached managed (live) resources.
-    (("error getting cached app managed resources",), "managed_resources"),
-    # Manifest generation failed at the repo-server / ingress (often the visible
-    # symptom of an OCI render that exceeded the request deadline).
-    (("GetManifests failed with status code 5", "code = Unknown desc = POST",
-      "status code 502", "status code 503", "status code 504"), "manifests_5xx"),
-    # ArgoCD server / app-controller temporarily unavailable or restarting.
-    (("the server is not currently accepting requests",
-      "error getting server version"), "server_unavailable"),
-    # Request cancelled or deadline hit (transient).
-    (("context canceled", "code = Canceled",
-      "context deadline exceeded"), "canceled"),
-    # diff-preview account lacks RBAC for this app (config issue, not no-diff).
-    (("rpc error: code = PermissionDenied", "permission denied"), "permission"),
-)
-
-# Subset of managed_resources that is specifically a Redis/proxy timeout rather
-# than a plain "resources not cached" state. Kept separate for clearer metrics.
-_REDIS_TIMEOUT_HINTS = ("i/o timeout", "connection refused")
-
-# Operator-friendly one-liners shown in the PR comment for each indeterminate
-# reason. Keep these short — the full ArgoCD stderr is in the pod logs (DEBUG).
+# Operator-friendly one-liners shown in the PR comment for each reason.
+# The full stderr is in the pod logs at LOG_LEVEL=DEBUG.
 _REASON_HINTS = {
-    "oci_not_found":      "Chart version not found in OCI registry — check that the version exists",
-    "oci_login":          "Helm OCI registry login failed on the repo-server",
-    "redis_timeout":      "spoke Redis timed out via argocd-agent proxy",
-    "managed_no_cache":   "live state not cached for this agent-managed app",
-    "manifests_5xx":      "repo-server returned 5xx while generating manifests",
-    "server_unavailable": "ArgoCD server temporarily unavailable",
-    "canceled":           "request cancelled / deadline exceeded",
-    "permission":         "diff-preview account lacks RBAC for this app",
-    "auth":               "ArgoCD session expired (re-login triggered)",
-    "timeout":            "diff command timed out after 60s",
-    "retry_exhausted":    "still failing after retry",
+    REASON_OCI_NOT_FOUND: "Chart version not found in OCI registry — check that the version exists",
+    REASON_OCI_PULL:      "could not pull the OCI chart (registry login or network)",
+    REASON_METADATA:      "app not yet in the discovery cache (added since last refresh)",
+    REASON_RENDER:        "helm template failed to render the chart with these values",
+    REASON_TIMEOUT:       f"a diff step exceeded {DIFF_TIMEOUT}s",
+    "retry_exhausted":    "still failing after retries",
     "legacy":             "diff could not be computed",
 }
 
 
-def classify_diff_error(stderr_text: str) -> tuple:
-    """Map an `argocd app diff` failure (exit >= 2, or exit 1 with empty stdout)
-    to (outcome, reason, detail).
-
-    Pure function — no subprocess, no globals — so it is unit-testable without
-    ArgoCD. Every recognised failure is INDETERMINATE (diff not computable);
-    only genuinely unknown output is OUT_ERROR.
-    """
-    text = stderr_text or "unknown error"
-    lower = text.lower()
-
-    # Auth first: an expired/invalid session also needs a background re-login.
-    if any(p in lower for p in _AUTH_ERROR_PATTERNS):
-        return OUT_INDETERMINATE, "auth", text
-
-    for patterns, reason in _DIFF_ERROR_RULES:
-        if any(p in text for p in patterns):
-            if reason == "managed_resources":
-                # Distinguish a Redis/proxy timeout from a plain uncached state.
-                if any(h in text for h in _REDIS_TIMEOUT_HINTS):
-                    return OUT_INDETERMINATE, "redis_timeout", text
-                return OUT_INDETERMINATE, "managed_no_cache", text
-            return OUT_INDETERMINATE, reason, text
-
-    return OUT_ERROR, "unknown", text
-
-def _async_relogin():
-    """Re-login to ArgoCD in a background thread when auth errors are detected.
-
-    Called when argocd app diff returns exit 1 with an auth failure message.
-    The JWT token may have expired (default ArgoCD expiry: 24h). Re-logging
-    in the background means the NEXT diff call will pick up a fresh session
-    without blocking the current iteration.
-    """
-    try:
-        argocd_login()
-        log(f"[auth] background re-login succeeded as {ARGOCD_USER}")
-    except Exception as e:
-        print(f"  [auth] background re-login failed: {e}", flush=True)
+# Status codes returned by _bb_fetch_status alongside the content.
+BB_OK        = "ok"          # file fetched
+BB_NOT_FOUND = "not_found"   # 404 — file genuinely absent at this sha (cacheable)
+BB_ERROR     = "error"       # transient (429/5xx/network) after retries (NOT cacheable)
 
 
-def _bb_fetch_file_at_sha(filepath, sha):
-    """Fetch raw file content from acme-config-dev at a specific commit SHA.
+def _bb_fetch_status(filepath, sha):
+    """Fetch a raw file from acme-config-dev at a commit SHA.
 
-    Returns the decoded string content, or None on any error (missing file,
-    network error, auth failure). Used to read the new chart version from a
-    PR config file before running argocd app diff.
+    Returns (content_or_None, status) where status is one of BB_OK / BB_NOT_FOUND
+    / BB_ERROR. The distinction matters for caching: a genuine 404 is a stable
+    fact and may be cached, but a transient error must NOT be cached as "missing"
+    or it would poison every app that shares the same (sha, path) key.
 
-    Uses a direct urllib call instead of bb()/http() because those helpers
-    always call json.loads() on the response, which fails for YAML/text files.
-
-    Distinguishes 404 (file does not exist at this sha - skip silently) from
-    transient errors (429 rate limit, 5xx, network timeout - retry with backoff).
-    Only 404 is returned as None and cached; transient errors are retried up to 3x.
+    Uses a direct urllib call instead of bb()/http() because those helpers always
+    json.loads() the response, which fails for YAML/text files.
     """
     import base64
     url = (f"https://api.bitbucket.org/2.0/repositories/"
@@ -900,25 +758,69 @@ def _bb_fetch_file_at_sha(filepath, sha):
         with _bb_api_sem:   # global rate limiter: caps concurrent BB API calls
             try:
                 with urllib.request.urlopen(req, context=_ssl, timeout=20) as r:
-                    return r.read().decode("utf-8", errors="replace")
+                    return r.read().decode("utf-8", errors="replace"), BB_OK
             except urllib.error.HTTPError as e:
                 if e.code == 404:
-                    return None   # File does not exist at this sha — skip silently
+                    return None, BB_NOT_FOUND   # genuinely absent at this sha
                 if e.code in (429, 500, 502, 503, 504) and attempt < 2:
                     wait = (attempt + 1) * 2  # 2s, 4s
                     debug(f"Bitbucket API {e.code} for {filepath}, retry {attempt+1}/2 in {wait}s")
                     time.sleep(wait)
                     continue
-                return None   # Other HTTP error — treat as missing
+                return None, BB_ERROR   # other / exhausted HTTP error — transient
             except Exception:
                 if attempt < 2:
                     time.sleep((attempt + 1) * 2)
                     continue
-                return None   # Network/timeout — skip after retries
+                return None, BB_ERROR   # network/timeout after retries — transient
+    return None, BB_ERROR
+
+
+def _bb_fetch_file_at_sha(filepath, sha):
+    """Back-compat wrapper: return content string or None (missing OR error)."""
+    content, _status = _bb_fetch_status(filepath, sha)
+    return content
+
+
+_appspace_key_re = re.compile(r"^\s*appspace:\s*(#.*)?$")
+_version_key_re  = re.compile(r"^\s*version:\s*([^\s#]+)")
+
+
+def _extract_chart_version(content: str):
+    """Return the chart targetRevision from a config file's `appspace.version`.
+
+    The ApplicationSet sets spec.sources[1].targetRevision = appspace.version, so
+    the only value we want is the `version:` that is a DIRECT child of the
+    top-level `appspace:` mapping. A plain regex for the first `version:` is
+    unsafe: config files carry other, deeper `version:` keys (e.g.
+    appspace.elastic.version: 8.15.1) that must never be mistaken for the chart
+    revision. We track indentation so only the direct child matches, and return
+    None when there is no appspace.version (the PR did not bump the chart here).
+    """
+    in_appspace     = False
+    appspace_indent = -1
+    child_indent    = None
+    for line in content.splitlines():
+        if not line.strip() or line.lstrip().startswith("#"):
+            continue
+        indent = len(line) - len(line.lstrip())
+        # A line at or above the appspace indent closes the block.
+        if in_appspace and indent <= appspace_indent:
+            in_appspace  = False
+            child_indent = None
+        if _appspace_key_re.match(line):
+            in_appspace     = True
+            appspace_indent = indent
+            child_indent    = None
+            continue
+        if in_appspace:
+            # The first key deeper than appspace defines the direct-child indent.
+            if child_indent is None and indent > appspace_indent:
+                child_indent = indent
+            vm = _version_key_re.match(line)
+            if vm and indent == child_indent:
+                return vm.group(1).strip("'\"")
     return None
-
-
-_yaml_version_re = re.compile(r"^\s{0,8}version:\s*([^\s#]+)", re.MULTILINE)
 
 
 # ── Helm-template local diff ─────────────────────────────────────────────────
@@ -927,6 +829,10 @@ HELM_BIN        = os.environ.get("HELM_BIN", "/usr/local/bin/helm")
 OCI_USER        = os.environ.get("OCI_USER", "acme-repo")
 OCI_PASS        = os.environ.get("OCI_PASS", "")
 HELM_CACHE_DIR  = os.environ.get("HELM_CACHE_DIR", "/tmp/acme-helm-cache")
+# Pin the Kubernetes version helm renders against so charts that branch on
+# .Capabilities.KubeVersion produce stable, cluster-representative output. Both
+# the main and PR renders use the same value, so the diff stays consistent.
+KUBE_VERSION    = os.environ.get("KUBE_VERSION", "1.30.0")
 
 # Registries that have been successfully authenticated this pod lifetime.
 _helm_logged_in: set = set()
@@ -1071,10 +977,69 @@ def _find_chart_subdir(chart_dir: str) -> str:
         return chart_dir
 
 
-# Value file cache: {(sha, path) -> content}. Shared across all apps in one PR
-# iteration. Main sha files (same across all apps) are fetched once and reused.
+# Cap on pulled chart versions kept on the pod's ephemeral disk. Each mass
+# version-bump pulls a couple of versions per chart; over a long pod lifetime
+# these accumulate and can fill node ephemeral storage (not bounded by the
+# memory limit). Keep the most-recently-used and evict the rest.
+HELM_CACHE_MAX_CHARTS = int(os.environ.get("HELM_CACHE_MAX_CHARTS", "60"))
+
+
+def _prune_helm_cache():
+    """Keep at most HELM_CACHE_MAX_CHARTS pulled chart version dirs on disk.
+
+    Called at the START of an iteration (before any diffs) so it never races a
+    chart that an in-flight diff is reading. Removes the oldest version dirs and
+    their matching in-memory cache entries.
+    """
+    try:
+        version_dirs = []
+        for registry in os.listdir(HELM_CACHE_DIR):
+            reg_path = os.path.join(HELM_CACHE_DIR, registry)
+            if not os.path.isdir(reg_path):
+                continue
+            for chart in os.listdir(reg_path):
+                chart_path = os.path.join(reg_path, chart)
+                if not os.path.isdir(chart_path):
+                    continue
+                for version in os.listdir(chart_path):
+                    vpath = os.path.join(chart_path, version)
+                    if os.path.isdir(vpath):
+                        version_dirs.append(
+                            (os.path.getmtime(vpath), registry, chart, version, vpath))
+    except OSError:
+        return
+    if len(version_dirs) <= HELM_CACHE_MAX_CHARTS:
+        return
+    version_dirs.sort(reverse=True)  # newest first
+    import shutil
+    removed = 0
+    for _mtime, registry, chart, version, vpath in version_dirs[HELM_CACHE_MAX_CHARTS:]:
+        shutil.rmtree(vpath, ignore_errors=True)
+        with _helm_cache_lock:
+            _helm_chart_cache.pop(f"{registry}/{chart}:{version}", None)
+        removed += 1
+    if removed:
+        log(f"Helm cache prune: removed {removed} old chart version(s)")
+
+
+# Value file cache: {(sha, path) -> content}. Keyed by immutable commit sha, so
+# entries never go stale; shared across all apps and all PRs in a pod lifetime.
 _vf_cache: dict = {}
 _vf_cache_lock  = threading.Lock()
+# Upper bound on cached value files so a long-lived pod cannot grow without limit
+# (each open PR adds ~7 base-sha + ~7 head-sha entries). When exceeded we drop the
+# oldest-inserted half. dict preserves insertion order, so the first keys are oldest.
+VF_CACHE_MAX = int(os.environ.get("VF_CACHE_MAX", "5000"))
+
+
+def _bound_vf_cache():
+    """Evict the oldest half of the value-file cache when it exceeds VF_CACHE_MAX."""
+    with _vf_cache_lock:
+        if len(_vf_cache) <= VF_CACHE_MAX:
+            return
+        drop = len(_vf_cache) - VF_CACHE_MAX // 2
+        for k in list(_vf_cache.keys())[:drop]:
+            del _vf_cache[k]
 # Bitbucket API rate limit: cap concurrent calls across all PRs+apps to avoid
 # 429 responses that cause value files to return None and helm template to fail
 # with "Missing required value". Each PR×app fetches 14 files (7 paths × 2 shas)
@@ -1105,25 +1070,22 @@ def _fetch_value_files(value_files: list, sha: str) -> dict:
         cache_key = (sha, clean)
         with _vf_cache_lock:
             if cache_key in _vf_cache:
-                return vf, _vf_cache[cache_key], True   # (path, content, from_cache)
-        content = _bb_fetch_file_at_sha(clean, sha)
-        # Only cache definitive results (file found OR confirmed 404/not-found).
-        # Do NOT cache None from transient errors (rate limit, timeout) — those
-        # should be retried on the next call rather than spreading "missing" state
-        # across all apps that share the same (sha, path) cache key.
-        # We can't distinguish 404 from transient here (both return None), so we
-        # cache None when sha looks like a real commit sha (not a branch name that
-        # changes). For PRs we always use a fixed sha so caching None is safe for
-        # the duration of one PR iteration, but wrong across retries. Clear cache
-        # per-PR-iteration (done in process_pr) to avoid stale None entries.
-        with _vf_cache_lock:
-            _vf_cache[cache_key] = content
-        return vf, content, False
+                return vf, _vf_cache[cache_key]
+        content, status = _bb_fetch_status(clean, sha)
+        # Cache ONLY definitive results: a fetched file (BB_OK) or a confirmed
+        # 404 (BB_NOT_FOUND, a stable fact for this immutable sha). NEVER cache a
+        # transient BB_ERROR as None — that would poison every app sharing this
+        # (sha, path) key and surface as a false "missing value" on the render.
+        # Leaving it uncached lets the next app/iteration re-fetch it.
+        if status in (BB_OK, BB_NOT_FOUND):
+            with _vf_cache_lock:
+                _vf_cache[cache_key] = content
+        return vf, content
 
     result = {}
     missing = []
-    with ThreadPoolExecutor(max_workers=max(1, len(value_files))) as ex:
-        for vf, content, _ in ex.map(_fetch_one, value_files):
+    with ThreadPoolExecutor(max_workers=max(1, min(len(value_files), BB_API_CONCURRENCY))) as ex:
+        for vf, content in ex.map(_fetch_one, value_files):
             if content:
                 result[vf] = content
             else:
@@ -1151,6 +1113,7 @@ def _helm_template(chart_path: str, release: str, namespace: str,
 
         cmd = ([HELM_BIN, "template", release, chart_path,
                 "--namespace", namespace or release,
+                "--kube-version", KUBE_VERSION,
                 "--include-crds"] + value_args)
         r = subprocess.run(cmd, capture_output=True, text=True, timeout=DIFF_TIMEOUT)
         if r.returncode != 0:
@@ -1188,13 +1151,11 @@ def _pr_chart_revision(app, changed_files, pr_sha):
         content = _bb_fetch_file_at_sha(filepath, pr_sha)
         if not content:
             continue
-        m = _yaml_version_re.search(content)
-        if m:
-            new_rev = m.group(1).strip("'\"")
-            if new_rev and new_rev != current_rev:
-                debug(f"chart version override: {current_rev} -> {new_rev}",
-                      app=app, file=filepath)
-                return new_rev
+        new_rev = _extract_chart_version(content)
+        if new_rev and new_rev != current_rev:
+            debug(f"chart version override: {current_rev} -> {new_rev}",
+                  app=app, file=filepath)
+            return new_rev
     return None
 
 
@@ -1281,11 +1242,11 @@ def _run_one_diff(app, pr_sha, main_sha, chart_revision=None):
 
     No `argocd app diff`, no `argocd app manifests`, no spoke-agent round-trips.
 
-    Returns (diff_text_or_None, timed_out_bool, error_str_or_None).
-    OciChartNotFound surfaces as a permanent error (no retry) with a clear message.
-    chart_not_configured is returned when app metadata is missing from the cache
-    (e.g. the app was not yet in `argocd app list` when the cache was built); the
-    outer retry loop will re-attempt after backoff.
+    Returns (diff_text, reason, detail):
+      reason is None on success (diff_text is the diff, "" means identical).
+      Otherwise reason is one of the REASON_* codes and detail is a short string.
+      REASON_OCI_NOT_FOUND is permanent; the rest are transient/soft and the
+      caller decides whether to retry (see RETRYABLE_REASONS).
     """
     chart_name  = _app_chart_map.get(app)
     main_rev    = _app_chart_revision_map.get(app)
@@ -1297,8 +1258,8 @@ def _run_one_diff(app, pr_sha, main_sha, chart_revision=None):
     if not (chart_name and main_rev and value_files and registry):
         missing = [k for k, v in [("chart", chart_name), ("revision", main_rev),
                                    ("value_files", value_files), ("registry", registry)] if not v]
-        return None, False, (f"app metadata not yet in cache ({', '.join(missing)}); "
-                             f"will retry after cache refresh")
+        return None, REASON_METADATA, (f"app metadata not yet in cache "
+                                        f"({', '.join(missing)})")
 
     pr_rev = chart_revision or main_rev
 
@@ -1311,20 +1272,20 @@ def _run_one_diff(app, pr_sha, main_sha, chart_revision=None):
             pr_chart   = pr_fut.result(timeout=DIFF_TIMEOUT)
             main_chart = main_fut.result(timeout=DIFF_TIMEOUT)
     except OciChartNotFound as e:
-        return None, False, str(e)
+        return None, REASON_OCI_NOT_FOUND, str(e)
     except concurrent.futures.TimeoutError:
-        return None, True, None
+        return None, REASON_TIMEOUT, f"chart pull exceeded {DIFF_TIMEOUT}s"
     except Exception as e:
-        # Re-raise OciChartNotFound even when wrapped by executor
+        # OciChartNotFound may arrive wrapped by the executor — unwrap it.
         cause = getattr(e, "__cause__", None) or getattr(e, "__context__", None)
         if isinstance(cause, OciChartNotFound) or isinstance(e, OciChartNotFound):
-            return None, False, str(cause or e)
-        return None, False, str(e)[:200]
+            return None, REASON_OCI_NOT_FOUND, str(cause or e)
+        return None, REASON_OCI_PULL, str(e)[:200]
 
     if not pr_chart:
-        return None, False, f"helm pull failed for {chart_name}:{pr_rev}"
+        return None, REASON_OCI_PULL, f"helm pull failed for {chart_name}:{pr_rev}"
     if not main_chart:
-        return None, False, f"helm pull failed for {chart_name}:{main_rev}"
+        return None, REASON_OCI_PULL, f"helm pull failed for {chart_name}:{main_rev}"
 
     try:
         # Fetch PR and main value files in parallel — each set takes ~300ms
@@ -1341,17 +1302,17 @@ def _run_one_diff(app, pr_sha, main_sha, chart_revision=None):
             main_fut = ex.submit(_helm_template, main_chart, release, namespace, main_vals)
             pr_yaml,   pr_err   = pr_fut.result(timeout=DIFF_TIMEOUT)
             main_yaml, main_err = main_fut.result(timeout=DIFF_TIMEOUT)
-    except subprocess.TimeoutExpired:
-        return None, True, None
+    except (subprocess.TimeoutExpired, concurrent.futures.TimeoutError):
+        return None, REASON_TIMEOUT, f"render exceeded {DIFF_TIMEOUT}s"
     except Exception as e:
-        return None, False, str(e)[:200]
+        return None, REASON_RENDER, str(e)[:200]
 
     if pr_err:
-        return None, False, pr_err
+        return None, REASON_RENDER, pr_err
     if main_err:
-        return None, False, main_err
+        return None, REASON_RENDER, main_err
 
-    return _diff_manifests(main_yaml, pr_yaml), False, None
+    return _diff_manifests(main_yaml, pr_yaml), None, None
 
 
 def _indeterminate(reason, detail):
@@ -1384,47 +1345,39 @@ def argocd_diff(app, pr_sha, main_sha, chart_revision=None):
 
     Returns a DiffResult. Never raises.
 
-    Uses `argocd app manifests` (repo-server rendering only) to get the rendered
-    YAML for both the PR revision and the current main revision, then diffs them
-    locally in Python. This avoids fetching live resources from spoke agents so:
-    - Each diff takes 2-15s instead of 20-360s
-    - No per-agent serialization (cap) is needed
-    - The whole fleet can be diffed in parallel
+    The diff is a pure local `helm pull` + `helm template` + Python YAML diff
+    (see _run_one_diff). No live cluster / spoke-agent access, so each diff takes
+    ~4-6s with a warm chart cache instead of 20-360s through the agents.
 
-    Retry policy: OCI cache-miss renders on the first pass are retried with
-    backoff. Persistent failures (OCI not found, auth) surface as INDETERMINATE.
+    Retry policy keys off the explicit reason code from _run_one_diff (not string
+    matching on stderr): transient reasons (RETRYABLE_REASONS) are retried with
+    exponential backoff + jitter; REASON_OCI_NOT_FOUND is permanent and blocks
+    the PR; everything else surfaces as INDETERMINATE (diff unavailable, never a
+    false "no changes" and never a hard error that fails the PR on a blip).
     """
     last_detail = ""
+    last_reason = "retry_exhausted"
     last_attempt = DIFF_RETRIES - 1
     for attempt in range(DIFF_RETRIES):
-        diff_text, timed_out, err = _run_one_diff(
+        diff_text, reason, detail = _run_one_diff(
             app, pr_sha, main_sha, chart_revision=chart_revision)
 
-        if timed_out:
-            debug(f"manifests timed out after {DIFF_TIMEOUT}s", app=app, attempt=attempt + 1)
-            if attempt < last_attempt:
-                time.sleep(_diff_backoff(attempt))
-                continue
-            return _indeterminate("timeout", f"manifests timed out after {DIFF_TIMEOUT}s")
-
-        if err:
-            last_detail = err
-            outcome, reason, detail = classify_diff_error(err)
-            debug(f"manifests error: {reason}", app=app, attempt=attempt + 1, stderr=detail[:800])
-            if reason == "auth":
-                threading.Thread(target=_async_relogin, daemon=True).start()
-            # OCI not-found is permanent: the version does not exist. Never retry.
-            if reason == "oci_not_found":
-                return _indeterminate(reason, detail)
-            if attempt < last_attempt and any(p in err for p in _RETRYABLE_DIFF_ERRORS):
+        if reason is not None:
+            last_detail, last_reason = detail or reason, reason
+            debug(f"diff step failed: {reason}", app=app,
+                  attempt=attempt + 1, detail=(detail or "")[:800])
+            # Permanent: the chart version does not exist. Never retry; block PR.
+            if reason in PERMANENT_REASONS:
+                return _indeterminate(reason, detail or reason)
+            # Transient: retry with backoff while attempts remain.
+            if reason in RETRYABLE_REASONS and attempt < last_attempt:
                 delay = _diff_backoff(attempt)
-                print(f"    [{app}] transient error (attempt {attempt + 1}/{DIFF_RETRIES}), "
-                      f"retrying in {delay:.0f}s: {err[:80]}", flush=True)
+                print(f"    [{app}] {reason} (attempt {attempt + 1}/{DIFF_RETRIES}), "
+                      f"retrying in {delay:.0f}s: {(detail or '')[:80]}", flush=True)
                 time.sleep(delay)
                 continue
-            if outcome == OUT_INDETERMINATE:
-                return _indeterminate(reason, detail)
-            return DiffResult("", False, detail[:400], OUT_ERROR, reason)
+            # Non-retryable soft failure (e.g. render_failed) or retries spent.
+            return _indeterminate(reason, detail or reason)
 
         # diff_text == "" means manifests are identical
         if not diff_text:
@@ -1441,7 +1394,7 @@ def argocd_diff(app, pr_sha, main_sha, chart_revision=None):
         )
         return DiffResult(clean_diff, True, None, OUT_DIFF, "changes")
     # Exhausted retries
-    return _indeterminate("retry_exhausted", last_detail or "unknown error")
+    return _indeterminate(last_reason, last_detail or "unknown error")
 
 
 def parse_diff_sections(diff_text):
@@ -2052,21 +2005,30 @@ def process_pr(pr, path_map, base_sha=""):
         outcome_counts = Counter()
         reason_counts  = Counter()
 
-        # Clear the value-file cache at the start of each PR so stale entries
-        # from a previous iteration don't mask a mid-run config update.
-        # Within a PR iteration, main-sha files are cached and reused across apps.
-        with _vf_cache_lock:
-            _vf_cache.clear()
+        # The value-file cache is keyed by (commit_sha, path). Commit shas are
+        # immutable, so an entry is always valid for that sha — no per-PR clear is
+        # needed (clearing it would also throw away the base-sha files that other
+        # concurrently-processed PRs just fetched). We only bound its size so a
+        # long-lived pod does not grow it without limit.
+        _bound_vf_cache()
 
         # For each affected app, detect whether the PR changes the OCI chart
-        # targetRevision (appspace.version bump). If so, we pass a second
-        # --revisions / --source-positions override so argocd renders the new
-        # chart, making the diff show the actual image changes that will happen.
+        # targetRevision (appspace.version bump). If so, the PR render uses the
+        # new chart version so the diff shows the real image changes. This reads
+        # config files from Bitbucket, so fan it out in parallel (cached + rate
+        # limited by _bb_api_sem) instead of a serial loop over 600+ apps.
         pr_chart_revisions = {}
-        for app in affected:
-            new_rev = _pr_chart_revision(app, changed, pr_sha)
-            if new_rev:
-                pr_chart_revisions[app] = new_rev
+        with ThreadPoolExecutor(max_workers=max(1, min(DIFF_WORKERS, len(affected)))) as ex:
+            rev_futs = {ex.submit(_pr_chart_revision, app, changed, pr_sha): app
+                        for app in affected}
+            for fut in as_completed(rev_futs):
+                app = rev_futs[fut]
+                try:
+                    new_rev = fut.result()
+                except Exception:
+                    new_rev = None
+                if new_rev:
+                    pr_chart_revisions[app] = new_rev
         if pr_chart_revisions:
             unique_bumps = sorted(set(pr_chart_revisions.values()))
             log(f"PR #{pr_id}: chart version bumps detected for "
@@ -2242,6 +2204,9 @@ def main_iteration():
     """Run one complete poll cycle: discover apps, get open PRs, process each."""
     log("ACME diff preview iteration starting")
 
+    # Trim the on-disk chart cache before any diffs so it never races a pull.
+    _prune_helm_cache()
+
     try:
         path_map = discover_path_app_map()
     except Exception as e:
@@ -2319,12 +2284,23 @@ def main_iteration():
 def main():
     """Start health server, login to ArgoCD, then run poll loop until SIGTERM."""
     global _last_ok
-    log("acme-diff-preview starting (Deployment mode, manifest-based diff)",
+    log("acme-diff-preview starting (Deployment mode, helm-template diff)",
         argocd_server=ARGOCD_SERVER, argocd_user=ARGOCD_USER,
         bb_repo=BB_REPO, diff_workers=DIFF_WORKERS, pr_workers=MAX_PR_WORKERS,
         max_apps_per_run=MAX_APPS_PER_RUN, diff_timeout=DIFF_TIMEOUT,
         diff_retries=DIFF_RETRIES, warm_workers=WARM_WORKERS,
-        log_level=LOG_LEVEL, vertex_model=VERTEX_MODEL)
+        kube_version=KUBE_VERSION, log_level=LOG_LEVEL, vertex_model=VERTEX_MODEL)
+
+    # Self-check: the entire diff engine depends on an OCI pull, which needs
+    # OCI_PASS. Without it _helm_login fails and EVERY diff returns "diff
+    # unavailable". Fail loudly at startup instead of silently degrading.
+    if not OCI_PASS:
+        log("OCI_PASS is empty — helm OCI pulls will fail and every diff will be "
+            "unavailable. Set secrets.ociPassKey/ociUserKey in the chart values.",
+            "ERROR")
+    else:
+        log(f"OCI credentials present (user={OCI_USER})")
+
     _start_health_server()
 
     # Initial login — raises on failure so the container restarts immediately.

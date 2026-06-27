@@ -115,132 +115,110 @@ def test_seen_not_cached_on_transient_error():
     )
 
 
-# ── Diff classification (functional) ─────────────────────────────────────────
-# These import the module and call classify_diff_error / argocd_diff helpers
-# directly, so they verify real behaviour rather than source-string presence.
+# ── Diff failure-reason model (functional) ───────────────────────────────────
+# The helm-template engine sets an explicit REASON_* code per failure (no stderr
+# regex). These tests drive argocd_diff with a stubbed _run_one_diff to verify the
+# retry/outcome behaviour for each reason class.
 
-def test_classify_oci_login_is_indeterminate():
-    """OCI 'helm registry login' failure must be indeterminate, NOT no-diff.
+def _fast_no_backoff(mod, monkeypatch_attr=True):
+    """Make retries instant and bounded so functional tests don't sleep."""
+    mod.DIFF_RETRIES = 2
+    mod._diff_backoff = lambda attempt: 0.0
 
-    This is the core bug: a repo-server cache miss + bad OCI credential made the
-    diff fail, but it was reported as a green 'no manifest changes'.
+
+def test_reason_sets_are_coherent():
+    """Reason constants must be partitioned into retryable vs permanent."""
+    mod = _import_module()
+    assert mod.REASON_OCI_NOT_FOUND in mod.PERMANENT_REASONS
+    assert mod.REASON_OCI_NOT_FOUND not in mod.RETRYABLE_REASONS
+    for r in (mod.REASON_OCI_PULL, mod.REASON_METADATA, mod.REASON_TIMEOUT):
+        assert r in mod.RETRYABLE_REASONS
+    # render_failed is a soft (non-retryable, non-permanent) indeterminate.
+    assert mod.REASON_RENDER not in mod.RETRYABLE_REASONS
+    assert mod.REASON_RENDER not in mod.PERMANENT_REASONS
+
+
+def test_oci_not_found_is_permanent_indeterminate():
+    """oci_not_found must resolve to INDETERMINATE/oci_not_found with no retry."""
+    mod = _import_module()
+    calls = {"n": 0}
+    def _stub(app, pr_sha, main_sha, chart_revision=None):
+        calls["n"] += 1
+        return None, mod.REASON_OCI_NOT_FOUND, "Chart x:9.9.9 not found in registry"
+    mod._run_one_diff = _stub
+    _fast_no_backoff(mod)
+    res = mod.argocd_diff("env-a-ms", "prsha", "mainsha")
+    assert res.outcome == mod.OUT_INDETERMINATE
+    assert res.reason == mod.REASON_OCI_NOT_FOUND
+    assert calls["n"] == 1, "permanent reason must not be retried"
+
+
+def test_transient_reason_retries_then_indeterminate():
+    """A transient reason is retried up to DIFF_RETRIES then ends INDETERMINATE.
+
+    Critically it must NOT become OUT_ERROR (which would FAIL the PR on a blip).
     """
     mod = _import_module()
-    stderr = ('{"level":"fatal","msg":"rpc error: code = Unknown desc = error '
-              'logging into OCI registry: failed to login to registry: failed '
-              'running helm: `helm registry login helm-oci-dev.repo.appspace.com '
-              '--username ****** --password ******` failed exit status 1: '
-              'response status code 401: : Bad Credentials"}')
-    outcome, reason, _ = mod.classify_diff_error(stderr)
-    assert outcome == mod.OUT_INDETERMINATE
-    assert reason == "oci_login"
+    calls = {"n": 0}
+    def _stub(app, pr_sha, main_sha, chart_revision=None):
+        calls["n"] += 1
+        return None, mod.REASON_OCI_PULL, "helm pull failed"
+    mod._run_one_diff = _stub
+    _fast_no_backoff(mod)
+    res = mod.argocd_diff("env-a-ms", "prsha", "mainsha")
+    assert res.outcome == mod.OUT_INDETERMINATE
+    assert res.reason == mod.REASON_OCI_PULL
+    assert calls["n"] == mod.DIFF_RETRIES, "transient reason must use all attempts"
 
 
-def test_classify_502_getmanifests_is_indeterminate():
-    """A 502 on GetManifests must be indeterminate, NOT silently no-diff."""
+def test_render_failed_is_soft_no_retry():
+    """render_failed is indeterminate but must not be retried (not transient)."""
     mod = _import_module()
-    stderr = ('{"level":"fatal","msg":"rpc error: code = Unknown desc = POST '
-              'https://argocd.appspace.com/application.ApplicationService/'
-              'GetManifests failed with status code 502"}')
-    outcome, reason, _ = mod.classify_diff_error(stderr)
-    assert outcome == mod.OUT_INDETERMINATE
-    assert reason == "manifests_5xx"
+    calls = {"n": 0}
+    def _stub(app, pr_sha, main_sha, chart_revision=None):
+        calls["n"] += 1
+        return None, mod.REASON_RENDER, "Error: execution error: missing value"
+    mod._run_one_diff = _stub
+    _fast_no_backoff(mod)
+    res = mod.argocd_diff("env-a-ms", "prsha", "mainsha")
+    assert res.outcome == mod.OUT_INDETERMINATE
+    assert res.reason == mod.REASON_RENDER
+    assert calls["n"] == 1, "render_failed must not be retried"
 
 
-def test_classify_redis_timeout_vs_managed_no_cache():
-    """Cached-managed-resources error splits into redis_timeout vs managed_no_cache.
-
-    Both are indeterminate (never no-diff): a failed live-state read means the
-    diff is unknown, not 'no changes'.
-    """
+def test_success_path_returns_diff_or_no_diff():
+    """reason=None with diff text -> OUT_DIFF; with empty text -> OUT_NO_DIFF."""
     mod = _import_module()
-    base = "rpc error: error getting cached app managed resources"
-    o1, r1, _ = mod.classify_diff_error(base + ": i/o timeout")
-    assert (o1, r1) == (mod.OUT_INDETERMINATE, "redis_timeout")
-    o2, r2, _ = mod.classify_diff_error(base)
-    assert (o2, r2) == (mod.OUT_INDETERMINATE, "managed_no_cache")
+    _fast_no_backoff(mod)
+
+    mod._run_one_diff = lambda *a, **k: (
+        "===== /Deployment ns/svc ======\n--- \n+++ \n@@ -1 +1 @@\n-image: a\n+image: b\n",
+        None, None)
+    res = mod.argocd_diff("env-a-ms", "prsha", "mainsha")
+    assert res.outcome == mod.OUT_DIFF and res.has_diff
+
+    mod._run_one_diff = lambda *a, **k: ("", None, None)
+    res = mod.argocd_diff("env-a-ms", "prsha", "mainsha")
+    assert res.outcome == mod.OUT_NO_DIFF
 
 
-def test_classify_auth_is_indeterminate():
-    """Expired/invalid session is indeterminate and recognised for re-login."""
-    mod = _import_module()
-    outcome, reason, _ = mod.classify_diff_error("rpc error: invalid session token")
-    assert outcome == mod.OUT_INDETERMINATE
-    assert reason == "auth"
-
-
-def test_classify_managed_mode_patterns_indeterminate():
-    """Server-busy / permission / canceled patterns map to indeterminate.
-
-    These were previously swallowed as silent no-diff. They must now surface as
-    'diff could not be computed' so a failed evaluation is never shown as green.
-    """
-    mod = _import_module()
-    cases = {
-        "the server is not currently accepting requests": "server_unavailable",
-        "error getting server version": "server_unavailable",
-        "rpc error: code = PermissionDenied desc=x": "permission",
-        "context canceled": "canceled",
-    }
-    for stderr, expected_reason in cases.items():
-        outcome, reason, _ = mod.classify_diff_error(stderr)
-        assert outcome == mod.OUT_INDETERMINATE, stderr
-        assert reason == expected_reason, (stderr, reason)
-
-
-def test_classify_unknown_is_error():
-    """Genuinely unrecognised output is a hard error, not indeterminate."""
-    mod = _import_module()
-    outcome, reason, _ = mod.classify_diff_error("totally unexpected boom")
-    assert outcome == mod.OUT_ERROR
-    assert reason == "unknown"
-
-
-def test_no_failure_is_classified_as_no_diff():
-    """Regression guard: no known failure pattern may resolve to OUT_NO_DIFF.
-
-    OUT_NO_DIFF must only come from a clean exit 0. classify_diff_error never
-    returns it — it only returns INDETERMINATE or ERROR.
-    """
-    mod = _import_module()
-    failure_samples = [
-        "error logging into OCI registry",
-        "GetManifests failed with status code 502",
-        "error getting cached app managed resources: i/o timeout",
-        "error getting cached app managed resources",
-        "the server is not currently accepting requests",
-        "permission denied",
-        "invalid session",
-        "random unknown failure",
-    ]
-    for s in failure_samples:
-        outcome, _, _ = mod.classify_diff_error(s)
-        assert outcome != mod.OUT_NO_DIFF, f"{s!r} must never be reported as no-diff"
+def test_classify_diff_error_removed():
+    """The argocd-era stderr classifier and its constants must be gone."""
+    src = _source()
+    assert "def classify_diff_error" not in src, "classify_diff_error must be removed"
+    assert "_RETRYABLE_DIFF_ERRORS" not in src, "stale retryable-stderr list must be removed"
+    assert "_DIFF_ERROR_RULES" not in src, "stale stderr rule table must be removed"
 
 
 # ── Retry and resilience tests ───────────────────────────────────────────────
 
-def test_retryable_diff_errors_defined():
-    """_RETRYABLE_DIFF_ERRORS must cover the known transient spoke-Redis patterns."""
-    src = _source()
-    assert "_RETRYABLE_DIFF_ERRORS" in src, "Missing _RETRYABLE_DIFF_ERRORS constant"
-    for pattern in ("i/o timeout", "connection refused", "context deadline exceeded"):
-        assert pattern in src, f"Retryable pattern missing: {pattern!r}"
-
-
-def test_auth_error_patterns_defined():
-    """_AUTH_ERROR_PATTERNS must cover known JWT expiry messages."""
-    src = _source()
-    assert "_AUTH_ERROR_PATTERNS" in src, "Missing _AUTH_ERROR_PATTERNS constant"
-    for pattern in ("invalid session", "token has expired", "unauthenticated"):
-        assert pattern in src, f"Auth pattern missing: {pattern!r}"
-
-
-def test_async_relogin_function_exists():
-    """_async_relogin must be present for background JWT refresh on auth errors."""
-    src = _source()
-    assert "def _async_relogin" in src, "Missing _async_relogin helper"
-    assert "argocd_login()" in src, "_async_relogin must call argocd_login()"
+def test_retryable_reasons_defined():
+    """RETRYABLE_REASONS must hold the transient helm-path reasons (and not permanent)."""
+    mod = _import_module()
+    assert mod.REASON_OCI_PULL in mod.RETRYABLE_REASONS
+    assert mod.REASON_METADATA in mod.RETRYABLE_REASONS
+    assert mod.REASON_TIMEOUT in mod.RETRYABLE_REASONS
+    assert mod.REASON_OCI_NOT_FOUND not in mod.RETRYABLE_REASONS
 
 
 def test_diff_timeout_configurable():
@@ -284,23 +262,6 @@ def test_retry_loop_with_backoff():
     )
     assert "def _diff_backoff(" in src, "Missing exponential backoff helper"
     assert "random.uniform" in src, "Backoff must add jitter (random.uniform)"
-
-
-def test_manifests_5xx_is_retryable():
-    """Burst 5xx / agent gRPC blips must be retried in-process, not surfaced raw.
-
-    Before this change 'code = Unknown desc = POST' (the gRPC symptom of a
-    mass-bump repo-server overload) was not in _RETRYABLE_DIFF_ERRORS, so it was
-    reported as indeterminate on the first try instead of being retried.
-    """
-    src = _source()
-    start = src.index("_RETRYABLE_DIFF_ERRORS = (")
-    end   = src.index(")", start)
-    block = src[start:end]
-    for needle in ("code = Unknown desc = POST",
-                   "GetManifests failed with status code 5",
-                   "error getting cached app managed resources"):
-        assert needle in block, f"5xx/burst pattern missing from retryable: {needle!r}"
 
 
 def test_cache_warm_selection():
@@ -355,21 +316,6 @@ def test_chart_revision_detection():
     )
     assert "_ensure_chart" in src and "pr_rev" in src, (
         "_run_one_diff must pull the PR chart version (pr_rev) from OCI"
-    )
-
-
-def test_interleave_by_agent():
-    """_interleave_by_agent round-robins apps across agents, dropping none."""
-    mod = _import_module()
-    mod._app_agent_map = {
-        "a1": "agentA", "a2": "agentA", "a3": "agentA",
-        "b1": "agentB", "b2": "agentB",
-    }
-    order = mod._interleave_by_agent(["a1", "a2", "a3", "b1", "b2"])
-    assert set(order) == {"a1", "a2", "a3", "b1", "b2"}, "no app dropped/duplicated"
-    # First two must be from different agents (spread, not piled on agentA).
-    assert mod._app_agent_map[order[0]] != mod._app_agent_map[order[1]], (
-        "interleave must alternate agents, not group them"
     )
 
 
@@ -637,22 +583,35 @@ def test_helm_diff_architecture():
     assert "OCI_PASS" in src, "OCI_PASS env var not wired"
 
 
-def test_oci_not_found_error_classification():
-    """OCI chart version not found must surface as oci_not_found, not a generic error."""
+def test_ensure_chart_raises_on_missing_version():
+    """_ensure_chart must raise OciChartNotFound when the registry returns 404.
+
+    This is what surfaces as the permanent oci_not_found reason.
+    """
     mod = _import_module()
-    for pattern in ("not found in", "chart not found",
-                    "unexpected status code: 404", "does not exist in oci registry"):
-        outcome, reason, detail = mod.classify_diff_error(pattern)
-        assert reason == "oci_not_found", (
-            f"Pattern {pattern!r} should map to oci_not_found, got {reason}")
-        assert outcome == mod.OUT_INDETERMINATE
+    import subprocess as _sp
+
+    class _R:
+        returncode = 1
+        stdout = ""
+        stderr = "Error: chart not found: unexpected status code: 404"
+
+    mod._helm_logged_in.add("reg.example.com")          # skip real login
+    orig_run = _sp.run
+    _sp.run = lambda *a, **k: _R()
+    try:
+        import pytest
+        with pytest.raises(mod.OciChartNotFound):
+            mod._ensure_chart("reg.example.com", "some-chart", "9.9.9-missing")
+    finally:
+        _sp.run = orig_run
 
 
 def test_oci_not_found_is_not_retried():
-    """OciChartNotFound must not be retried (it is permanent, not transient)."""
+    """The permanent reason must be caught before the retry loop."""
     src = _source()
-    assert 'reason == "oci_not_found"' in src, (
-        "oci_not_found must be caught before the retry loop to avoid wasting retries"
+    assert "reason in PERMANENT_REASONS" in src, (
+        "oci_not_found (PERMANENT_REASONS) must short-circuit the retry loop"
     )
 
 
@@ -788,4 +747,125 @@ def test_ai_prompt_sre_format():
     assert "CRITICAL CHANGES" in src, "AI prompt must have critical changes section"
     assert "Version downgrade" in src or "downgrade" in src, (
         "AI prompt must instruct model to flag version downgrades"
+    )
+
+
+# ── appspace.version detection (scoped, not first version:) ──────────────────
+
+def test_extract_chart_version_scoped_to_appspace():
+    """_extract_chart_version must return ONLY the direct appspace.version child,
+    ignoring decoy version: keys at other depths (real-config shape)."""
+    mod = _import_module()
+    content = (
+        "apiextensions:\n"
+        "  version: 0.0.1\n"            # decoy: top-level sibling
+        "appspace:\n"
+        "  region: eu\n"
+        "  version: 2603.1.0-dev\n"     # the real chart targetRevision (direct child)
+        "  elastic:\n"
+        "    version: 8.15.1\n"          # deep decoy: appspace.elastic.version
+    )
+    assert mod._extract_chart_version(content) == "2603.1.0-dev"
+
+
+def test_extract_chart_version_ignores_deep_version_when_no_direct_child():
+    """A config with only a deep appspace.elastic.version (no appspace.version)
+    must return None — never the unrelated elastic version (this was the bug)."""
+    mod = _import_module()
+    content = (
+        "appspace:\n"
+        "  elastic:\n"
+        "    version: 8.15.1\n"
+    )
+    assert mod._extract_chart_version(content) is None
+
+
+def test_extract_chart_version_quoted_and_absent():
+    mod = _import_module()
+    assert mod._extract_chart_version("appspace:\n  version: '2603.1.0-dev'\n") == "2603.1.0-dev"
+    assert mod._extract_chart_version("foo: bar\nbaz: qux\n") is None
+
+
+# ── Noise filter works on difflib unified-diff output ────────────────────────
+
+def test_checksum_only_section_difflib_format():
+    """A unified-diff section that only flips a checksum annotation is noise."""
+    mod = _import_module()
+    body = (
+        "--- \n"
+        "+++ \n"
+        "@@ -3,3 +3,3 @@\n"
+        "     annotations:\n"
+        "-      checksum/config: aaaaaaaa\n"
+        "+      checksum/config: bbbbbbbb\n"
+    )
+    assert mod._is_checksum_only_section(body) is True
+
+
+def test_real_change_not_treated_as_noise():
+    """A genuine image change in unified-diff form must NOT be filtered as noise."""
+    mod = _import_module()
+    body = (
+        "--- \n"
+        "+++ \n"
+        "@@ -5,3 +5,3 @@\n"
+        "-        image: app:1.0.0\n"
+        "+        image: app:2.0.0\n"
+    )
+    assert mod._is_checksum_only_section(body) is False
+
+
+# ── Bitbucket fetch status + safe caching ────────────────────────────────────
+
+def test_bb_fetch_status_constants():
+    """Distinct OK / NOT_FOUND / ERROR statuses must exist so only definitive
+    results are cached (transient errors must never poison the value cache)."""
+    mod = _import_module()
+    assert mod.BB_OK and mod.BB_NOT_FOUND and mod.BB_ERROR
+    src = _source()
+    assert "if status in (BB_OK, BB_NOT_FOUND):" in src, (
+        "value cache must store only OK / NOT_FOUND, never transient BB_ERROR"
+    )
+    assert "def _bb_fetch_status" in src
+
+
+# ── helm --kube-version, OCI startup self-check, cache eviction ──────────────
+
+def test_kube_version_passed_to_helm_template():
+    mod = _import_module()
+    src = _source()
+    assert 'KUBE_VERSION    = os.environ.get("KUBE_VERSION"' in src
+    assert '"--kube-version", KUBE_VERSION' in src, (
+        "helm template must pin --kube-version for capability-stable renders"
+    )
+
+
+def test_oci_pass_startup_self_check():
+    """main() must loudly flag an empty OCI_PASS (otherwise every diff is unavailable)."""
+    src = _source()
+    assert "OCI_PASS is empty" in src, "startup must log an ERROR when OCI_PASS is unset"
+
+
+def test_helm_cache_pruning_exists():
+    """The on-disk chart cache must be bounded and pruned each iteration."""
+    src = _source()
+    assert "def _prune_helm_cache" in src, "missing on-disk chart cache prune"
+    assert "_prune_helm_cache()" in src, "prune must be called from the loop"
+    assert "HELM_CACHE_MAX_CHARTS" in src
+    assert "def _bound_vf_cache" in src, "value-file cache must be bounded too"
+
+
+def test_dead_agent_era_code_removed():
+    """Agent-era machinery must be fully gone (it no longer runs in the helm path)."""
+    src = _source()
+    for symbol in ("AGENT_MAX_CONCURRENCY", "_interleave_by_agent",
+                   "_app_agent_map", "_agent_semaphore", "_async_relogin"):
+        assert symbol not in src, f"dead agent-era symbol still present: {symbol}"
+
+
+def test_no_per_pr_vf_cache_clear():
+    """The cross-PR _vf_cache.clear() must be gone (it thrashed concurrent PRs)."""
+    src = _source()
+    assert "_vf_cache.clear()" not in src, (
+        "value cache must not be cleared per PR (keys are immutable shas)"
     )

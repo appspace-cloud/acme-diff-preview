@@ -7,45 +7,40 @@ fullnameOverride: "acme-diff-preview"
 
 image:
   repository: us-central1-docker.pkg.dev/appspace-devops/artifact/acme-diff-preview
-  tag: "1.8.3"
+  tag: "1.9.0"
   pullPolicy: IfNotPresent
 
 # Log verbosity for the diff-preview service. Set to DEBUG to emit the full
-# ArgoCD stderr and per-attempt diff classification (useful when diffs come
-# back "unavailable" and you need to see why).
+# per-step diff detail (useful when diffs come back "unavailable").
 logLevel: INFO
 
-# Diff engine tuning. Defaults are sized for a single PR that diffs hundreds of
-# apps at once (a chart version bump rolled out to many clusters). Leave unset to
-# use the in-code defaults; override here only to tune for a specific load.
+# Kubernetes version helm renders against (--kube-version). Both the main and PR
+# renders use this same value, so charts that branch on .Capabilities.KubeVersion
+# produce stable, cluster-representative output.
+kubeVersion: "1.30.0"
+
+# Diff engine tuning. The diff is a pure local `helm pull` + `helm template` +
+# Python YAML diff (no ArgoCD agent round-trips), so the client can fan out wide;
+# the only shared limit is the Bitbucket API used to fetch value files. Defaults
+# are sized for a single PR that diffs hundreds of apps at once (a chart version
+# bump rolled out to many clusters). Override only to tune for a specific load.
 diff:
-  # Hard cap on apps diffed per PR (was 30; raised to cover 600+ apps/PR).
+  # Hard cap on apps diffed per PR (covers 600+ apps/PR with headroom).
   maxAppsPerRun: 800
-  # Parallel `argocd app diff` calls within one PR.
+  # Parallel per-app helm-template diffs within one PR.
   workers: 16
-  # Parallel PR processing workers (effective subprocess pool = prWorkers * workers).
+  # Parallel PR processing workers.
   prWorkers: 3
-  # Seconds per diff attempt (OCI cache-miss renders can exceed a minute).
+  # Seconds per diff step (OCI cache-miss pulls can be slow on the first render).
   timeout: 120
-  # Retry attempts per diff with exponential backoff + jitter on transient errors.
-  # 5 attempts absorb the occasional late resource-proxy response on a single app.
+  # Retry attempts per diff with exponential backoff + jitter on transient errors
+  # (transient OCI pull failures, discovery-cache misses, timeouts).
   retries: 5
-  # Parallel chart-cache warm-up diffs (one representative per distinct OCI chart
-  # is diffed first to warm the repo-server cache before the big fan-out).
+  # Parallel chart-cache warm-up pulls (one representative per distinct OCI chart
+  # is pulled first so the fan-out reuses the local tarball).
   warmWorkers: 4
   # Only warm when a PR fans out to more apps than this.
   warmThreshold: 8
-  # Max concurrent diffs per agent / spoke cluster. All apps on one spoke share a
-  # single argocd-agent and the principal resource-proxy connection to it. A single
-  # `argocd app diff` of a large app (hundreds of resources) fans out into hundreds
-  # of live-resource requests to that one agent; running several diffs at once on
-  # the same spoke overruns the agent's response window and the principal drops the
-  # late responses ("resource response not tracked"), which surfaces as redis_timeout.
-  # Serializing per agent (1) and parallelizing ACROSS agents (workers) keeps every
-  # request inside the proxy window while total throughput still scales with the
-  # number of spokes. Validated on a 24-app mass bump: 1 -> 26/27 clean, 0 principal
-  # panics; 3 -> 11 failures + channel-close panics.
-  agentMaxConcurrency: 1
 
 # ArgoCD server (hub cluster ingress)
 argocd:
@@ -72,6 +67,12 @@ secrets:
   argocdPassKey: argocd-diff-preview-admin-pass
   # GCP SM secret name for the JFrog webhook HMAC shared secret
   jfrogWebhookSecretKey: argocd-jfrog-webhook-shared-secret
+  # OCI registry credentials for the helm-template diff (both helm-oci-dev and
+  # helm-oci-release use the same pair). REQUIRED: without OCI_PASS every diff
+  # returns "diff unavailable" because the chart pull fails. The pod logs an
+  # ERROR at startup if OCI_PASS is empty.
+  ociUserKey: acme-repo-username
+  ociPassKey: acme-repo-password
 
 # Webhook endpoint exposed via the ArgoCD Ingress extraPaths
 webhook:
