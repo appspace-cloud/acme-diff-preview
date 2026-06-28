@@ -1406,10 +1406,10 @@ def _render_new_env_diff(env_info: dict, pr_sha: str) -> tuple:
     # 1. Fetch config to get appspace.version
     raw_config, status = _bb_fetch_status(config_file, pr_sha)
     if status != BB_OK or not raw_config:
-        return None, f"could not fetch {config_file} from Bitbucket"
+        return None, f"could not fetch {config_file} from Bitbucket", 0, None
     version = _extract_chart_version(raw_config)
     if not version:
-        return None, "no appspace.version found in config file"
+        return None, "no appspace.version found in config file", 0, None
 
     # 2. Determine registry and chart name
     registry   = (_app_chart_registry_map.get(next(iter(_app_chart_registry_map), None))
@@ -1426,12 +1426,12 @@ def _render_new_env_diff(env_info: dict, pr_sha: str) -> tuple:
     try:
         chart_path = _ensure_chart(registry, chart_name, version)
     except OciChartNotFound as e:
-        return None, f"chart not found in OCI: {str(e)[:120]}"
+        return None, f"chart not found in OCI: {str(e)[:120]}", 0, version
     except Exception as e:
-        return None, f"chart pull failed: {str(e)[:120]}"
+        return None, f"chart pull failed: {str(e)[:120]}", 0, version
 
     if not chart_path:
-        return None, "chart pull returned None (registry login may have failed)"
+        return None, "chart pull returned None (registry login may have failed)", 0, version
 
     # 4. Gather value files from the new env dir (files found in changed_files)
     value_files_prefixed = sorted(set(
@@ -1444,13 +1444,13 @@ def _render_new_env_diff(env_info: dict, pr_sha: str) -> tuple:
     # 5. Fetch value file contents
     vals = _fetch_value_files(value_files_prefixed, pr_sha)
     if not vals:
-        return None, "could not fetch value files from Bitbucket"
+        return None, "could not fetch value files from Bitbucket", 0, version
 
     # 6. Render with helm template
     namespace = env_name
     rendered, err = _helm_template(chart_path, env_name, namespace, vals)
     if err or not rendered:
-        return None, f"helm template failed: {(err or 'no output')[:120]}"
+        return None, f"helm template failed: {(err or 'no output')[:120]}", 0, version
 
     # 7. Format all resources as additions (entirely new — no prior state)
     diff_lines = []
@@ -1460,7 +1460,7 @@ def _render_new_env_diff(env_info: dict, pr_sha: str) -> tuple:
     diff_text = "\n".join(diff_lines)
     # Count distinct resource kinds/names for summary
     resource_count = rendered.count("\nkind: ") + (1 if rendered.startswith("kind: ") else 0)
-    return diff_text, None, resource_count
+    return diff_text, None, resource_count, version
 
 
 def _pr_chart_revision(app, changed_files, pr_sha):
@@ -2481,17 +2481,20 @@ def process_pr(pr, path_map, base_sha=""):
                 any_render_ok = False
                 for env_info in new_env_candidates:
                     render_result = _render_new_env_diff(env_info, pr_sha)
-                    # _render_new_env_diff returns (diff_text, error) or (diff_text, error, n_res)
-                    diff_text, render_err = render_result[0], render_result[1]
-                    n_res = render_result[2] if len(render_result) > 2 else 0
+                    # Returns (diff_text, error [, n_res [, version]])
+                    diff_text  = render_result[0]
+                    render_err = render_result[1]
+                    n_res      = render_result[2] if len(render_result) > 2 else 0
+                    detected_version = render_result[3] if len(render_result) > 3 else None
                     env_name = env_info["name"]
+                    display_version = detected_version or env_info.get("version", "unknown")
                     if diff_text:
                         any_render_ok = True
                         log(f"  new env {env_name}: rendered {n_res} resource(s)")
                         diff_preview_text = diff_text[:30_000] + ("\n...(truncated)" if len(diff_text) > 30_000 else "")
                         new_env_sections.append({
                             "name":    env_name,
-                            "version": env_info.get("version", "unknown"),
+                            "version": display_version,
                             "files":   env_info["all_yaml_files"],
                             "n_res":   n_res,
                             "diff":    diff_preview_text,
@@ -2501,7 +2504,7 @@ def process_pr(pr, path_map, base_sha=""):
                         log(f"  new env {env_name}: render failed - {render_err}", "WARNING")
                         new_env_sections.append({
                             "name":    env_name,
-                            "version": env_info.get("version", "unknown"),
+                            "version": display_version,
                             "files":   env_info["all_yaml_files"],
                             "n_res":   0,
                             "diff":    None,
