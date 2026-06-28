@@ -75,10 +75,7 @@ spec:
             - name: WARM_WORKERS
               value: {{ .warmWorkers | quote }}
             {{- end }}
-            {{- if .warmThreshold }}
-            - name: WARM_THRESHOLD
-              value: {{ .warmThreshold | quote }}
-            {{- end }}
+            {{- /* warmThreshold removed — no effect after warm-diff pass was replaced by pre-pull */ -}}
             {{- end }}
           envFrom:
             - secretRef:

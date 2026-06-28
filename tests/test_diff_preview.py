@@ -135,10 +135,9 @@ def test_reason_sets_are_coherent():
     mod = _import_module()
     assert mod.REASON_OCI_NOT_FOUND in mod.PERMANENT_REASONS
     assert mod.REASON_OCI_NOT_FOUND not in mod.RETRYABLE_REASONS
-    for r in (mod.REASON_OCI_PULL, mod.REASON_METADATA, mod.REASON_TIMEOUT):
+    for r in (mod.REASON_OCI_PULL, mod.REASON_METADATA, mod.REASON_TIMEOUT, mod.REASON_RENDER):
         assert r in mod.RETRYABLE_REASONS
-    # render_failed is a soft (non-retryable, non-permanent) indeterminate.
-    assert mod.REASON_RENDER not in mod.RETRYABLE_REASONS
+    # render_failed is retried once (brief subprocess glitch may recover).
     assert mod.REASON_RENDER not in mod.PERMANENT_REASONS
 
 
@@ -175,8 +174,8 @@ def test_transient_reason_retries_then_indeterminate():
     assert calls["n"] == mod.DIFF_RETRIES, "transient reason must use all attempts"
 
 
-def test_render_failed_is_soft_no_retry():
-    """render_failed is indeterminate but must not be retried (not transient)."""
+def test_render_failed_is_retried_once():
+    """render_failed is retried once — a brief subprocess glitch may recover."""
     mod = _import_module()
     calls = {"n": 0}
     def _stub(app, pr_sha, main_sha, chart_revision=None, **_kw):
@@ -184,10 +183,11 @@ def test_render_failed_is_soft_no_retry():
         return None, mod.REASON_RENDER, "Error: execution error: missing value"
     mod._run_one_diff = _stub
     _fast_no_backoff(mod)
+    mod.DIFF_RETRIES = 2
     res = mod.argocd_diff("env-a-ms", "prsha", "mainsha")
     assert res.outcome == mod.OUT_INDETERMINATE
     assert res.reason == mod.REASON_RENDER
-    assert calls["n"] == 1, "render_failed must not be retried"
+    assert calls["n"] == mod.DIFF_RETRIES, "render_failed must use all retries"
 
 
 def test_success_path_returns_diff_or_no_diff():

@@ -140,10 +140,26 @@ _diff_stats_lock: threading.Lock = threading.Lock()
 # In-memory SHA dedup: avoids reprocessing same PR SHA within this pod run
 _seen: dict    = {}
 _shutdown: bool = False   # set True by SIGTERM handler
-_last_ok: float = time.monotonic()  # updated after each successful iteration
 _ready: bool    = False   # set True after first successful argocd_login()
 _wake           = threading.Event()  # set by POST /diff-preview/webhook
 _seen_lock      = threading.Lock()   # guards _seen for concurrent PR processing
+
+# ── Health tracking ───────────────────────────────────────────────────────────
+# _last_ok: updated by a background heartbeat thread while the main loop runs.
+# This decouples liveness from iteration duration — a long 800-app PR is healthy
+# while running, not just when it finishes. Updated every 30s while iterating.
+_last_ok: float       = time.monotonic()
+_last_ok_lock         = threading.Lock()
+# _last_poll_ok: set True only when PR polling (get_open_prs + base SHA fetch)
+# succeeds. If Bitbucket is down, _last_ok stays green but /healthz exposes the
+# poll failure so alerts can distinguish "busy processing" from "broken loop".
+_last_poll_ok: bool   = True
+_consecutive_poll_fails: int = 0
+POLL_FAIL_THRESHOLD   = int(os.environ.get("POLL_FAIL_THRESHOLD", "3"))
+# _ready tracks whether the service is operationally ready: cleared when OCI
+# creds are missing or repeated login failures make the diff engine broken.
+_consecutive_login_fails: int = 0
+LOGIN_FAIL_THRESHOLD  = int(os.environ.get("LOGIN_FAIL_THRESHOLD", "3"))
 
 # Max parallel PR processing workers. Each worker fans out up to DIFF_WORKERS
 # per-app helm-template diffs internally, so the effective worker pool is
@@ -239,19 +255,35 @@ class _HealthHandler(BaseHTTPRequestHandler):
             self.wfile.write(data)
 
         elif self.path == "/healthz":
-            # Healthy if the main loop completed successfully within 5 min.
-            age = time.monotonic() - _last_ok
-            ok  = age < 300
+            # Healthy when the heartbeat thread has ticked within 10 minutes.
+            # The heartbeat updates _last_ok every 30s while the main loop runs
+            # so liveness is not tied to individual iteration duration.
+            with _last_ok_lock:
+                age = time.monotonic() - _last_ok
+            alive = age < 600
+            if alive and not _last_poll_ok:
+                msg = f"degraded: poll_fails={_consecutive_poll_fails}".encode()
+            elif alive:
+                msg = b"ok"
+            else:
+                msg = f"stale: last heartbeat {age:.0f}s ago".encode()
+            self.send_response(200 if alive else 503)
+            self.end_headers()
+            self.wfile.write(msg)
+
+        elif self.path == "/readyz":
+            # Ready when login succeeded, OCI creds present, and poll is working.
+            ok = (_ready
+                  and bool(OCI_PASS)
+                  and _consecutive_login_fails < LOGIN_FAIL_THRESHOLD)
+            if not ok:
+                reason = (b"oci_missing " if not OCI_PASS else b"") + \
+                         (f"login_fails={_consecutive_login_fails}".encode()
+                          if _consecutive_login_fails >= LOGIN_FAIL_THRESHOLD else b"") + \
+                         (b"not_started" if not _ready else b"")
             self.send_response(200 if ok else 503)
             self.end_headers()
-            self.wfile.write(
-                b"ok" if ok else f"stale: last success {age:.0f}s ago".encode()
-            )
-        elif self.path == "/readyz":
-            # Ready once argocd_login() has succeeded at startup.
-            self.send_response(200 if _ready else 503)
-            self.end_headers()
-            self.wfile.write(b"ready" if _ready else b"not ready")
+            self.wfile.write(b"ready" if ok else reason.strip())
         else:
             self.send_response(404)
             self.end_headers()
@@ -452,6 +484,23 @@ def _jfrog_hard_refresh(chart_name: str, chart_version: str) -> None:
     log(f"JFrog webhook: done — {ok} refreshed, {failed} failed")
 
 
+def _start_heartbeat() -> None:
+    """Tick _last_ok every 30s while the pod is alive.
+
+    Decouples liveness from iteration duration — a long 800-app PR stays healthy
+    while running instead of triggering a restart after 5 minutes.
+    """
+    def _beat():
+        global _last_ok
+        while not _shutdown:
+            with _last_ok_lock:
+                _last_ok = time.monotonic()
+            time.sleep(30)
+    t = threading.Thread(target=_beat, daemon=True, name="heartbeat")
+    t.start()
+    log("Heartbeat thread started (tick every 30s, liveness threshold 10 min)")
+
+
 def _start_health_server(port: int = 8080) -> ThreadingHTTPServer:
     """Start the health server in a daemon thread and handle webhook POSTs.
 
@@ -501,10 +550,9 @@ def http(method, url, body=None, headers=None, auth=None):
             with urllib.request.urlopen(req, context=_ssl, timeout=60) as r:
                 return json.loads(r.read())
         except urllib.error.HTTPError as e:
-            if e.code in (429, 503) and attempt < 2:
+            if e.code in (429, 500, 502, 503, 504) and attempt < 2:
                 wait = 2 ** attempt
-                print(f"    [http] {e.code} - retry {attempt+1}/2 in {wait}s",
-                      file=sys.stderr)
+                log(f"[http] {e.code} on {method} — retry {attempt+1}/2 in {wait}s", "WARNING")
                 time.sleep(wait)
                 last_exc = e
                 continue
@@ -512,8 +560,7 @@ def http(method, url, body=None, headers=None, auth=None):
         except (OSError, urllib.error.URLError) as e:
             if attempt < 2:
                 wait = 2 ** attempt
-                print(f"    [http] network error - retry {attempt+1}/2 in {wait}s",
-                      file=sys.stderr)
+                log(f"[http] network error on {method} — retry {attempt+1}/2 in {wait}s", "WARNING")
                 time.sleep(wait)
                 last_exc = e
                 continue
@@ -538,20 +585,20 @@ def discover_path_app_map():
            _app_chart_map, _app_chart_revision_map, _app_chart_registry_map, \
            _app_value_files_map, _app_namespace_map
     if _path_map_cache and (time.monotonic() - _path_map_ts) < PATH_MAP_TTL:
-        # Invalidate if either the number of path keys OR the total app-reference
-        # count has changed (a new app under an existing path changes app count
-        # without changing key count, so key count alone is insufficient).
-        current_app_count = sum(len(v) for v in _path_map_cache.values())
-        if (len(_path_map_cache) == _path_map_count
-                and current_app_count == _path_map_app_count):
-            return _path_map_cache
+        # Within TTL: return cached map. The self-referential app-count comparison
+        # (comparing cache to itself) was removed — it could never detect new apps
+        # added under existing paths between refreshes. Rely purely on TTL.
+        return _path_map_cache
     r = subprocess.run(
         [ARGOCD_BIN, "app", "list", "-o", "json"] + _auth_flags(),
         capture_output=True, text=True, timeout=90)
     if r.returncode != 0:
         raise RuntimeError(f"argocd app list failed: {r.stderr[:200]}")
     try:
-        apps = json.loads(r.stdout)
+        raw = json.loads(r.stdout)
+        # `argocd app list -o json` returns a bare array normally, but may
+        # wrap it in {"items": [...]} depending on the CLI version.
+        apps = raw if isinstance(raw, list) else raw.get("items", raw)
     except json.JSONDecodeError as e:
         raise RuntimeError(f"argocd app list: invalid JSON: {e}")
     path_map = {}
@@ -660,8 +707,19 @@ def _argocd_fetch_token() -> str:
 
 
 def argocd_login():
-    global _ready, _path_map_ts, _path_map_count, _path_map_app_count, _argocd_token
-    _argocd_token = _argocd_fetch_token()
+    global _ready, _path_map_ts, _path_map_count, _path_map_app_count, \
+           _argocd_token, _consecutive_login_fails
+    try:
+        _argocd_token = _argocd_fetch_token()
+    except Exception as e:
+        _consecutive_login_fails += 1
+        log(f"ArgoCD login failed (attempt {_consecutive_login_fails}): {e}", "ERROR")
+        if _consecutive_login_fails >= LOGIN_FAIL_THRESHOLD:
+            _ready = False
+            log(f"ArgoCD login failed {_consecutive_login_fails} times — "
+                f"readiness cleared; pod may be restarted by readiness probe.", "ERROR")
+        raise
+    _consecutive_login_fails = 0
     _path_map_ts        = 0.0  # Invalidate path map cache on re-login.
     _path_map_count     = 0
     _path_map_app_count = 0
@@ -762,7 +820,9 @@ REASON_RENDER        = "render_failed"      # `helm template` failed (bad values
 REASON_TIMEOUT       = "timeout"            # a step exceeded DIFF_TIMEOUT — retry
 
 # Reasons worth retrying in-process with backoff (transient).
-RETRYABLE_REASONS = {REASON_OCI_PULL, REASON_METADATA, REASON_TIMEOUT}
+# REASON_RENDER is retried once — a brief subprocess glitch (node IO, tmp
+# exhaustion) should not produce a permanent "diff unavailable" result.
+RETRYABLE_REASONS = {REASON_OCI_PULL, REASON_METADATA, REASON_TIMEOUT, REASON_RENDER}
 # Reasons that permanently block the PR (the deployer would fail the same way).
 PERMANENT_REASONS = {REASON_OCI_NOT_FOUND}
 
@@ -931,6 +991,10 @@ _vf_inflight_lock   = threading.Lock()
 _main_render_cache: dict = {}
 _main_render_lock        = threading.Lock()
 _main_render_sha: str    = ""   # the main_sha the cache is valid for
+# Cap to prevent memory pressure during long-lived pods with many apps.
+# Each entry holds parsed YAML dicts per resource — can be several hundred KB
+# for a large micro-services chart. 200 entries ≈ a few hundred MB worst case.
+MAIN_RENDER_CACHE_MAX = int(os.environ.get("MAIN_RENDER_CACHE_MAX", "200"))
 
 
 class OciChartNotFound(Exception):
@@ -1070,11 +1134,22 @@ def _ensure_chart(registry: str, chart: str, version: str) -> str:
 
 
 def _find_chart_subdir(chart_dir: str) -> str:
-    """Return the chart directory inside chart_dir (helm --untar creates a subdir)."""
+    """Return the chart directory inside chart_dir (helm --untar creates a subdir).
+
+    Prefers the subdirectory that contains a Chart.yaml to avoid picking an
+    arbitrary one when untaring produces multiple dirs (e.g. chart + dependency).
+    """
     try:
         subdirs = [d for d in os.listdir(chart_dir)
                    if os.path.isdir(os.path.join(chart_dir, d))]
-        return os.path.join(chart_dir, subdirs[0]) if subdirs else chart_dir
+        if not subdirs:
+            return chart_dir
+        # Pick the subdir that contains Chart.yaml (the chart root)
+        for d in subdirs:
+            if os.path.isfile(os.path.join(chart_dir, d, "Chart.yaml")):
+                return os.path.join(chart_dir, d)
+        # Fallback: first subdir (as before)
+        return os.path.join(chart_dir, subdirs[0])
     except OSError:
         return chart_dir
 
@@ -1188,9 +1263,15 @@ def _fetch_value_files(value_files: list, sha: str) -> dict:
                 fetcher = True
 
         if not fetcher:
-            evt.wait(timeout=30)
+            done = evt.wait(timeout=30)
             with _vf_cache_lock:
-                return vf, _vf_cache.get(cache_key)
+                val = _vf_cache.get(cache_key)
+            if not done and val is None:
+                # Fetcher did not complete within 30s (slow Bitbucket). Return
+                # None but do not cache it — the caller treats None as a missing
+                # file which may be correct. Logged so diff stats show the miss.
+                debug(f"Singleflight timeout for ({sha[:8]}, {clean})")
+            return vf, val
 
         # We are the fetcher for this cache key.
         try:
@@ -1451,10 +1532,17 @@ def _run_one_diff(app, pr_sha, main_sha, chart_revision=None, changed_paths=None
 
             main_vals = main_vf_fut.result(timeout=DIFF_TIMEOUT)
 
-            # Build pr_vals: fresh fetch for changed files, reuse main_vals for rest.
-            pr_vals = dict(main_vals)   # start with the main-side values
-            if pr_changed_fut:
-                pr_vals.update(pr_changed_fut.result(timeout=DIFF_TIMEOUT))
+            # Build pr_vals preserving the ORIGINAL order from value_files.
+            # dict.update() would append new keys at the end, breaking -f ordering
+            # for files present in PR but absent in main (new environment files).
+            pr_fresh = pr_changed_fut.result(timeout=DIFF_TIMEOUT) if pr_changed_fut else {}
+            pr_vals = {}
+            for vf in value_files:
+                if vf in pr_fresh:
+                    pr_vals[vf] = pr_fresh[vf]
+                elif vf in main_vals:
+                    pr_vals[vf] = main_vals[vf]
+                # files absent from both sides are silently omitted (404 at both SHAs)
         else:
             # No changed_paths info — fall back to fetching both sides in full.
             pr_vf_fut = pool.submit(_fetch_value_files, value_files, pr_sha)
@@ -1487,6 +1575,11 @@ def _run_one_diff(app, pr_sha, main_sha, chart_revision=None, changed_paths=None
             main_resources = _parse_manifest_resources(main_yaml)
             with _main_render_lock:
                 _main_render_cache[main_cache_key] = main_resources
+                # Evict oldest half when cap exceeded (dict preserves insertion order)
+                if len(_main_render_cache) > MAIN_RENDER_CACHE_MAX:
+                    drop = len(_main_render_cache) - MAIN_RENDER_CACHE_MAX // 2
+                    for k in list(_main_render_cache.keys())[:drop]:
+                        del _main_render_cache[k]
 
     except (subprocess.TimeoutExpired, concurrent.futures.TimeoutError):
         return None, REASON_TIMEOUT, f"render exceeded {DIFF_TIMEOUT}s"
@@ -1615,7 +1708,7 @@ def post_build_status(pr_sha, state, description):
             "description": description[:255],
         })
     except Exception as e:
-        print(f"    [build status] failed to set {state}: {e}", file=sys.stderr)
+        log(f"[build status] failed to set {state}: {e}", "WARNING")
 
 _BB_API_BASE = f"https://api.bitbucket.org/2.0/repositories/{BB_WORKSPACE}/{BB_REPO}"
 _BB_MAX_PAGES = 100   # safety guard: prevents infinite loops on malformed next-links
@@ -1659,8 +1752,11 @@ def find_existing_comment(pr_id):
     while nxt and pages < _BB_MAX_PAGES:
         try:
             data = bb("GET", nxt)
-        except Exception:
-            return None, "", ""
+        except Exception as e:
+            # Transient Bitbucket error: raise so process_pr skips this PR
+            # rather than posting a duplicate comment (new ID, no update in place).
+            debug(f"find_existing_comment page {pages} error: {e}")
+            raise
         for c in data.get("values", []):
             raw = c.get("content", {}).get("raw", "")
             # Match the current marker AND the legacy one so comments written by
@@ -1681,8 +1777,7 @@ def upsert_comment(pr_id, body, existing_id=None):
         body   = body.encode("utf-8")[:cutoff].decode("utf-8", errors="ignore")
         body  += (f"\n\n*... comment truncated ({len(encoded)//1024}KB exceeds limit)"
                    f" - see ArgoCD UI for full diff - {COMMENT_MARKER}*")
-        print(f"    [comment] truncated: {len(encoded)//1024}KB -> "
-              f"{MAX_COMMENT_BYTES//1024}KB", file=sys.stderr)
+        log(f"[comment] truncated: {len(encoded)//1024}KB -> {MAX_COMMENT_BYTES//1024}KB", "WARNING")
     payload = {"content": {"raw": body}}
     try:
         if existing_id:
@@ -1694,12 +1789,12 @@ def upsert_comment(pr_id, body, existing_id=None):
         # original body so the diff is still visible and no error text appears.
         # Using an error message as fallback caused a re-run loop because the
         # error text triggered the "had errors" re-run check in process_pr.
-        print(f"    [comment] upsert failed ({e}); retrying as new POST", file=sys.stderr)
+        log(f"[comment] upsert failed ({e}); retrying as new POST", "WARNING")
         try:
             bb("POST", f"pullrequests/{pr_id}/comments", body=payload)
-            print(f"    [comment] fallback POST succeeded", file=sys.stderr)
+            log("[comment] fallback POST succeeded", "INFO")
         except Exception as e2:
-            print(f"    [comment] fallback POST also failed: {e2}", file=sys.stderr)
+            log(f"[comment] fallback POST also failed: {e2}", "ERROR")
 
 def fix_stuck_inprogress(pr_sha, pr_id, comment_raw):
     """If build status is stuck INPROGRESS but comment is current, fix the status.
@@ -1744,7 +1839,7 @@ def fix_stuck_inprogress(pr_sha, pr_id, comment_raw):
         post_build_status(pr_sha, state, desc)
         print(f"    Fixed stuck INPROGRESS for PR #{pr_id} -> {state}")
     except Exception as e:
-        print(f"    [fix_stuck_inprogress] PR #{pr_id}: {e}", file=sys.stderr)
+        log(f"[fix_stuck_inprogress] PR #{pr_id}: {e}", "WARNING")
 
 # ── Vertex AI (Gemini) summary ─────────────────────────────────────────
 # AI-powered diff summary using Vertex AI Gemini.
@@ -1937,23 +2032,17 @@ def generate_ai_summary(app_results: dict) -> str | None:
               f"tokens in={in_tok} out={out_tok} | "
               f"output={len(ai_text)} chars | elapsed={elapsed}ms")
         if finish == "MAX_TOKENS":
-            print(
-                "      [AI] WARNING: response truncated (MAX_TOKENS) — "
-                "increase maxOutputTokens or shorten prompt",
-                file=sys.stderr,
-            )
+            log("AI response truncated (MAX_TOKENS) — increase maxOutputTokens or shorten prompt",
+                "WARNING")
         return _normalize_ai_markdown(ai_text)
     except Exception as e:
         err_str = str(e)
         if "404" in err_str and "does not have access" in err_str:
-            print(
-                "    [AI summary] Vertex AI Model Garden not enabled. "
-                "Accept Gemini terms: https://console.cloud.google.com/"
-                "vertex-ai/model-garden?project=appspace-devops",
-                file=sys.stderr,
-            )
+            log("Vertex AI Model Garden not enabled. Accept Gemini terms: "
+                "https://console.cloud.google.com/vertex-ai/model-garden?project=appspace-devops",
+                "WARNING")
         else:
-            print(f"    [AI summary] Vertex AI call failed: {e}", file=sys.stderr)
+            log(f"[AI] Vertex AI call failed: {e}", "WARNING")
         return None
 
 # ── Comment format ────────────────────────────────────────────────────
@@ -2144,8 +2233,11 @@ def format_comment(pr_sha, app_results, skipped_apps=None):
         # Distinguish oci_not_found (permanent) from soft indeterminate (transient)
         resolved = [_result(v) for v in app_results.values()]
         indet    = [r for r in resolved if r.outcome == OUT_INDETERMINATE]
-        all_permanent = bool(indet) and all(r.reason in PERMANENT_REASONS for r in indet)
-        _status_token = "permanent" if all_permanent else "transient"
+        # Permanent if ANY app has a permanent reason (e.g. oci_not_found mixed
+        # with transient ones). A mixed PR is still "permanent" for dedup purposes
+        # because the FAILED build status requires human action regardless.
+        has_permanent = any(r.reason in PERMANENT_REASONS for r in indet)
+        _status_token = "permanent" if has_permanent else "transient"
     else:
         _status_token = "clean"
 
@@ -2294,13 +2386,21 @@ def process_pr(pr, path_map, base_sha=""):
             return app, result, elapsed
 
         def process_batch(apps, workers):
-            """Diff a list of apps with a bounded pool, accumulating results."""
+            """Diff a list of apps with a bounded pool, accumulating results.
+
+            Checks _shutdown between futures so SIGTERM drains gracefully instead
+            of waiting for the entire batch to complete before yielding.
+            """
             nonlocal any_hard_error, any_unknown
             if not apps:
                 return
             with ThreadPoolExecutor(max_workers=max(1, min(workers, len(apps)))) as ex:
                 futures = {ex.submit(run_diff, app): app for app in apps}
                 for fut in as_completed(futures):
+                    if _shutdown:
+                        log(f"SIGTERM received mid-batch — draining remaining futures",
+                            "WARNING")
+                        break
                     app, result, elapsed = fut.result()
                     app_results[app] = result
                     outcome_counts[result.outcome] += 1
@@ -2405,6 +2505,13 @@ def process_pr(pr, path_map, base_sha=""):
                     f"{oci_not_found_count} app(s): chart version not found in OCI registry")
             else:
                 post_build_status(pr_sha, "FAILED", "Diff failed - check PR comment")
+        elif skipped_apps:
+            # Apps beyond MAX_APPS_PER_RUN were never evaluated — never post SUCCESSFUL
+            # with a coverage gap, as reviewers assume full coverage.
+            n_skipped = len(skipped_apps)
+            extra = f" | {sections_total} resource(s) changed" if sections_total else ""
+            post_build_status(pr_sha, "FAILED",
+                f"{n_skipped} app(s) not evaluated (cap={MAX_APPS_PER_RUN}){extra} — review comment")
         elif sections_total > 0:
             extra = f" ({n_unknown} unavailable)" if any_unknown else ""
             post_build_status(pr_sha, "SUCCESSFUL",
@@ -2433,7 +2540,7 @@ def process_pr(pr, path_map, base_sha=""):
         return outcome_counts
 
     except Exception as e:
-        print(f"    [ERROR] PR #{pr_id}: {e}", file=sys.stderr)
+        log(f"[ERROR] PR #{pr_id}: {e}", "ERROR")
         try:
             post_build_status(pr_sha, "FAILED", f"Diff error: {str(e)[:200]}")
         except Exception:
@@ -2463,16 +2570,10 @@ def main_iteration():
         path_map = discover_path_app_map()
     except Exception as e:
         log(f"Cannot discover ArgoCD apps: {e}", "ERROR")
-        # Best-effort: mark all main-targeting open PRs as FAILED
-        try:
-            for pr in get_open_prs():
-                if pr.get("destination", {}).get("branch", {}).get("name") == "main":
-                    post_build_status(
-                        pr["source"]["commit"]["hash"],
-                        "FAILED", f"ArgoCD unavailable: {str(e)[:180]}")
-        except Exception:
-            pass
-        # Re-login in case the ArgoCD session expired
+        # Re-login in case the ArgoCD session expired — next iteration will retry.
+        # Do NOT mass-FAILED all open PRs: a brief ArgoCD blip would flood every
+        # PR with spurious FAILED statuses. Leave existing statuses intact and
+        # let the next loop attempt recovery.
         try:
             argocd_login()
         except Exception:
@@ -2497,8 +2598,14 @@ def main_iteration():
             _main_render_sha = base_sha
         prs = get_open_prs()
     except Exception as e:
-        log(f"Bitbucket API error: {e}", "ERROR")
+        global _last_poll_ok, _consecutive_poll_fails
+        _last_poll_ok = False
+        _consecutive_poll_fails += 1
+        log(f"Bitbucket API error (poll_fails={_consecutive_poll_fails}): {e}", "ERROR")
         return
+    # Mark poll as healthy after successful fetch (outside try so it only runs on success)
+    _last_poll_ok = True
+    _consecutive_poll_fails = 0
     log(f"Open PRs: {len(prs)}")
 
     # Evict _seen entries for PRs no longer open. Without this, a PR that
@@ -2564,6 +2671,7 @@ def main():
         log(f"OCI credentials present (user={OCI_USER})")
 
     _start_health_server()
+    _start_heartbeat()    # keep /healthz alive during long PR processing
     _get_subtask_pool()   # warm the shared thread pool before the first iteration
     log(f"Sub-task pool ready ({_SUBTASK_POOL_WORKERS} workers)")
 

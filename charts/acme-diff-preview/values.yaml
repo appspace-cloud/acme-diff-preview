@@ -7,7 +7,7 @@ fullnameOverride: "acme-diff-preview"
 
 image:
   repository: us-central1-docker.pkg.dev/appspace-devops/artifact/acme-diff-preview
-  tag: "2.0.0"
+  tag: "2.1.0"
   pullPolicy: IfNotPresent
 
 # Log verbosity for the diff-preview service. Set to DEBUG to emit the full
@@ -34,13 +34,13 @@ diff:
   # Seconds per diff step (OCI cache-miss pulls can be slow on the first render).
   timeout: 120
   # Retry attempts per diff with exponential backoff + jitter on transient errors
-  # (transient OCI pull failures, discovery-cache misses, timeouts).
+  # (transient OCI pull failures, discovery-cache misses, timeouts, render errors).
   retries: 5
   # Parallel chart-cache warm-up pulls (one representative per distinct OCI chart
   # is pulled first so the fan-out reuses the local tarball).
   warmWorkers: 4
-  # Only warm when a PR fans out to more apps than this.
-  warmThreshold: 8
+  # warmThreshold was removed — it had no effect after the warm-diff pass was
+  # replaced by the pre-pull phase. Keeping the key here is intentionally omitted.
 
 # ArgoCD server (hub cluster ingress)
 argocd:
@@ -93,9 +93,14 @@ serviceAccount:
 # subprocesses (each ~50-100Mi) plus the warm-up pool during a 600+ app PR.
 resources:
   requests:
+    # CPU: sized for DIFF_WORKERS(16) × PR_WORKERS(3) concurrent helm subprocesses
+    # plus Bitbucket API fan-out. Each helm template call uses <0.1 CPU serially.
     cpu: 500m
     memory: 512Mi
   limits:
+    # CPU limit prevents noisy-neighbor starvation on shared GKE nodes during
+    # 800-app PR bursts. Aligned with 48 concurrent subprocesses × node capacity.
+    cpu: "4"
     memory: 2Gi
 
 # Hard-refresh CronJob — hard-refreshes all dev/QA apps every 2 hours
