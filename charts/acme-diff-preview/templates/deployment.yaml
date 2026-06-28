@@ -22,7 +22,10 @@ spec:
         {{- include "acme-diff-preview.selectorLabels" . | nindent 8 }}
     spec:
       serviceAccountName: {{ include "acme-diff-preview.fullname" . }}
-      terminationGracePeriodSeconds: 60
+      # Grace period must exceed worst-case single-PR duration:
+      # DIFF_TIMEOUT(120s) x DIFF_RETRIES(5) x batch_serialization ≈ 10 min max.
+      # 600s = 10 min; gives SIGTERM handler time to finish in-flight diffs cleanly.
+      terminationGracePeriodSeconds: 600
       securityContext:
         runAsNonRoot: true
         runAsUser: 65534

@@ -272,18 +272,28 @@ class _HealthHandler(BaseHTTPRequestHandler):
             self.wfile.write(msg)
 
         elif self.path == "/readyz":
-            # Ready when login succeeded, OCI creds present, and poll is working.
+            # Ready when login succeeded, OCI creds present, poll is healthy.
+            # Unhealthy readiness removes the pod from the load balancer so stale
+            # or broken diffs don't silently block PRs.
+            poll_ok = _last_poll_ok or (_consecutive_poll_fails < POLL_FAIL_THRESHOLD)
             ok = (_ready
                   and bool(OCI_PASS)
-                  and _consecutive_login_fails < LOGIN_FAIL_THRESHOLD)
+                  and _consecutive_login_fails < LOGIN_FAIL_THRESHOLD
+                  and poll_ok)
             if not ok:
-                reason = (b"oci_missing " if not OCI_PASS else b"") + \
-                         (f"login_fails={_consecutive_login_fails}".encode()
-                          if _consecutive_login_fails >= LOGIN_FAIL_THRESHOLD else b"") + \
-                         (b"not_started" if not _ready else b"")
+                parts = []
+                if not _ready:
+                    parts.append(b"not_started")
+                if not OCI_PASS:
+                    parts.append(b"oci_missing")
+                if _consecutive_login_fails >= LOGIN_FAIL_THRESHOLD:
+                    parts.append(f"login_fails={_consecutive_login_fails}".encode())
+                if not poll_ok:
+                    parts.append(f"poll_fails={_consecutive_poll_fails}".encode())
+                reason = b" ".join(parts)
             self.send_response(200 if ok else 503)
             self.end_headers()
-            self.wfile.write(b"ready" if ok else reason.strip())
+            self.wfile.write(b"ready" if ok else reason)
         else:
             self.send_response(404)
             self.end_headers()
@@ -422,7 +432,8 @@ def _jfrog_hard_refresh(chart_name: str, chart_version: str) -> None:
     r = subprocess.run(
         [ARGOCD_BIN, "app", "list", "--output", "json"]
          + [arg for p in ARGOCD_PROJECTS for arg in ("--project", p)] + _auth_flags(),
-        capture_output=True, text=True, timeout=60)
+        capture_output=True, text=True, timeout=60,
+        env=_argocd_subprocess_env())
 
     if r.returncode != 0:
         log(f"JFrog webhook: app list failed: {r.stderr[:200]}", "ERROR")
@@ -458,7 +469,8 @@ def _jfrog_hard_refresh(chart_name: str, chart_version: str) -> None:
         try:
             r = subprocess.run(
                 [ARGOCD_BIN, "app", "get", app_name, "--hard-refresh"] + _auth_flags(),
-                capture_output=True, text=True, timeout=60)
+                capture_output=True, text=True, timeout=60,
+                env=_argocd_subprocess_env())
             if r.returncode == 0:
                 log(f"  hard-refresh OK: {app_name}")
                 return True
@@ -514,16 +526,21 @@ def _start_health_server(port: int = 8080) -> ThreadingHTTPServer:
     return server
 
 def _auth_flags():
-    """Return ArgoCD CLI flags for auth and transport.
+    """Return ArgoCD CLI flags for transport only (no credentials on argv).
 
-    The JWT token is passed via --auth-token from module memory (not from a
-    shell environment variable or command-line password). Combined with
-    --server it makes every argocd invocation self-contained and credential-safe.
+    The JWT is injected via the ARGOCD_AUTH_TOKEN environment variable in
+    _argocd_subprocess_env(), so it never appears in ps/proc listings.
     """
-    flags = ["--server", ARGOCD_SERVER, "--grpc-web", "--insecure"]
+    return ["--server", ARGOCD_SERVER, "--grpc-web", "--insecure"]
+
+
+def _argocd_subprocess_env() -> dict:
+    """Return an env dict for ArgoCD subprocesses with the JWT injected as
+    ARGOCD_AUTH_TOKEN so it does not appear on the command line (ps safe)."""
+    env = os.environ.copy()
     if _argocd_token:
-        flags += ["--auth-token", _argocd_token]
-    return flags
+        env["ARGOCD_AUTH_TOKEN"] = _argocd_token
+    return env
 
 def _ts():
     return datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
@@ -591,7 +608,8 @@ def discover_path_app_map():
         return _path_map_cache
     r = subprocess.run(
         [ARGOCD_BIN, "app", "list", "-o", "json"] + _auth_flags(),
-        capture_output=True, text=True, timeout=90)
+        capture_output=True, text=True, timeout=90,
+        env=_argocd_subprocess_env())
     if r.returncode != 0:
         raise RuntimeError(f"argocd app list failed: {r.stderr[:200]}")
     try:
@@ -689,6 +707,10 @@ def get_affected_apps(changed_files, path_map):
 # in the process argv because it is stored in module memory, not in a shell
 # environment variable that could be inherited by unrelated processes.
 _argocd_token: str = ""
+_argocd_token_ts: float = 0.0   # monotonic time of last successful token fetch
+# Proactively refresh the JWT every ARGOCD_TOKEN_TTL seconds so it never expires
+# mid-iteration. ArgoCD default JWT lifetime is 24h; refresh at 12h leaves margin.
+ARGOCD_TOKEN_TTL = int(os.environ.get("ARGOCD_TOKEN_TTL", str(12 * 3600)))
 
 
 def _argocd_fetch_token() -> str:
@@ -708,7 +730,7 @@ def _argocd_fetch_token() -> str:
 
 def argocd_login():
     global _ready, _path_map_ts, _path_map_count, _path_map_app_count, \
-           _argocd_token, _consecutive_login_fails
+           _argocd_token, _argocd_token_ts, _consecutive_login_fails
     try:
         _argocd_token = _argocd_fetch_token()
     except Exception as e:
@@ -720,6 +742,7 @@ def argocd_login():
                 f"readiness cleared; pod may be restarted by readiness probe.", "ERROR")
         raise
     _consecutive_login_fails = 0
+    _argocd_token_ts    = time.monotonic()
     _path_map_ts        = 0.0  # Invalidate path map cache on re-login.
     _path_map_count     = 0
     _path_map_app_count = 0
@@ -1050,13 +1073,18 @@ def _ensure_chart(registry: str, chart: str, version: str) -> str:
             with _helm_cache_lock:
                 _helm_chart_cache[key] = path
             return path
-        # Dev chart is stale — evict and re-pull below.
-        debug(f"Dev chart cache stale ({version} in {registry}), re-pulling")
+        # Dev chart is stale — evict from memory cache so next caller re-pulls.
+        # Do NOT rmtree here: in-flight helm template calls hold a path reference
+        # into chart_dir and could fail mid-read if we delete it from under them.
+        # _prune_helm_cache() runs at iteration START before any diffs and is the
+        # safe cleanup point (no active readers at that time).
+        debug(f"Dev chart cache stale ({version} in {registry}) — "
+              f"evicting from cache; dir removed on next _prune_helm_cache")
         with _helm_cache_lock:
             _helm_chart_cache.pop(key, None)
         with _helm_pull_locks_lock:
             _helm_pull_locks.pop(key, None)
-        shutil.rmtree(chart_dir, ignore_errors=True)
+        # Fall through to re-pull into a fresh tmp dir (atomic rename below).
 
     if not _helm_login(registry):
         return None
@@ -1537,12 +1565,26 @@ def _run_one_diff(app, pr_sha, main_sha, chart_revision=None, changed_paths=None
             # for files present in PR but absent in main (new environment files).
             pr_fresh = pr_changed_fut.result(timeout=DIFF_TIMEOUT) if pr_changed_fut else {}
             pr_vals = {}
+            # Track which vf paths were changed by this PR (normalized form)
+            changed_vf_set = {
+                posixpath.normpath(vf.replace("$config/", "").lstrip("/"))
+                for vf in pr_changed_vf
+            }
             for vf in value_files:
+                clean_path = posixpath.normpath(vf.replace("$config/", "").lstrip("/"))
                 if vf in pr_fresh:
+                    # Changed file present at pr_sha — use fresh fetch
                     pr_vals[vf] = pr_fresh[vf]
+                elif clean_path in changed_vf_set:
+                    # Changed file returned 404 at pr_sha: the file was deleted or
+                    # moved by this PR. Do NOT fall back to main content — that would
+                    # make helm render as if the file still exists → false no_diff.
+                    # Omit: helm template runs without this -f (reflects deletion).
+                    pass
                 elif vf in main_vals:
+                    # Unchanged file — reuse main sha content safely
                     pr_vals[vf] = main_vals[vf]
-                # files absent from both sides are silently omitted (404 at both SHAs)
+                # Files absent from both sides omitted (new path, 404 everywhere)
         else:
             # No changed_paths info — fall back to fetching both sides in full.
             pr_vf_fut = pool.submit(_fetch_value_files, value_files, pr_sha)
@@ -1739,6 +1781,13 @@ def get_pr_changed_files(pr_id):
         nxt  = data.get("next", "")
         path = nxt.replace(f"{_BB_API_BASE}/", "") if nxt else ""
         pages += 1
+    if pages >= _BB_MAX_PAGES and path:
+        # Page limit hit and more pages exist — affected app list is INCOMPLETE.
+        # Missing changed files → apps appear unaffected → potential false no_diff.
+        log(f"PR #{pr_id}: diffstat page limit ({_BB_MAX_PAGES}) hit with more pages "
+            f"remaining — {len(files)} files captured; PR has >10k changed files. "
+            f"App detection is incomplete for this PR.",
+            "WARNING", pr=pr_id)
     return files
 
 def find_existing_comment(pr_id):
@@ -2464,6 +2513,16 @@ def process_pr(pr, path_map, base_sha=""):
         # diff pass is needed (the old ArgoCD repo-server warm-up no longer applies).
         process_batch(affected, DIFF_WORKERS)
 
+        # If SIGTERM arrived mid-batch, results are incomplete — do NOT post them
+        # as a final comment (could show false green on partial evaluation). Leave
+        # the PR un-seen; it will be re-evaluated on the next pod if one starts.
+        if _shutdown and len(app_results) < len(affected):
+            n_done  = len(app_results)
+            n_total = len(affected)
+            log(f"PR #{pr_id}: SIGTERM mid-diff ({n_done}/{n_total} apps evaluated) "
+                f"— skipping comment/status to avoid false result", "WARNING", pr=pr_id)
+            return  # _seen NOT set → will retry next iteration or pod
+
         # Per-PR breakdown — at a glance, how many apps failed and why.
         breakdown = ", ".join(f"{k}={v}" for k, v in sorted(outcome_counts.items()))
         reasons   = ", ".join(f"{k}={v}" for k, v in sorted(reason_counts.items()))
@@ -2565,6 +2624,17 @@ def main_iteration():
 
     # Trim the on-disk chart cache before any diffs so it never races a pull.
     _prune_helm_cache()
+
+    # Proactively refresh the ArgoCD JWT before it expires so a busy iteration
+    # never hits a mid-run 401. ARGOCD_TOKEN_TTL default=12h (well under the
+    # 24h ArgoCD default); refresh is cheap (~100ms REST call).
+    if _argocd_token and (time.monotonic() - _argocd_token_ts) > ARGOCD_TOKEN_TTL:
+        try:
+            argocd_login()
+            log(f"ArgoCD JWT proactively refreshed (TTL={ARGOCD_TOKEN_TTL}s)")
+        except Exception as e:
+            log(f"Proactive JWT refresh failed: {e} — continuing with existing token",
+                "WARNING")
 
     try:
         path_map = discover_path_app_map()
