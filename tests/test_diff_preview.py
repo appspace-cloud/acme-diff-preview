@@ -915,8 +915,102 @@ def test_no_warm_diff_pass():
 def test_pr_chart_revision_uses_vf_cache():
     """_pr_chart_revision must route file fetches through _vf_cache."""
     src = _source()
-    # _pr_chart_revision should use _bb_fetch_status + _vf_cache, not
-    # calling _bb_fetch_file_at_sha directly (which bypasses the cache).
     assert "_bb_fetch_status(clean, pr_sha)" in src, (
         "_pr_chart_revision must call _bb_fetch_status for cache-routed fetches"
+    )
+
+
+# ── New environment detection (2.3.0) ────────────────────────────────────────
+
+def test_detect_new_env_candidates_basic():
+    """_detect_new_env_candidates must identify new env configs not in path_map."""
+    mod = _import_module()
+    changed = [
+        "gcp/dev/private-cloud/ap1/custom/pv-dev-new-a/customer.yaml",
+        "gcp/dev/private-cloud/ap1/custom/pv-dev-new-a/constellation/cicd-versions.yaml",
+    ]
+    path_map = {}  # empty — no existing apps
+    result = mod._detect_new_env_candidates(changed, path_map)
+    assert len(result) == 1, f"expected 1 new env candidate, got {len(result)}"
+    assert result[0]["name"] == "pv-dev-new-a"
+    assert result[0]["config_file"] == "gcp/dev/private-cloud/ap1/custom/pv-dev-new-a/customer.yaml"
+
+
+def test_detect_new_env_candidates_skips_existing_apps():
+    """_detect_new_env_candidates must not flag config files already in path_map."""
+    mod = _import_module()
+    changed = [
+        "gcp/dev/private-cloud/ap1/custom/pv-dev-03-a/customer.yaml",
+    ]
+    path_map = {
+        "gcp/dev/private-cloud/ap1/custom/pv-dev-03-a/customer.yaml": ["pv-dev-03-a-ms"],
+    }
+    result = mod._detect_new_env_candidates(changed, path_map)
+    assert len(result) == 0, "existing app config must not be flagged as new env"
+
+
+def test_detect_new_env_candidates_non_config_files():
+    """README or non-env files must not trigger new-env detection."""
+    mod = _import_module()
+    changed = ["README.md", "scripts/deploy.sh", "docs/overview.md"]
+    path_map = {}
+    result = mod._detect_new_env_candidates(changed, path_map)
+    assert len(result) == 0, "non-config files must not produce new env candidates"
+
+
+def test_detect_new_env_candidates_multiple_envs():
+    """Multiple new env dirs in one PR must each be detected."""
+    mod = _import_module()
+    changed = [
+        "gcp/qa/public-cloud/ap1/cl-qa-new1-a/config.yaml",
+        "gcp/qa/public-cloud/ap1/cl-qa-new2-a/config.yaml",
+        "gcp/qa/public-cloud/ap1/cl-qa-new1-a/constellation/cicd-versions.yaml",
+    ]
+    path_map = {}
+    result = mod._detect_new_env_candidates(changed, path_map)
+    names = {r["name"] for r in result}
+    assert "cl-qa-new1-a" in names, "cl-qa-new1-a must be detected"
+    assert "cl-qa-new2-a" in names, "cl-qa-new2-a must be detected"
+    # cicd-versions.yaml must be grouped with cl-qa-new1-a all_yaml_files
+    new1 = next(r for r in result if r["name"] == "cl-qa-new1-a")
+    assert any("cicd-versions" in f for f in new1["all_yaml_files"]), (
+        "constellation files must be grouped with their parent env"
+    )
+
+
+def test_detect_new_env_candidates_shallow_paths_ignored():
+    """Paths too shallow to be env-specific (< 5 parts) must be ignored."""
+    mod = _import_module()
+    changed = [
+        "gcp/config.yaml",           # top-level shared config (depth 2)
+        "gcp/dev/config.yaml",       # lifecycle config (depth 3)
+    ]
+    path_map = {}
+    result = mod._detect_new_env_candidates(changed, path_map)
+    assert len(result) == 0, "shallow shared config files must not be flagged as new envs"
+
+
+def test_detect_and_render_new_env_functions_exist():
+    """Both helper functions must exist in the module."""
+    src = _source()
+    assert "_detect_new_env_candidates" in src, "missing _detect_new_env_candidates"
+    assert "_render_new_env_diff" in src, "missing _render_new_env_diff"
+
+
+def test_new_env_detected_in_process_pr():
+    """process_pr must call _detect_new_env_candidates when affected is empty."""
+    src = _source()
+    assert "_detect_new_env_candidates(changed, path_map)" in src, (
+        "process_pr must call _detect_new_env_candidates when no apps are affected"
+    )
+
+
+def test_new_env_build_status_description():
+    """New env comment must include recognisable resource count pattern."""
+    src = _source()
+    assert "resource(s) to create" in src, (
+        "new env comment must include 'resource(s) to create' for build status parsing"
+    )
+    assert "New Environment(s) Detected" in src, (
+        "new env comment must include 'New Environment(s) Detected' header"
     )

@@ -1352,6 +1352,117 @@ def _helm_template(chart_path: str, release: str, namespace: str,
         return r.stdout, None
 
 
+def _detect_new_env_candidates(changed_files: list, path_map: dict) -> list:
+    """Scan changed files for patterns that indicate a brand-new environment.
+
+    A 'new env' is a customer.yaml or config.yaml at env-directory depth that is
+    NOT covered by any existing ArgoCD app in path_map. The caller should only
+    invoke this after confirming get_affected_apps() returned an empty set.
+
+    Returns a list of dicts:
+      {name, config_file, env_dir, all_yaml_files}
+    """
+    candidates = {}
+    path_map_keys = set(path_map.keys())
+    for f in changed_files:
+        parts = f.split("/")
+        # Must be a top-level env config at adequate depth and not already mapped
+        # Pattern: gcp/{lifecycle}/{cloud}/{region}/{tier?}/{env-name}/{file}
+        if len(parts) < 5 or parts[-1] not in ("customer.yaml", "config.yaml"):
+            continue
+        if f in path_map_keys:
+            continue
+        env_dir  = "/".join(parts[:-1])
+        env_name = parts[-2]
+        if env_dir not in candidates:
+            candidates[env_dir] = {
+                "name":          env_name,
+                "config_file":   f,
+                "env_dir":       env_dir,
+                "all_yaml_files": [],
+            }
+    # Collect all YAML files from changed_files that belong to each candidate env
+    for f in changed_files:
+        if not f.endswith((".yaml", ".yml")):
+            continue
+        for env_dir, info in candidates.items():
+            if f.startswith(env_dir + "/") or "/".join(f.split("/")[:-1]) == env_dir:
+                info["all_yaml_files"].append(f)
+    return list(candidates.values())
+
+
+def _render_new_env_diff(env_info: dict, pr_sha: str) -> tuple:
+    """Attempt to render a new environment's chart and return all resources as diff.
+
+    Fetches the config file from Bitbucket, extracts appspace.version, pulls the
+    chart from OCI, and runs helm template with the value files found in changed
+    files for that env directory.
+
+    Returns (diff_text, error_str). diff_text is None on failure.
+    """
+    config_file = env_info["config_file"]
+    env_name    = env_info["name"]
+
+    # 1. Fetch config to get appspace.version
+    raw_config, status = _bb_fetch_status(config_file, pr_sha)
+    if status != BB_OK or not raw_config:
+        return None, f"could not fetch {config_file} from Bitbucket"
+    version = _extract_chart_version(raw_config)
+    if not version:
+        return None, "no appspace.version found in config file"
+
+    # 2. Determine registry and chart name
+    registry   = (_app_chart_registry_map.get(next(iter(_app_chart_registry_map), None))
+                  or "helm-oci-dev.repo.appspace.com")
+    if not ("-dev" in version or "dev" in version):
+        # Release-style version — prefer release registry if we know it
+        for r in _app_chart_registry_map.values():
+            if "release" in r:
+                registry = r
+                break
+    chart_name = next(iter(_app_chart_map.values()), "appspace-micro-services") if _app_chart_map else "appspace-micro-services"
+
+    # 3. Pull chart
+    try:
+        chart_path = _ensure_chart(registry, chart_name, version)
+    except OciChartNotFound as e:
+        return None, f"chart not found in OCI: {str(e)[:120]}"
+    except Exception as e:
+        return None, f"chart pull failed: {str(e)[:120]}"
+
+    if not chart_path:
+        return None, "chart pull returned None (registry login may have failed)"
+
+    # 4. Gather value files from the new env dir (files found in changed_files)
+    value_files_prefixed = sorted(set(
+        f"$config/{f}" for f in env_info["all_yaml_files"]
+        if f.endswith((".yaml", ".yml"))
+    ))
+    if not value_files_prefixed:
+        value_files_prefixed = [f"$config/{config_file}"]
+
+    # 5. Fetch value file contents
+    vals = _fetch_value_files(value_files_prefixed, pr_sha)
+    if not vals:
+        return None, "could not fetch value files from Bitbucket"
+
+    # 6. Render with helm template
+    namespace = env_name
+    rendered, err = _helm_template(chart_path, env_name, namespace, vals)
+    if err or not rendered:
+        return None, f"helm template failed: {(err or 'no output')[:120]}"
+
+    # 7. Format all resources as additions (entirely new — no prior state)
+    diff_lines = []
+    for line in rendered.splitlines():
+        diff_lines.append(f"+{line}" if line else "+")
+
+    diff_text = "\n".join(diff_lines)
+    # Count distinct resource kinds/names for summary
+    resource_count = rendered.count("\nkind: ") + (1 if rendered.startswith("kind: ") else 0)
+    return diff_text, None, resource_count
+
+
 def _pr_chart_revision(app, changed_files, pr_sha):
     """Return the new OCI chart targetRevision for an app if the PR changes it.
 
@@ -1869,6 +1980,12 @@ def fix_stuck_inprogress(pr_sha, pr_id, comment_raw):
                 m = re.search(r"(\d+) resource\(s\) will change", comment_raw)
                 n = m.group(1) if m else "?"
                 state, desc = "SUCCESSFUL", f"{n} resource(s) will change - review comment"
+            elif "New Environment(s) Detected" in comment_raw or "resource(s) to create" in comment_raw:
+                m = re.search(r"~?(\d+) resource\(s\) to create", comment_raw)
+                n = m.group(1) if m else "?"
+                state, desc = "SUCCESSFUL", f"New environment(s) - ~{n} resource(s) to create"
+            elif "No ArgoCD apps affected" in comment_raw:
+                state, desc = "SUCCESSFUL", "No ArgoCD apps affected by this PR"
             else:
                 state, desc = "SUCCESSFUL", "No manifest changes"
         elif _token_m and _token_m.group(1) == "transient":
@@ -2353,9 +2470,88 @@ def process_pr(pr, path_map, base_sha=""):
         print(f"    Changed files: {len(changed)} | Affected apps: {len(affected)}")
 
         if not affected:
-            # No infra apps matched - post SUCCESSFUL so merge gates don't block.
-            # Always write a comment so the reviewer sees a clear explanation,
-            # especially for new-environment PRs where no Application exists yet.
+            # No existing ArgoCD app matched the changed files.
+            # Check if any changed file looks like a new environment being added.
+            new_env_candidates = _detect_new_env_candidates(changed, path_map)
+            if new_env_candidates:
+                log(f"PR #{pr_id}: {len(new_env_candidates)} new env candidate(s): "
+                    f"{[e['name'] for e in new_env_candidates]}", pr=pr_id)
+                post_build_status(pr_sha, "INPROGRESS", "Rendering new environment(s)...")
+                new_env_sections = []
+                any_render_ok = False
+                for env_info in new_env_candidates:
+                    render_result = _render_new_env_diff(env_info, pr_sha)
+                    # _render_new_env_diff returns (diff_text, error) or (diff_text, error, n_res)
+                    diff_text, render_err = render_result[0], render_result[1]
+                    n_res = render_result[2] if len(render_result) > 2 else 0
+                    env_name = env_info["name"]
+                    if diff_text:
+                        any_render_ok = True
+                        log(f"  new env {env_name}: rendered {n_res} resource(s)")
+                        diff_preview_text = diff_text[:30_000] + ("\n...(truncated)" if len(diff_text) > 30_000 else "")
+                        new_env_sections.append({
+                            "name":    env_name,
+                            "version": env_info.get("version", "unknown"),
+                            "files":   env_info["all_yaml_files"],
+                            "n_res":   n_res,
+                            "diff":    diff_preview_text,
+                            "error":   None,
+                        })
+                    else:
+                        log(f"  new env {env_name}: render failed - {render_err}", "WARNING")
+                        new_env_sections.append({
+                            "name":    env_name,
+                            "version": env_info.get("version", "unknown"),
+                            "files":   env_info["all_yaml_files"],
+                            "n_res":   0,
+                            "diff":    None,
+                            "error":   render_err,
+                        })
+
+                lines = [
+                    f"## \U0001f52d {STATUS_NAME}", "",
+                    f"**Commit** `{pr_sha[:8]}` \u2192 `main` | `{BB_REPO}`", "",
+                    f"### \U0001f195 New Environment(s) Detected", "",
+                    f"This PR adds configuration for **{len(new_env_candidates)} new "
+                    f"environment(s)** that do not yet exist in ArgoCD. "
+                    f"The ApplicationSet will create them automatically after merge. "
+                    f"Below is a preview of the resources that will be provisioned.", "",
+                ]
+                for sec in new_env_sections:
+                    lines.append(f"#### `{sec['name']}` (chart `{sec['version']}`)")
+                    lines.append("")
+                    if sec["files"]:
+                        lines.append("**Files added:**")
+                        for f in sorted(sec["files"])[:15]:
+                            lines.append(f"- `{f}`")
+                        if len(sec["files"]) > 15:
+                            lines.append(f"- *... {len(sec['files'])-15} more files*")
+                        lines.append("")
+                    if sec["diff"]:
+                        lines.append(f"**Preview ({sec['n_res']} resource(s) will be created):**")
+                        lines.append("")
+                        lines.append("```diff")
+                        lines.append(sec["diff"])
+                        lines.append("```")
+                    elif sec["error"]:
+                        lines.append(f"\u26a0\ufe0f Could not render preview: {sec['error']}")
+                        lines.append("All resources for this environment will be provisioned from scratch.")
+                    lines.append("")
+
+                total_new = sum(s["n_res"] for s in new_env_sections)
+                desc = f"{len(new_env_candidates)} new environment(s), ~{total_new} resource(s) to create"
+                post_build_status(pr_sha, "SUCCESSFUL", desc)
+                lines += [
+                    "---",
+                    f"**Status:** \u2705 New environment(s) - all resources will be created on merge",
+                    f"*{_ts()} \u2014 {COMMENT_MARKER} [clean]*",
+                ]
+                upsert_comment(pr_id, "\n".join(lines), existing_id)
+                with _seen_lock:
+                    _seen[pr_id] = pr_sha
+                return
+
+            # No apps affected and no new env pattern found.
             print(f"    No ArgoCD apps affected - posting SUCCESSFUL")
             post_build_status(pr_sha, "SUCCESSFUL",
                 "No ArgoCD apps affected by this PR")
@@ -2364,12 +2560,9 @@ def process_pr(pr, path_map, base_sha=""):
                 f"Commit `{pr_sha[:8]}` vs `main` | `{BB_REPO}`\n\n"
                 f"\u2705 **No ArgoCD apps are currently affected by the files "
                 f"changed in this commit.**\n\n"
-                f"If this PR adds configuration for a **new environment** that "
-                f"has not been deployed before, this is expected. ArgoCD does not "
-                f"have an Application for it yet - the ApplicationSet will create "
-                f"one automatically once this PR is merged to `main`. "
-                f"Subsequent PRs for this environment will show a normal diff.\n\n"
-                f"---\n**Status:** \u2705 No manifest changes\n"
+                f"This is expected for documentation, tooling, or script changes that "
+                f"do not affect any ArgoCD-managed environment configuration.\n\n"
+                f"---\n**Status:** \u2705 No ArgoCD apps affected\n"
                 f"*{_ts()} \u2014 {COMMENT_MARKER} [clean]*"
             )
             upsert_comment(pr_id, no_apps_body, existing_id)
