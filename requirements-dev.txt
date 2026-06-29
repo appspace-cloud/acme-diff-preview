@@ -1,0 +1,4 @@
+# Dev / CI dependencies only — no runtime deps (stdlib only in production).
+# Pin exact versions to ensure reproducible CI runs.
+# To update: pip install pytest --upgrade && pip freeze > requirements-dev.txt
+pytest==8.3.5

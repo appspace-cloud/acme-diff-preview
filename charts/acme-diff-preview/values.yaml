@@ -7,7 +7,7 @@ fullnameOverride: "acme-diff-preview"
 
 image:
   repository: us-central1-docker.pkg.dev/appspace-devops/artifact/acme-diff-preview
-  tag: "2.2.0"
+  tag: "2.4.0"
   pullPolicy: IfNotPresent
 
 # Log verbosity for the diff-preview service. Set to DEBUG to emit the full
@@ -67,6 +67,9 @@ secrets:
   argocdPassKey: argocd-diff-preview-admin-pass
   # GCP SM secret name for the JFrog webhook HMAC shared secret
   jfrogWebhookSecretKey: argocd-jfrog-webhook-shared-secret
+  # GCP SM secret name for Bitbucket webhook HMAC (X-Hub-Signature).
+  # Leave empty to run in permissive mode (no verification) during rollout.
+  bbWebhookSecretKey: ""
   # OCI registry credentials for the helm-template diff (both helm-oci-dev and
   # helm-oci-release use the same pair). REQUIRED: without OCI_PASS every diff
   # returns "diff unavailable" because the chart pull fails. The pod logs an

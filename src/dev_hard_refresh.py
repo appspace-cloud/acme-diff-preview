@@ -12,12 +12,15 @@ This is targeted only at dev/qa environments - staging and
 production apps are not touched.
 """
 import concurrent.futures
+import json
 import os
+import ssl
 import subprocess
 import sys
 import time
+import urllib.request
 
-SERVER    = "argocd.appspace.com"
+SERVER    = os.environ.get("ARGOCD_SERVER", "argocd.appspace.com")
 ARGOCD    = os.environ.get("ARGOCD_BIN", "/usr/local/bin/argocd")
 PROJECTS  = ["appspace-dev", "appspace-qa"]
 WORKERS   = 8
@@ -25,10 +28,33 @@ WORKERS   = 8
 # single slow app never crashes the entire ThreadPoolExecutor pool.
 TIMEOUT   = 60
 
+# --insecure removed: argocd.appspace.com has a valid CA-signed certificate.
 BASE_FLAGS = [
     "--server", SERVER,
-    "--grpc-web", "--insecure",
+    "--grpc-web",
 ]
+
+
+def _fetch_argocd_token() -> str:
+    """Obtain a short-lived JWT from ArgoCD REST session API.
+
+    Uses ARGOCD_USER / ARGOCD_PASS from env (injected by ExternalSecret).
+    The token is exported as ARGOCD_AUTH_TOKEN so the argocd CLI picks it up
+    without needing `argocd login`, keeping ARGOCD_PASS off the process list.
+    """
+    user     = os.environ.get("ARGOCD_USER", "diff-preview")
+    password = os.environ["ARGOCD_PASS"]
+    url      = f"https://{SERVER}/api/v1/session"
+    data     = json.dumps({"username": user, "password": password}).encode()
+    req      = urllib.request.Request(
+        url, data=data,
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+    # CA-verified TLS (default context) — no CERT_NONE.
+    ssl_ctx = ssl.create_default_context()
+    with urllib.request.urlopen(req, context=ssl_ctx, timeout=30) as resp:
+        return json.loads(resp.read())["token"]
 
 def list_apps():
     args = [ARGOCD, "app", "list", "-o", "name"] + BASE_FLAGS
@@ -64,6 +90,18 @@ def hard_refresh(app):
         return app, False, elapsed
 
 def main():
+    # Authenticate once via REST: sets ARGOCD_AUTH_TOKEN in the process env
+    # so all argocd CLI calls below pick it up without `argocd login`.
+    # ARGOCD_PASS never touches the process argument list this way.
+    print("Authenticating to ArgoCD via REST session API ...", flush=True)
+    try:
+        token = _fetch_argocd_token()
+        os.environ["ARGOCD_AUTH_TOKEN"] = token
+        print("ArgoCD authentication OK.", flush=True)
+    except Exception as exc:
+        print(f"ERROR: ArgoCD authentication failed: {exc}", flush=True)
+        sys.exit(1)
+
     apps = list_apps()
     t_start = time.monotonic()
     print(f"Hard-refreshing {len(apps)} dev/qa apps ...", flush=True)
