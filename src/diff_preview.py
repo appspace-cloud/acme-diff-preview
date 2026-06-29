@@ -2548,9 +2548,15 @@ def process_pr(pr, path_map, base_sha=""):
                         lines.append("```diff")
                         lines.append(sec["diff"])
                         lines.append("```")
-                    elif sec["error"]:
-                        lines.append(f"\u26a0\ufe0f Could not render preview: {sec['error']}")
-                        lines.append("All resources for this environment will be provisioned from scratch.")
+                    else:
+                        lines.append(
+                            "\U0001f4cb **Resource preview not available for new environments.**  \n"
+                            "The chart requires additional constellation files and credentials that "
+                            "are provisioned after the first deployment. This is expected.  \n"
+                            "All resources will be created from scratch when this PR is merged."
+                        )
+                        if sec["error"] and "helm template failed" not in sec["error"]:
+                            lines.append(f"  \n*Technical detail: {sec['error'][:120]}*")
                     lines.append("")
 
                 total_new = sum(s["n_res"] for s in new_env_sections)
