@@ -1411,16 +1411,28 @@ def _render_new_env_diff(env_info: dict, pr_sha: str) -> tuple:
     if not version:
         return None, "no appspace.version found in config file", 0, None
 
-    # 2. Determine registry and chart name
-    registry   = (_app_chart_registry_map.get(next(iter(_app_chart_registry_map), None))
-                  or "helm-oci-dev.repo.appspace.com")
-    if not ("-dev" in version or "dev" in version):
-        # Release-style version — prefer release registry if we know it
-        for r in _app_chart_registry_map.values():
-            if "release" in r:
-                registry = r
-                break
-    chart_name = next(iter(_app_chart_map.values()), "appspace-micro-services") if _app_chart_map else "appspace-micro-services"
+    # 2. Determine registry from the chart version tag.
+    # Dev versions contain "-dev"; release versions do not.
+    # Look up the registry from existing ms apps so we use the correct hostname.
+    DEV_REG     = "helm-oci-dev.repo.appspace.com"
+    RELEASE_REG = "helm-oci-release.repo.appspace.com"
+    is_dev_version = "-dev" in version or version.endswith("-dev")
+    if is_dev_version:
+        registry = next(
+            (r for r in _app_chart_registry_map.values() if "dev" in r),
+            DEV_REG,
+        )
+    else:
+        registry = next(
+            (r for r in _app_chart_registry_map.values() if "release" in r),
+            RELEASE_REG,
+        )
+    # Always render with appspace-micro-services for new env previews.
+    # Other chart types (appspace-glb, appspace-supporting-services) require
+    # values that a brand-new environment customer.yaml will not have yet, and
+    # their templates would fail with missing-value errors. The ms chart gives
+    # the most useful resource preview for a reviewer.
+    chart_name = "appspace-micro-services"
 
     # 3. Pull chart
     try:
