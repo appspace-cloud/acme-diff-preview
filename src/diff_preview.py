@@ -75,6 +75,13 @@ ARGOCD_PASS          = os.environ["ARGOCD_PASS"]
 # Comma-separated list of ArgoCD projects the webhook hard-refresh targets.
 ARGOCD_PROJECTS      = os.environ.get("ARGOCD_PROJECTS", "appspace-dev,appspace-qa").split(",")
 # HMAC-SHA256 key for verifying incoming JFrog webhook requests.
+# HMAC-SHA256 secret for verifying incoming Bitbucket PR webhook requests.
+# Bitbucket signs the payload with X-Hub-Signature: sha256=<hex>.
+# When set, any request without a valid signature is rejected with 401.
+# When empty (default), webhooks are accepted without verification for
+# backward compatibility during rollout; set the secret once Bitbucket
+# is configured with the same value.
+BB_WEBHOOK_SECRET    = os.environ.get("BB_WEBHOOK_SECRET", "")
 JFROG_WEBHOOK_SECRET = os.environ.get("JFROG_WEBHOOK_SECRET", "")
 # Deduplication window: skip hard-refresh if same chart:version was processed
 # within this many seconds. Handles JFrog retries and rapid successive pushes.
@@ -302,8 +309,7 @@ class _HealthHandler(BaseHTTPRequestHandler):
     def do_POST(self):
         if self.path == "/diff-preview/webhook":
             # Bitbucket PR webhook — wake the diff loop immediately.
-            # Cap body size (same guard as the JFrog webhook) so a large
-            # malformed request cannot exhaust pod memory.
+            # Cap body size so a large malformed request cannot exhaust pod memory.
             try:
                 length = int(self.headers.get("Content-Length", 0))
             except (ValueError, TypeError):
@@ -312,8 +318,16 @@ class _HealthHandler(BaseHTTPRequestHandler):
                 self.send_response(413)
                 self.end_headers()
                 return
-            if length:
-                self.rfile.read(length)
+            body = self.rfile.read(length) if length else b""
+
+            # HMAC-SHA256 verification (Bitbucket X-Hub-Signature header).
+            # Permissive when BB_WEBHOOK_SECRET is not set (backward compat).
+            if not _verify_bb_hmac(body, self.headers.get("X-Hub-Signature", "")):
+                log("Bitbucket webhook: HMAC verification failed — rejecting request", "WARNING")
+                self.send_response(401)
+                self.end_headers()
+                return
+
             event_key = self.headers.get("X-Event-Key", "")
             if event_key.startswith("pullrequest:"):
                 log(f"Webhook received: {event_key} — waking loop")
@@ -417,6 +431,26 @@ def _verify_jfrog_hmac(body: bytes, header: str) -> bool:
         return False
     expected = hmac.new(JFROG_WEBHOOK_SECRET.encode(), body, hashlib.sha256).hexdigest()
     return hmac.compare_digest(header, expected)
+
+
+def _verify_bb_hmac(body: bytes, header: str) -> bool:
+    """Verify Bitbucket X-Hub-Signature HMAC-SHA256 against BB_WEBHOOK_SECRET.
+
+    Bitbucket signs the payload as: X-Hub-Signature: sha256=<hex-digest>
+    If BB_WEBHOOK_SECRET is empty, the webhook is accepted without verification
+    (permissive mode for backward compatibility during rollout). Once the secret
+    is configured in both Bitbucket and GCP SM, all unsigned requests are rejected.
+    """
+    import hmac, hashlib
+    if not BB_WEBHOOK_SECRET:
+        # Secret not yet configured — accept all (permissive mode).
+        return True
+    if not header:
+        return False
+    # Strip "sha256=" prefix sent by Bitbucket.
+    sig = header.removeprefix("sha256=")
+    expected = hmac.new(BB_WEBHOOK_SECRET.encode(), body, hashlib.sha256).hexdigest()
+    return hmac.compare_digest(sig, expected)
 
 
 def _jfrog_hard_refresh(chart_name: str, chart_version: str) -> None:
@@ -531,7 +565,9 @@ def _auth_flags():
     The JWT is injected via the ARGOCD_AUTH_TOKEN environment variable in
     _argocd_subprocess_env(), so it never appears in ps/proc listings.
     """
-    return ["--server", ARGOCD_SERVER, "--grpc-web", "--insecure"]
+    # --insecure removed: argocd.appspace.com has a valid CA-signed certificate;
+    # TLS verification is enforced on both the CLI and the REST session API.
+    return ["--server", ARGOCD_SERVER, "--grpc-web"]
 
 
 def _argocd_subprocess_env() -> dict:
@@ -721,9 +757,9 @@ def _argocd_fetch_token() -> str:
         url, data=data,
         headers={"Content-Type": "application/json"},
         method="POST")
+    # Use default SSL context: enforces CA verification for argocd.appspace.com
+    # (cert issued by Google Trust Services, valid CA chain in the container).
     ssl_ctx = ssl.create_default_context()
-    ssl_ctx.check_hostname = False
-    ssl_ctx.verify_mode    = ssl.CERT_NONE
     with urllib.request.urlopen(req, context=ssl_ctx, timeout=30) as resp:
         return json.loads(resp.read())["token"]
 
@@ -2088,6 +2124,34 @@ def _normalize_ai_markdown(text: str) -> str:
     t = re.sub(r'\n([⚠✅][^⚠✅])', r'\n\n\1', t)
     return t.strip()
 
+_SENSITIVE_KEYS = re.compile(
+    r'(?i)(password|passwd|secret|token|key|api[-_]?key|private[-_]?key'
+    r'|auth|credential|bearer|jwt|access[-_]?token|refresh[-_]?token'
+    r'|connection[-_]?string|dsn|mongodb[-_]?uri|postgres[-_]?url'
+    r'|encryption[-_]?key|signing[-_]?key)',
+)
+
+def _redact_sensitive(text: str) -> str:
+    """Redact secret-like values from diff text before sending to Vertex AI.
+
+    Matches lines where the key name looks sensitive (password, token, key,
+    secret, etc.) and replaces the value with [REDACTED]. Operates on the
+    rendered diff lines ('+'/'-' prefixed) so structural diff context is kept.
+
+    Only the VALUE portion (after ':', '=', or quoted assignment) is redacted;
+    key names and diff markers are preserved for context.
+    """
+    redacted_lines = []
+    for line in text.splitlines():
+        # Match key: value or key=value patterns (YAML / env-style).
+        m = re.match(r'^([+\- ]*)([\w.\-/]+\s*[:=]\s*)(.+)$', line)
+        if m and _SENSITIVE_KEYS.search(m.group(2)):
+            redacted_lines.append(f"{m.group(1)}{m.group(2)}[REDACTED]")
+        else:
+            redacted_lines.append(line)
+    return "\n".join(redacted_lines)
+
+
 def generate_ai_summary(app_results: dict) -> str | None:
     """Call Vertex AI Gemini to produce an operator-friendly diff summary.
 
@@ -2125,7 +2189,7 @@ def generate_ai_summary(app_results: dict) -> str | None:
         for app, sections in changed.items():
             sections_parts.append(f"### App: {app}")
             for header, body in sections[:AI_MAX_SECTIONS_PER_APP]:
-                trimmed = body[:AI_MAX_BODY_CHARS]
+                trimmed = _redact_sensitive(body[:AI_MAX_BODY_CHARS])
                 if len(body) > AI_MAX_BODY_CHARS:
                     trimmed += "\n... (truncated)"
                 sections_parts.append(f"Resource: {header}\n{trimmed}")

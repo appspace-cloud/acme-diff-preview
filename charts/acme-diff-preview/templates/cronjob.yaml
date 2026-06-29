@@ -25,17 +25,10 @@ spec:
             - name: hard-refresh
               image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"
               imagePullPolicy: {{ .Values.image.pullPolicy }}
-              # Uses ARGOCD_PASS from ESO secret — dedicated diff-preview local account.
-              command: ["/bin/sh", "-c"]
-              args:
-                - |
-                  set -euo pipefail
-                  ARGOCD_SERVER="{{ .Values.argocd.server }}"
-                  argocd login "$ARGOCD_SERVER" \
-                    --username {{ .Values.argocd.username | quote }} \
-                    --password "$ARGOCD_PASS" \
-                    --grpc-web --insecure
-                  python3 /app/dev_hard_refresh.py
+              # dev_hard_refresh.py obtains the ArgoCD JWT via REST session API
+              # (ARGOCD_PASS from ESO secret) and sets ARGOCD_AUTH_TOKEN in-process.
+              # ARGOCD_PASS is never passed to argocd CLI on the command line.
+              command: ["python3", "/app/dev_hard_refresh.py"]
               env:
                 - name: ARGOCD_USER
                   value: {{ .Values.argocd.username | quote }}

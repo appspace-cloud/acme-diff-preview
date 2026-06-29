@@ -1,4 +1,6 @@
-FROM python:3.12-slim
+# Pin base image by digest to prevent silent upstream updates.
+# To update: docker pull python:3.12-slim && docker inspect ... | grep RepoDigest
+FROM python:3.12-slim@sha256:423ed6ab25b1921a477529254bfeeabf5855151dc2c3141699a1bfc852199fbf
 
 ARG ARGOCD_VERSION=v3.4.3
 ARG HELM_VERSION=v3.21.2
