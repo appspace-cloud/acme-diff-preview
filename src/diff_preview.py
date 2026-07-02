@@ -132,6 +132,15 @@ _jfrog_stats:      dict          = {
 }
 _jfrog_stats_lock: threading.Lock = threading.Lock()
 
+# Bounded worker pool for webhook-triggered hard refreshes. A CI republish
+# burst (dozens of distinct chart versions in a minute) previously spawned
+# one daemon thread per event — an uncapped thundering herd on the ArgoCD
+# API (bughunt F3: 24 pushes -> 24 concurrent threads). Tasks now queue and
+# drain at a controlled rate.
+JFROG_REFRESH_WORKERS = int(os.environ.get("JFROG_REFRESH_WORKERS", "4"))
+_jfrog_refresh_pool = ThreadPoolExecutor(
+    max_workers=JFROG_REFRESH_WORKERS, thread_name_prefix="jfrog-refresh-worker")
+
 # Diff operation counters — exposed at GET /diff-preview/stats
 _diff_stats:      dict          = {
     "prs_processed": 0,      # PRs where we ran at least one diff
@@ -416,12 +425,7 @@ class _HealthHandler(BaseHTTPRequestHandler):
                 _invalidate_for_republish(chart_name, chart_ver)
             except Exception as exc:
                 log(f"JFrog webhook: local invalidation failed: {exc}", "ERROR")
-            threading.Thread(
-                target=_jfrog_hard_refresh,
-                args=(chart_name, chart_ver),
-                daemon=True,
-                name=f"jfrog-refresh-{chart_name}:{chart_ver}",
-            ).start()
+            _jfrog_refresh_pool.submit(_jfrog_hard_refresh, chart_name, chart_ver)
 
         else:
             self.send_response(404)
@@ -663,6 +667,15 @@ def http(method, url, body=None, headers=None, auth=None):
         except urllib.error.HTTPError as e:
             if e.code in (429, 500, 502, 503, 504) and attempt < 2:
                 wait = 2 ** attempt
+                if e.code == 429:
+                    # Honor the server-mandated pause: Bitbucket rate-limit
+                    # windows run ~60s while our old total backoff was ~3s,
+                    # so a storm failed straight through (bughunt F4).
+                    # Capped so a broken header cannot stall the loop.
+                    try:
+                        wait = max(wait, min(int((e.headers or {}).get("Retry-After", "")), 60))
+                    except (TypeError, ValueError):
+                        pass
                 log(f"[http] {e.code} on {method} — retry {attempt+1}/2 in {wait}s", "WARNING")
                 time.sleep(wait)
                 last_exc = e
@@ -1698,12 +1711,42 @@ def _parse_manifest_resources(yaml_text):
                     name = line.split(":", 1)[1].strip()
                 elif line and not line.startswith(" "):
                     in_meta = False
+        if kind and not name:
+            # Fallback for flow-style metadata (e.g. `metadata: {name: x}`),
+            # valid YAML that the block-style line scan above cannot see.
+            # Without this the whole resource was skipped on BOTH sides and
+            # a real change reported as no-diff (bughunt F5a).
+            m = re.search(r"^metadata:\s*\{(.*)\}\s*$", doc, re.MULTILINE)
+            if m:
+                flow = m.group(1)
+                def _flow_val(field):
+                    fm = re.search(
+                        r"\b" + field + r":\s*(\"([^\"]*)\"|'([^']*)'|([^,}\s]+))",
+                        flow)
+                    return (fm.group(2) or fm.group(3) or fm.group(4)) if fm else ""
+                name = name or _flow_val("name")
+                ns   = ns or _flow_val("namespace")
         if not (kind and name):
+            if kind or name or "apiVersion:" in doc:
+                # A K8s-looking document we could not identify: say so instead
+                # of dropping it silently (diagnosability for future parser gaps).
+                debug(f"manifest parser: skipping unidentifiable document "
+                      f"(kind={kind!r} name={name!r}): {doc[:120]!r}")
             continue
         # Use ArgoCD-style key: /Kind ns/name (group prefix for non-core)
         grp = api.split("/")[0] if "/" in api else ""
         type_key = f"{grp}/{kind}" if grp and grp not in ("v1", "") else kind
         key = (type_key, ns or "", name)
+        if key in resources and resources[key] != doc + "\n":
+            # Same (kind, ns, name) emitted twice with different content
+            # (umbrella charts merging subchart output). Keep both diffable
+            # instead of silently overwriting the first (bughunt F5b).
+            n2 = 2
+            while (key[0], key[1], f"{name}#{n2}") in resources:
+                n2 += 1
+            log(f"manifest parser: duplicate resource {key} in render "
+                f"\u2014 keeping both as '#{n2}' variant", "WARNING")
+            key = (key[0], key[1], f"{name}#{n2}")
         resources[key] = doc + "\n"
     return resources
 
@@ -2104,11 +2147,19 @@ def upsert_comment(pr_id, body, existing_id=None):
         else:
             bb("POST", f"pullrequests/{pr_id}/comments", body=payload)
     except Exception as e:
-        # If PUT returns 404 the comment was deleted — fall back to POST with the
-        # original body so the diff is still visible and no error text appears.
-        # Using an error message as fallback caused a re-run loop because the
-        # error text triggered the "had errors" re-run check in process_pr.
-        log(f"[comment] upsert failed ({e}); retrying as new POST", "WARNING")
+        # Only a 404 on PUT means the comment was deleted and a fresh POST is
+        # correct. Any other failure (429/5xx/network) means the old comment
+        # still exists: POSTing would create a duplicate (bughunt F2). Give up
+        # this round — the comment still carries the previous sha, so the
+        # next iteration's cross-pod check recomputes and retries the update.
+        # (Error-message fallbacks caused a re-run loop in the past; see git log.)
+        was_deleted = (existing_id and isinstance(e, urllib.error.HTTPError)
+                       and e.code == 404)
+        if not was_deleted:
+            log(f"[comment] upsert failed ({e}); NOT posting a fallback "
+                f"(comment likely still exists — would duplicate)", "ERROR")
+            return
+        log(f"[comment] comment {existing_id} was deleted; re-creating", "WARNING")
         try:
             bb("POST", f"pullrequests/{pr_id}/comments", body=payload)
             log("[comment] fallback POST succeeded", "INFO")
@@ -2504,7 +2555,7 @@ def _format_app_diff_block(app, sections, diff_text, show_diff=True):
     return out
 
 
-def format_comment(pr_sha, app_results, skipped_apps=None):
+def format_comment(pr_sha, app_results, skipped_apps=None, base_sha=""):
     """Format the full PR comment. Never uses <details>/<summary> — Bitbucket
     does not render them. Large changesets get a compact summary table at the
     top (all apps, one row each) and inline diffs for the top-N most-changed
@@ -2665,7 +2716,7 @@ def format_comment(pr_sha, app_results, skipped_apps=None):
     lines += [
         "---",
         f"**Status:** {status}",
-        f"*{_ts()} \u2014 {COMMENT_MARKER} [{_status_token}]*",
+        f"*{_ts()} \u2014 {COMMENT_MARKER} [{_status_token}]" + (f" [base:{base_sha[:8]}]" if base_sha else "") + "*",
     ]
     return "\n".join(lines)
 
@@ -2691,8 +2742,8 @@ def process_pr(pr, path_map, base_sha=""):
 
     # In-memory dedup: skip same SHA already processed in this pod run
     with _seen_lock:
-        if not forced and _seen.get(pr_id) == pr_sha:
-            print(f"    Skipping: SHA {pr_sha[:8]} already processed in this run")
+        if not forced and _seen.get(pr_id) == (pr_sha, base_sha):
+            print(f"    Skipping: SHA {pr_sha[:8]} (base {base_sha[:8] if base_sha else '?'}) already processed in this run")
             return
 
     # Cross-pod dedup: existing comment already covers this exact SHA
@@ -2717,12 +2768,23 @@ def process_pr(pr, path_map, base_sha=""):
                                                  or "error:" in comment_raw))
                 or "no-diff ERR:" in comment_raw
             )
+        # Recompute when the DESTINATION moved: the published diff was
+        # rendered against the main sha embedded in the footer; once main
+        # advances, the comment no longer answers "what will merging do?"
+        # (bughunt F1). Legacy comments without a [base:] token are treated
+        # as stale once and rewritten with the token.
+        if not rerun and base_sha:
+            base_m = re.search(r"\[base:([0-9a-f]{4,12})\]", comment_raw)
+            if not base_m or base_m.group(1) != base_sha[:8]:
+                rerun = True
+                print(f"    Re-running: main advanced (comment base "
+                      f"{base_m.group(1) if base_m else 'legacy'} -> {base_sha[:8]})")
         if rerun:
             print(f"    Re-running: previous comment for SHA {pr_sha[:8]} was not clean, retrying diff")
             # existing_id is kept — the comment will be updated in place, not duplicated.
         else:
             with _seen_lock:
-                _seen[pr_id] = pr_sha
+                _seen[pr_id] = (pr_sha, base_sha)
             print(f"    Skipping: comment up to date for SHA {pr_sha[:8]}")
             # Fix potential stuck INPROGRESS from a previously killed pod
             fix_stuck_inprogress(pr_sha, pr_id, comment_raw)
@@ -2817,11 +2879,11 @@ def process_pr(pr, path_map, base_sha=""):
                 lines += [
                     "---",
                     f"**Status:** \u2705 New environment(s) - all resources will be created on merge",
-                    f"*{_ts()} \u2014 {COMMENT_MARKER} [clean]*",
+                    f"*{_ts()} \u2014 {COMMENT_MARKER} [clean]" + (f" [base:{base_sha[:8]}]" if base_sha else "") + "*",
                 ]
                 upsert_comment(pr_id, "\n".join(lines), existing_id)
                 with _seen_lock:
-                    _seen[pr_id] = pr_sha
+                    _seen[pr_id] = (pr_sha, base_sha)
                 return
 
             # No apps affected and no new env pattern found.
@@ -2836,11 +2898,11 @@ def process_pr(pr, path_map, base_sha=""):
                 f"This is expected for documentation, tooling, or script changes that "
                 f"do not affect any ArgoCD-managed environment configuration.\n\n"
                 f"---\n**Status:** \u2705 No ArgoCD apps affected\n"
-                f"*{_ts()} \u2014 {COMMENT_MARKER} [clean]*"
+                f"*{_ts()} \u2014 {COMMENT_MARKER} [clean]" + (f" [base:{base_sha[:8]}]" if base_sha else "") + "*"
             )
             upsert_comment(pr_id, no_apps_body, existing_id)
             with _seen_lock:
-                _seen[pr_id] = pr_sha
+                _seen[pr_id] = (pr_sha, base_sha)
             return
 
         print(f"    Apps: {affected}")
@@ -3013,7 +3075,7 @@ def process_pr(pr, path_map, base_sha=""):
             + (f" | reasons: {reasons}" if reasons else ""),
             pr=pr_id, **{f"n_{k}": v for k, v in outcome_counts.items()})
 
-        body = format_comment(pr_sha, app_results, skipped_apps)
+        body = format_comment(pr_sha, app_results, skipped_apps, base_sha=base_sha)
         comment_kb = round(len(body.encode()) / 1024, 1)
         upsert_comment(pr_id, body, existing_id)
         action = "updated" if existing_id else "posted"
@@ -3078,7 +3140,7 @@ def process_pr(pr, path_map, base_sha=""):
             # Mark seen for both clean runs AND permanent failures so we don't
             # spam the PR with repeated "not found" comments every 60s.
             with _seen_lock:
-                _seen[pr_id] = pr_sha
+                _seen[pr_id] = (pr_sha, base_sha)
         return outcome_counts
 
     except Exception as e:
@@ -3092,7 +3154,7 @@ def process_pr(pr, path_map, base_sha=""):
             f"Commit `{pr_sha[:8]}` vs `main` | `{BB_REPO}`\n\n"
             f"\u274c **Error processing diff:** {str(e)[:400]}\n\n"
             f"---\n**Status:** \u274c Error running diff\n"
-            f"*{_ts()} \u2014 {COMMENT_MARKER} [permanent]*"
+            f"*{_ts()} \u2014 {COMMENT_MARKER} [permanent]" + (f" [base:{base_sha[:8]}]" if base_sha else "") + "*"
         )
         try:
             upsert_comment(pr_id, err_body, existing_id)

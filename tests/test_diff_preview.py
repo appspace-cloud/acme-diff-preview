@@ -416,10 +416,12 @@ def test_dedup_logic():
     # Find the 202 send, the dedup_key assignment, and the thread name in do_POST
     idx_202    = src.find('send_response(202)')
     idx_dedup  = src.find('dedup_key = f"')
-    idx_thread = src.find('jfrog-refresh-{chart_name}:{chart_ver}')
+    # v2.4.4: thread-per-event replaced by a bounded pool (bughunt F3);
+    # the dispatch point is now the pool submit call.
+    idx_thread = src.find('_jfrog_refresh_pool.submit(_jfrog_hard_refresh')
     assert idx_202 > 0 and idx_dedup > 0 and idx_thread > 0
     assert idx_202 < idx_dedup < idx_thread, \
-        "Order must be: 202 response -> dedup check -> thread spawn"
+        "Order must be: 202 response -> dedup check -> pool dispatch"
 
 def test_stats_counters():
     """Stats counters must exist and cover key events."""
