@@ -2178,7 +2178,7 @@ VERTEX_PROJECT           = os.environ.get("GCP_PROJECT", "appspace-devops")
 VERTEX_LOCATION          = os.environ.get("VERTEX_LOCATION", "us-central1")
 # gemini-2.5-flash: better reasoning than lite, still fast and cheap.
 # One call per PR run (not per resource), so cost impact is negligible.
-VERTEX_MODEL             = "gemini-2.5-flash"
+VERTEX_MODEL             = os.environ.get("VERTEX_MODEL", "gemini-2.5-flash")
 
 # Thresholds for switching between inline and collapsed diff display.
 # Bitbucket does NOT render HTML <details>/<summary> tags, so there is no
@@ -2258,6 +2258,20 @@ def _redact_sensitive(text: str) -> str:
     return "\n".join(redacted_lines)
 
 
+_APP_COMPONENT_SUFFIX = re.compile(r"-(ss|ms|glb)$")
+
+def _envs_from_apps(apps) -> list:
+    """Derive environment names deterministically from ArgoCD app names.
+
+    Apps follow \'<env>-<component>\' (e.g. pv-qa88-a-ss -> pv-qa88-a).
+    Unknown suffixes fall back to the app name itself, so a new component
+    type degrades to a slightly verbose but always-true environment list.
+    The AI model is never asked for environment names - before v2.4.2 it
+    copied literal example values straight from the prompt template.
+    """
+    return sorted({_APP_COMPONENT_SUFFIX.sub("", a.split("/")[-1]) for a in apps})
+
+
 def generate_ai_summary(app_results: dict) -> str | None:
     """Call Vertex AI Gemini to produce an operator-friendly diff summary.
 
@@ -2307,35 +2321,39 @@ def generate_ai_summary(app_results: dict) -> str | None:
                 f"not unchanged): {', '.join(errors.keys())}"
             )
 
+        envs = _envs_from_apps(changed.keys())
+        env_line = ("\U0001f30d **AFFECTED ENVIRONMENTS:** "
+                    + ", ".join(f"`{e}`" for e in envs)
+                    + f" ({len(envs)} total)")
+
         prompt = (
             "You are a Senior SRE reviewing a Kubernetes GitOps diff from a Helm-based platform.\n"
             f"Changeset: {len(changed)} app(s), {total_resources} resource section(s).\n\n"
             "ANALYSIS REQUIREMENTS:\n"
-            "- Only analyse what is explicitly shown in the diff below.\n"
-            "- Helm shows changes as '-' (old) and '+' (new) lines — this is normal for updates.\n"
+            "- Only analyse what is explicitly shown in DIFF DATA below.\n"
+            "- Use ONLY service and resource names that literally appear in DIFF DATA. "
+            "Never invent, guess, or copy names from these instructions.\n"
+            "- Helm shows changes as '-' (old) and '+' (new) lines \u2014 this is normal for updates.\n"
             "- VERSION COMPARISON: only report a downgrade when the full version string actually "
-            "decreases (e.g. 1.93.1 → 1.93.0 is a downgrade; 1.93.1-rc1 → 1.93.1-rc2 is NOT).\n"
+            "decreases (e.g. 1.93.1 \u2192 1.93.0 is a downgrade; 1.93.1-rc1 \u2192 1.93.1-rc2 is NOT).\n"
             "- Skip annotation-only changes (argocd.argoproj.io/tracking-id, "
             "helm.sh/chart, kubectl.kubernetes.io/last-applied-configuration, checksum/).\n"
-            "- For new Deployments/StatefulSets: say 'new service'.\n"
-            "- For removed ones: say 'removed'.\n\n"
-            "Respond in EXACTLY this format (no extra sections, no prose outside these headers):\n\n"
-            f"**{len(changed)} app(s) updated · {total_resources} resource(s) changed**\n\n"
-            "1. 🌍 **AFFECTED ENVIRONMENTS:** `cl-env1-a`, `cl-env2-a` (N total)\n\n"
-            "2. 📊 **SUMMARY:**\n"
-            "   One sentence overview of the change type (e.g. 'Version bump from X to Y across N envs').\n"
-            "   Key service changes (max 8 entries, group similar ones):\n"
-            "   - `service-name`: `old-ver` → `new-ver`\n"
-            "   - `service-name`: new service added\n"
-            "   - `service-name`: removed\n\n"
-            "3. ⚠️ **CRITICAL CHANGES:**\n"
+            "- For new Deployments/StatefulSets: say 'new service'. For removed ones: say 'removed'.\n\n"
+            "Respond with EXACTLY the two sections below and nothing else. Replace every "
+            "<angle-bracket> placeholder with real values taken from DIFF DATA:\n\n"
+            "\U0001f4ca **SUMMARY:**\n"
+            "   <one sentence overview of the change type>\n"
+            "   Key service changes (max 8 entries, group similar ones with '+N more'):\n"
+            "   - `<service>`: `<old-version>` \u2192 `<new-version>`\n"
+            "   - `<service>`: new service added\n"
+            "   - `<service>`: removed\n\n"
+            "\u26a0\ufe0f **CRITICAL CHANGES:**\n"
             "   - Version downgrades (full version string decreasing only)\n"
             "   - Replicas dropping to 0\n"
             "   - Services removed\n"
             "   - Liveness/readiness probes removed\n"
             "   If none: `No critical changes detected`\n\n"
-            "Rules: max 250 words total. Do NOT repeat the environments list in the summary. "
-            "Group similar changes with '+N more'. Be terse — operators scan, they do not read.\n\n"
+            "Rules: max 200 words total. Be terse \u2014 operators scan, they do not read.\n\n"
             "DIFF DATA:\n"
             + "\n".join(sections_parts)
             + error_note
@@ -2362,10 +2380,12 @@ def generate_ai_summary(app_results: dict) -> str | None:
                 "generationConfig": {
                     "maxOutputTokens": 2000,
                     "temperature": 0.1,
-                    # Disable thinking tokens in gemini-2.5-flash.
-                    # Without this, the model uses ~1100 thinking tokens
-                    # leaving almost nothing for actual output (finish=MAX_TOKENS).
-                    "thinkingConfig": {"thinkingBudget": 0},
+                    # Disable thinking tokens on flash models. Without this,
+                    # the model spends ~1100 thinking tokens leaving almost
+                    # nothing for output (finish=MAX_TOKENS). Pro models do
+                    # not accept thinkingBudget 0, so only send it for flash.
+                    **({"thinkingConfig": {"thinkingBudget": 0}}
+                       if "flash" in VERTEX_MODEL else {}),
                 },
             },
         )
@@ -2382,7 +2402,19 @@ def generate_ai_summary(app_results: dict) -> str | None:
         if finish == "MAX_TOKENS":
             log("AI response truncated (MAX_TOKENS) — increase maxOutputTokens or shorten prompt",
                 "WARNING")
-        return _normalize_ai_markdown(ai_text)
+        # The environments line is deterministic (built from app names in
+        # code). Strip any such line the model may still emit, then prepend
+        # the code-built header so facts never depend on the model.
+        ai_text = "\n".join(
+            l for l in ai_text.splitlines()
+            if "AFFECTED ENVIRONMENT" not in l.upper()
+        ).strip()
+        head = (
+            f"**{len(changed)} app(s) updated \u00b7 "
+            f"{total_resources} resource(s) changed**\n\n"
+            f"{env_line}\n\n"
+        )
+        return _normalize_ai_markdown(head + ai_text)
     except Exception as e:
         err_str = str(e)
         if "404" in err_str and "does not have access" in err_str:

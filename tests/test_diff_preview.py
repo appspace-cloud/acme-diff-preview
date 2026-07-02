@@ -1082,3 +1082,42 @@ def test_prune_removes_parked_and_stale_dev_dirs(tmp_path):
     mod._prune_helm_cache()
     assert not parked.exists(), "parked dir must be removed"
     assert not live.exists(), "expired dev build must be removed"
+
+
+# ── v2.4.2: AI summary hallucination fixes ──────────────────────────────────
+
+def test_prompt_has_no_literal_example_env_names():
+    """The prompt template must not contain copyable example env names.
+
+    gemini copied `cl-env1-a`, `cl-env2-a` verbatim from the format template
+    into real comments ("Respond in EXACTLY this format" + literal examples).
+    """
+    src = _source()
+    assert "cl-env1-a" not in src and "cl-env2-a" not in src
+
+
+def test_envs_derived_deterministically():
+    """Environment names must come from code, never from the model."""
+    mod = _import_module()
+    apps = ["pv-qa88-a-ss", "pv-qa88-a-ms", "argocd/cl-qa-15-a-glb", "weird-app"]
+    assert mod._envs_from_apps(apps) == ["cl-qa-15-a", "pv-qa88-a", "weird-app"]
+
+
+def test_vertex_model_env_overridable():
+    """VERTEX_MODEL must honor the env var so the helm value works."""
+    os.environ["VERTEX_MODEL"] = "gemini-9.9-test"
+    try:
+        mod = _import_module()
+        assert mod.VERTEX_MODEL == "gemini-9.9-test"
+    finally:
+        del os.environ["VERTEX_MODEL"]
+    mod = _import_module()
+    assert mod.VERTEX_MODEL == "gemini-2.5-flash"
+
+
+def test_ai_header_built_in_code_and_thinking_conditional():
+    """Deterministic header assembly and flash-only thinkingConfig."""
+    src = _source()
+    assert "AFFECTED ENVIRONMENT" in src, "env-line strip filter missing"
+    assert "_envs_from_apps" in src
+    assert '"flash" in VERTEX_MODEL' in src, "thinkingConfig must be flash-only"
