@@ -1156,8 +1156,8 @@ def _ensure_chart(registry: str, chart: str, version: str) -> str:
     _now = time.monotonic()
     with _helm_cache_lock:
         if key in _helm_chart_cache:
-            pull_ts = _helm_chart_pull_ts.get(key, 0)
-            if (not _is_dev) or (_now - pull_ts < DEV_CHART_TTL):
+            pull_ts = _helm_chart_pull_ts.get(key)
+            if (not _is_dev) or (pull_ts is not None and _now - pull_ts < DEV_CHART_TTL):
                 return _helm_chart_cache[key]
             # Dev chart in memory is past its TTL: evict and fall through so
             # the pull section below fetches the current build of this tag.
@@ -1166,8 +1166,8 @@ def _ensure_chart(registry: str, chart: str, version: str) -> str:
 
     chart_dir = os.path.join(HELM_CACHE_DIR, registry, chart, version)
     if os.path.isdir(chart_dir) and os.listdir(chart_dir):
-        pull_ts = _helm_chart_pull_ts.get(key, 0)
-        is_fresh = (not _is_dev) or (_now - pull_ts < DEV_CHART_TTL)
+        pull_ts = _helm_chart_pull_ts.get(key)
+        is_fresh = (not _is_dev) or (pull_ts is not None and _now - pull_ts < DEV_CHART_TTL)
         if is_fresh:
             path = _find_chart_subdir(chart_dir)
             with _helm_cache_lock:
@@ -1204,8 +1204,8 @@ def _ensure_chart(registry: str, chart: str, version: str) -> str:
             if key in _helm_chart_cache:
                 return _helm_chart_cache[key]
         if os.path.isdir(chart_dir) and os.listdir(chart_dir):
-            pull_ts = _helm_chart_pull_ts.get(key, 0)
-            if (not _is_dev) or (time.monotonic() - pull_ts < DEV_CHART_TTL):
+            pull_ts = _helm_chart_pull_ts.get(key)
+            if (not _is_dev) or (pull_ts is not None and time.monotonic() - pull_ts < DEV_CHART_TTL):
                 with _helm_cache_lock:
                     _helm_chart_cache[key] = _find_chart_subdir(chart_dir)
                 return _helm_chart_cache[key]
@@ -1336,9 +1336,10 @@ def _prune_helm_cache():
         _mtime, registry, chart, version, vpath = entry
         key = f"{registry}/{chart}:{version}"
         parked = ".stale-" in version
+        pull_ts = _helm_chart_pull_ts.get(key)
         stale_dev = (
             _DEV_REGISTRY_PATTERN in registry
-            and _now - _helm_chart_pull_ts.get(key, 0) >= DEV_CHART_TTL
+            and (pull_ts is None or _now - pull_ts >= DEV_CHART_TTL)
         )
         if parked or stale_dev:
             shutil.rmtree(vpath, ignore_errors=True)
