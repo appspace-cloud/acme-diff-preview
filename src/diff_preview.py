@@ -149,7 +149,9 @@ _seen: dict    = {}
 _shutdown: bool = False   # set True by SIGTERM handler
 _ready: bool    = False   # set True after first successful argocd_login()
 _wake           = threading.Event()  # set by POST /diff-preview/webhook
-_seen_lock      = threading.Lock()   # guards _seen for concurrent PR processing
+_seen_lock      = threading.Lock()   # guards _seen, _force_recompute and _pr_chart_targets
+_force_recompute: set  = set()   # PR ids that must bypass dedup once (chart republished)
+_pr_chart_targets: dict = {}     # pr_id -> {(chart, version), ...} builds each open PR renders with
 
 # ── Health tracking ───────────────────────────────────────────────────────────
 # _last_ok: updated by a background heartbeat thread while the main loop runs.
@@ -408,6 +410,12 @@ class _HealthHandler(BaseHTTPRequestHandler):
                     del _jfrog_recent[k]
 
             log(f"JFrog webhook: push event for {chart_name}:{chart_ver} — triggering hard-refresh")
+            # Invalidate our own local chart cache and force affected open
+            # PRs to recompute with the fresh build (cheap, in-memory).
+            try:
+                _invalidate_for_republish(chart_name, chart_ver)
+            except Exception as exc:
+                log(f"JFrog webhook: local invalidation failed: {exc}", "ERROR")
             threading.Thread(
                 target=_jfrog_hard_refresh,
                 args=(chart_name, chart_ver),
@@ -451,6 +459,56 @@ def _verify_bb_hmac(body: bytes, header: str) -> bool:
     sig = header.removeprefix("sha256=")
     expected = hmac.new(BB_WEBHOOK_SECRET.encode(), body, hashlib.sha256).hexdigest()
     return hmac.compare_digest(sig, expected)
+
+
+def _invalidate_for_republish(chart_name: str, chart_version: str) -> None:
+    """React to a chart republish under the same tag (mutable dev tags).
+
+    Called inline from the JFrog webhook handler, before the ArgoCD
+    hard-refresh thread starts, so the local state is already clean when
+    the woken loop recomputes.
+
+    1. Evict the version from the local helm chart cache so the next
+       _ensure_chart call re-pulls the fresh build.
+    2. Drop cached main-side renders of apps tracking this chart:version.
+    3. Force open PRs that render with this chart:version to recompute
+       their diff (bypassing the SHA dedup once) and wake the main loop.
+    """
+    suffix = f"/{chart_name}:{chart_version}"
+    evicted = 0
+    with _helm_cache_lock:
+        for k in [k for k in list(_helm_chart_cache) if k.endswith(suffix)]:
+            _helm_chart_cache.pop(k, None)
+            evicted += 1
+    for k in [k for k in list(_helm_chart_pull_ts) if k.endswith(suffix)]:
+        _helm_chart_pull_ts.pop(k, None)
+    with _helm_pull_locks_lock:
+        for k in [k for k in list(_helm_pull_locks) if k.endswith(suffix)]:
+            _helm_pull_locks.pop(k, None)
+
+    # Drop stale main-side renders for apps tracking this chart:version.
+    stale_apps = {a for a, c in list(_app_chart_map.items())
+                  if c == chart_name
+                  and _app_chart_revision_map.get(a) == chart_version}
+    if stale_apps:
+        with _main_render_lock:
+            for k in [k for k in list(_main_render_cache) if k[0] in stale_apps]:
+                del _main_render_cache[k]
+
+    # Force recompute of open PRs that render with this chart build.
+    forced = []
+    with _seen_lock:
+        for pid, targets in list(_pr_chart_targets.items()):
+            if (chart_name, chart_version) in targets:
+                _force_recompute.add(pid)
+                _seen.pop(pid, None)
+                forced.append(pid)
+    if evicted or forced:
+        log(f"Chart republish {chart_name}:{chart_version} — evicted "
+            f"{evicted} local cache entrie(s), forcing recompute of "
+            f"PR(s): {forced if forced else 'none'}")
+    if forced:
+        _wake.set()
 
 
 def _jfrog_hard_refresh(chart_name: str, chart_version: str) -> None:
@@ -1092,15 +1150,21 @@ def _ensure_chart(registry: str, chart: str, version: str) -> str:
     Returns None on other pull failures (network, auth).
     """
     key = f"{registry}/{chart}:{version}"
-    with _helm_cache_lock:
-        if key in _helm_chart_cache:
-            return _helm_chart_cache[key]
-
-    chart_dir = os.path.join(HELM_CACHE_DIR, registry, chart, version)
-    # Dev registries can republish charts under the same tag. Treat the disk
-    # cache as stale after DEV_CHART_TTL seconds and re-pull to pick up updates.
+    # Dev registries can republish charts under the same tag. Treat any cached
+    # copy (memory or disk) as stale after DEV_CHART_TTL seconds and re-pull.
     _is_dev = _DEV_REGISTRY_PATTERN in registry
     _now = time.monotonic()
+    with _helm_cache_lock:
+        if key in _helm_chart_cache:
+            pull_ts = _helm_chart_pull_ts.get(key, 0)
+            if (not _is_dev) or (_now - pull_ts < DEV_CHART_TTL):
+                return _helm_chart_cache[key]
+            # Dev chart in memory is past its TTL: evict and fall through so
+            # the pull section below fetches the current build of this tag.
+            debug(f"Dev chart memory cache stale ({version} in {registry}) — evicting")
+            _helm_chart_cache.pop(key, None)
+
+    chart_dir = os.path.join(HELM_CACHE_DIR, registry, chart, version)
     if os.path.isdir(chart_dir) and os.listdir(chart_dir):
         pull_ts = _helm_chart_pull_ts.get(key, 0)
         is_fresh = (not _is_dev) or (_now - pull_ts < DEV_CHART_TTL)
@@ -1140,9 +1204,21 @@ def _ensure_chart(registry: str, chart: str, version: str) -> str:
             if key in _helm_chart_cache:
                 return _helm_chart_cache[key]
         if os.path.isdir(chart_dir) and os.listdir(chart_dir):
-            with _helm_cache_lock:
-                _helm_chart_cache[key] = _find_chart_subdir(chart_dir)
-            return _helm_chart_cache[key]
+            pull_ts = _helm_chart_pull_ts.get(key, 0)
+            if (not _is_dev) or (time.monotonic() - pull_ts < DEV_CHART_TTL):
+                with _helm_cache_lock:
+                    _helm_chart_cache[key] = _find_chart_subdir(chart_dir)
+                return _helm_chart_cache[key]
+            # Stale dev build still on disk: park it aside so the fresh pull
+            # below can land in chart_dir. Parked dirs are removed by
+            # _prune_helm_cache at the start of the next iteration. A diff
+            # holding the old path mid-rename fails as REASON_RENDER and is
+            # absorbed by the per-diff retry loop.
+            parked = f"{chart_dir}.stale-{int(time.monotonic() * 1000)}"
+            try:
+                os.rename(chart_dir, parked)
+            except OSError:
+                shutil.rmtree(chart_dir, ignore_errors=True)
 
         # Pull into a temp dir and atomically rename to avoid partial state.
         # Retry up to 3 times on transient network failures; don't retry on
@@ -1249,6 +1325,35 @@ def _prune_helm_cache():
                             (os.path.getmtime(vpath), registry, chart, version, vpath))
     except OSError:
         return
+
+    # Remove parked stale dirs (renamed aside by _ensure_chart) and dev chart
+    # builds past their TTL. This runs at iteration start, before any diff,
+    # so no in-flight helm template call is reading these paths.
+    _now = time.monotonic()
+    kept = []
+    removed_stale = 0
+    for entry in version_dirs:
+        _mtime, registry, chart, version, vpath = entry
+        key = f"{registry}/{chart}:{version}"
+        parked = ".stale-" in version
+        stale_dev = (
+            _DEV_REGISTRY_PATTERN in registry
+            and _now - _helm_chart_pull_ts.get(key, 0) >= DEV_CHART_TTL
+        )
+        if parked or stale_dev:
+            shutil.rmtree(vpath, ignore_errors=True)
+            with _helm_cache_lock:
+                _helm_chart_cache.pop(key, None)
+            _helm_chart_pull_ts.pop(key, None)
+            with _helm_pull_locks_lock:
+                _helm_pull_locks.pop(key, None)
+            removed_stale += 1
+            continue
+        kept.append(entry)
+    version_dirs = kept
+    if removed_stale:
+        log(f"Helm cache prune: removed {removed_stale} stale/parked dev chart build(s)")
+
     if len(version_dirs) <= HELM_CACHE_MAX_CHARTS:
         return
     version_dirs.sort(reverse=True)  # newest first
@@ -2501,15 +2606,24 @@ def process_pr(pr, path_map, base_sha=""):
     if dest != "main":
         return
 
+    # A chart republish (JFrog webhook) can force this PR to recompute once,
+    # bypassing both dedups below. Consume-once: if the recompute then fails,
+    # the error-comment retry path takes over on the next iteration.
+    with _seen_lock:
+        forced = pr_id in _force_recompute
+        if forced:
+            _force_recompute.discard(pr_id)
+            print(f"    Forced recompute: a chart this PR renders with was republished")
+
     # In-memory dedup: skip same SHA already processed in this pod run
     with _seen_lock:
-        if _seen.get(pr_id) == pr_sha:
+        if not forced and _seen.get(pr_id) == pr_sha:
             print(f"    Skipping: SHA {pr_sha[:8]} already processed in this run")
             return
 
     # Cross-pod dedup: existing comment already covers this exact SHA
     existing_id, comment_sha, comment_raw = find_existing_comment(pr_id)
-    if comment_sha == pr_sha[:8]:
+    if not forced and comment_sha == pr_sha[:8]:
         # Use the machine-readable [token] embedded in the comment footer (1.9.1+)
         # to decide if a re-run is needed. For legacy comments that lack the token
         # fall back to string matching on human-readable text.
@@ -2700,6 +2814,23 @@ def process_pr(pr, path_map, base_sha=""):
             log(f"PR #{pr_id}: chart version bumps detected for "
                 f"{len(pr_chart_revisions)} app(s) -> {unique_bumps}",
                 pr=pr_id)
+
+        # Record which chart builds this PR renders with, so a republish of
+        # any of them (JFrog webhook) can force this PR to recompute. Covers
+        # both the main-side build and the PR-side bumped build.
+        _targets = set()
+        for app in affected:
+            _cn = _app_chart_map.get(app)
+            if not _cn:
+                continue
+            _mr = _app_chart_revision_map.get(app)
+            if _mr:
+                _targets.add((_cn, _mr))
+            _bumped = pr_chart_revisions.get(app)
+            if _bumped:
+                _targets.add((_cn, _bumped))
+        with _seen_lock:
+            _pr_chart_targets[pr_id] = _targets
 
         _changed_paths_set = set(changed)   # for value-file skip optimization
 
@@ -2963,6 +3094,9 @@ def main_iteration():
     with _seen_lock:
         for stale_id in [k for k in _seen if k not in open_ids]:
             del _seen[stale_id]
+        for stale_id in [k for k in _pr_chart_targets if k not in open_ids]:
+            del _pr_chart_targets[stale_id]
+        _force_recompute.intersection_update(open_ids)
 
     pending = [
         pr for pr in prs

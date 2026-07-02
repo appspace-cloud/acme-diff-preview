@@ -1014,3 +1014,71 @@ def test_new_env_build_status_description():
     assert "New Environment(s) Detected" in src, (
         "new env comment must include 'New Environment(s) Detected' header"
     )
+
+
+# ── v2.4.1: stale dev chart cache fixes ─────────────────────────────────────
+
+def test_dev_ttl_checked_on_memory_cache_hit():
+    """A dev chart past DEV_CHART_TTL must not be served from the memory cache."""
+    mod = _import_module()
+    reg, chart, ver = "helm-oci-dev.test", "chartx", "1.0.0-x-dev"
+    key = f"{reg}/{chart}:{ver}"
+    mod._helm_chart_cache[key] = "/nonexistent/fake/path"
+    mod._helm_chart_pull_ts[key] = mod.time.monotonic() - mod.DEV_CHART_TTL - 5
+    mod._helm_login = lambda r: False   # block any real pull attempt
+    result = mod._ensure_chart(reg, chart, ver)
+    assert result != "/nonexistent/fake/path", "stale dev chart served from memory"
+    assert key not in mod._helm_chart_cache, "stale dev key must be evicted"
+
+
+def test_fresh_dev_chart_served_from_memory():
+    """A dev chart inside its TTL is still served from the memory cache."""
+    mod = _import_module()
+    reg, chart, ver = "helm-oci-dev.test", "chartx", "1.0.1-x-dev"
+    key = f"{reg}/{chart}:{ver}"
+    mod._helm_chart_cache[key] = "/cached/path"
+    mod._helm_chart_pull_ts[key] = mod.time.monotonic()
+    assert mod._ensure_chart(reg, chart, ver) == "/cached/path"
+
+
+def test_invalidate_for_republish_evicts_and_forces():
+    """JFrog republish must evict the local cache and force affected PRs."""
+    mod = _import_module()
+    reg, chart, ver = "helm-oci-dev.test", "chartx", "2.0.0-y-dev"
+    key = f"{reg}/{chart}:{ver}"
+    mod._helm_chart_cache[key] = "/cached/path"
+    mod._helm_chart_pull_ts[key] = mod.time.monotonic()
+    mod._seen[42] = "aabbccdd"
+    mod._pr_chart_targets[42] = {(chart, ver)}
+    mod._pr_chart_targets[43] = {("other", "1.0.0")}
+    mod._wake.clear()
+    mod._invalidate_for_republish(chart, ver)
+    assert key not in mod._helm_chart_cache, "republished build must be evicted"
+    assert 42 in mod._force_recompute and 42 not in mod._seen
+    assert 43 not in mod._force_recompute, "unrelated PR must not be forced"
+    assert mod._wake.is_set(), "loop must be woken to recompute quickly"
+
+
+def test_force_recompute_bypasses_both_dedups():
+    """process_pr must honor the force flag on both dedup checks."""
+    src = _source()
+    assert "not forced and _seen.get(pr_id)" in src
+    assert "not forced and comment_sha == pr_sha[:8]" in src
+    assert "_force_recompute.discard(pr_id)" in src
+
+
+def test_prune_removes_parked_and_stale_dev_dirs(tmp_path):
+    """_prune_helm_cache must delete parked dirs and expired dev builds."""
+    mod = _import_module()
+    mod.HELM_CACHE_DIR = str(tmp_path)
+    reg = "helm-oci-dev.test"
+    live = tmp_path / reg / "chartx" / "3.0.0-z-dev"
+    parked = tmp_path / reg / "chartx" / "3.0.0-z-dev.stale-123"
+    live.mkdir(parents=True)
+    (live / "Chart.yaml").write_text("x")
+    parked.mkdir(parents=True)
+    (parked / "Chart.yaml").write_text("x")
+    # No pull_ts entry means a dev build is treated as past its TTL.
+    mod._prune_helm_cache()
+    assert not parked.exists(), "parked dir must be removed"
+    assert not live.exists(), "expired dev build must be removed"
