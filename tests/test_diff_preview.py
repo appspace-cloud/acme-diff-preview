@@ -1121,3 +1121,49 @@ def test_ai_header_built_in_code_and_thinking_conditional():
     assert "AFFECTED ENVIRONMENT" in src, "env-line strip filter missing"
     assert "_envs_from_apps" in src
     assert '"flash" in VERTEX_MODEL' in src, "thinkingConfig must be flash-only"
+
+
+# ── v2.4.3: Bitbucket diff redaction + chart-aware main render cache ────────
+
+def test_secret_sections_fully_masked_in_bitbucket_output():
+    """A kind Secret diff must never publish values, sensitive-named or not."""
+    mod = _import_module()
+    hdr = "/v1/Secret pv-x-a/mongo-express"
+    body = ("--- \n+++ \n@@ -1,4 +1,4 @@\n"
+            " type: Opaque\n"
+            "-  mongodb-admin-password: cGFzczEyMw==\n"
+            "+  mongodb-admin-password: bmV3cGFzcw==\n"
+            "-  ca.crt: TFMwdExTMUNSVWRKVGc9PQ==\n"
+            "+  ca.crt: TFMwdExTMUNSVWRPVFE9PQ==\n")
+    out = mod._redact_for_display(hdr, body)
+    assert "cGFzczEyMw==" not in out and "TFMwdExTMUNSVWRJVGc9PQ==" not in out
+    assert out.count("[REDACTED]") == 4, out
+    assert "mongodb-admin-password" in out, "key names must stay visible"
+    assert "type: Opaque" in out, "structural lines must stay intact"
+
+
+def test_external_secrets_not_whole_masked_and_deployments_keep_key_based():
+    """ExternalSecret holds references; Deployments keep key-name redaction."""
+    mod = _import_module()
+    es = mod._redact_for_display("/external-secrets.io/ExternalSecret pv-x/scim-auth-key",
+                                 "+  refreshInterval: 24h\n+  name: scim-auth-key")
+    assert "24h" in es, "ExternalSecret reference fields must not be masked"
+    dep = mod._redact_for_display("/apps/Deployment pv-x/api",
+                                  "+  api_token: abc123\n+  replicas: 3")
+    assert "abc123" not in dep and "[REDACTED]" in dep
+    assert "replicas: 3" in dep, "non-sensitive keys untouched"
+
+
+def test_format_app_diff_block_applies_redaction():
+    """The Bitbucket comment path itself must go through redaction."""
+    mod = _import_module()
+    sections = [("/v1/Secret pv-x/mongo-express", "+  site-cookie-secret: c2VjcmV0\n")]
+    out = "\n".join(mod._format_app_diff_block("pv-x-a-ss", sections, ""))
+    assert "c2VjcmV0" not in out and "[REDACTED]" in out
+
+
+def test_main_render_cache_key_is_chart_and_pull_aware():
+    """(app, main_sha) alone reuses stale renders after a tag republish."""
+    src = _source()
+    assert "main_cache_key = (app, main_sha)" not in src, "old 2-tuple key still present"
+    assert "main_cache_key = (app, main_sha, main_rev, main_pull_gen)" in src

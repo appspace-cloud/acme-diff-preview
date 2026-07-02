@@ -1859,7 +1859,12 @@ def _run_one_diff(app, pr_sha, main_sha, chart_revision=None, changed_paths=None
         # Main-side render cache: reuse parsed resources if we already rendered
         # this app at main_sha (common when the same app appears in multiple PRs
         # or when a retry loop re-runs the diff).
-        main_cache_key = (app, main_sha)
+        # Key includes the chart revision AND its pull generation: a dev tag
+        # republished under the same version gets a new pull timestamp on
+        # re-pull, which invalidates renders made from the previous build
+        # even if the webhook-driven eviction was missed.
+        main_pull_gen = _helm_chart_pull_ts.get(f"{registry}/{chart_name}:{main_rev}", 0)
+        main_cache_key = (app, main_sha, main_rev, main_pull_gen)
         with _main_render_lock:
             main_resources = _main_render_cache.get(main_cache_key)
         needs_main_render = main_resources is None
@@ -2237,6 +2242,40 @@ _SENSITIVE_KEYS = re.compile(
     r'|encryption[-_]?key|signing[-_]?key)',
 )
 
+def _redact_secret_section(text: str) -> str:
+    """Display-time redaction for `kind: Secret` diff sections.
+
+    Inside a Secret, the key NAME is not a reliable sensitivity signal
+    (ca.crt, connection-string, arbitrary app keys), so every `key: value`
+    line is masked, keeping keys and diff markers so the reader still sees
+    WHICH entries changed. Runs at display time only - the diff engine
+    compares the real values, so changes are still detected.
+    """
+    out = []
+    for line in text.splitlines():
+        m = re.match(r'^([+\- ]*)([\w.\-/]+\s*[:=]\s*)(.+)$', line)
+        if m and m.group(3).strip() not in ("{}", "[]", "|", ">", "Opaque"):
+            out.append(f"{m.group(1)}{m.group(2)}[REDACTED]")
+        else:
+            out.append(line)
+    return "\n".join(out)
+
+
+def _redact_for_display(hdr: str, body: str) -> str:
+    """Redact a diff section before it is posted to Bitbucket.
+
+    v1 Secret sections get whole-value masking; everything else gets the
+    same key-name based redaction the AI prompt has always had. Before
+    v2.4.3 only the AI path redacted - the Bitbucket comment published
+    rendered manifests verbatim, including Secret data blocks.
+    Kinds merely containing "Secret" (ExternalSecret, SealedSecret) hold
+    references, not values, and are NOT whole-masked.
+    """
+    if re.search(r"/Secret[\s/]", hdr + " "):
+        return _redact_secret_section(body)
+    return _redact_sensitive(body)
+
+
 def _redact_sensitive(text: str) -> str:
     """Redact secret-like values from diff text before sending to Vertex AI.
 
@@ -2456,10 +2495,12 @@ def _format_app_diff_block(app, sections, diff_text, show_diff=True):
         return out
     if sections:
         for hdr, body in sections:
-            # body is already truncated at DiffResult creation time
-            out += [f"**`{hdr}`**", "", "```diff", body.rstrip(), "```", ""]
+            # body is already truncated at DiffResult creation time.
+            # Redaction happens here, at display time, so the diff engine
+            # still compares real values and detects Secret changes.
+            out += [f"**`{hdr}`**", "", "```diff", _redact_for_display(hdr, body).rstrip(), "```", ""]
     elif diff_text:
-        out += ["```diff", diff_text.rstrip(), "```", ""]
+        out += ["```diff", _redact_sensitive(diff_text).rstrip(), "```", ""]
     return out
 
 
