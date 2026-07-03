@@ -295,6 +295,7 @@ _path_map_app_count: int = 0
 # GCE access token cache: token valid ~3600s, no reason to refetch each PR.
 _gcp_token:     str   = ""
 _gcp_token_exp: float = 0.0
+_gcp_token_lock       = threading.Lock()
 
 def log(msg: str, severity: str = "INFO", **labels) -> None:
     """Emit a structured JSON log line in GCP Cloud Logging format."""
@@ -2141,13 +2142,26 @@ def parse_diff_sections(diff_text):
     return sections
 
 # ── Bitbucket helpers ─────────────────────────────────────────────────
-def post_build_status(pr_sha, state, description):
-    """Post build status. Swallows errors - never crashes the script."""
+def post_build_status(pr_sha, state, description, pr_id=None):
+    """Post build status. Swallows errors - never crashes the script.
+
+    The status URL used to always point at the ArgoCD server (bughunt: this
+    build status is the acme-diff-preview service itself running as an
+    ArgoCD Application - the link told a reviewer nothing about the actual
+    diff and required separate ArgoCD access to even load). The full diff
+    and every detail is already in the PR comment, so the link now points
+    back at the PR itself when the caller has pr_id; only the handful of
+    call sites that fire before the PR id is known fall back to no
+    meaningful destination (ARGOCD_SERVER), which practically never happens
+    in the normal flow (pr_id is available everywhere process_pr runs).
+    """
+    url = (f"https://bitbucket.org/{BB_WORKSPACE}/{BB_REPO}/pull-requests/{pr_id}"
+           if pr_id else f"https://{ARGOCD_SERVER}")
     try:
         bb("POST", f"commit/{pr_sha}/statuses/build", body={
             "state": state, "key": BUILD_KEY,
             "name": STATUS_NAME,
-            "url": f"https://{ARGOCD_SERVER}",
+            "url": url,
             "description": description[:255],
         })
     except Exception as e:
@@ -2326,7 +2340,7 @@ def fix_stuck_inprogress(pr_sha, pr_id, comment_raw):
             state, desc = "SUCCESSFUL", "Diff unavailable - review comment"
         else:
             state, desc = "SUCCESSFUL", "No manifest changes"
-        post_build_status(pr_sha, state, desc)
+        post_build_status(pr_sha, state, desc, pr_id=pr_id)
         print(f"    Fixed stuck INPROGRESS for PR #{pr_id} -> {state}")
     except Exception as e:
         log(f"[fix_stuck_inprogress] PR #{pr_id}: {e}", "WARNING")
@@ -2369,22 +2383,32 @@ def _gcp_access_token() -> str:
 
     Tokens are valid for ~3600s. We refresh when fewer than 60s remain
     so there is no risk of using an expired token mid-request.
+
+    Locked (bughunt): generate_ai_summary runs per-PR under MAX_PR_WORKERS
+    concurrent threads, all reading/writing this module-level cache. Without
+    a lock, two threads racing near expiry could both trigger a redundant
+    metadata-server fetch, or (narrower window) end up with a token from one
+    fetch paired with the expiry timestamp from a different concurrent fetch.
+    Neither produces an invalid/unsafe token, but the lock removes the race
+    entirely at negligible cost (this is called once per PR render, not
+    per-app).
     """
     global _gcp_token, _gcp_token_exp
-    if _gcp_token and time.monotonic() < (_gcp_token_exp - 60):
+    with _gcp_token_lock:
+        if _gcp_token and time.monotonic() < (_gcp_token_exp - 60):
+            return _gcp_token
+        print("      [AI] Fetching GCP token from metadata server...")
+        resp           = http(
+            "GET",
+            "http://metadata.google.internal/computeMetadata/v1"
+            "/instance/service-accounts/default/token",
+            headers={"Metadata-Flavor": "Google"},
+        )
+        _gcp_token     = resp["access_token"]
+        _gcp_token_exp = time.monotonic() + resp.get("expires_in", 3600)
+        exp = resp.get("expires_in", "?")
+        print(f"      [AI] Token refreshed (valid for {exp}s)")
         return _gcp_token
-    print("      [AI] Fetching GCP token from metadata server...")
-    resp           = http(
-        "GET",
-        "http://metadata.google.internal/computeMetadata/v1"
-        "/instance/service-accounts/default/token",
-        headers={"Metadata-Flavor": "Google"},
-    )
-    _gcp_token     = resp["access_token"]
-    _gcp_token_exp = time.monotonic() + resp.get("expires_in", 3600)
-    exp = resp.get("expires_in", "?")
-    print(f"      [AI] Token refreshed (valid for {exp}s)")
-    return _gcp_token
 
 def _normalize_ai_markdown(text: str) -> str:
     """Ensure the AI output renders correctly in Bitbucket Markdown.
@@ -2774,11 +2798,22 @@ def format_comment(pr_sha, app_results, skipped_apps=None, base_sha=""):
         elif r.outcome == OUT_INDETERMINATE:
             any_unknown = True
             unknown_apps.append(app)
-            hint = _REASON_HINTS.get(r.reason, "diff could not be computed")
-            lines += [
-                f"\u2754 **`{app}`** \u2014 diff unavailable ({hint})",
-                "",
-            ]
+            if r.reason == REASON_OCI_NOT_FOUND and r.error:
+                # Surface the exact missing chart:version prominently (bughunt):
+                # the generic hint below used to be the ONLY thing shown here,
+                # hiding which specific package was missing inside r.error -
+                # a reviewer had no way to tell what to go publish/fix.
+                lines += [
+                    f"\u274c **`{app}`** \u2014 **chart version not found in OCI registry**",
+                    f"> **{r.error}**",
+                    "",
+                ]
+            else:
+                hint = _REASON_HINTS.get(r.reason, "diff could not be computed")
+                lines += [
+                    f"\u2754 **`{app}`** \u2014 diff unavailable ({hint})",
+                    "",
+                ]
 
         elif r.outcome == OUT_DIFF:
             any_change = True
@@ -2924,7 +2959,7 @@ def process_pr(pr, path_map, base_sha=""):
             if new_env_candidates:
                 log(f"PR #{pr_id}: {len(new_env_candidates)} new env candidate(s): "
                     f"{[e['name'] for e in new_env_candidates]}", pr=pr_id)
-                post_build_status(pr_sha, "INPROGRESS", "Rendering new environment(s)...")
+                post_build_status(pr_sha, "INPROGRESS", "Rendering new environment(s)...", pr_id=pr_id)
                 new_env_sections = []
                 any_render_ok = False
                 for env_info in new_env_candidates:
@@ -2997,7 +3032,7 @@ def process_pr(pr, path_map, base_sha=""):
 
                 total_new = sum(s["n_res"] for s in new_env_sections)
                 desc = f"{len(new_env_candidates)} new environment(s), ~{total_new} resource(s) to create"
-                post_build_status(pr_sha, "SUCCESSFUL", desc)
+                post_build_status(pr_sha, "SUCCESSFUL", desc, pr_id=pr_id)
                 lines += [
                     "---",
                     f"**Status:** \u2705 New environment(s) - all resources will be created on merge",
@@ -3011,7 +3046,7 @@ def process_pr(pr, path_map, base_sha=""):
             # No apps affected and no new env pattern found.
             print(f"    No ArgoCD apps affected - posting SUCCESSFUL")
             post_build_status(pr_sha, "SUCCESSFUL",
-                "No ArgoCD apps affected by this PR")
+                "No ArgoCD apps affected by this PR", pr_id=pr_id)
             no_apps_body = (
                 f"## \U0001f52d {STATUS_NAME}\n\n"
                 f"Commit `{pr_sha[:8]}` vs `main` | `{BB_REPO}`\n\n"
@@ -3028,7 +3063,7 @@ def process_pr(pr, path_map, base_sha=""):
             return
 
         print(f"    Apps: {affected}")
-        post_build_status(pr_sha, "INPROGRESS", "Running ArgoCD diff...")
+        post_build_status(pr_sha, "INPROGRESS", "Running ArgoCD diff...", pr_id=pr_id)
 
         skipped_apps = []
         if len(affected) > MAX_APPS_PER_RUN:
@@ -3233,28 +3268,31 @@ def process_pr(pr, path_map, base_sha=""):
         if any_hard_error or has_blocking_indet:
             if oci_not_found_count:
                 post_build_status(pr_sha, "FAILED",
-                    f"{oci_not_found_count} app(s): chart version not found in OCI registry")
+                    f"{oci_not_found_count} app(s): chart version not found in OCI registry",
+                    pr_id=pr_id)
             else:
-                post_build_status(pr_sha, "FAILED", "Diff failed - check PR comment")
+                post_build_status(pr_sha, "FAILED", "Diff failed - check PR comment", pr_id=pr_id)
         elif skipped_apps:
             # Apps beyond MAX_APPS_PER_RUN were never evaluated — never post SUCCESSFUL
             # with a coverage gap, as reviewers assume full coverage.
             n_skipped = len(skipped_apps)
             extra = f" | {sections_total} resource(s) changed" if sections_total else ""
             post_build_status(pr_sha, "FAILED",
-                f"{n_skipped} app(s) not evaluated (cap={MAX_APPS_PER_RUN}){extra} — review comment")
+                f"{n_skipped} app(s) not evaluated (cap={MAX_APPS_PER_RUN}){extra} — review comment",
+                pr_id=pr_id)
         elif sections_total > 0:
             extra = f" ({n_unknown} unavailable)" if any_unknown else ""
             post_build_status(pr_sha, "SUCCESSFUL",
-                f"{sections_total} resource(s) will change - review comment{extra}")
+                f"{sections_total} resource(s) will change - review comment{extra}",
+                pr_id=pr_id)
         elif any_unknown:
             # Soft indeterminate (transient timeout, etc.) - not a hard block but
             # operator should review. Use SUCCESSFUL so it does not block merge
             # gates on a transient failure; the next iteration will retry.
             post_build_status(pr_sha, "SUCCESSFUL",
-                f"Diff unavailable for {n_unknown} app(s) - review comment")
+                f"Diff unavailable for {n_unknown} app(s) - review comment", pr_id=pr_id)
         else:
-            post_build_status(pr_sha, "SUCCESSFUL", "No manifest changes")
+            post_build_status(pr_sha, "SUCCESSFUL", "No manifest changes", pr_id=pr_id)
 
         # Mark as seen logic:
         # - Clean run (no error, no indeterminate): mark seen -> skip next iteration
@@ -3273,7 +3311,7 @@ def process_pr(pr, path_map, base_sha=""):
     except Exception as e:
         log(f"[ERROR] PR #{pr_id}: {e}", "ERROR")
         try:
-            post_build_status(pr_sha, "FAILED", f"Diff error: {str(e)[:200]}")
+            post_build_status(pr_sha, "FAILED", f"Diff error: {str(e)[:200]}", pr_id=pr_id)
         except Exception:
             pass
         err_body = (
