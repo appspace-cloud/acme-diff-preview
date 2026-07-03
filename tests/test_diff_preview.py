@@ -3,6 +3,7 @@ import ast
 import importlib
 import os
 import sys
+import time
 
 SRC = os.path.join(os.path.dirname(__file__), "..", "src", "diff_preview.py")
 
@@ -1070,9 +1071,18 @@ def test_force_recompute_bypasses_both_dedups():
 
 
 def test_prune_removes_parked_and_stale_dev_dirs(tmp_path):
-    """_prune_helm_cache must delete parked dirs and expired dev builds."""
+    """_prune_helm_cache must delete parked dirs and expired dev builds.
+
+    v2.4.8: "no in-memory pull_ts" no longer means "treat as expired" — that
+    was the bug where a pod restart wiped the entire on-disk dev chart cache
+    (see the mtime-fallback fix in _prune_helm_cache). Staleness for a build
+    with no pull_ts is now decided by the directory's real mtime, which
+    survives restarts. This test backdates the mtime to simulate a build
+    that is genuinely older than DEV_CHART_TTL.
+    """
     mod = _import_module()
     mod.HELM_CACHE_DIR = str(tmp_path)
+    mod.DEV_CHART_TTL = 600
     reg = "helm-oci-dev.test"
     live = tmp_path / reg / "chartx" / "3.0.0-z-dev"
     parked = tmp_path / reg / "chartx" / "3.0.0-z-dev.stale-123"
@@ -1080,10 +1090,34 @@ def test_prune_removes_parked_and_stale_dev_dirs(tmp_path):
     (live / "Chart.yaml").write_text("x")
     parked.mkdir(parents=True)
     (parked / "Chart.yaml").write_text("x")
-    # No pull_ts entry means a dev build is treated as past its TTL.
+    # Backdate mtime well past the TTL — no pull_ts AND an old mtime, so this
+    # must still be recognized as genuinely expired.
+    old = time.time() - mod.DEV_CHART_TTL - 60
+    os.utime(live, (old, old))
     mod._prune_helm_cache()
     assert not parked.exists(), "parked dir must be removed"
-    assert not live.exists(), "expired dev build must be removed"
+    assert not live.exists(), "genuinely expired dev build must be removed"
+
+
+def test_prune_keeps_recent_dev_dir_with_no_in_memory_timestamp(tmp_path):
+    """v2.4.8 regression: a fresh dev build with NO in-memory pull_ts (the
+    exact state right after a pod restart) must survive the prune, using
+    the directory mtime as a substitute for the lost in-memory timestamp."""
+    mod = _import_module()
+    mod.HELM_CACHE_DIR = str(tmp_path)
+    mod.DEV_CHART_TTL = 600
+    mod._helm_chart_pull_ts.clear()   # simulate a just-restarted pod
+    reg = "helm-oci-dev.test"
+    live = tmp_path / reg / "charty" / "1.0.0-dev"
+    live.mkdir(parents=True)
+    (live / "Chart.yaml").write_text("x")
+    # mtime defaults to "now" — well within DEV_CHART_TTL.
+    mod._prune_helm_cache()
+    assert live.exists(), "a recently-pulled dev build must survive a restart"
+    assert mod._helm_chart_pull_ts.get(f"{reg}/charty:1.0.0-dev") is not None, (
+        "prune should seed the in-memory timestamp from mtime so later "
+        "_ensure_chart TTL checks agree with this decision"
+    )
 
 
 # ── v2.4.2: AI summary hallucination fixes ──────────────────────────────────

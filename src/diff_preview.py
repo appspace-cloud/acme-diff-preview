@@ -880,17 +880,43 @@ def _extract_app_chart_info(app):
     return None, None, None, []
 
 
-def get_affected_apps(changed_files, path_map):
-    """Return sorted app names whose manifest-generate-paths overlap with changed files."""
-    apps = set()
+def _match_files_to_apps(changed_files, path_map):
+    """Single O(files x paths) pass matching changed files to affected apps.
+
+    PERF FIX (v2.4.8): previously get_affected_apps() did this scan once per
+    PR, and _pr_chart_revision() independently redid an equivalent scan once
+    PER AFFECTED APP -- O(apps x files x paths) total. Measured with a
+    realistic 600-app fleet: 413ms of pure CPU per PR just for version-bump
+    detection, before any network calls. This computes the match ONCE and
+    returns both the affected-apps list and a per-app file list, so every
+    caller reuses the same result instead of recomputing it.
+
+    Preserves the original union semantics: a file with no exact path_map key
+    is checked against EVERY path_map entry (not just the first match), since
+    a single file can legitimately belong to more than one path prefix.
+
+    Returns (affected_apps: sorted list[str], app_to_files: dict[str, list[str]]).
+    """
+    app_to_files: dict = {}
     for f in changed_files:
-        if f in path_map:
-            apps.update(path_map[f])
+        exact = path_map.get(f)
+        if exact is not None:
+            matched_apps = exact
         else:
+            matched = set()
             for p, app_list in path_map.items():
                 if f.startswith(p + "/") or p.startswith(f + "/"):
-                    apps.update(app_list)
-    return sorted(apps)
+                    matched.update(app_list)
+            matched_apps = matched
+        for app in matched_apps:
+            app_to_files.setdefault(app, []).append(f)
+    return sorted(app_to_files), app_to_files
+
+
+def get_affected_apps(changed_files, path_map):
+    """Return sorted app names whose manifest-generate-paths overlap with changed files."""
+    affected, _ = _match_files_to_apps(changed_files, path_map)
+    return affected
 
 
 # ── ArgoCD login (used only for app discovery, never for the diff itself) ──
@@ -1034,6 +1060,11 @@ REASON_OCI_PULL      = "oci_pull_failed"    # transient pull/login failure — r
 REASON_METADATA      = "metadata_pending"   # app not yet in the 5-min app cache — retry
 REASON_RENDER        = "render_failed"      # `helm template` failed (bad values/chart) — soft
 REASON_TIMEOUT       = "timeout"            # a step exceeded DIFF_TIMEOUT — retry
+# An unhandled exception inside run_diff/argocd_diff itself (bug, unexpected
+# API shape, etc.) — not one of the known, classified failure modes above.
+# Added in v2.4.8 so process_batch can record a per-app crash and continue
+# the rest of the batch instead of letting the exception abort it entirely.
+REASON_UNEXPECTED    = "unexpected_error"
 
 # Reasons worth retrying in-process with backoff (transient).
 # REASON_RENDER is retried once — a brief subprocess glitch (node IO, tmp
@@ -1050,6 +1081,7 @@ _REASON_HINTS = {
     REASON_METADATA:      "app not yet in the discovery cache (added since last refresh)",
     REASON_RENDER:        "helm template failed to render the chart with these values",
     REASON_TIMEOUT:       f"a diff step exceeded {DIFF_TIMEOUT}s",
+    REASON_UNEXPECTED:    "an unexpected error occurred while computing the diff",
     "retry_exhausted":    "still failing after retries",
     "legacy":             "diff could not be computed",
 }
@@ -1100,6 +1132,22 @@ def _bb_fetch_status(filepath, sha):
 _appspace_key_re = re.compile(r"^\s*appspace:\s*(#.*)?$")
 _version_key_re  = re.compile(r"^\s*version:\s*([^\s#]+)")
 
+# A chart targetRevision is an OCI tag / semver-ish string. It flows from a
+# PR-authored config file into `helm pull --version <v>` and into
+# os.path.join(cache, registry, chart, <v>). Anyone who can open a PR against
+# acme-config-dev controls this value, so it must be strictly validated before
+# use: reject anything that is not a safe tag. This blocks both path traversal
+# (../../etc) and argument injection (--foo, leading dash) at the source.
+# OCI tags allow [A-Za-z0-9._-], max 128 chars, and must not start with a dash.
+_SAFE_CHART_VERSION_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
+
+
+def _is_valid_chart_version(version: str) -> bool:
+    """True only for a safe OCI tag: no path separators, no leading dash,
+    no shell/whitespace metacharacters. See _SAFE_CHART_VERSION_RE."""
+    return bool(version) and bool(_SAFE_CHART_VERSION_RE.match(version))
+
+
 
 def _extract_chart_version(content: str):
     """Return the chart targetRevision from a config file's `appspace.version`.
@@ -1134,7 +1182,16 @@ def _extract_chart_version(content: str):
                 child_indent = indent
             vm = _version_key_re.match(line)
             if vm and indent == child_indent:
-                return vm.group(1).strip("'\"")
+                candidate = vm.group(1).strip("'\"")
+                # Reject anything that is not a safe OCI tag. A PR author
+                # controls this value and it reaches `helm pull --version`
+                # and a filesystem path, so an unsafe value is treated as
+                # "no version bump" rather than passed downstream.
+                if not _is_valid_chart_version(candidate):
+                    log(f"_extract_chart_version: rejecting unsafe version "
+                        f"{candidate!r} (not a valid OCI tag)", "WARNING")
+                    return None
+                return candidate
     return None
 
 
@@ -1248,6 +1305,16 @@ def _ensure_chart(registry: str, chart: str, version: str) -> str:
     Raises OciChartNotFound if the version does not exist in the registry.
     Returns None on other pull failures (network, auth).
     """
+    # Defense in depth: never build a filesystem path or a `helm pull
+    # --version` argument from an unvalidated tag, regardless of caller.
+    # _extract_chart_version already filters PR input, but this guarantees
+    # the invariant at the single choke point every pull goes through.
+    if not _is_valid_chart_version(version):
+        log(f"_ensure_chart: refusing unsafe chart version {version!r}", "ERROR")
+        return None
+    if "/" in chart or ".." in chart:
+        log(f"_ensure_chart: refusing unsafe chart name {chart!r}", "ERROR")
+        return None
     key = f"{registry}/{chart}:{version}"
     # Dev registries can republish charts under the same tag. Treat any cached
     # copy (memory or disk) as stale after DEV_CHART_TTL seconds and re-pull.
@@ -1436,6 +1503,21 @@ def _prune_helm_cache():
         key = f"{registry}/{chart}:{version}"
         parked = ".stale-" in version
         pull_ts = _helm_chart_pull_ts.get(key)
+        if pull_ts is None:
+            # CORRECTNESS FIX (v2.4.8): _helm_chart_pull_ts is in-memory only
+            # and starts empty on every pod restart. Treating "no timestamp"
+            # as "definitely stale" meant the pod wiped its ENTIRE on-disk dev
+            # chart cache on the first prune after every restart, even for
+            # charts pulled seconds before the restart. The filesystem mtime
+            # survives restarts (the directory itself does), so use it as the
+            # source of truth when the in-memory timestamp is missing, and
+            # seed the in-memory map from it so later TTL checks in
+            # _ensure_chart (which only reads _helm_chart_pull_ts) agree with
+            # this decision instead of re-deriving it differently.
+            file_age_s = time.time() - _mtime
+            if file_age_s < DEV_CHART_TTL:
+                _helm_chart_pull_ts[key] = _now - file_age_s
+                pull_ts = _helm_chart_pull_ts[key]
         stale_dev = (
             _DEV_REGISTRY_PATTERN in registry
             and (pull_ts is None or _now - pull_ts >= DEV_CHART_TTL)
@@ -1716,13 +1798,21 @@ def _render_new_env_diff(env_info: dict, pr_sha: str) -> tuple:
     return diff_text, None, resource_count, version
 
 
-def _pr_chart_revision(app, changed_files, pr_sha):
+def _pr_chart_revision(app, candidate_files, pr_sha):
     """Return the new OCI chart targetRevision for an app if the PR changes it.
 
-    Strategy: look at the changed config files that affect this app, fetch each
-    one from Bitbucket at pr_sha, and search for an `appspace.version` YAML key.
-    That value is the new helm chart targetRevision (the ApplicationSet sets
+    Strategy: candidate_files is this app's own subset of the PR's changed
+    files, already matched against path_map by the caller (see
+    _match_files_to_apps, v2.4.8). Fetch each one from Bitbucket at pr_sha
+    and search for an `appspace.version` YAML key. That value is the new
+    helm chart targetRevision (the ApplicationSet sets
     spec.sources[1].targetRevision = appspace.version).
+
+    PERF FIX (v2.4.8): this function used to re-derive candidate_files by
+    scanning the full changed_files list against path_map on every call --
+    once per affected app. With ~600 apps that scan ran 600 times per PR.
+    The caller now does that scan ONCE for the whole PR and hands each app
+    just its own file list, so this function is pure O(candidate_files).
 
     Returns the new revision string if it differs from the current one cached in
     _app_chart_revision_map, otherwise returns None.
@@ -1730,18 +1820,6 @@ def _pr_chart_revision(app, changed_files, pr_sha):
     current_rev = _app_chart_revision_map.get(app)
     if not current_rev:
         return None
-    # Find config files that (a) changed in this PR and (b) feed this app.
-    path_map = _path_map_cache
-    candidate_files = []
-    for f in changed_files:
-        apps_for_file = path_map.get(f, [])
-        if app in apps_for_file:
-            candidate_files.append(f)
-        else:
-            for p, app_list in path_map.items():
-                if (f.startswith(p + "/") or p.startswith(f + "/")) and app in app_list:
-                    candidate_files.append(f)
-                    break
     for filepath in candidate_files:
         # Route through _vf_cache so parallel calls for the same (pr_sha, path)
         # from different apps share one Bitbucket API call instead of all fetching
@@ -2949,7 +3027,10 @@ def process_pr(pr, path_map, base_sha=""):
 
     try:
         changed  = get_pr_changed_files(pr_id)
-        affected = get_affected_apps(changed, path_map)
+        # Single O(files x paths) match for the whole PR (v2.4.8 perf fix) —
+        # _app_to_files is reused below for the version-bump detection pass
+        # instead of every app independently rescanning changed x path_map.
+        affected, _app_to_files = _match_files_to_apps(changed, path_map)
         print(f"    Changed files: {len(changed)} | Affected apps: {len(affected)}")
 
         if not affected:
@@ -3092,7 +3173,7 @@ def process_pr(pr, path_map, base_sha=""):
         # limited by _bb_api_sem) instead of a serial loop over 600+ apps.
         pr_chart_revisions = {}
         with ThreadPoolExecutor(max_workers=max(1, min(DIFF_WORKERS, len(affected)))) as ex:
-            rev_futs = {ex.submit(_pr_chart_revision, app, changed, pr_sha): app
+            rev_futs = {ex.submit(_pr_chart_revision, app, _app_to_files.get(app, []), pr_sha): app
                         for app in affected}
             for fut in as_completed(rev_futs):
                 app = rev_futs[fut]
@@ -3152,7 +3233,23 @@ def process_pr(pr, path_map, base_sha=""):
                         log(f"SIGTERM received mid-batch — draining remaining futures",
                             "WARNING")
                         break
-                    app, result, elapsed = fut.result()
+                    app = futures[fut]
+                    try:
+                        app, result, elapsed = fut.result()
+                    except Exception as exc:
+                        # CORRECTNESS FIX (v2.4.8): an unhandled exception here
+                        # used to propagate out of process_batch entirely,
+                        # aborting every remaining app in the batch (their
+                        # results were simply never recorded — no comment
+                        # update, no error, just silence for that app on this
+                        # run). Every other pool in this module (pre-warm,
+                        # JFrog refresh) already isolates per-item failures;
+                        # this one did not. Record it as OUT_ERROR and keep
+                        # processing the rest of the batch.
+                        log(f"diff crashed for {app}: {exc}", "ERROR", pr=pr_id, app=app)
+                        result = DiffResult("", [], 0, False, str(exc)[:300],
+                                            OUT_ERROR, REASON_UNEXPECTED)
+                        elapsed = 0.0
                     app_results[app] = result
                     outcome_counts[result.outcome] += 1
                     if result.outcome == OUT_ERROR:
@@ -3186,10 +3283,19 @@ def process_pr(pr, path_map, base_sha=""):
                         unique_chart_pulls.add((reg, chart, pr_rv))
 
             # Filter out versions already cached on disk (pod restart preserves /tmp)
+            # CORRECTNESS FIX (v2.4.8): snapshot _helm_chart_cache under its
+            # lock instead of reading it live while other threads mutate it.
+            # Worst case before this fix was an extra redundant pull (the
+            # dict is only ever added to or evicted, never corrupted, so this
+            # was never unsafe under the GIL — just an unsynchronized read of
+            # shared state, which is the kind of thing that turns into a real
+            # bug the next time this function grows a second read).
+            with _helm_cache_lock:
+                _cache_snapshot = set(_helm_chart_cache)
             pulls_needed = {
                 (reg, chart, ver) for reg, chart, ver in unique_chart_pulls
                 if not os.path.isdir(os.path.join(HELM_CACHE_DIR, reg, chart, ver))
-                and f"{reg}/{chart}:{ver}" not in _helm_chart_cache
+                and f"{reg}/{chart}:{ver}" not in _cache_snapshot
             }
             already_cached = len(unique_chart_pulls) - len(pulls_needed)
             if pulls_needed or already_cached:
