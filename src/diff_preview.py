@@ -58,6 +58,25 @@ import concurrent.futures
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone
 
+def _env_int(name: str, default: int) -> int:
+    """Parse an integer env var, falling back to default on any bad value.
+
+    A typo in ANY numeric env var (e.g. DIFF_WORKERS=sixteen) used to crash
+    the pod at import time with a raw traceback and no hint which variable
+    was at fault (bughunt N3). Now it logs a WARNING naming the variable,
+    the bad value, and the default used, and the pod starts normally.
+    """
+    raw = os.environ.get(name)
+    if raw is None:
+        return default
+    try:
+        return int(raw)
+    except ValueError:
+        print(f'WARNING: env var {name}="{raw}" is not a valid integer; '
+              f'using default {default}', file=sys.stderr, flush=True)
+        return default
+
+
 BB_WORKSPACE       = "appspace-cloud"
 BB_REPO            = "acme-config-dev"
 BB_USER            = os.environ["BB_USER"]
@@ -85,7 +104,7 @@ BB_WEBHOOK_SECRET    = os.environ.get("BB_WEBHOOK_SECRET", "")
 JFROG_WEBHOOK_SECRET = os.environ.get("JFROG_WEBHOOK_SECRET", "")
 # Deduplication window: skip hard-refresh if same chart:version was processed
 # within this many seconds. Handles JFrog retries and rapid successive pushes.
-JFROG_DEDUP_WINDOW   = int(os.environ.get("JFROG_DEDUP_WINDOW", "15"))
+JFROG_DEDUP_WINDOW   = _env_int("JFROG_DEDUP_WINDOW", 15)
 # Human-readable name shown on the Bitbucket PR build status and comment header.
 STATUS_NAME        = "ACME Diff Preview"
 # Marker written into the footer of every comment we post. find_existing_comment
@@ -108,13 +127,13 @@ MAX_DIFF_CHARS     = 2000    # chars per resource diff block
 # The diff is a pure local `helm template` render (no ArgoCD agent round-trips),
 # so the client can fan out wide: the only shared limit is the Bitbucket API
 # (BB_API_CONCURRENCY) used to fetch value files.
-MAX_APPS_PER_RUN   = int(os.environ.get("MAX_APPS_PER_RUN", "800"))   # cover 600+ apps/PR with headroom
-DIFF_WORKERS       = int(os.environ.get("DIFF_WORKERS", "16"))        # parallel per-app helm-template diffs
-DIFF_TIMEOUT       = int(os.environ.get("DIFF_TIMEOUT", "120"))       # seconds per diff (OCI cache-miss pulls are slow)
-WARM_WORKERS       = int(os.environ.get("WARM_WORKERS", "4"))         # parallel chart-cache warm-up pulls
-WARM_THRESHOLD     = int(os.environ.get("WARM_THRESHOLD", "8"))       # only warm when a PR fans out to more apps than this
+MAX_APPS_PER_RUN   = _env_int("MAX_APPS_PER_RUN", 800)   # cover 600+ apps/PR with headroom
+DIFF_WORKERS       = _env_int("DIFF_WORKERS", 16)        # parallel per-app helm-template diffs
+DIFF_TIMEOUT       = _env_int("DIFF_TIMEOUT", 120)       # seconds per diff (OCI cache-miss pulls are slow)
+WARM_WORKERS       = _env_int("WARM_WORKERS", 4)         # parallel chart-cache warm-up pulls
+WARM_THRESHOLD     = _env_int("WARM_THRESHOLD", 8)       # only warm when a PR fans out to more apps than this
 MAX_COMMENT_BYTES  = 245_000 # Bitbucket ~256KB limit; leave headroom
-JFROG_MAX_BODY_BYTES = int(os.environ.get("JFROG_MAX_BODY_BYTES", "65536"))  # 64 KB — reject oversized bodies before HMAC
+JFROG_MAX_BODY_BYTES = _env_int("JFROG_MAX_BODY_BYTES", 65536)  # 64 KB — reject oversized bodies before HMAC
 
 # JFrog webhook dedup state: {chart:version -> last_processed_timestamp}
 _jfrog_recent:     dict          = {}
@@ -137,9 +156,14 @@ _jfrog_stats_lock: threading.Lock = threading.Lock()
 # one daemon thread per event — an uncapped thundering herd on the ArgoCD
 # API (bughunt F3: 24 pushes -> 24 concurrent threads). Tasks now queue and
 # drain at a controlled rate.
-JFROG_REFRESH_WORKERS = int(os.environ.get("JFROG_REFRESH_WORKERS", "4"))
+# Renamed from the overloaded JFROG_REFRESH_WORKERS (bughunt N1): that one
+# name was read in two places with two different meanings and different
+# defaults (4 here, 8 below) - lowering it to calm the ArgoCD API throttled
+# both the event-dispatch pool AND the per-event app fan-out at once, with a
+# confusing multiplicative effect. Now each has its own name and default.
+JFROG_DISPATCH_WORKERS = _env_int("JFROG_DISPATCH_WORKERS", 4)
 _jfrog_refresh_pool = ThreadPoolExecutor(
-    max_workers=JFROG_REFRESH_WORKERS, thread_name_prefix="jfrog-refresh-worker")
+    max_workers=JFROG_DISPATCH_WORKERS, thread_name_prefix="jfrog-refresh-worker")
 
 # Diff operation counters — exposed at GET /diff-preview/stats
 _diff_stats:      dict          = {
@@ -148,10 +172,23 @@ _diff_stats:      dict          = {
     "apps_no_diff": 0,       # apps confirmed unchanged
     "apps_indeterminate": 0, # diffs that could not be computed
     "apps_oci_not_found": 0, # permanent OCI version missing
+    "apps_render_failed": 0, # helm template failed (bad values/chart) — bughunt N4
+    "apps_timeout": 0,       # a diff step exceeded DIFF_TIMEOUT — bughunt N4
+    "main_render_cache_hits": 0,   # reused a parsed main-side render — bughunt N4
+    "main_render_cache_misses": 0, # had to render main fresh — bughunt N4
     "last_iteration_s": None,# seconds taken by most recent iteration
     "last_iteration_at": None,
 }
 _diff_stats_lock: threading.Lock = threading.Lock()
+
+# Comment-ID cache: avoids re-paginating ALL comments on every iteration to
+# find ours (bughunt N5). Our comment is updated in place, so its position
+# among a PR's comments never moves; on a heavily-discussed PR the old
+# lookup re-scanned every human comment every ~60s. Once found, a single
+# GET by ID replaces the full page scan. Self-healing: a 404 (comment
+# deleted) evicts the entry and falls back to a full scan once.
+_comment_id_cache: dict      = {}
+_comment_id_cache_lock       = threading.Lock()
 
 # In-memory SHA dedup: avoids reprocessing same PR SHA within this pod run
 _seen: dict    = {}
@@ -173,16 +210,16 @@ _last_ok_lock         = threading.Lock()
 # poll failure so alerts can distinguish "busy processing" from "broken loop".
 _last_poll_ok: bool   = True
 _consecutive_poll_fails: int = 0
-POLL_FAIL_THRESHOLD   = int(os.environ.get("POLL_FAIL_THRESHOLD", "3"))
+POLL_FAIL_THRESHOLD   = _env_int("POLL_FAIL_THRESHOLD", 3)
 # _ready tracks whether the service is operationally ready: cleared when OCI
 # creds are missing or repeated login failures make the diff engine broken.
 _consecutive_login_fails: int = 0
-LOGIN_FAIL_THRESHOLD  = int(os.environ.get("LOGIN_FAIL_THRESHOLD", "3"))
+LOGIN_FAIL_THRESHOLD  = _env_int("LOGIN_FAIL_THRESHOLD", 3)
 
 # Max parallel PR processing workers. Each worker fans out up to DIFF_WORKERS
 # per-app helm-template diffs internally, so the effective worker pool is
 # MAX_PR_WORKERS × DIFF_WORKERS. Env-overridable via PR_WORKERS.
-MAX_PR_WORKERS  = int(os.environ.get("PR_WORKERS", "3"))
+MAX_PR_WORKERS  = _env_int("PR_WORKERS", 3)
 
 # Path map TTL cache: argocd app list is ~350ms and downloads ~50KB.
 # The map only changes when apps are added/removed (rare).
@@ -559,7 +596,10 @@ def _jfrog_hard_refresh(chart_name: str, chart_version: str) -> None:
         f"{', '.join(matching[:5])}{'...' if len(matching) > 5 else ''}")
 
     # Parallel hard-refresh: same approach as the CronJob in dev_hard_refresh.py
-    REFRESH_WORKERS = int(os.environ.get("JFROG_REFRESH_WORKERS", "8"))
+    # See JFROG_DISPATCH_WORKERS above for why this has its own name (N1):
+    # this one controls how many apps are hard-refreshed in parallel WITHIN
+    # a single chart:version event, a different knob than the dispatch pool.
+    REFRESH_WORKERS = _env_int("JFROG_REFRESH_FANOUT", 8)
 
     def _do_refresh(app_name: str):
         try:
@@ -817,7 +857,7 @@ _argocd_token: str = ""
 _argocd_token_ts: float = 0.0   # monotonic time of last successful token fetch
 # Proactively refresh the JWT every ARGOCD_TOKEN_TTL seconds so it never expires
 # mid-iteration. ArgoCD default JWT lifetime is 24h; refresh at 12h leaves margin.
-ARGOCD_TOKEN_TTL = int(os.environ.get("ARGOCD_TOKEN_TTL", str(12 * 3600)))
+ARGOCD_TOKEN_TTL = _env_int("ARGOCD_TOKEN_TTL", 12 * 3600)
 
 
 def _argocd_fetch_token() -> str:
@@ -1066,7 +1106,7 @@ KUBE_VERSION    = os.environ.get("KUBE_VERSION", "1.30.0")
 # Dev OCI registries may republish charts with the same tag (CI fast-loop). Cache
 # dev-registry chart versions for at most this many seconds before re-pulling.
 # Release registry charts are immutable, so we skip the TTL check for them.
-DEV_CHART_TTL        = int(os.environ.get("DEV_CHART_TTL", "600"))   # 10 min default
+DEV_CHART_TTL        = _env_int("DEV_CHART_TTL", 600)   # 10 min default
 _DEV_REGISTRY_PATTERN = "helm-oci-dev."           # hostname prefix identifying dev registries
 # Timestamp of each cached chart version's last pull, for dev-TTL eviction.
 _helm_chart_pull_ts: dict = {}   # key -> monotonic time of last successful pull
@@ -1076,7 +1116,7 @@ _helm_logged_in: set = set()
 _helm_login_lock     = threading.Lock()
 # Timestamp of the last successful login per registry. Re-login after this many
 # seconds so a secret rotation (new OCI_PASS) is picked up without a pod restart.
-HELM_LOGIN_TTL       = int(os.environ.get("HELM_LOGIN_TTL", str(6 * 3600)))  # 6h default
+HELM_LOGIN_TTL       = _env_int("HELM_LOGIN_TTL", 6 * 3600)  # 6h default
 _helm_login_ts: dict = {}   # registry -> monotonic timestamp of last successful login
 # Local chart path cache: "{registry}/{chart}:{version}" -> "/tmp/.../chart_dir"
 _helm_chart_cache: dict = {}
@@ -1124,7 +1164,7 @@ _main_render_sha: str    = ""   # the main_sha the cache is valid for
 # Cap to prevent memory pressure during long-lived pods with many apps.
 # Each entry holds parsed YAML dicts per resource — can be several hundred KB
 # for a large micro-services chart. 200 entries ≈ a few hundred MB worst case.
-MAIN_RENDER_CACHE_MAX = int(os.environ.get("MAIN_RENDER_CACHE_MAX", "200"))
+MAIN_RENDER_CACHE_MAX = _env_int("MAIN_RENDER_CACHE_MAX", 200)
 
 
 class OciChartNotFound(Exception):
@@ -1311,7 +1351,7 @@ def _find_chart_subdir(chart_dir: str) -> str:
 # version-bump pulls a couple of versions per chart; over a long pod lifetime
 # these accumulate and can fill node ephemeral storage (not bounded by the
 # memory limit). Keep the most-recently-used and evict the rest.
-HELM_CACHE_MAX_CHARTS = int(os.environ.get("HELM_CACHE_MAX_CHARTS", "60"))
+HELM_CACHE_MAX_CHARTS = _env_int("HELM_CACHE_MAX_CHARTS", 60)
 
 
 def _prune_helm_cache():
@@ -1393,7 +1433,7 @@ _vf_cache_lock  = threading.Lock()
 # Upper bound on cached value files so a long-lived pod cannot grow without limit
 # (each open PR adds ~7 base-sha + ~7 head-sha entries). When exceeded we drop the
 # oldest-inserted half. dict preserves insertion order, so the first keys are oldest.
-VF_CACHE_MAX = int(os.environ.get("VF_CACHE_MAX", "5000"))
+VF_CACHE_MAX = _env_int("VF_CACHE_MAX", 5000)
 
 
 def _bound_vf_cache():
@@ -1409,7 +1449,7 @@ def _bound_vf_cache():
 # with "Missing required value". Each PR×app fetches 14 files (7 paths × 2 shas)
 # and with 3 PRs × 16 workers × 14 files = 672 potential concurrent requests.
 # Cap at 30 to stay well within BB API limits while keeping good throughput.
-BB_API_CONCURRENCY = int(os.environ.get("BB_API_CONCURRENCY", "30"))
+BB_API_CONCURRENCY = _env_int("BB_API_CONCURRENCY", 30)
 _bb_api_sem = threading.Semaphore(BB_API_CONCURRENCY)
 
 
@@ -1911,6 +1951,9 @@ def _run_one_diff(app, pr_sha, main_sha, chart_revision=None, changed_paths=None
         with _main_render_lock:
             main_resources = _main_render_cache.get(main_cache_key)
         needs_main_render = main_resources is None
+        with _diff_stats_lock:
+            _diff_stats["main_render_cache_misses" if needs_main_render
+                        else "main_render_cache_hits"] += 1
 
         pool     = _get_subtask_pool()
         pr_fut   = pool.submit(_helm_template, pr_chart, release, namespace, pr_vals)
@@ -1954,7 +1997,7 @@ def _indeterminate(reason, detail):
 # saturated, so a transient 5xx/timeout on the first try is normal and clears
 # within a few seconds once the chart cache warms. More attempts with growing
 # backoff make the diff transparent to reviewers instead of "diff unavailable".
-DIFF_RETRIES       = int(os.environ.get("DIFF_RETRIES", "5"))   # total attempts per diff
+DIFF_RETRIES       = _env_int("DIFF_RETRIES", 5)   # total attempts per diff
 DIFF_BACKOFF_BASE  = float(os.environ.get("DIFF_BACKOFF_BASE", "3"))   # seconds
 DIFF_BACKOFF_CAP   = float(os.environ.get("DIFF_BACKOFF_CAP", "30"))   # seconds
 
@@ -2104,12 +2147,36 @@ def get_pr_changed_files(pr_id):
     return files
 
 def find_existing_comment(pr_id):
-    """Search all comment pages for our marker.
+    """Find our comment on a PR, cheaply when possible.
 
     Returns (comment_id, sha_8, raw_text).
     sha_8 is 8-char hex or '' if not found in comment.
-    Paginates through all pages so >100-comment PRs are handled correctly.
+
+    Fast path: if we already know this PR's comment id (bughunt N5), fetch
+    it directly (1 API call) instead of paginating every comment on the PR.
+    Falls back to a full scan on first sight or if the cached id 404s
+    (comment was deleted) or no longer carries our marker.
     """
+    with _comment_id_cache_lock:
+        cached_id = _comment_id_cache.get(pr_id)
+    if cached_id:
+        try:
+            c = bb("GET", f"pullrequests/{pr_id}/comments/{cached_id}")
+            raw = c.get("content", {}).get("raw", "")
+            if any(mk in raw for mk in _COMMENT_MARKERS):
+                m = re.search(r'Commit `([0-9a-f]{8})`', raw)
+                return cached_id, (m.group(1) if m else ""), raw
+            # Marker gone (comment edited by a human) — fall through to a
+            # full scan rather than trust a comment that is no longer ours.
+        except urllib.error.HTTPError as e:
+            if e.code == 404:
+                with _comment_id_cache_lock:
+                    _comment_id_cache.pop(pr_id, None)
+            else:
+                raise  # transient — same contract as the full-scan path below
+        except Exception:
+            raise
+
     nxt, pages = f"pullrequests/{pr_id}/comments?pagelen=100", 0
     while nxt and pages < _BB_MAX_PAGES:
         try:
@@ -2125,6 +2192,8 @@ def find_existing_comment(pr_id):
             # older pods are updated in place instead of duplicated during rollout.
             if any(mk in raw for mk in _COMMENT_MARKERS):
                 m = re.search(r'Commit `([0-9a-f]{8})`', raw)
+                with _comment_id_cache_lock:
+                    _comment_id_cache[pr_id] = c["id"]
                 return c["id"], (m.group(1) if m else ""), raw
         next_url = data.get("next", "")
         nxt = next_url.replace(f"{_BB_API_BASE}/", "") if next_url else ""
@@ -2160,6 +2229,8 @@ def upsert_comment(pr_id, body, existing_id=None):
                 f"(comment likely still exists — would duplicate)", "ERROR")
             return
         log(f"[comment] comment {existing_id} was deleted; re-creating", "WARNING")
+        with _comment_id_cache_lock:
+            _comment_id_cache.pop(pr_id, None)
         try:
             bb("POST", f"pullrequests/{pr_id}/comments", body=payload)
             log("[comment] fallback POST succeeded", "INFO")
@@ -2244,7 +2315,7 @@ LARGE_PR_APP_THRESHOLD   = 5       # changed apps above this -> large mode
 LARGE_PR_DIFF_BYTES      = 40_000  # total diff bytes above this -> large mode
 # In large mode, show the diff for the top N most-changed apps inline.
 # Others get a table row only (no diff block) to stay within the 245KB limit.
-LARGE_PR_INLINE_APPS     = int(os.environ.get("LARGE_PR_INLINE_APPS", "6"))
+LARGE_PR_INLINE_APPS     = _env_int("LARGE_PR_INLINE_APPS", 6)
 
 # Limits for what we send to the model.
 AI_MAX_SECTIONS_PER_APP  = 10
@@ -2607,6 +2678,9 @@ def format_comment(pr_sha, app_results, skipped_apps=None, base_sha=""):
     # ── Large-PR summary table ────────────────────────────────────────
     # For large changesets, show a compact overview table first so reviewers
     # can scan all affected apps at a glance before reading the inline diffs.
+    # Apps confirmed unchanged are OMITTED from the table (bughunt N2): a
+    # 300+3-change PR previously listed all 300 as "no changes" rows, adding
+    # pure scroll with zero review value. A one-line count replaces them.
     if is_large:
         lines += [
             "#### Changeset overview",
@@ -2614,6 +2688,7 @@ def format_comment(pr_sha, app_results, skipped_apps=None, base_sha=""):
             "| App | Status | Resources |",
             "|-----|--------|-----------|",
         ]
+        no_change_count = 0
         for app, r in results.items():
             if r.outcome == OUT_DIFF:
                 lines.append(f"| `{app}` | \u26a0\ufe0f changed | {r.n_res} |")
@@ -2622,7 +2697,9 @@ def format_comment(pr_sha, app_results, skipped_apps=None, base_sha=""):
             elif r.outcome == OUT_ERROR:
                 lines.append(f"| `{app}` | \u274c error | \u2014 |")
             else:
-                lines.append(f"| `{app}` | \u2705 no changes | 0 |")
+                no_change_count += 1
+        if no_change_count:
+            lines.append(f"| *(+{no_change_count} more)* | \u2705 no changes | \u2014 |")
         lines += [""]
 
     # ── Per-app diff sections ─────────────────────────────────────────
@@ -2777,8 +2854,12 @@ def process_pr(pr, path_map, base_sha=""):
             base_m = re.search(r"\[base:([0-9a-f]{4,12})\]", comment_raw)
             if not base_m or base_m.group(1) != base_sha[:8]:
                 rerun = True
-                print(f"    Re-running: main advanced (comment base "
-                      f"{base_m.group(1) if base_m else 'legacy'} -> {base_sha[:8]})")
+                # Structured (not just print): this is the F1 fix actually
+                # firing — worth counting/alerting on, unlike the narrative
+                # trace lines around it (bughunt N7).
+                log(f"PR #{pr_id}: recompute triggered by main advancing "
+                    f"({base_m.group(1) if base_m else 'legacy'} -> {base_sha[:8]})",
+                    pr=pr_id, event="main_advanced_recompute")
         if rerun:
             print(f"    Re-running: previous comment for SHA {pr_sha[:8]} was not clean, retrying diff")
             # existing_id is kept — the comment will be updated in place, not duplicated.
@@ -3102,6 +3183,11 @@ def process_pr(pr, path_map, base_sha=""):
             _diff_stats["apps_no_diff"] += outcome_counts.get(OUT_NO_DIFF, 0)
             _diff_stats["apps_indeterminate"] += outcome_counts.get(OUT_INDETERMINATE, 0)
             _diff_stats["apps_oci_not_found"] += oci_not_found_count
+            # Split out the two most actionable failure reasons (bughunt N4):
+            # a render failure usually means a chart/values bug, a timeout
+            # usually means registry/network slowness — different owners.
+            _diff_stats["apps_render_failed"] += reason_counts.get(REASON_RENDER, 0)
+            _diff_stats["apps_timeout"] += reason_counts.get(REASON_TIMEOUT, 0)
 
         if any_hard_error or has_blocking_indet:
             if oci_not_found_count:
@@ -3233,6 +3319,9 @@ def main_iteration():
         for stale_id in [k for k in _pr_chart_targets if k not in open_ids]:
             del _pr_chart_targets[stale_id]
         _force_recompute.intersection_update(open_ids)
+    with _comment_id_cache_lock:
+        for stale_id in [k for k in _comment_id_cache if k not in open_ids]:
+            del _comment_id_cache[stale_id]
 
     pending = [
         pr for pr in prs

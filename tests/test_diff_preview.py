@@ -233,7 +233,7 @@ def test_diff_timeout_configurable():
     DIFF_TIMEOUT for tuning.
     """
     src = _source()
-    assert 'DIFF_TIMEOUT       = int(os.environ.get("DIFF_TIMEOUT", "120"))' in src, (
+    assert 'DIFF_TIMEOUT       = _env_int("DIFF_TIMEOUT", 120)' in src, (
         "DIFF_TIMEOUT must be env-configurable with default 120"
     )
     assert "timeout=DIFF_TIMEOUT" in src, (
@@ -244,13 +244,13 @@ def test_diff_timeout_configurable():
 def test_capacity_knobs_configurable():
     """Worker/cap knobs must be env-overridable for mass-app PRs (600+ apps)."""
     src = _source()
-    assert 'DIFF_WORKERS       = int(os.environ.get("DIFF_WORKERS", "16"))' in src, (
+    assert 'DIFF_WORKERS       = _env_int("DIFF_WORKERS", 16)' in src, (
         "DIFF_WORKERS must be env-configurable (default 16)"
     )
-    assert 'MAX_APPS_PER_RUN   = int(os.environ.get("MAX_APPS_PER_RUN", "800"))' in src, (
+    assert 'MAX_APPS_PER_RUN   = _env_int("MAX_APPS_PER_RUN", 800)' in src, (
         "MAX_APPS_PER_RUN must be env-configurable (default 800) to cover 600+ apps"
     )
-    assert 'MAX_PR_WORKERS  = int(os.environ.get("PR_WORKERS", "3"))' in src, (
+    assert 'MAX_PR_WORKERS  = _env_int("PR_WORKERS", 3)' in src, (
         "MAX_PR_WORKERS must be env-configurable via PR_WORKERS"
     )
 
@@ -261,7 +261,7 @@ def test_retry_loop_with_backoff():
     assert "for attempt in range(DIFF_RETRIES):" in src, (
         "argocd_diff must loop over DIFF_RETRIES attempts"
     )
-    assert 'DIFF_RETRIES       = int(os.environ.get("DIFF_RETRIES", "5"))' in src, (
+    assert 'DIFF_RETRIES       = _env_int("DIFF_RETRIES", 5)' in src, (
         "DIFF_RETRIES must be env-configurable (default 5)"
     )
     assert "def _diff_backoff(" in src, "Missing exponential backoff helper"
