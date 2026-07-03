@@ -112,6 +112,51 @@ STATUS_NAME        = "ACME Diff Preview"
 # older pods are still updated in place (no duplicate comment) during rollout.
 COMMENT_MARKER     = "acme-diff-preview"
 _COMMENT_MARKERS   = ("acme-diff-preview", "argocd-diff-preview")
+
+
+def _extract_comment_sha(raw: str) -> str:
+    """Pull the 8-char PR sha out of a previously-posted comment's header.
+
+    BUG FIX: the header is written as "**Commit** `{sha}`" (bold markdown,
+    space before the backtick). The regex used to read it back was
+    r'Commit `([0-9a-f]{8})`' -- missing the "**" and the space -- so it
+    NEVER matched any comment this bot ever posted, in any version since
+    the header format was introduced. Every call returned "". That made
+    the cross-pod sha-dedup check (`comment_sha == pr_sha[:8]`) permanently
+    false, so a pod restart caused a full, unnecessary re-diff of every
+    currently open PR even when the posted comment already covered the
+    exact same commit. Confirmed empirically against real format_comment()
+    output before fixing; regression test constructs a REAL comment via
+    format_comment rather than a hand-typed string, so this class of
+    generated-vs-parsed drift cannot silently reappear.
+    """
+    m = re.search(r'\*\*Commit\*\*\s*`([0-9a-f]{8})`', raw)
+    return m.group(1) if m else ""
+
+
+def _extract_status_token(raw: str) -> str:
+    """Pull the machine-readable clean/permanent/transient token out of a
+    previously-posted comment's footer.
+
+    BUG FIX: the footer is written as "{COMMENT_MARKER} [{token}]" (an
+    em-dash and a space precede the marker, never a literal '['). The
+    regex used to read it back required a literal bracket before the marker --
+    requiring a literal '[' immediately before the marker -- so it NEVER
+    matched, in any version since the token was introduced (comment
+    itself said "1.9.1+"). Every call silently fell back to matching
+    human-readable substrings, which happened to reproduce the intended
+    behavior for "clean" and error/transient cases but not for "permanent"
+    errors (oci_not_found's status text also contains "Diff incomplete",
+    the substring used to detect *transient* problems) -- so a permanent,
+    unfixable error was retried forever instead of being left alone, and
+    in the pod-crash recovery path (fix_stuck_inprogress) a stuck-INPROGRESS
+    PR with a permanent error could be resolved to a false "SUCCESSFUL"
+    Bitbucket status instead of "FAILED". Confirmed empirically against
+    real format_comment() output across all 5 outcome scenarios before
+    fixing (clean, clean-with-diff, permanent, transient, error).
+    """
+    m = re.search(re.escape(COMMENT_MARKER) + r'\s+\[(clean|permanent|transient)\]', raw)
+    return m.group(1) if m else ""
 # BUILD_KEY is the STABLE Bitbucket build-status key. It MUST NOT change: the
 # key identifies the status row, so renaming it would leave the old status
 # orphaned and create a second row on every existing PR. Only STATUS_NAME (the
@@ -2164,8 +2209,7 @@ def find_existing_comment(pr_id):
             c = bb("GET", f"pullrequests/{pr_id}/comments/{cached_id}")
             raw = c.get("content", {}).get("raw", "")
             if any(mk in raw for mk in _COMMENT_MARKERS):
-                m = re.search(r'Commit `([0-9a-f]{8})`', raw)
-                return cached_id, (m.group(1) if m else ""), raw
+                return cached_id, _extract_comment_sha(raw), raw
             # Marker gone (comment edited by a human) — fall through to a
             # full scan rather than trust a comment that is no longer ours.
         except urllib.error.HTTPError as e:
@@ -2191,10 +2235,9 @@ def find_existing_comment(pr_id):
             # Match the current marker AND the legacy one so comments written by
             # older pods are updated in place instead of duplicated during rollout.
             if any(mk in raw for mk in _COMMENT_MARKERS):
-                m = re.search(r'Commit `([0-9a-f]{8})`', raw)
                 with _comment_id_cache_lock:
                     _comment_id_cache[pr_id] = c["id"]
-                return c["id"], (m.group(1) if m else ""), raw
+                return c["id"], _extract_comment_sha(raw), raw
         next_url = data.get("next", "")
         nxt = next_url.replace(f"{_BB_API_BASE}/", "") if next_url else ""
         pages += 1
@@ -2250,13 +2293,13 @@ def fix_stuck_inprogress(pr_sha, pr_id, comment_raw):
             auth=(BB_USER, BB_TOKEN))
         if st.get("state") != "INPROGRESS":
             return
-        # Derive correct state from the machine-readable token first (1.9.1+),
-        # then fall back to parsing the human-readable comment text.
-        _token_m = re.search(r'\[' + re.escape(COMMENT_MARKER) + r'\s+\[(clean|permanent|transient)\]',
-                              comment_raw)
-        if _token_m and _token_m.group(1) in ("permanent",):
+        # Derive correct state from the machine-readable token first (1.9.1+,
+        # fixed for real in this version - see _extract_status_token), then
+        # fall back to parsing the human-readable comment text.
+        _token = _extract_status_token(comment_raw)
+        if _token == "permanent":
             state, desc = "FAILED", "Diff failed - check PR comment"
-        elif _token_m and _token_m.group(1) in ("clean",):
+        elif _token == "clean":
             if "resource(s) will change" in comment_raw:
                 m = re.search(r"(\d+) resource\(s\) will change", comment_raw)
                 n = m.group(1) if m else "?"
@@ -2269,7 +2312,7 @@ def fix_stuck_inprogress(pr_sha, pr_id, comment_raw):
                 state, desc = "SUCCESSFUL", "No ArgoCD apps affected by this PR"
             else:
                 state, desc = "SUCCESSFUL", "No manifest changes"
-        elif _token_m and _token_m.group(1) == "transient":
+        elif _token == "transient":
             state, desc = "SUCCESSFUL", "Diff unavailable - review comment"
         elif "Error running diff" in comment_raw or "\u274c" in comment_raw:
             state, desc = "FAILED", "Diff failed - check PR comment"
@@ -2829,10 +2872,8 @@ def process_pr(pr, path_map, base_sha=""):
         # Use the machine-readable [token] embedded in the comment footer (1.9.1+)
         # to decide if a re-run is needed. For legacy comments that lack the token
         # fall back to string matching on human-readable text.
-        _token_match = re.search(r'\[' + re.escape(COMMENT_MARKER) + r'\s+\[(clean|permanent|transient)\]',
-                                 comment_raw)
-        if _token_match:
-            _token = _token_match.group(1)
+        _token = _extract_status_token(comment_raw)
+        if _token:
             rerun = (_token == "transient")
         else:
             # Legacy fallback: parse human-readable strings.

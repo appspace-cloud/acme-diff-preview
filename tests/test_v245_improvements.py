@@ -135,7 +135,7 @@ def test_n5_cached_lookup_makes_a_single_call(monkeypatch):
         assert path == "pullrequests/555/comments/42", (
             "cached path must fetch the comment DIRECTLY by id, not paginate"
         )
-        return {"content": {"raw": f"diff ok Commit `abcd1234` {mod.COMMENT_MARKER} [clean]"}}
+        return {"content": {"raw": f"**Commit** `abcd1234` \u2192 `main` | `{mod.BB_REPO}`\n\n*ts \u2014 {mod.COMMENT_MARKER} [clean]*"}}
 
     monkeypatch.setattr(mod, "bb", fake_bb)
     cid, sha8, raw = mod.find_existing_comment(555)
@@ -156,7 +156,7 @@ def test_n5_stale_cached_id_falls_back_to_full_scan(monkeypatch):
         if path == "pullrequests/777/comments/999":
             raise urllib.error.HTTPError("u", 404, "Not Found", None, None)
         return {"values": [{"id": 1001,
-                            "content": {"raw": f"Commit `deadbeef` {mod.COMMENT_MARKER} [clean]"}}]}
+                            "content": {"raw": f"**Commit** `deadbeef` \u2192 `main` | `{mod.BB_REPO}`\n\n*ts \u2014 {mod.COMMENT_MARKER} [clean]*"}}]}
 
     monkeypatch.setattr(mod, "bb", fake_bb)
     cid, sha8, raw = mod.find_existing_comment(777)
