@@ -1065,13 +1065,24 @@ REASON_TIMEOUT       = "timeout"            # a step exceeded DIFF_TIMEOUT — r
 # Added in v2.4.8 so process_batch can record a per-app crash and continue
 # the rest of the batch instead of letting the exception abort it entirely.
 REASON_UNEXPECTED    = "unexpected_error"
+# The PR sets appspace.version to a value that is not a safe OCI tag
+# (path traversal, leading dash, whitespace, shell metachars). The value is
+# author-controlled and reaches `helm pull --version` / a filesystem path, so
+# it is rejected. This is PERMANENT and blocks the PR: previously it was
+# indistinguishable from "no version bump" and produced a green "no changes"
+# comment, hiding the rejection from reviewers (v2.4.9).
+REASON_INVALID_VERSION = "invalid_version"
+# `helm template` failed specifically because a value file is not parseable
+# YAML (as opposed to a valid-but-incomplete chart render). Distinct hint so
+# the author knows to fix their YAML syntax rather than chart values (v2.4.9).
+REASON_INVALID_YAML  = "invalid_yaml"
 
 # Reasons worth retrying in-process with backoff (transient).
 # REASON_RENDER is retried once — a brief subprocess glitch (node IO, tmp
 # exhaustion) should not produce a permanent "diff unavailable" result.
 RETRYABLE_REASONS = {REASON_OCI_PULL, REASON_METADATA, REASON_TIMEOUT, REASON_RENDER}
 # Reasons that permanently block the PR (the deployer would fail the same way).
-PERMANENT_REASONS = {REASON_OCI_NOT_FOUND}
+PERMANENT_REASONS = {REASON_OCI_NOT_FOUND, REASON_INVALID_VERSION}
 
 # Operator-friendly one-liners shown in the PR comment for each reason.
 # The full stderr is in the pod logs at LOG_LEVEL=DEBUG.
@@ -1082,6 +1093,8 @@ _REASON_HINTS = {
     REASON_RENDER:        "helm template failed to render the chart with these values",
     REASON_TIMEOUT:       f"a diff step exceeded {DIFF_TIMEOUT}s",
     REASON_UNEXPECTED:    "an unexpected error occurred while computing the diff",
+    REASON_INVALID_VERSION: "appspace.version was rejected as unsafe/invalid — not a valid OCI tag",
+    REASON_INVALID_YAML:  "a changed value file is not valid YAML — fix the YAML syntax",
     "retry_exhausted":    "still failing after retries",
     "legacy":             "diff could not be computed",
 }
@@ -1149,16 +1162,29 @@ def _is_valid_chart_version(version: str) -> bool:
 
 
 
-def _extract_chart_version(content: str):
-    """Return the chart targetRevision from a config file's `appspace.version`.
+def _extract_chart_version_checked(content: str):
+    """Return (version, status) for a config file's `appspace.version`.
+
+    status is one of:
+      "ok"      — a safe appspace.version was found; version is the string.
+      "none"    — there is no appspace.version direct child (no chart bump);
+                  version is None.
+      "invalid" — an appspace.version WAS present but was rejected as unsafe
+                  (path traversal, leading dash, whitespace/shell metachars);
+                  version is None.
+
+    The distinction matters: "none" means the PR did not touch the chart
+    revision, while "invalid" means the author DID set a version and it was
+    rejected. Collapsing both into None (the old behaviour) made a rejected
+    version look identical to "no bump" and produced a green "no changes"
+    comment that hid the rejection from reviewers (FIX A, v2.4.9).
 
     The ApplicationSet sets spec.sources[1].targetRevision = appspace.version, so
     the only value we want is the `version:` that is a DIRECT child of the
     top-level `appspace:` mapping. A plain regex for the first `version:` is
     unsafe: config files carry other, deeper `version:` keys (e.g.
     appspace.elastic.version: 8.15.1) that must never be mistaken for the chart
-    revision. We track indentation so only the direct child matches, and return
-    None when there is no appspace.version (the PR did not bump the chart here).
+    revision. We track indentation so only the direct child matches.
     """
     in_appspace     = False
     appspace_indent = -1
@@ -1190,9 +1216,20 @@ def _extract_chart_version(content: str):
                 if not _is_valid_chart_version(candidate):
                     log(f"_extract_chart_version: rejecting unsafe version "
                         f"{candidate!r} (not a valid OCI tag)", "WARNING")
-                    return None
-                return candidate
-    return None
+                    return None, "invalid"
+                return candidate, "ok"
+    return None, "none"
+
+
+def _extract_chart_version(content: str):
+    """Backward-compatible wrapper: returns the version string or None.
+
+    Existing callers that only care about the value (new-env render path)
+    keep working unchanged. Callers that must react to a rejected version
+    use _extract_chart_version_checked directly.
+    """
+    version, _status = _extract_chart_version_checked(content)
+    return version
 
 
 # ── Helm-template local diff ─────────────────────────────────────────────────
@@ -1714,6 +1751,38 @@ def _detect_new_env_candidates(changed_files: list, path_map: dict) -> list:
     return list(candidates.values())
 
 
+def _new_env_status(render_error: str):
+    """Classify a new-environment render failure into a Bitbucket status.
+
+    Returns (bitbucket_state, is_expected):
+      ("SUCCESSFUL", True)  — the failure is EXPECTED for a first-time env
+                              (helm needs credentials/constellation files that
+                              only exist after the first deploy). Stays green.
+      ("FAILED", False)     — the failure is STRUCTURAL and will not fix itself
+                              on merge (missing appspace.version, unparseable
+                              config, chart not found). Must block, not go green.
+
+    Before v2.4.9 every new-env render failure produced the same green
+    "will be created on merge" status, so a genuinely broken new env (e.g. a
+    missing/typo'd appspace.version) merged with a green check and then simply
+    failed to deploy with no earlier warning (FIX E).
+    """
+    err = (render_error or "").lower()
+    # Structural problems the author must fix before this can ever deploy.
+    structural = (
+        "no appspace.version" in err
+        or "not found in oci" in err
+        or "chart not found" in err
+        or ("invalid" in err and "version" in err)
+        or "could not fetch" in err
+    )
+    if structural:
+        return "FAILED", False
+    # Everything else (notably "helm template failed: Missing required value"
+    # for post-deploy credentials) is the expected first-time-env case.
+    return "SUCCESSFUL", True
+
+
 def _render_new_env_diff(env_info: dict, pr_sha: str) -> tuple:
     """Attempt to render a new environment's chart and return all resources as diff.
 
@@ -1847,6 +1916,46 @@ def _pr_chart_revision(app, candidate_files, pr_sha):
     return None
 
 
+def _pr_chart_revision_checked(app, candidate_files, pr_sha):
+    """Like _pr_chart_revision, but also reports a rejected version.
+
+    Returns (new_rev, invalid):
+      new_rev — the new safe revision string if the PR bumps it, else None.
+      invalid — True if any candidate file set appspace.version to a value
+                that was rejected as unsafe/invalid. When invalid is True the
+                caller must surface a blocking failure instead of silently
+                diffing against the current revision (FIX A, v2.4.9).
+    """
+    current_rev = _app_chart_revision_map.get(app)
+    if not current_rev:
+        return None, False
+    invalid = False
+    for filepath in candidate_files:
+        clean = posixpath.normpath(filepath.lstrip("/"))
+        cache_key = (pr_sha, clean)
+        with _vf_cache_lock:
+            cached = _vf_cache.get(cache_key, ...)
+        if cached is ...:
+            raw, status = _bb_fetch_status(clean, pr_sha)
+            if status in (BB_OK, BB_NOT_FOUND):
+                with _vf_cache_lock:
+                    _vf_cache[cache_key] = raw
+            content = raw
+        else:
+            content = cached
+        if not content:
+            continue
+        new_rev, vstatus = _extract_chart_version_checked(content)
+        if vstatus == "invalid":
+            invalid = True
+            continue
+        if new_rev and new_rev != current_rev:
+            debug(f"chart version override: {current_rev} -> {new_rev}",
+                  app=app, file=filepath)
+            return new_rev, invalid
+    return None, invalid
+
+
 
 def _parse_manifest_resources(yaml_text):
     """Split a multi-document YAML string into a dict keyed by (group/Kind, ns/name).
@@ -1947,6 +2056,24 @@ def _diff_manifests(main_yaml: str, pr_yaml: str) -> str:
         _parse_manifest_resources(main_yaml),
         _parse_manifest_resources(pr_yaml)
     )
+
+
+def _render_reason(render_err: str) -> str:
+    """Classify a helm render error into a REASON_* code (FIX F, v2.4.9).
+
+    A `helm template` failure caused by a value file that is not parseable
+    YAML gets its own reason so the PR comment can tell the author to fix the
+    YAML syntax, instead of the generic "helm template failed to render the
+    chart with these values" which points them at chart values by mistake.
+    Everything else stays REASON_RENDER.
+    """
+    e = (render_err or "").lower()
+    if ("error converting yaml" in e or "did not find expected" in e
+            or "could not find expected" in e or "mapping values are not allowed" in e
+            or "yaml: line" in e or "found character that cannot start" in e
+            or "yaml:" in e and "unmarshal" in e):
+        return REASON_INVALID_YAML
+    return REASON_RENDER
 
 
 def _run_one_diff(app, pr_sha, main_sha, chart_revision=None, changed_paths=None):
@@ -2088,12 +2215,12 @@ def _run_one_diff(app, pr_sha, main_sha, chart_revision=None, changed_paths=None
         if pr_err:
             if main_fut:
                 main_fut.cancel()
-            return None, REASON_RENDER, pr_err
+            return None, _render_reason(pr_err), pr_err
 
         if needs_main_render:
             main_yaml, main_err = main_fut.result(timeout=DIFF_TIMEOUT)
             if main_err:
-                return None, REASON_RENDER, main_err
+                return None, _render_reason(main_err), main_err
             main_resources = _parse_manifest_resources(main_yaml)
             with _main_render_lock:
                 _main_render_cache[main_cache_key] = main_resources
@@ -2268,9 +2395,16 @@ def get_pr_changed_files(pr_id):
     while path and pages < _BB_MAX_PAGES:
         data = bb("GET", path)
         for item in data.get("values", []):
-            p = (item.get("new") or item.get("old") or {}).get("path", "")
-            if p:
-                files.append(p)
+            # FIX C (v2.4.9): a rename has BOTH old and new paths. The OLD
+            # path is the one referenced by the live ArgoCD Application's
+            # valueFiles (and present in path_map), so it must be kept or the
+            # affected-app detector misses the change entirely and wrongly
+            # reports "no apps affected" for a rename that will break sync.
+            old_p = (item.get("old") or {}).get("path", "")
+            new_p = (item.get("new") or {}).get("path", "")
+            for p in (old_p, new_p):
+                if p and p not in files:
+                    files.append(p)
         nxt  = data.get("next", "")
         path = nxt.replace(f"{_BB_API_BASE}/", "") if nxt else ""
         pages += 1
@@ -2528,19 +2662,67 @@ def _redact_secret_section(text: str) -> str:
     return "\n".join(out)
 
 
+def _redact_k8s_env_pairs(text: str) -> str:
+    """Redact the two-line Kubernetes env-var form.
+
+    Rendered Deployment manifests express env vars as:
+        - name: appspace_someSecretKey
+          value: <the actual secret>
+    The single-line redactors test the YAML key of each line, but here the
+    secret sits on a line whose own key is literally `value` — which never
+    matches _SENSITIVE_KEYS. So before v2.4.9 every such secret leaked in
+    full into the PR comment regardless of the (sensitive) name above it
+    (FIX D, the highest-severity finding of the July 2026 campaign).
+
+    This pass looks at each `value:` line and, if the immediately preceding
+    `name:` line carries a sensitive name, masks the value. Diff markers,
+    the name line, and the `value:` key are all preserved for context.
+    """
+    lines = text.splitlines()
+    # Capture the name token from a `- name: X` / `name: X` line.
+    name_re  = re.compile(r'^[+\- ]*\s*-?\s*name\s*:\s*(.+?)\s*$')
+    value_re = re.compile(r'^([+\- ]*\s*value\s*:\s*)(.+)$')
+    # A `name:` value is sensitive if the NAME string matches _SENSITIVE_KEYS.
+    last_name_sensitive = False
+    out = []
+    for line in lines:
+        nm = name_re.match(line)
+        if nm:
+            last_name_sensitive = bool(_SENSITIVE_KEYS.search(nm.group(1)))
+            out.append(line)
+            continue
+        vm = value_re.match(line)
+        if vm:
+            # A single env var change produces TWO value lines (the '-' old and
+            # the '+' new) under one `name:`. Redact BOTH while the pending
+            # name is sensitive — do not reset after the first one.
+            if last_name_sensitive:
+                out.append(f"{vm.group(1)}[REDACTED]")
+            else:
+                out.append(line)
+            continue
+        # A non-name, non-value line ends this env-var block. Reset unless the
+        # line is blank (helm sometimes emits blank continuation lines).
+        if line.strip() != "":
+            last_name_sensitive = False
+        out.append(line)
+    return "\n".join(out)
+
+
 def _redact_for_display(hdr: str, body: str) -> str:
     """Redact a diff section before it is posted to Bitbucket.
 
     v1 Secret sections get whole-value masking; everything else gets the
-    same key-name based redaction the AI prompt has always had. Before
-    v2.4.3 only the AI path redacted - the Bitbucket comment published
-    rendered manifests verbatim, including Secret data blocks.
-    Kinds merely containing "Secret" (ExternalSecret, SealedSecret) hold
-    references, not values, and are NOT whole-masked.
+    same key-name based redaction the AI prompt has always had, PLUS the
+    two-line k8s env-var pass (FIX D). Before v2.4.3 only the AI path
+    redacted - the Bitbucket comment published rendered manifests verbatim,
+    including Secret data blocks. Kinds merely containing "Secret"
+    (ExternalSecret, SealedSecret) hold references, not values, and are NOT
+    whole-masked.
     """
     if re.search(r"/Secret[\s/]", hdr + " "):
         return _redact_secret_section(body)
-    return _redact_sensitive(body)
+    return _redact_k8s_env_pairs(_redact_sensitive(body))
 
 
 def _redact_sensitive(text: str) -> str:
@@ -2622,9 +2804,15 @@ def generate_ai_summary(app_results: dict) -> str | None:
 
         error_note = ""
         if errors:
+            # FIX G (v2.4.9): make the indeterminate note explicit so the AI
+            # summary never renders a misleading "No changes" for apps that
+            # actually failed to diff. These are NOT confirmed unchanged and
+            # their diff could not be computed.
             error_note = (
-                "\n\nApps whose diff could NOT be computed (treat as unknown, "
-                f"not unchanged): {', '.join(errors.keys())}"
+                "\n\nIMPORTANT: the following app(s) are NOT confirmed unchanged — "
+                "their diff could not be computed and their state is UNKNOWN. "
+                "Never describe them as having no changes; if there are no other "
+                f"changed apps, say the diff could not be computed: {', '.join(errors.keys())}"
             )
 
         envs = _envs_from_apps(changed.keys())
@@ -2749,18 +2937,31 @@ def _result(value):
     return DiffResult("", [], 0, False, None, OUT_NO_DIFF, "clean")
 
 
-def _format_app_diff_block(app, sections, diff_text, show_diff=True):
+def _format_app_diff_block(app, sections, diff_text, show_diff=True, n_res=None):
     """Return a list of markdown lines for one app's diff block.
 
     sections is DiffResult.sections — already truncated to display budget.
-    show_diff=False outputs just the header line (large-mode table overflow).
+    n_res is the REAL total resource count (DiffResult.n_res); the header must
+    report this, not len(sections), which is capped at AI_MAX_SECTIONS_PER_APP.
+    Before v2.4.9 the header used len(sections), so an app that changed e.g.
+    103 resources showed "10 resource(s) changed" and only 10 diffs, with no
+    hint that 93 more changed silently (FIX B). show_diff=False outputs just
+    the header line (large-mode table overflow).
     Bitbucket does NOT render HTML <details>/<summary>, so we never use them.
     """
-    n = len(sections) if sections else 1
+    shown = len(sections) if sections else 0
+    total = n_res if n_res is not None else shown
+    n = total if total else 1
     out = [f"\u26a0\ufe0f **`{app}`** \u2014 {n} resource(s) changed", ""]
     if not show_diff:
         return out
     if sections:
+        if total > shown:
+            out += [
+                f"> \U0001f50d Showing first {shown} of {total} changed "
+                f"resources. See ArgoCD for the full set.",
+                "",
+            ]
         for hdr, body in sections:
             # body is already truncated at DiffResult creation time.
             # Redaction happens here, at display time, so the diff engine
@@ -2897,8 +3098,10 @@ def format_comment(pr_sha, app_results, skipped_apps=None, base_sha=""):
             any_change = True
             total_changed += r.n_res
             show_diff = (inline_set is None) or (app in inline_set)
-            # sections are already truncated in DiffResult — no re-parsing
-            lines += _format_app_diff_block(app, r.sections, r.text, show_diff=show_diff)
+            # sections are already truncated in DiffResult — no re-parsing.
+            # Pass r.n_res so the header shows the REAL count (FIX B).
+            lines += _format_app_diff_block(app, r.sections, r.text,
+                                            show_diff=show_diff, n_res=r.n_res)
 
         else:
             lines += [f"\u2705 **`{app}`** \u2014 no manifest changes", ""]
@@ -3107,17 +3310,45 @@ def process_pr(pr, path_map, base_sha=""):
                             "are provisioned after the first deployment. This is expected.  \n"
                             "All resources will be created from scratch when this PR is merged."
                         )
-                        if sec["error"] and "helm template failed" not in sec["error"]:
-                            lines.append(f"  \n*Technical detail: {sec['error'][:120]}*")
+                        if sec["error"]:
+                            state, expected = _new_env_status(sec["error"])
+                            if not expected:
+                                lines.append(
+                                    f"  \n\u26a0\ufe0f **This is a structural problem, not the "
+                                    f"usual first-deploy case — it must be fixed before merge:** "
+                                    f"{sec['error'][:160]}")
+                            elif "helm template failed" not in sec["error"]:
+                                lines.append(f"  \n*Technical detail: {sec['error'][:120]}*")
                     lines.append("")
 
                 total_new = sum(s["n_res"] for s in new_env_sections)
-                desc = f"{len(new_env_candidates)} new environment(s), ~{total_new} resource(s) to create"
-                post_build_status(pr_sha, "SUCCESSFUL", desc, pr_id=pr_id)
+                # FIX E (v2.4.9): classify each new-env failure. A structural
+                # failure (missing version, unparseable config, chart missing)
+                # must NOT get the green "will be created on merge" status.
+                structural_envs = [
+                    s["name"] for s in new_env_sections
+                    if s["error"] and _new_env_status(s["error"])[1] is False
+                ]
+                if structural_envs:
+                    desc = (f"{len(structural_envs)} new environment(s) have a "
+                            f"structural config problem: {', '.join(structural_envs)}")
+                    post_build_status(pr_sha, "FAILED", desc, pr_id=pr_id)
+                    status_line = (
+                        f"**Status:** \u274c New environment(s) with a structural "
+                        f"problem that must be fixed before merge: "
+                        f"{', '.join(f'`{e}`' for e in structural_envs)}")
+                    clean_tag = "[blocked]"
+                else:
+                    desc = f"{len(new_env_candidates)} new environment(s), ~{total_new} resource(s) to create"
+                    post_build_status(pr_sha, "SUCCESSFUL", desc, pr_id=pr_id)
+                    status_line = (
+                        f"**Status:** \u2705 New environment(s) - all resources "
+                        f"will be created on merge")
+                    clean_tag = "[clean]"
                 lines += [
                     "---",
-                    f"**Status:** \u2705 New environment(s) - all resources will be created on merge",
-                    f"*{_ts()} \u2014 {COMMENT_MARKER} [clean]" + (f" [base:{base_sha[:8]}]" if base_sha else "") + "*",
+                    status_line,
+                    f"*{_ts()} \u2014 {COMMENT_MARKER} {clean_tag}" + (f" [base:{base_sha[:8]}]" if base_sha else "") + "*",
                 ]
                 upsert_comment(pr_id, "\n".join(lines), existing_id)
                 with _seen_lock:
@@ -3172,17 +3403,24 @@ def process_pr(pr, path_map, base_sha=""):
         # config files from Bitbucket, so fan it out in parallel (cached + rate
         # limited by _bb_api_sem) instead of a serial loop over 600+ apps.
         pr_chart_revisions = {}
+        invalid_version_apps = set()
         with ThreadPoolExecutor(max_workers=max(1, min(DIFF_WORKERS, len(affected)))) as ex:
-            rev_futs = {ex.submit(_pr_chart_revision, app, _app_to_files.get(app, []), pr_sha): app
+            rev_futs = {ex.submit(_pr_chart_revision_checked, app, _app_to_files.get(app, []), pr_sha): app
                         for app in affected}
             for fut in as_completed(rev_futs):
                 app = rev_futs[fut]
                 try:
-                    new_rev = fut.result()
+                    new_rev, invalid = fut.result()
                 except Exception:
-                    new_rev = None
+                    new_rev, invalid = None, False
+                if invalid:
+                    invalid_version_apps.add(app)
                 if new_rev:
                     pr_chart_revisions[app] = new_rev
+        if invalid_version_apps:
+            log(f"PR #{pr_id}: appspace.version rejected as unsafe/invalid for "
+                f"{len(invalid_version_apps)} app(s): "
+                f"{', '.join(sorted(invalid_version_apps))}", "WARNING", pr=pr_id)
         if pr_chart_revisions:
             unique_bumps = sorted(set(pr_chart_revisions.values()))
             log(f"PR #{pr_id}: chart version bumps detected for "
@@ -3210,6 +3448,15 @@ def process_pr(pr, path_map, base_sha=""):
 
         def run_diff(app):
             t0 = time.monotonic()
+            # FIX A (v2.4.9): if the PR set this app's appspace.version to an
+            # unsafe/invalid value, do not diff against the current revision
+            # (that would render identically and show a misleading green "no
+            # changes"). Report it as a permanent, blocking failure instead.
+            if app in invalid_version_apps:
+                result = DiffResult("", [], 0, False,
+                                    "appspace.version was rejected as unsafe/invalid",
+                                    OUT_INDETERMINATE, REASON_INVALID_VERSION)
+                return app, result, round(time.monotonic() - t0, 1)
             chart_rev = pr_chart_revisions.get(app)
             result = argocd_diff(app, pr_sha, main_sha=base_sha,
                                  chart_revision=chart_rev,
