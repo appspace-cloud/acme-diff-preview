@@ -1082,7 +1082,7 @@ REASON_INVALID_YAML  = "invalid_yaml"
 # exhaustion) should not produce a permanent "diff unavailable" result.
 RETRYABLE_REASONS = {REASON_OCI_PULL, REASON_METADATA, REASON_TIMEOUT, REASON_RENDER}
 # Reasons that permanently block the PR (the deployer would fail the same way).
-PERMANENT_REASONS = {REASON_OCI_NOT_FOUND, REASON_INVALID_VERSION}
+PERMANENT_REASONS = {REASON_OCI_NOT_FOUND, REASON_INVALID_VERSION, REASON_INVALID_YAML}
 
 # Operator-friendly one-liners shown in the PR comment for each reason.
 # The full stderr is in the pod logs at LOG_LEVEL=DEBUG.
@@ -1152,7 +1152,10 @@ _version_key_re  = re.compile(r"^\s*version:\s*([^\s#]+)")
 # use: reject anything that is not a safe tag. This blocks both path traversal
 # (../../etc) and argument injection (--foo, leading dash) at the source.
 # OCI tags allow [A-Za-z0-9._-], max 128 chars, and must not start with a dash.
-_SAFE_CHART_VERSION_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
+# A safe OCI tag: alphanumeric start, then alphanumerics and . _ - + (build
+# metadata like 1.0.0+abc is legal in OCI tags and semver, v2.5.0 H5). Still
+# forbids path separators, whitespace, leading dash, and shell metacharacters.
+_SAFE_CHART_VERSION_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._+-]{0,127}$")
 
 
 def _is_valid_chart_version(version: str) -> bool:
@@ -1768,9 +1771,19 @@ def _new_env_status(render_error: str):
     failed to deploy with no earlier warning (FIX E).
     """
     err = (render_error or "").lower()
+    # A value file that is not parseable YAML is a structural author error
+    # (v2.5.0 H10) — the same class _render_reason flags as invalid_yaml. It
+    # never renders on merge, so it must not get the green new-env status.
+    invalid_yaml = (
+        "error converting yaml" in err or "did not find expected" in err
+        or "could not find expected" in err or "mapping values are not allowed" in err
+        or "yaml: line" in err or "found character that cannot start" in err
+        or ("yaml:" in err and "unmarshal" in err)
+    )
     # Structural problems the author must fix before this can ever deploy.
     structural = (
-        "no appspace.version" in err
+        invalid_yaml
+        or "no appspace.version" in err
         or "not found in oci" in err
         or "chart not found" in err
         or ("invalid" in err and "version" in err)
@@ -1957,6 +1970,53 @@ def _pr_chart_revision_checked(app, candidate_files, pr_sha):
 
 
 
+def _unquote(s: str) -> str:
+    """Strip one layer of matching surrounding quotes from a scalar (v2.5.0 H1)."""
+    s = s.strip()
+    if len(s) >= 2 and s[0] == s[-1] and s[0] in ("'", '"'):
+        return s[1:-1]
+    return s
+
+
+def _split_yaml_docs(yaml_text):
+    """Yield top-level YAML documents, expanding a `kind: List` wrapper.
+
+    Helm/kubectl output can wrap resources in `kind: List` with an `items:`
+    array. Before v2.5.0 that whole document parsed to zero resources (silent
+    loss). We detect a List doc and re-emit each item as its own document at
+    top-level indentation so the normal line scan can pick it up.
+    """
+    for doc in re.split(r'\n---\s*\n|^---\s*\n', yaml_text, flags=re.MULTILINE):
+        if not doc.strip():
+            continue
+        # Is this a List wrapper? (kind: List with an items: sequence)
+        if re.search(r'^kind:\s*List\s*$', doc, re.MULTILINE) and \
+           re.search(r'^items:\s*$', doc, re.MULTILINE):
+            # Split items on the `- ` sequence markers at column 0 and dedent.
+            body = doc.split("items:", 1)[1]
+            # Each item starts with "- " at the item indent; capture blocks.
+            items = re.split(r'\n(?=- )', body.strip())
+            for it in items:
+                it = it.strip()
+                if it.startswith("- "):
+                    it = it[2:]
+                # dedent: drop the common leading whitespace helm added to items
+                lines = it.splitlines()
+                dedented = []
+                for i, ln in enumerate(lines):
+                    if i == 0:
+                        dedented.append(ln)
+                    elif ln.startswith("  "):
+                        dedented.append(ln[2:])
+                    else:
+                        dedented.append(ln)
+                block = "\n".join(dedented).strip()
+                if block:
+                    yield block
+        else:
+            yield doc
+
+
 def _parse_manifest_resources(yaml_text):
     """Split a multi-document YAML string into a dict keyed by (group/Kind, ns/name).
 
@@ -1964,7 +2024,7 @@ def _parse_manifest_resources(yaml_text):
     Documents without kind/metadata are skipped.
     """
     resources = {}
-    for doc in re.split(r'\n---\s*\n|^---\s*\n', yaml_text, flags=re.MULTILINE):
+    for doc in _split_yaml_docs(yaml_text):
         doc = doc.strip()
         if not doc:
             continue
@@ -2006,7 +2066,12 @@ def _parse_manifest_resources(yaml_text):
                 debug(f"manifest parser: skipping unidentifiable document "
                       f"(kind={kind!r} name={name!r}): {doc[:120]!r}")
             continue
-        # Use ArgoCD-style key: /Kind ns/name (group prefix for non-core)
+        # Use ArgoCD-style key: /Kind ns/name (group prefix for non-core).
+        # Strip matching surrounding quotes from name/namespace so a change
+        # that only re-quotes the name (name: x vs name: "x") is seen as the
+        # SAME resource, not a phantom add+delete (v2.5.0 H1).
+        name = _unquote(name)
+        ns   = _unquote(ns)
         grp = api.split("/")[0] if "/" in api else ""
         type_key = f"{grp}/{kind}" if grp and grp not in ("v1", "") else kind
         key = (type_key, ns or "", name)
@@ -2674,39 +2739,96 @@ def _redact_k8s_env_pairs(text: str) -> str:
     full into the PR comment regardless of the (sensitive) name above it
     (FIX D, the highest-severity finding of the July 2026 campaign).
 
-    This pass looks at each `value:` line and, if the immediately preceding
-    `name:` line carries a sensitive name, masks the value. Diff markers,
-    the name line, and the `value:` key are all preserved for context.
+    This pass handles three shapes of the k8s env-var pattern:
+      1. two-line inline:  - name: X\n  value: <secret>
+      2. two-line block:   - name: X\n  value: |\n    <secret lines...>
+      3. flow mapping:     - {name: X, value: <secret>}
+    In every case, if the NAME string matches _SENSITIVE_KEYS the value is
+    masked. Diff markers, the name line, and the `value:` key are preserved.
+    Block scalars (H3) and flow mappings (H4) were added in v2.5.0 after the
+    v2.4.9 FIX D only covered the two-line inline shape.
     """
     lines = text.splitlines()
     # Capture the name token from a `- name: X` / `name: X` line.
     name_re  = re.compile(r'^[+\- ]*\s*-?\s*name\s*:\s*(.+?)\s*$')
-    value_re = re.compile(r'^([+\- ]*\s*value\s*:\s*)(.+)$')
-    # A `name:` value is sensitive if the NAME string matches _SENSITIVE_KEYS.
+    # Inline value, or a block-scalar opener (value: | / |- / > / >- ...).
+    value_re = re.compile(r'^([+\- ]*)(\s*)value\s*:\s*(.*)$')
+    # Flow mapping: - {name: X, value: Y}
+    flow_re  = re.compile(r'^([+\- ]*\s*-?\s*\{)(.*)(\})\s*$')
     last_name_sensitive = False
+    in_block = False          # inside a block-scalar value we are masking
+    block_indent = 0          # column of the `value:` key that opened the block
     out = []
     for line in lines:
-        nm = name_re.match(line)
-        if nm:
-            last_name_sensitive = bool(_SENSITIVE_KEYS.search(nm.group(1)))
-            out.append(line)
-            continue
-        vm = value_re.match(line)
-        if vm:
-            # A single env var change produces TWO value lines (the '-' old and
-            # the '+' new) under one `name:`. Redact BOTH while the pending
-            # name is sensitive — do not reset after the first one.
-            if last_name_sensitive:
-                out.append(f"{vm.group(1)}[REDACTED]")
+        # Continuation lines of a sensitive block scalar: mask until indentation
+        # returns to or above the value-key column, or the line is empty.
+        if in_block:
+            # A unified-diff marker is at most ONE leading char (+/-/space).
+            # Do NOT greedily eat a run of dashes — content like "-----BEGIN"
+            # starts with dashes that are data, not diff markers (v2.5.0 H3).
+            marker_len = 1 if line[:1] in "+- " else 0
+            rest = line[marker_len:]
+            content_indent = len(rest) - len(rest.lstrip())
+            if line.strip() == "":
+                out.append(line)
+                continue
+            if content_indent > block_indent:
+                out.append(_mask_block_line(line))
+                continue
+            in_block = False  # dedented out of the block -> normal handling
+
+        fm = flow_re.match(line)
+        if fm:
+            inner = fm.group(2)
+            # find name: X and value: Y inside the flow mapping
+            nmatch = re.search(r'name\s*:\s*([^,}\s]+)', inner)
+            if nmatch and _SENSITIVE_KEYS.search(_unquote(nmatch.group(1))):
+                inner2 = re.sub(r'(value\s*:\s*)([^,}]+)', r'\1[REDACTED]', inner)
+                out.append(f"{fm.group(1)}{inner2}{fm.group(3)}")
             else:
                 out.append(line)
             continue
-        # A non-name, non-value line ends this env-var block. Reset unless the
-        # line is blank (helm sometimes emits blank continuation lines).
+
+        nm = name_re.match(line)
+        if nm:
+            last_name_sensitive = bool(_SENSITIVE_KEYS.search(_unquote(nm.group(1))))
+            out.append(line)
+            continue
+
+        vm = value_re.match(line)
+        if vm:
+            marker, indent_ws, val = vm.group(1), vm.group(2), vm.group(3)
+            key_col = len(marker) + len(indent_ws)
+            if last_name_sensitive:
+                if val.strip() in ("|", "|-", "|+", ">", ">-", ">+", ""):
+                    # Block scalar opener: keep the `value: |` line, mask body.
+                    out.append(line)
+                    in_block = True
+                    block_indent = key_col
+                else:
+                    # Inline value: mask it. Both '-' old and '+' new lines hit
+                    # here while last_name_sensitive stays True.
+                    out.append(f"{marker}{indent_ws}value: [REDACTED]")
+            else:
+                out.append(line)
+            continue
+
+        # A non-name, non-value, non-continuation line ends this env-var block.
         if line.strip() != "":
             last_name_sensitive = False
         out.append(line)
     return "\n".join(out)
+
+
+def _mask_block_line(line: str) -> str:
+    """Replace the content of a block-scalar continuation line with a marker,
+    preserving the diff marker and indentation for readability (v2.5.0 H3)."""
+    # A unified-diff marker is at most one leading char; do not eat data dashes.
+    marker_len = 1 if line[:1] in "+- " else 0
+    prefix = line[:marker_len]
+    rest = line[marker_len:]
+    indent = len(rest) - len(rest.lstrip())
+    return f"{prefix}{' ' * indent}[REDACTED]"
 
 
 def _redact_for_display(hdr: str, body: str) -> str:
