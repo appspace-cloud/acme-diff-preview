@@ -33,3 +33,41 @@ jobs:
           skip_existing: true
         env:
           CR_TOKEN: "${{ secrets.GITHUB_TOKEN }}"
+
+  # Human-readable GitHub Release per v* tag (separate from the
+  # chart-releaser-action job above, which publishes "acme-diff-preview-X.Y.Z"
+  # releases carrying the .tgz chart artifact for the Helm repo index — do not
+  # touch those, ArgoCD/helm depend on them to pull the chart).
+  #
+  # Release notes come from the v* tag's OWN annotation message (git tag -a
+  # -F ..., set by hand at release time with the full bug/fix/verification
+  # story), NOT from the commit message the tag points to — those differ here
+  # (unlike a workflow that both creates the tag and writes its message from
+  # the commit in one step). Idempotent: skips any tag that already has a
+  # release, so it also backfills every past v* tag the first time it runs.
+  github-release:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5.0.0
+        with:
+          fetch-depth: 0
+
+      - name: Ensure every v* tag has a GitHub Release (backfill)
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          for TAG in $(git tag -l 'v*' | sort -V); do
+            if gh release view "$TAG" >/dev/null 2>&1; then
+              continue
+            fi
+            NOTES=$(git for-each-ref "refs/tags/$TAG" --format='%(contents)')
+            if [ -z "$NOTES" ]; then
+              echo "Skipping $TAG: empty tag message (lightweight tag?)."
+              continue
+            fi
+            echo "Creating release for $TAG"
+            gh release create "$TAG" --title "$TAG" --notes "$NOTES" --verify-tag
+          done

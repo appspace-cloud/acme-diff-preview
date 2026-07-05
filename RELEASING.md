@@ -71,5 +71,30 @@ cleanly without error.
 | Workflow | Trigger | What it does |
 |---|---|---|
 | `ci.yml` | PR or push to `main` | Tests + helm lint + docker build (no push) |
-| `release.yml` | Push to `main` | Publishes Helm chart to GitHub Pages via chart-releaser |
+| `release.yml` | Push to `main` | Publishes Helm chart to GitHub Pages via chart-releaser, and ensures every `v*` tag has a matching GitHub Release (see below) |
 | `docker.yml` | Push of `v*` tag | Builds and pushes Docker image to JFrog Artifact Registry |
+
+## GitHub Releases (human-readable, one per `v*` tag)
+
+Every `v<version>` tag (e.g. `v2.5.1`) should be an **annotated** tag whose
+message is the full release story: what broke, why, the fix, and how it was
+verified — see any existing `v*` tag for the expected level of detail
+(`git tag -n99 v2.5.1`). This is the same convention used in `acme-mcp`.
+
+`release.yml`'s `github-release` job runs on every push to `main` and creates
+a GitHub Release for any `v*` tag that doesn't have one yet, using **the
+tag's own annotation message** (`git for-each-ref refs/tags/<tag>
+--format='%(contents)'`) as the release notes — not the commit message the
+tag points to, which is usually shorter and less useful as a changelog entry.
+The job is idempotent (`gh release view` check before creating), so:
+
+- A normal release just needs `git tag -a vX.Y.Z -F <message-file>` + `git
+  push origin vX.Y.Z` (or push it along with the `main` merge, as usual) —
+  the Release appears automatically on the next `release.yml` run.
+- It also backfills any past tag that never got a Release (this is how
+  v2.4.9 through v2.5.1 got their Releases retroactively).
+
+**Do not confuse this with the chart-releaser-action releases** named
+`acme-diff-preview-X.Y.Z` (no `v` prefix) — those carry the actual `.tgz`
+chart artifact that the published Helm repo index points to. ArgoCD/helm
+depend on them to pull the chart; never delete or rename them.
