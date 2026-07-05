@@ -413,3 +413,76 @@ fix surface for next phase (the tool's core matching/fan-out/bulk-diff
 machinery is solid; the problems are specifically in status
 classification (Findings 1/2/3), new-env path isolation (Finding 4), and
 path-rename resolution (Finding 6)).
+
+
+---
+
+## RESOLUTION (2026-07-05, same day) — all 6 findings implemented, tested,
+deployed, and re-verified live
+
+Marcos gave full autonomy to implement everything at once. Done end to end:
+local tests first (28 new, all red against a real repro before the fix,
+green after), full suite (224 -> then 228 after a hotfix), real local
+behavioral check with the actual acme-config-dev repo + a real helm binary
+(bypassing only OCI auth, which needs the pod's production secret),
+release v2.5.4, deploy, and live re-verification with the exact same real
+PRs that found each bug.
+
+**Shipped as v2.5.4 (commit a260368) + v2.5.5 hotfix (commit 6365dd9).**
+Pod running 2.5.5, 0 restarts, clean logs.
+
+### Finding 1 (+2): traffic-light rule — RESOLVED
+Any indeterminate reason now blocks (not just oci_not_found), in both the
+main status cascade and fix_stuck_inprogress. invalid_yaml/invalid_version
+also now correctly stop the retry loop (a second bug found while fixing
+this one — before, only oci_not_found did, so an invalid_yaml PR was
+silently re-diffed forever).
+Verified live: PR #6656 (invalid_yaml) -> FAILED. PR #6659 (render_failed)
+-> FAILED, "will retry automatically if transient".
+
+### Finding 3: fix_stuck_inprogress — RESOLVED
+Same fix as above, same session, same token vocabulary.
+
+### Finding 5: new-env default-to-red — RESOLVED
+_new_env_status inverted to an allow-list: only "missing required value"
+stays green, everything else (chart pull failures, registry login
+failures, generic render_failed) is red by default now.
+
+### Finding 6: rename/move resolution — RESOLVED (the flagship fix)
+get_pr_changed_files now returns (files, renames); the old->new pairing is
+threaded through to both _run_one_diff's value-file fetch (the core fix)
+and _pr_chart_revision_checked (so a version bump bundled with a rename
+isn't missed either). Verified live: PR #6657 replicated PR #6648's exact
+scenario (folder rename + a real version bump in the same commit) and now
+correctly shows "1 resource(s) will change" with the real diff, instead
+of the old generic "helm template failed" that hid everything.
+
+### Finding 4: mixed-PR blind spot — RESOLVED
+_detect_new_env_candidates now runs unconditionally; format_comment gained
+new_env_lines/new_env_structural/new_env_desc to splice a bundled new
+environment into the same comment and force red on a structural problem
+even with an otherwise-clean existing-app diff. Verified live: PR #6658
+replicated PR #6652's exact scenario (valid new customer + real change on
+an existing customer, same commit) and now shows BOTH sections in one
+comment with the correct green status.
+
+### Bonus finding, caught during v2.5.4's own live re-verification, fixed
+in the v2.5.5 hotfix before declaring done
+Combining Finding 4 (always run new-env detection) with Finding 6 (follow
+renames) created a genuine interaction bug: a rename's NEW path isn't yet
+in path_map, so it also looked like a brand-new environment and got
+double-evaluated through the wrong code path (_render_new_env_diff, which
+doesn't know "this app already exists, it just moved"), producing a false
+structural-problem red status for the WRONG reason on top of the correct
+diff. A second, independent bug in the same area: _render_new_env_diff's
+old 120-char truncation could cut "Missing required value" off a long
+error before Finding 5's allow-list ever saw it. Both confirmed live on
+PR #6657 before the hotfix, both fixed and re-verified live after.
+
+### Lesson for next time
+Live-verifying a fix with the exact real PR that found the original bug
+is what caught this interaction bug — a fix that looks correct in
+isolation (and passed 28 new unit tests) can still misbehave when
+combined with another fix touching adjacent code. Always re-run the real
+repro PRs after deploying, not just the unit suite, before considering a
+hardening round done.
