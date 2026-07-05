@@ -1,5 +1,34 @@
 # Release process
 
+## Mandatory: regression tests before every change ships
+
+Every change to this service — a bugfix, a hardening pass, a refactor, even a
+"trivial" one-liner — must go through the full cycle, no exceptions:
+
+1. **Write the regression test(s) first**, encoding the bug/requirement.
+   Run them and confirm they FAIL against the current code (red) — a test
+   that never failed never proved anything.
+2. Implement the fix.
+3. Run **that test file** until it's green, then run the **entire suite**
+   (`python3 -m pytest tests/ -q`) — a change that only touches one function
+   can still break an unrelated test elsewhere (shared globals, locks,
+   caches). Never ship on a partial run.
+4. For anything touching concurrency, timing, or a background thread
+   (heartbeat, locks, retries), also do a real **local behavioral check**
+   beyond unit assertions where practical — e.g. actually start the
+   component and observe it over a few real ticks — the way v2.5.2's C2 fix
+   was confirmed by running the heartbeat loop live and watching staleness
+   grow under a simulated wedge, not just asserting a pure function's
+   return value.
+5. After deploying, verify the running pod: image tag, clean startup in the
+   logs, no restarts, and (when relevant) a real PR against
+   `acme-config-dev` exercising the exact scenario that was fixed.
+
+This is not optional or size-dependent — it applies the same way whether the
+change is one line or a full hardening pass. The goal is the same as any QA
+process: prove the new thing works AND prove it did not break anything that
+already worked.
+
 ## Critical: never overwrite an existing image tag
 
 JFrog does not allow overwriting a tag once pushed (it would require DELETE
