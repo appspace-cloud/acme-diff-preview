@@ -317,3 +317,99 @@ change within a single PR.
    doing both in the same session.
 4. Finding 5 (new-env default-to-green). Still last — needs production
    log sampling before writing the allow-list.
+
+
+---
+
+## SESSION 3 (2026-07-05, same day, second follow-up) — more real prod-style
+operational patterns
+
+Marcos asked to keep digging for operational patterns that could break the
+tool, using more real acme-config-prod examples as inspiration. 6 more real
+PRs (#6650-#6655), all declined after capture, no merge.
+
+### CONFIRMED WORKING CORRECTLY (no new findings — good news, listed for
+completeness so these aren't re-tested from scratch next time)
+
+- **PR #6650 — fan-out change on shared `private-cloud/config.yaml`**
+  (real pattern: prod's "Unify HPAs configuration" / "Refactor Public and
+  Private Configuration" commits). Added a label at the shared config
+  level inherited by all 10 dev private-cloud customers (30 apps total:
+  10 customers × ms/ss/glb). All 30 apps correctly evaluated, all
+  correctly show "no manifest changes" since the test label isn't
+  consumed by any template. Confirms the fan-out mechanism itself
+  (discover_path_app_map, path-prefix matching) scales correctly and
+  doesn't drop or duplicate any app.
+
+- **PR #6651 — valid, complete, brand-new customer added alone (happy
+  path)**. Real `appspace.version`, complete `customer.yaml`, empty
+  `cicd-versions.yaml`. Correctly detected as new env, correctly shows the
+  documented "resource preview not available for new environments...
+  provisioned after first deployment... this is expected" message with
+  **SUCCESSFUL** status. This is the control test for Findings 4/5 — when
+  a new env is evaluated in isolation (no existing app touched in the same
+  PR), the classification logic works exactly as designed.
+
+- **PR #6653 — junk binary `.DS_Store` file alongside a real change**
+  (real precedent: `acme-config-prod` has actual committed `.DS_Store`
+  files at `gcp/`, `azure/`, `aws/`, `.cursor/`). The binary file is
+  silently ignored (doesn't match any value-file pattern), the real tag
+  bump on `cl-dev11-a`'s `poll` service is correctly diffed. No crash, no
+  interference.
+
+- **PR #6655 — bulk multi-customer bump, 5 unrelated customers changed in
+  one commit** (real pattern: prod's "NA, CA, AP Weekly customers going to
+  2601.4.6" style mass-update commits). All 5 customers correctly
+  detected, each shows exactly its own changed resource, zero
+  cross-customer contamination in the diff sections.
+
+### FINDING 4 — STRENGTHENED (confirmed with a VALID new environment, not
+just a broken one)
+
+**PR #6652** repeated PR #6646's shape but with a twist: the new customer
+(`pv-dev-98-a`) was **completely valid** — same shape as PR #6651, which
+in isolation correctly renders the "new environment detected, expected"
+message. Bundled with a real, unrelated tag bump on an already-existing
+customer (`pv-dev-01-a`) in the same commit, the result was identical to
+PR #6646: **zero mention of `pv-dev-98-a` anywhere.** The comment, AI
+summary, and status are 100% built from `pv-dev-01-a`'s change alone.
+
+This upgrades Finding 4's severity assessment: it is not just that a
+*broken* new environment goes unnoticed (bad enough on its own) — **any**
+new environment, valid or not, is completely invisible whenever the same
+PR also touches an already-known app. Given how often bulk/combination PRs
+happen in production (Session 3's own PR #6655 shows 5-customer bulk edits
+are routine), this blind spot likely triggers far more often in practice
+than the narrower "broken new env" framing from Session 2 suggested. No
+change to the recommended fix direction (already documented under
+Finding 4) — this is additional live evidence to weigh when prioritizing
+it, not a new root cause.
+
+### FINDING 6 — CONFIRMED with a case-only rename variant
+
+**PR #6654**: renamed `pv-dev-04-a` to `PV-DEV-04-a` (case-only, zero
+content change; a Linux/Bitbucket-valid distinct path, even though a
+default macOS filesystem treats them as the same file — had to use a
+two-step `git mv` through a temp name locally to produce the rename at
+all). Result: identical `render_failed` outcome as every other rename
+variant in Finding 6 (PR #6647/#6648/#6649). No new root cause — this
+confirms Finding 6's mechanism is purely path-string-based (old path 404s
+at `pr_sha` regardless of *why* the path changed), which is useful
+confirmation that the eventual fix (resolve renamed value files to their
+new path) doesn't need any case-sensitivity-specific handling — the
+general old-path/new-path pairing fix already scoped for Finding 6 covers
+this variant too.
+
+### Updated finding count: 6 total, now 8 real-PR confirmations across
+Findings 1, 2, 4 (x2), 6 (x4), plus 4 clean/correct confirmations (fan-out,
+happy-path new-env, junk file, bulk multi-customer) that do NOT need any
+fix and don't need re-testing in a future session.
+
+No new findings requiring a NEW fix category this session — Session 3
+was mostly a stress-test / breadth pass confirming Session 1-2's findings
+generalize (or don't) across more shapes of the same root causes, plus
+several explicit "this works fine" confirmations that narrow the actual
+fix surface for next phase (the tool's core matching/fan-out/bulk-diff
+machinery is solid; the problems are specifically in status
+classification (Findings 1/2/3), new-env path isolation (Finding 4), and
+path-rename resolution (Finding 6)).
