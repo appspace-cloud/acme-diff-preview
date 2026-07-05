@@ -2913,7 +2913,16 @@ def generate_ai_summary(app_results: dict) -> str | None:
         print(f"      [AI] Preparing prompt: {len(changed)} changed app(s), "
               f"{sum(len(s) for s in changed.values())} section(s)")
 
-        total_resources = sum(len(s) for s in changed.values())
+        # FIX B2 (v2.5.1): the top summary line must use the REAL resource
+        # count (DiffResult.n_res), not len(sections) which is truncated to
+        # AI_MAX_SECTIONS_PER_APP=10 for the LLM prompt. v2.4.9 FIX B fixed
+        # the per-app inline header but missed this deterministic top line,
+        # which is prepended to the AI text verbatim (not LLM-generated) and
+        # is exactly the number a reviewer reads first. Found during the
+        # post-merge live verification round.
+        total_resources = sum(
+            results[app].n_res for app in changed if app in results
+        )
 
         sections_parts = []
         for app, sections in changed.items():
