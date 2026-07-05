@@ -1,0 +1,38 @@
+# Manual, on-demand fix for a GitHub Release's notes.
+#
+# Exists because a personal PAT (used for everything else in this repo's
+# tooling) only has read access here — editing an existing Release needs the
+# workflow's own GITHUB_TOKEN. Dispatch with:
+#   gh workflow run fix-release-notes.yml -f tag=vX.Y.Z -f notes_file=path/in/repo.md
+#
+# notes_file is a path to a markdown file already committed to the repo
+# (simplest way to pass multi-line, properly-escaped content) — NOT the
+# release notes inline as a workflow input.
+
+name: fix-release-notes
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Tag whose GitHub Release notes to overwrite (e.g. v2.5.2)'
+        required: true
+      notes_file:
+        description: 'Path to a markdown file in this repo with the new notes'
+        required: true
+
+permissions:
+  contents: write
+
+jobs:
+  edit:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5.0.0
+
+      - name: Edit release notes
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release edit "${{ inputs.tag }}" --notes-file "${{ inputs.notes_file }}"
+          echo "Updated release notes for ${{ inputs.tag }} from ${{ inputs.notes_file }}"
