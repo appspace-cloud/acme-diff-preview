@@ -186,3 +186,134 @@ permanent test files yet — recreate when implementing)
   AND simultaneously add `gcp/dev/public-cloud/ap1/cl-zztest99-a/config.yaml`
   with no `appspace.version` in the same commit → new env silently never
   evaluated, full green on the existing-env diff only.
+
+
+---
+
+## SESSION 2 (2026-07-05, same day, follow-up campaign) — folder rename/move/delete
+
+Marcos asked specifically for real-config-prod-style folder restructuring
+tests (renames, moves between "cadence" folders, decommissions), since
+`acme-config-prod`'s git history shows this happens routinely (customers
+moved between `weekly`/`monthly`/`hardcoded`/`sandbox`/`monthly-friday`
+folders, typo fixes in folder names, cross-region customer migrations,
+full decommissions). Confirmed via `git log --diff-filter=R` and
+`--diff-filter=D` on acme-config-prod: dozens of real examples.
+
+`acme-config-dev` does not have the cadence-folder pattern, but DOES have
+the same underlying mechanism: `gcp/dev/private-cloud/*/custom/pv-dev-NN-a/`
+customer folders, each backed by its own ArgoCD Applications
+(`pv-dev-NN-a-ms/-ss/-glb`) whose `helm.valueFiles` are STATIC paths
+pointing at that exact folder (confirmed via `argocd app get`). This is
+structurally identical to a prod customer folder, so it's a faithful
+substitute for testing the rename/move/delete family.
+
+## FINDING 6 (HIGH SEVERITY, confirmed live 3x: PR #6647, #6648, #6649) —
+renaming, moving, or deleting a customer folder makes the bot report a
+generic render failure and silently swallows any real change bundled with it
+
+Root cause chain, confirmed step by step:
+
+1. The live ArgoCD Application for a customer (e.g. `pv-dev-06-a-ms`) has
+   `helm.valueFiles` hardcoded to the OLD path (`.../custom/pv-dev-06-a/
+   customer.yaml`, `.../cicd-versions.yaml`) — this is how ArgoCD is
+   currently configured and won't change until the PR merges.
+2. `get_pr_changed_files` correctly captures BOTH old and new paths for a
+   git-detected rename (FIX C, v2.4.9) — so `_match_files_to_apps` DOES
+   correctly identify `pv-dev-06-a-*` as affected, via the OLD path. This
+   part works.
+3. But when `_run_one_diff` renders the PR side, it fetches the app's
+   STATIC valueFiles list at `pr_sha`. The OLD path is gone at `pr_sha`
+   (confirmed directly: `git show <pr-branch>:<old-path>` →
+   "fatal: path ... exists on disk, but not in <branch>"), so
+   `_bb_fetch_status` returns 404 for it.
+4. Per the existing (deliberate, documented) logic in `_run_one_diff`: a
+   changed file that 404s at `pr_sha` is treated as "deleted by this PR"
+   and OMITTED from the value files used to render — not backfilled from
+   `main`. This is CORRECT behavior for a genuine deletion of an override,
+   but here the file didn't disappear, it MOVED, and its content (often
+   including `appspace.version`, `cloudShortName`, and every service
+   override for that customer) is simply gone from the render inputs.
+5. Helm then fails to render the chart at all — typically "Missing
+   required value" for a field customer.yaml used to provide — producing
+   the SAME generic `render_failed` / "helm template failed to render the
+   chart with these values" message you'd get from an actual unrelated
+   bug. There is no distinction between "this customer's config file
+   moved" and "this customer's config is broken."
+
+Confirmed live, three ways:
+- **Pure rename, zero content change** (PR #6647, `pv-dev-05-a` →
+  `pv-dev-05-renametest-a`): render fails for all 3 apps. A completely
+  safe, no-op operation looks identical to a broken deploy.
+- **Rename + a real version bump in the same commit** (PR #6648,
+  `pv-dev-06-a` → `pv-dev-06-renametest-a` + a real tag change on
+  `user-background`): SAME render failure. The AI summary literally says
+  "0 app(s) updated · 0 resource(s) changed" and "No critical changes
+  detected" — the deliberate version bump is 100% invisible. A reviewer
+  sees a clean-looking (if oddly empty) green check for what is actually
+  an unverified, unreviewed real change.
+- **Full decommission** (PR #6649, deleted `pv-dev-07-a` entirely,
+  replicating real prod pattern COPR-30708 "Decommission PV-Raytheon"):
+  same generic render failure, giving zero signal that this is an
+  intentional, expected teardown rather than a bug.
+
+All three currently resolve to **green** (Finding 1's bug), which makes
+this compound with Finding 1: not only is the color wrong, but even once
+Finding 1 is fixed and this correctly shows red, the message itself will
+still be the unhelpful, generic "helm template failed" with no indication
+that a rename/move/delete is the actual, common, everyday cause. Given how
+frequently this operation happens in production (dozens of examples in
+`acme-config-prod` history), this is likely one of the most operationally
+disruptive gaps found in the whole campaign: it means the tool cannot
+currently produce a trustworthy diff for one of the most routine change
+types customers/operators make.
+
+This also interacts with **Finding 4** (new-env candidates only checked
+when `affected` is empty): since the rename IS matched via the old path
+(`affected` is non-empty), the new path's files never get a chance to be
+considered as "a new environment" either — even if they did, `affected`
+being non-empty would block that path per Finding 4. So a rename currently
+falls into a gap between both mechanisms: not treated as "the same app
+moved" (which would need new logic) and not treated as "a new env"
+(blocked by Finding 4).
+
+Fix direction (harder than Findings 1-3, needs real design work): the tool
+needs an explicit concept of "this app's config file moved within the same
+PR" — detect it from the old/new path pairs already available in the raw
+Bitbucket diffstat (currently collapsed into a flat file list by
+`get_pr_changed_files`, losing the pairing), and when detected, fetch the
+value file content from its NEW path instead of treating the old path's
+404 as a deletion. This is different from a real deletion (old path 404,
+no corresponding new path) which should keep today's "omit it" behavior.
+Suggest tackling this together with Finding 4 in the same design session,
+since both are about the app-to-file identity model breaking when paths
+change within a single PR.
+
+## Repro recipes added this session
+
+- PR #6647: `git mv gcp/dev/private-cloud/ap1/custom/pv-dev-05-a
+  gcp/dev/private-cloud/ap1/custom/pv-dev-05-renametest-a`, no content
+  change. Push, open PR, wait ~45-90s for the bot.
+- PR #6648: same `git mv` pattern on `pv-dev-06-a`, PLUS a real tag change
+  on one service in the moved `cicd-versions.yaml` before committing.
+- PR #6649: `git rm -r` a full customer folder (e.g. `pv-dev-07-a`),
+  replicating a decommission PR.
+- Remember to `git checkout main` + restore the moved/deleted dev sandbox
+  folders are automatically fine since these are throwaway branches never
+  merged — `main` was never touched, no cleanup needed on the real dev
+  environments themselves, only the test branches (already deleted).
+
+## Updated suggested order for next phase
+
+1. Finding 1 + 3 together (main fix: any indeterminate reason → FAILED,
+   including in fix_stuck_inprogress). Cheapest, highest-value, unblocks
+   correct coloring everywhere else.
+2. Finding 6 (rename/move/delete handling). HIGH severity and HIGH
+   frequency in production — arguably should be prioritized above Finding
+   4 despite being harder, precisely because it happens constantly in
+   acme-config-prod and currently produces zero useful signal.
+3. Finding 4 (mixed PR blind spot for brand-new environments). Related
+   design work to #2 (same underlying "path identity" gap), consider
+   doing both in the same session.
+4. Finding 5 (new-env default-to-green). Still last — needs production
+   log sampling before writing the allow-list.
