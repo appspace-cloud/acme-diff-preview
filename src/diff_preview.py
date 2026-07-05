@@ -543,12 +543,23 @@ def _verify_jfrog_hmac(body: bytes, header: str) -> bool:
     JFrog signs the payload with HMAC-SHA256 using the secret configured in
     Administration -> Webhooks. The signature is the hex digest of the HMAC,
     sent in the X-JFrog-Event-Auth header.
+
+    The header is attacker-controlled and compared PRE-AUTH. Comparing it as
+    a str with hmac.compare_digest raises TypeError on any non-ASCII byte,
+    which propagated out of do_POST uncaught -- a single unauthenticated
+    request with a non-ASCII signature header crashed the request thread and
+    dumped a full traceback to logs on both webhook endpoints (v2.5.3
+    CRIT-2, confirmed live with a real server). Comparing as bytes sidesteps
+    the ASCII restriction entirely: any header value is a valid input and a
+    mismatch (including "not valid hex", "wrong length", "non-ASCII") is
+    just another way to be unequal, never an exception.
     """
     import hmac, hashlib
     if not JFROG_WEBHOOK_SECRET or not header:
         return False
     expected = hmac.new(JFROG_WEBHOOK_SECRET.encode(), body, hashlib.sha256).hexdigest()
-    return hmac.compare_digest(header, expected)
+    return hmac.compare_digest(header.encode("utf-8", errors="replace"),
+                                expected.encode("ascii"))
 
 
 def _verify_bb_hmac(body: bytes, header: str) -> bool:
@@ -558,6 +569,10 @@ def _verify_bb_hmac(body: bytes, header: str) -> bool:
     If BB_WEBHOOK_SECRET is empty, the webhook is accepted without verification
     (permissive mode for backward compatibility during rollout). Once the secret
     is configured in both Bitbucket and GCP SM, all unsigned requests are rejected.
+
+    See _verify_jfrog_hmac for why the comparison is done in bytes, not str
+    (v2.5.3 CRIT-2): hmac.compare_digest on two str values raises TypeError
+    for any non-ASCII character, and that exception was uncaught in do_POST.
     """
     import hmac, hashlib
     if not BB_WEBHOOK_SECRET:
@@ -568,7 +583,8 @@ def _verify_bb_hmac(body: bytes, header: str) -> bool:
     # Strip "sha256=" prefix sent by Bitbucket.
     sig = header.removeprefix("sha256=")
     expected = hmac.new(BB_WEBHOOK_SECRET.encode(), body, hashlib.sha256).hexdigest()
-    return hmac.compare_digest(sig, expected)
+    return hmac.compare_digest(sig.encode("utf-8", errors="replace"),
+                                expected.encode("ascii"))
 
 
 def _invalidate_for_republish(chart_name: str, chart_version: str) -> None:
@@ -1241,10 +1257,21 @@ def _extract_chart_version_checked(content: str):
     unsafe: config files carry other, deeper `version:` keys (e.g.
     appspace.elastic.version: 8.15.1) that must never be mistaken for the chart
     revision. We track indentation so only the direct child matches.
+
+    IMPORTANT (v2.5.3 CRIT-1): a duplicate `version:` key at the direct-child
+    level must resolve to the LAST occurrence, matching real YAML/Helm
+    semantics (confirmed empirically against `helm template`: last key wins).
+    The scan below used to return on the FIRST match, which let a duplicated
+    key mask a real chart bump — confirmed live in production on PR #6637,
+    where the bot rendered the OLD chart and reported a harmless-looking tag
+    downgrade instead of the real full-service undeploy the merge would
+    actually cause. We now scan the whole file and keep the last match.
     """
     in_appspace     = False
     appspace_indent = -1
     child_indent    = None
+    last_candidate  = None  # raw (quote-stripped) value of the LAST direct-
+                             # child version: line seen, across the whole file.
     for line in content.splitlines():
         if not line.strip() or line.lstrip().startswith("#"):
             continue
@@ -1264,17 +1291,22 @@ def _extract_chart_version_checked(content: str):
                 child_indent = indent
             vm = _version_key_re.match(line)
             if vm and indent == child_indent:
-                candidate = vm.group(1).strip("'\"")
-                # Reject anything that is not a safe OCI tag. A PR author
-                # controls this value and it reaches `helm pull --version`
-                # and a filesystem path, so an unsafe value is treated as
-                # "no version bump" rather than passed downstream.
-                if not _is_valid_chart_version(candidate):
-                    log(f"_extract_chart_version: rejecting unsafe version "
-                        f"{candidate!r} (not a valid OCI tag)", "WARNING")
-                    return None, "invalid"
-                return candidate, "ok"
-    return None, "none"
+                # Do not return yet -- a later duplicate key on a subsequent
+                # line must overwrite this one (last-key-wins).
+                last_candidate = vm.group(1).strip("'\"")
+    if last_candidate is None:
+        return None, "none"
+    # Reject anything that is not a safe OCI tag. A PR author controls this
+    # value and it reaches `helm pull --version` and a filesystem path, so an
+    # unsafe value is treated as "no version bump" rather than passed
+    # downstream. This applies to the LAST occurrence: if it is unsafe we
+    # must not silently fall back to an earlier, safe-looking duplicate --
+    # that would just relocate the false-green bug instead of fixing it.
+    if not _is_valid_chart_version(last_candidate):
+        log(f"_extract_chart_version: rejecting unsafe version "
+            f"{last_candidate!r} (not a valid OCI tag)", "WARNING")
+        return None, "invalid"
+    return last_candidate, "ok"
 
 
 def _extract_chart_version(content: str):
@@ -2070,6 +2102,19 @@ def _split_yaml_docs(yaml_text):
             yield doc
 
 
+def _strip_trailing_comment(value: str) -> str:
+    """Strip a trailing ` # comment` from an unquoted YAML scalar (v2.5.3).
+
+    A quoted value ('...' or "...") is left untouched -- a '#' inside quotes
+    is literal data, not a comment, and k8s resource names can't legally
+    contain one anyway (DNS-1123), so this only ever affects the defensive
+    unquoted-scalar case.
+    """
+    if value[:1] in ("'", '"'):
+        return value
+    return re.sub(r'\s+#.*$', '', value).strip()
+
+
 def _parse_manifest_resources(yaml_text):
     """Split a multi-document YAML string into a dict keyed by (group/Kind, ns/name).
 
@@ -2083,6 +2128,16 @@ def _parse_manifest_resources(yaml_text):
             continue
         kind = ns = name = api = ""
         in_meta = False
+        meta_child_indent = None  # indent of metadata's direct children,
+                                   # determined dynamically instead of the
+                                   # hardcoded "exactly 2 spaces" this used to
+                                   # assume. Real `helm template` output is
+                                   # always 2-space, so this never triggered
+                                   # in production, but hardcoding it was
+                                   # fragile (v2.5.3 defensive hardening).
+                                   # Still required (not "any indent") to
+                                   # avoid matching a deeper nested `name:`,
+                                   # e.g. metadata.ownerReferences[].name.
         for line in doc.splitlines():
             if line.startswith("apiVersion:"):
                 api = line.split(":", 1)[1].strip()
@@ -2090,13 +2145,24 @@ def _parse_manifest_resources(yaml_text):
                 kind = line.split(":", 1)[1].strip()
             elif line.startswith("metadata:"):
                 in_meta = True
+                meta_child_indent = None
             elif in_meta:
-                if line.startswith("  namespace:"):
-                    ns = line.split(":", 1)[1].strip()
-                elif line.startswith("  name:"):
-                    name = line.split(":", 1)[1].strip()
-                elif line and not line.startswith(" "):
+                stripped = line.lstrip()
+                if not stripped:
+                    continue
+                indent = len(line) - len(stripped)
+                if indent == 0:
                     in_meta = False
+                    continue
+                if meta_child_indent is None:
+                    meta_child_indent = indent
+                if indent == meta_child_indent:
+                    if stripped.startswith("namespace:"):
+                        ns = _strip_trailing_comment(
+                            stripped.split(":", 1)[1].strip())
+                    elif stripped.startswith("name:"):
+                        name = _strip_trailing_comment(
+                            stripped.split(":", 1)[1].strip())
         if kind and not name:
             # Fallback for flow-style metadata (e.g. `metadata: {name: x}`),
             # valid YAML that the block-style line scan above cannot see.
@@ -2755,7 +2821,7 @@ def _normalize_ai_markdown(text: str) -> str:
     return t.strip()
 
 _SENSITIVE_KEYS = re.compile(
-    r'(?i)(password|passwd|secret|token|key|api[-_]?key|private[-_]?key'
+    r'(?i)(password|passwd|pwd|pass|secret|token|key|api[-_]?key|private[-_]?key'
     r'|auth|credential|bearer|jwt|access[-_]?token|refresh[-_]?token'
     r'|connection[-_]?string|dsn|mongodb[-_]?uri|postgres[-_]?url'
     r'|encryption[-_]?key|signing[-_]?key)',
