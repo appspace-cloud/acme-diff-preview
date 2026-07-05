@@ -1001,10 +1001,11 @@ def test_detect_and_render_new_env_functions_exist():
 
 
 def test_new_env_detected_in_process_pr():
-    """process_pr must call _detect_new_env_candidates when affected is empty."""
+    """process_pr must call _detect_new_env_candidates (v2.5.4: unconditionally,
+    not just when affected is empty -- see Finding 4)."""
     src = _source()
-    assert "_detect_new_env_candidates(changed, path_map)" in src, (
-        "process_pr must call _detect_new_env_candidates when no apps are affected"
+    assert "_detect_new_env_candidates(changed, path_map, renames)" in src, (
+        "process_pr must call _detect_new_env_candidates"
     )
 
 

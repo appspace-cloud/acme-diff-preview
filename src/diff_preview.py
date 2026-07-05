@@ -1800,18 +1800,32 @@ def _helm_template(chart_path: str, release: str, namespace: str,
         return r.stdout, None
 
 
-def _detect_new_env_candidates(changed_files: list, path_map: dict) -> list:
+def _detect_new_env_candidates(changed_files: list, path_map: dict, renames: dict = None) -> list:
     """Scan changed files for patterns that indicate a brand-new environment.
 
     A 'new env' is a customer.yaml or config.yaml at env-directory depth that is
-    NOT covered by any existing ArgoCD app in path_map. The caller should only
-    invoke this after confirming get_affected_apps() returned an empty set.
+    NOT covered by any existing ArgoCD app in path_map. Since v2.5.4 (Finding 4)
+    this is called unconditionally, whether or not other apps are also affected
+    in the same PR — it no longer requires get_affected_apps() to be empty.
+
+    renames (v2.5.4, Finding 4/6 interaction fix): a customer folder rename
+    produces a NEW path that is, by definition, not yet in path_map — without
+    this check it looked exactly like a brand-new environment and was
+    double-evaluated through the wrong path (_render_new_env_diff, which has
+    no concept of "this app already exists, just moved" and structurally
+    failed on missing post-rename secrets that the RENAMED app already has).
+    Confirmed live: PR verifying the rename+bump fix (#6657) correctly showed
+    the real diff for the existing app AND incorrectly flagged the same
+    folder as a broken new environment. Any new-side path whose old side is
+    a known existing app is excluded here — the existing-app path (which
+    now correctly follows the rename, see _run_one_diff) already covers it.
 
     Returns a list of dicts:
       {name, config_file, env_dir, all_yaml_files}
     """
     candidates = {}
     path_map_keys = set(path_map.keys())
+    rename_new_sides = set(renames.values()) if renames else set()
     for f in changed_files:
         parts = f.split("/")
         # Must be a top-level env config at adequate depth and not already mapped
@@ -1819,6 +1833,8 @@ def _detect_new_env_candidates(changed_files: list, path_map: dict) -> list:
         if len(parts) < 5 or parts[-1] not in ("customer.yaml", "config.yaml"):
             continue
         if f in path_map_keys:
+            continue
+        if f in rename_new_sides:
             continue
         env_dir  = "/".join(parts[:-1])
         env_name = parts[-2]
@@ -2058,7 +2074,16 @@ def _render_new_env_diff(env_info: dict, pr_sha: str) -> tuple:
     namespace = env_name
     rendered, err = _helm_template(chart_path, env_name, namespace, vals)
     if err or not rendered:
-        return None, f"helm template failed: {(err or 'no output')[:120]}", 0, version
+        # v2.5.4 (Finding 4/5 interaction fix): do NOT re-truncate here. `err`
+        # is already capped at 400 chars by _helm_template. The old [:120]
+        # cut here often sliced off "Missing required value" when the file
+        # path/line-number prefix in the real helm error was long (e.g.
+        # ".../legacy-db-credentials.yaml:2:27): Missing requir" — cutting
+        # the exact phrase _new_env_status's allow-list checks for, and
+        # misclassifying a genuinely expected new-env error as structural.
+        # Confirmed live on PR #6657. Display-layer truncation for the
+        # comment body still happens separately in _evaluate_new_envs.
+        return None, f"helm template failed: {err or 'no output'}", 0, version
 
     # 7. Format all resources as additions (entirely new — no prior state)
     diff_lines = []
@@ -3682,7 +3707,7 @@ def process_pr(pr, path_map, base_sha=""):
         # dropping a bundled new environment from evaluation entirely —
         # confirmed live with both a broken (#6646) and a fully valid
         # (#6652) new environment.
-        new_env_candidates = _detect_new_env_candidates(changed, path_map)
+        new_env_candidates = _detect_new_env_candidates(changed, path_map, renames)
         if new_env_candidates:
             log(f"PR #{pr_id}: {len(new_env_candidates)} new env candidate(s): "
                 f"{[e['name'] for e in new_env_candidates]}", pr=pr_id)

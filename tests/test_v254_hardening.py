@@ -397,3 +397,65 @@ def test_format_comment_without_new_env_args_unchanged():
     body = m.format_comment("deadbeef01234567", {"a": _mk_result(m.OUT_DIFF, n=1)})
     assert "New Environment" not in body
     assert m._extract_status_token(body) == "clean"
+
+
+# ── v2.5.4 hotfix (found during live verification, PR #6657): a rename's
+#    NEW path must not ALSO be picked up as a "new environment" candidate
+#    when its OLD path is a known existing app. ─────────────────────────
+def test_detect_new_env_excludes_rename_target_of_existing_app():
+    old_path = "gcp/dev/private-cloud/ap1/custom/pv-dev-06-a/customer.yaml"
+    new_path = "gcp/dev/private-cloud/ap1/custom/pv-dev-06-renametest-a/customer.yaml"
+    path_map = {old_path: ["pv-dev-06-a-ms"]}
+    changed_files = [old_path, new_path,
+                     "gcp/dev/private-cloud/ap1/custom/pv-dev-06-a/cicd-versions.yaml",
+                     "gcp/dev/private-cloud/ap1/custom/pv-dev-06-renametest-a/cicd-versions.yaml"]
+    renames = {old_path: new_path}
+    candidates = m._detect_new_env_candidates(changed_files, path_map, renames)
+    assert candidates == [], (
+        f"a renamed existing app's new path must not be a new-env candidate, got {candidates}")
+
+
+def test_detect_new_env_still_detects_genuine_new_env_with_renames_present():
+    # Guard: a genuinely new environment elsewhere in the same PR must still
+    # be detected even when an unrelated rename is also present.
+    old_path = "gcp/dev/private-cloud/ap1/custom/pv-dev-06-a/customer.yaml"
+    new_path = "gcp/dev/private-cloud/ap1/custom/pv-dev-06-renametest-a/customer.yaml"
+    genuinely_new = "gcp/dev/private-cloud/ap1/custom/pv-dev-99-a/customer.yaml"
+    path_map = {old_path: ["pv-dev-06-a-ms"]}
+    changed_files = [old_path, new_path, genuinely_new]
+    renames = {old_path: new_path}
+    candidates = m._detect_new_env_candidates(changed_files, path_map, renames)
+    names = [c["name"] for c in candidates]
+    assert names == ["pv-dev-99-a"]
+
+
+def test_detect_new_env_without_renames_arg_backward_compatible():
+    # Guard: existing callers that don't pass renames must keep working.
+    genuinely_new = "gcp/dev/private-cloud/ap1/custom/pv-dev-99-a/customer.yaml"
+    candidates = m._detect_new_env_candidates([genuinely_new], {})
+    assert len(candidates) == 1
+
+
+# ── v2.5.4 hotfix: _render_new_env_diff must not truncate the helm error
+#    before _new_env_status can see "missing required value" in it. ─────
+def test_render_new_env_diff_preserves_full_error_for_classification(monkeypatch):
+    # A long file path pushes "Missing required value" past where the old
+    # [:120] cut would have sliced it off (confirmed live, PR #6657).
+    long_prefix = "execution error at (appspace-micro-services/templates/configmaps/legacy-db-credentials.yaml:2:27): "
+    assert len(long_prefix) > 90  # sanity: this alone eats most of the old 120-char budget
+    full_err = long_prefix + "Missing required value: .Values.appspace.secret"
+
+    monkeypatch.setattr(m, "_bb_fetch_status",
+        lambda path, sha: ("appspace:\n  version: 2603.0.0-dev\n", m.BB_OK))
+    monkeypatch.setattr(m, "_ensure_chart", lambda registry, chart, ver: "/fake/chart")
+    monkeypatch.setattr(m, "_fetch_value_files", lambda files, sha: {f: "x: y\n" for f in files})
+    monkeypatch.setattr(m, "_helm_template", lambda *a, **k: (None, full_err))
+
+    env_info = {"config_file": "gcp/dev/private-cloud/ap1/custom/pv-x-a/customer.yaml",
+                "name": "pv-x-a", "env_dir": "gcp/dev/private-cloud/ap1/custom/pv-x-a",
+                "all_yaml_files": ["gcp/dev/private-cloud/ap1/custom/pv-x-a/customer.yaml"]}
+    diff_text, render_err, n_res, version = m._render_new_env_diff(env_info, "prsha")
+    assert "missing required value" in render_err.lower()
+    state, expected = m._new_env_status(render_err)
+    assert (state, expected) == ("SUCCESSFUL", True), (
+        f"long error prefix must not hide the expected-case phrase, got render_err={render_err!r}")
