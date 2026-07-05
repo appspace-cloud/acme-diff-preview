@@ -76,17 +76,43 @@ cleanly without error.
 
 ## GitHub Releases (human-readable, one per `v*` tag)
 
-Every `v<version>` tag (e.g. `v2.5.1`) should be an **annotated** tag whose
-message is the full release story: what broke, why, the fix, and how it was
-verified — see any existing `v*` tag for the expected level of detail
-(`git tag -n99 v2.5.1`). This is the same convention used in `acme-mcp`.
+Every `v<version>` tag (e.g. `v2.5.2`) should be an **annotated** tag, and its
+message IS the GitHub Release body verbatim — so it must be written for that
+page, not as an internal design doc. Two hard rules, learned from v2.5.2
+rendering badly:
+
+1. **Keep it short — a few bullets, not an essay.** Aim for under ~120 words:
+   a one-line summary, then 2-5 short bullets (one per fix/change), then an
+   optional one-line test/verification note. The full technical story (root
+   cause, code paths, before/after numbers, live-verification detail) belongs
+   in the **commit message** instead — that has no length or rendering limits
+   and isn't shown on the Releases page.
+2. **Never hand-wrap a line inside a paragraph or bullet.** GitHub's Release
+   renderer shows every single `\n` as a hard line break — it does NOT
+   reflow a hard-wrapped paragraph to the page width like a text editor
+   would. A tag message written like a wrapped commit message (each source
+   line ~72-80 chars) renders as a wall of short, choppy lines instead of a
+   normal paragraph (exactly what v2.5.2 looked like before it was fixed).
+   Write each paragraph/bullet as ONE continuous line (let your editor
+   soft-wrap it, but do not insert a literal newline until the
+   paragraph/bullet actually ends), and use real blank lines between
+   paragraphs and real `- ` markdown bullets for lists.
+
+Template:
+```
+vX.Y.Z: <one-line summary>
+
+- **<short label>:** <what changed and why, one sentence, one line>.
+- **<short label>:** <what changed and why, one sentence, one line>.
+
+Tests: N passing (M new).
+```
 
 `release.yml`'s `github-release` job runs on every push to `main` and creates
 a GitHub Release for any `v*` tag that doesn't have one yet, using **the
 tag's own annotation message** (`git for-each-ref refs/tags/<tag>
---format='%(contents)'`) as the release notes — not the commit message the
-tag points to, which is usually shorter and less useful as a changelog entry.
-The job is idempotent (`gh release view` check before creating), so:
+--format='%(contents)'`) as the release notes verbatim. The job is idempotent
+(`gh release view` check before creating), so:
 
 - A normal release just needs `git tag -a vX.Y.Z -F <message-file>` + `git
   push origin vX.Y.Z` (or push it along with the `main` merge, as usual) —
@@ -98,3 +124,18 @@ The job is idempotent (`gh release view` check before creating), so:
 `acme-diff-preview-X.Y.Z` (no `v` prefix) — those carry the actual `.tgz`
 chart artifact that the published Helm repo index points to. ArgoCD/helm
 depend on them to pull the chart; never delete or rename them.
+
+### Fixing an already-published Release's notes
+
+The underlying git tag is immutable in practice (never force-move an
+already-pushed tag). If a Release's notes need correcting after the fact
+(wrong content, or written before this template existed), edit the
+**Release**, not the tag: commit a markdown file to
+`.release-notes/<tag>.md` with the corrected notes and push it to `main`.
+The `fix-release-notes.yml` workflow watches that path and overwrites the
+matching Release's notes from the file — this exists because a personal
+PAT only has read access to this repo (`push: false`), so editing an
+existing Release needs the workflow's own `GITHUB_TOKEN`, and even
+`workflow_dispatch` needs admin rights the PAT also lacks. A plain
+`git push` over SSH is the one write path that works, hence the
+push-triggered design.
