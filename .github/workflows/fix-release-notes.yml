@@ -2,24 +2,19 @@
 #
 # Exists because a personal PAT (used for everything else in this repo's
 # tooling) only has read access here — editing an existing Release needs the
-# workflow's own GITHUB_TOKEN. Dispatch with:
-#   gh workflow run fix-release-notes.yml -f tag=vX.Y.Z -f notes_file=path/in/repo.md
-#
-# notes_file is a path to a markdown file already committed to the repo
-# (simplest way to pass multi-line, properly-escaped content) — NOT the
-# release notes inline as a workflow input.
+# workflow's own GITHUB_TOKEN, and triggering workflow_dispatch over the API
+# needs admin rights this PAT also lacks. So this triggers off something a
+# plain `git push` (SSH, already used for everything else here) CAN do:
+# committing a markdown file to .release-notes/<tag>.md and pushing it to
+# main. The tag name is the filename without extension.
 
 name: fix-release-notes
 
 on:
-  workflow_dispatch:
-    inputs:
-      tag:
-        description: 'Tag whose GitHub Release notes to overwrite (e.g. v2.5.2)'
-        required: true
-      notes_file:
-        description: 'Path to a markdown file in this repo with the new notes'
-        required: true
+  push:
+    branches: [main]
+    paths:
+      - '.release-notes/*.md'
 
 permissions:
   contents: write
@@ -29,10 +24,20 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v5.0.0
+        with:
+          fetch-depth: 2
 
-      - name: Edit release notes
+      - name: Edit release notes for every changed file
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          gh release edit "${{ inputs.tag }}" --notes-file "${{ inputs.notes_file }}"
-          echo "Updated release notes for ${{ inputs.tag }} from ${{ inputs.notes_file }}"
+          for f in $(git diff --name-only HEAD~1 HEAD -- '.release-notes/*.md'); do
+            [ -f "$f" ] || continue
+            tag=$(basename "$f" .md)
+            if gh release view "$tag" >/dev/null 2>&1; then
+              gh release edit "$tag" --notes-file "$f"
+              echo "Updated release notes for $tag from $f"
+            else
+              echo "Tag $tag has no GitHub Release yet — skipping (nothing to edit)."
+            fi
+          done
