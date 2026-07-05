@@ -250,6 +250,19 @@ _pr_chart_targets: dict = {}     # pr_id -> {(chart, version), ...} builds each 
 # while running, not just when it finishes. Updated every 30s while iterating.
 _last_ok: float       = time.monotonic()
 _last_ok_lock         = threading.Lock()
+# _loop_progress_token / _loop_idle: what the heartbeat actually checks before
+# vouching for liveness (v2.5.2 C2). Before this, _beat() bumped _last_ok
+# every 30s completely unconditionally, so a truly wedged main loop (deadlock,
+# a blocking call with no timeout in some future code path) still reported
+# /healthz healthy forever — Kubernetes would never restart it, and PRs would
+# silently stop being processed. Now the heartbeat only vouches for liveness
+# when EITHER real progress happened since the last tick (_loop_progress_token
+# advanced) OR the loop is known to be idly waiting on _wake (a safe, expected
+# state, not a hang). main_iteration() advances the token at coarse
+# checkpoints; main()'s outer loop sets _loop_idle around the wait.
+_loop_progress_token: int = 0
+_loop_idle: bool           = False
+_progress_lock             = threading.Lock()
 # _last_poll_ok: set True only when PR polling (get_open_prs + base SHA fetch)
 # succeeds. If Bitbucket is down, _last_ok stays green but /healthz exposes the
 # poll failure so alerts can distinguish "busy processing" from "broken loop".
@@ -408,11 +421,17 @@ class _HealthHandler(BaseHTTPRequestHandler):
                 length = int(self.headers.get("Content-Length", 0))
             except (ValueError, TypeError):
                 length = 0
-            if length > JFROG_MAX_BODY_BYTES:
+            # A negative length (e.g. "-1") used to pass the "> cap" check below
+            # and then self.rfile.read(length) reads UNTIL EOF (Python treats
+            # any negative size as "read everything"), completely bypassing the
+            # cap this code claims to enforce — an unauthenticated request
+            # (HMAC is verified AFTER the body is read) could exhaust pod memory
+            # or hang this thread forever on an open connection (v2.5.2 C1).
+            if length <= 0 or length > JFROG_MAX_BODY_BYTES:
                 self.send_response(413)
                 self.end_headers()
                 return
-            body = self.rfile.read(length) if length else b""
+            body = self.rfile.read(length)
 
             # HMAC-SHA256 verification (Bitbucket X-Hub-Signature header).
             # Permissive when BB_WEBHOOK_SECRET is not set (backward compat).
@@ -435,8 +454,12 @@ class _HealthHandler(BaseHTTPRequestHandler):
                 length = int(self.headers.get("Content-Length", 0))
             except (ValueError, TypeError):
                 length = 0  # malformed header — treat as no body
-            if length > JFROG_MAX_BODY_BYTES:
-                log(f"JFrog webhook: body too large ({length} bytes > {JFROG_MAX_BODY_BYTES}), rejecting", "WARNING")
+            # length <= 0 covers both "no body" AND a negative length such as
+            # "-1", which would otherwise pass the "> cap" check and then make
+            # self.rfile.read(length) read UNTIL EOF — unbounded, on an
+            # unauthenticated request (HMAC checked after the read) (v2.5.2 C1).
+            if length < 0 or length > JFROG_MAX_BODY_BYTES:
+                log(f"JFrog webhook: rejecting invalid Content-Length ({length})", "WARNING")
                 self.send_response(413)
                 self.end_headers()
                 return
@@ -678,17 +701,47 @@ def _jfrog_hard_refresh(chart_name: str, chart_version: str) -> None:
     log(f"JFrog webhook: done — {ok} refreshed, {failed} failed")
 
 
+def _touch_progress() -> None:
+    """Record that the main loop made real, observable progress right now
+    (v2.5.2 C2). Called from coarse checkpoints inside main_iteration() and
+    from the per-app diff completion loop, so a long-but-healthy iteration
+    keeps refreshing liveness the same way a short one does."""
+    global _loop_progress_token
+    with _progress_lock:
+        _loop_progress_token += 1
+
+
+def _liveness_should_refresh(token: int, last_seen_token: int, idle: bool) -> bool:
+    """Pure decision: should this heartbeat tick vouch for /healthz?
+
+    True when the loop is in the known-safe idle wait (blocked on _wake with
+    a bounded 60s timeout — never a hang), or when the progress token has
+    advanced since the last tick (real work happened in the last 30s).
+    False only when the loop claims to be busy but produced zero observable
+    progress since the last check — exactly what a wedged main loop looks
+    like, and exactly the signal /healthz must be allowed to see (v2.5.2 C2).
+    """
+    return idle or (token != last_seen_token)
+
+
 def _start_heartbeat() -> None:
-    """Tick _last_ok every 30s while the pod is alive.
+    """Tick _last_ok every 30s, but only when the main loop demonstrably
+    earned it — see _liveness_should_refresh — not unconditionally (v2.5.2 C2).
 
     Decouples liveness from iteration duration — a long 800-app PR stays healthy
-    while running instead of triggering a restart after 5 minutes.
+    while running instead of triggering a restart after 5 minutes — without
+    also hiding a genuinely wedged loop from Kubernetes forever.
     """
     def _beat():
         global _last_ok
+        last_seen_token = -1
         while not _shutdown:
-            with _last_ok_lock:
-                _last_ok = time.monotonic()
+            with _progress_lock:
+                token, idle = _loop_progress_token, _loop_idle
+            if _liveness_should_refresh(token, last_seen_token, idle):
+                with _last_ok_lock:
+                    _last_ok = time.monotonic()
+            last_seen_token = token
             time.sleep(30)
     t = threading.Thread(target=_beat, daemon=True, name="heartbeat")
     t.start()
@@ -3629,6 +3682,7 @@ def process_pr(pr, path_map, base_sha=""):
                                             OUT_ERROR, REASON_UNEXPECTED)
                         elapsed = 0.0
                     app_results[app] = result
+                    _touch_progress()  # C2 checkpoint: one app's diff completed
                     outcome_counts[result.outcome] += 1
                     if result.outcome == OUT_ERROR:
                         any_hard_error = True
@@ -3815,6 +3869,7 @@ def main_iteration():
     """Run one complete poll cycle: discover apps, get open PRs, process each."""
     _iter_start = time.monotonic()
     log("ACME diff preview iteration starting")
+    _touch_progress()  # C2 checkpoint: iteration is alive and beginning work
 
     # Trim the on-disk chart cache before any diffs so it never races a pull.
     _prune_helm_cache()
@@ -3843,6 +3898,7 @@ def main_iteration():
         except Exception:
             pass
         return
+    _touch_progress()  # C2 checkpoint: app discovery succeeded
     cache_age = round(time.monotonic() - _path_map_ts, 0) if _path_map_ts else -1
     log(f"Discovered {len(path_map)} unique paths across "
         f"{sum(len(v) for v in path_map.values())} app refs "
@@ -3870,6 +3926,7 @@ def main_iteration():
     # Mark poll as healthy after successful fetch (outside try so it only runs on success)
     _last_poll_ok = True
     _consecutive_poll_fails = 0
+    _touch_progress()  # C2 checkpoint: Bitbucket poll succeeded
     log(f"Open PRs: {len(prs)}")
 
     # Evict _seen entries for PRs no longer open. Without this, a PR that
@@ -3902,6 +3959,7 @@ def main_iteration():
                 except Exception as exc:
                     pr = futs[fut]
                     log(f"Unhandled error processing PR #{pr['id']}: {exc}", "ERROR")
+                _touch_progress()  # C2 checkpoint: one PR finished processing
 
     # Iteration-level rollup across all PRs: a single line that shows whether
     # this cycle was healthy or how many app diffs could not be computed.
@@ -3922,7 +3980,7 @@ def main_iteration():
 # ── Main entry point (long-running Deployment mode) ───────────────────
 def main():
     """Start health server, login to ArgoCD, then run poll loop until SIGTERM."""
-    global _last_ok
+    global _last_ok, _loop_idle
     log("acme-diff-preview starting (Deployment mode, helm-template diff)",
         argocd_server=ARGOCD_SERVER, argocd_user=ARGOCD_USER,
         bb_repo=BB_REPO, diff_workers=DIFF_WORKERS, pr_workers=MAX_PR_WORKERS,
@@ -3959,7 +4017,17 @@ def main():
         if not _shutdown:
             # Webhook wakes the loop instantly (<1s). The 60s timeout is
             # just a safety net in case webhook delivery is ever unavailable.
+            # _loop_idle marks this as a known-safe, bounded wait — NOT a
+            # hang — so the heartbeat can keep vouching for liveness while
+            # the loop is legitimately doing nothing (v2.5.2 C2). Guarded by
+            # the same lock _beat() reads it under, for a clean, unambiguous
+            # happens-before relationship (belt-and-braces on top of the
+            # GIL's own atomicity for a single bool assignment).
+            with _progress_lock:
+                _loop_idle = True
             _wake.wait(timeout=60)
+            with _progress_lock:
+                _loop_idle = False
             _wake.clear()
 
     log("Shutdown complete", "WARNING")
