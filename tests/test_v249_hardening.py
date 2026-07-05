@@ -129,9 +129,11 @@ def test_changed_files_keeps_both_rename_paths():
         "next": "",
     }]
     mod.bb = lambda method, path, **kw: pages[0]
-    files = mod.get_pr_changed_files(1234)
+    # v2.5.4 (Finding 6): now returns (files, renames) instead of just files.
+    files, renames = mod.get_pr_changed_files(1234)
     assert "gcp/dev/a/customer.yaml" in files, "OLD path (in path_map) must be kept"
     assert "gcp/dev/a/customer2.yaml" in files, "NEW path must be kept"
+    assert renames == {"gcp/dev/a/customer.yaml": "gcp/dev/a/customer2.yaml"}
 
 
 # ── FIX D: two-line k8s env-var secret redaction ─────────────────────────────

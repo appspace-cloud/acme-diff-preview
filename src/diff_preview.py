@@ -1846,39 +1846,145 @@ def _new_env_status(render_error: str):
       ("SUCCESSFUL", True)  — the failure is EXPECTED for a first-time env
                               (helm needs credentials/constellation files that
                               only exist after the first deploy). Stays green.
-      ("FAILED", False)     — the failure is STRUCTURAL and will not fix itself
-                              on merge (missing appspace.version, unparseable
-                              config, chart not found). Must block, not go green.
+      ("FAILED", False)     — anything else. Default is FAILED (v2.5.4,
+                              Finding 5) — see below for why.
 
     Before v2.4.9 every new-env render failure produced the same green
     "will be created on merge" status, so a genuinely broken new env (e.g. a
     missing/typo'd appspace.version) merged with a green check and then simply
     failed to deploy with no earlier warning (FIX E).
+
+    v2.5.4 (Finding 5): FIX E only ever built a DENY-list of known-bad
+    patterns (invalid YAML, missing version, chart not found, ...) and
+    defaulted everything NOT on that list to green "expected". That default
+    was backwards: "chart pull failed" (a generic exception — network,
+    disk, or an actual bug) and "registry login may have failed" matched
+    none of the deny-list patterns and went green; worse, a genuine
+    render_failed error unrelated to missing credentials (the same
+    error class fixed for existing envs in Finding 1, e.g. a type-mismatched
+    value making a template execution fail) also went green, silently
+    telling a reviewer "this will be created cleanly on merge" for a
+    brand-new environment that would actually fail to deploy.
+    The fix inverts the polarity to an ALLOW-list: only the one specific,
+    well-understood shape already documented above and in the original FIX E
+    comment — Helm's `required` template function failing because
+    constellation/secret files don't exist until first deploy, which always
+    surfaces as "Missing required value" — is treated as expected. Every
+    other error, recognized or not, defaults to FAILED.
     """
     err = (render_error or "").lower()
-    # A value file that is not parseable YAML is a structural author error
-    # (v2.5.0 H10) — the same class _render_reason flags as invalid_yaml. It
-    # never renders on merge, so it must not get the green new-env status.
-    invalid_yaml = (
-        "error converting yaml" in err or "did not find expected" in err
-        or "could not find expected" in err or "mapping values are not allowed" in err
-        or "yaml: line" in err or "found character that cannot start" in err
-        or ("yaml:" in err and "unmarshal" in err)
-    )
-    # Structural problems the author must fix before this can ever deploy.
-    structural = (
-        invalid_yaml
-        or "no appspace.version" in err
-        or "not found in oci" in err
-        or "chart not found" in err
-        or ("invalid" in err and "version" in err)
-        or "could not fetch" in err
-    )
-    if structural:
-        return "FAILED", False
-    # Everything else (notably "helm template failed: Missing required value"
-    # for post-deploy credentials) is the expected first-time-env case.
-    return "SUCCESSFUL", True
+    # The one well-understood, deliberately-designed "expected" shape: Helm's
+    # `required` function failing on a value that only exists after the first
+    # real deploy (constellation files, post-deploy secrets). This is the
+    # ONLY case that stays green for a new environment.
+    if "missing required value" in err:
+        return "SUCCESSFUL", True
+    # Everything else — invalid YAML, missing appspace.version, chart/OCI
+    # not found, a generic chart-pull exception, a registry-login failure,
+    # or any other render_failed error — is FAILED by default now.
+    return "FAILED", False
+
+
+
+def _evaluate_new_envs(new_env_candidates: list, pr_sha: str) -> tuple:
+    """Render and classify a list of new-environment candidates.
+
+    v2.5.4 (Finding 4): extracted from process_pr's inline logic so the same
+    rendering/classification path can be reused whether the new environments
+    are the ONLY thing in the PR, or bundled alongside changes to already-
+    existing apps. Before this refactor, new-env detection only ran when
+    zero existing apps were affected, so a new environment added in the same
+    commit as an existing-app change was silently never evaluated at all —
+    confirmed live with both a broken (#6646) and a fully valid (#6652) new
+    environment.
+
+    Returns (comment_lines, structural_envs, total_new_resources):
+      comment_lines     — a self-contained "### New Environment(s) Detected"
+                          markdown block (no outer "## <title>" header, no
+                          trailing Status line — the caller decides how that
+                          fits into its own comment/footer).
+      structural_envs   — names of environments with a structural problem
+                          (FIX E) that must block the PR, not go green.
+      total_new_resources — sum of resources that would be created across
+                          all successfully-rendered new environments.
+    """
+    new_env_sections = []
+    for env_info in new_env_candidates:
+        render_result = _render_new_env_diff(env_info, pr_sha)
+        # Returns (diff_text, error [, n_res [, version]])
+        diff_text  = render_result[0]
+        render_err = render_result[1]
+        n_res      = render_result[2] if len(render_result) > 2 else 0
+        detected_version = render_result[3] if len(render_result) > 3 else None
+        env_name = env_info["name"]
+        display_version = detected_version or env_info.get("version", "unknown")
+        if diff_text:
+            log(f"  new env {env_name}: rendered {n_res} resource(s)")
+            diff_preview_text = diff_text[:30_000] + ("\n...(truncated)" if len(diff_text) > 30_000 else "")
+            new_env_sections.append({
+                "name": env_name, "version": display_version,
+                "files": env_info["all_yaml_files"], "n_res": n_res,
+                "diff": diff_preview_text, "error": None,
+            })
+        else:
+            log(f"  new env {env_name}: render failed - {render_err}", "WARNING")
+            new_env_sections.append({
+                "name": env_name, "version": display_version,
+                "files": env_info["all_yaml_files"], "n_res": 0,
+                "diff": None, "error": render_err,
+            })
+
+    lines = [
+        f"### \U0001f195 New Environment(s) Detected", "",
+        f"This PR adds configuration for **{len(new_env_candidates)} new "
+        f"environment(s)** that do not yet exist in ArgoCD. "
+        f"The ApplicationSet will create them automatically after merge. "
+        f"Below is a preview of the resources that will be provisioned.", "",
+    ]
+    for sec in new_env_sections:
+        lines.append(f"#### `{sec['name']}` (chart `{sec['version']}`)")
+        lines.append("")
+        if sec["files"]:
+            lines.append("**Files added:**")
+            for f in sorted(sec["files"])[:15]:
+                lines.append(f"- `{f}`")
+            if len(sec["files"]) > 15:
+                lines.append(f"- *... {len(sec['files'])-15} more files*")
+            lines.append("")
+        if sec["diff"]:
+            lines.append(f"**Preview ({sec['n_res']} resource(s) will be created):**")
+            lines.append("")
+            lines.append("```diff")
+            lines.append(sec["diff"])
+            lines.append("```")
+        else:
+            lines.append(
+                "\U0001f4cb **Resource preview not available for new environments.**  \n"
+                "The chart requires additional constellation files and credentials that "
+                "are provisioned after the first deployment. This is expected.  \n"
+                "All resources will be created from scratch when this PR is merged."
+            )
+            if sec["error"]:
+                state, expected = _new_env_status(sec["error"])
+                if not expected:
+                    lines.append(
+                        f"  \n\u26a0\ufe0f **This is a structural problem, not the "
+                        f"usual first-deploy case — it must be fixed before merge:** "
+                        f"{sec['error'][:160]}")
+                elif "helm template failed" not in sec["error"]:
+                    lines.append(f"  \n*Technical detail: {sec['error'][:120]}*")
+        lines.append("")
+
+    total_new = sum(s["n_res"] for s in new_env_sections)
+    # FIX E (v2.4.9): classify each new-env failure. A structural failure
+    # (missing version, unparseable config, chart missing, or — since
+    # v2.5.4 Finding 5 — any unrecognized error) must NOT get the green
+    # "will be created on merge" status.
+    structural_envs = [
+        s["name"] for s in new_env_sections
+        if s["error"] and _new_env_status(s["error"])[1] is False
+    ]
+    return lines, structural_envs, total_new
 
 
 def _render_new_env_diff(env_info: dict, pr_sha: str) -> tuple:
@@ -2014,7 +2120,7 @@ def _pr_chart_revision(app, candidate_files, pr_sha):
     return None
 
 
-def _pr_chart_revision_checked(app, candidate_files, pr_sha):
+def _pr_chart_revision_checked(app, candidate_files, pr_sha, renames=None):
     """Like _pr_chart_revision, but also reports a rejected version.
 
     Returns (new_rev, invalid):
@@ -2023,6 +2129,14 @@ def _pr_chart_revision_checked(app, candidate_files, pr_sha):
                 that was rejected as unsafe/invalid. When invalid is True the
                 caller must surface a blocking failure instead of silently
                 diffing against the current revision (FIX A, v2.4.9).
+
+    renames (v2.5.4, Finding 6): {old_clean_path: new_clean_path} for files
+    the PR renamed/moved (from the raw Bitbucket diffstat pairing). A
+    candidate file (typically customer.yaml) that 404s at pr_sha because it
+    moved is followed to its new path instead of being skipped — otherwise
+    a version bump bundled with a folder move (a real, common prod pattern:
+    "monthly ver caught up ... moving to regular monthly cadence dir") is
+    silently missed and the diff renders the OLD chart version.
     """
     current_rev = _app_chart_revision_map.get(app)
     if not current_rev:
@@ -2041,6 +2155,19 @@ def _pr_chart_revision_checked(app, candidate_files, pr_sha):
             content = raw
         else:
             content = cached
+        if not content and renames and clean in renames:
+            new_clean = renames[clean]
+            new_key = (pr_sha, new_clean)
+            with _vf_cache_lock:
+                new_cached = _vf_cache.get(new_key, ...)
+            if new_cached is ...:
+                raw2, status2 = _bb_fetch_status(new_clean, pr_sha)
+                if status2 in (BB_OK, BB_NOT_FOUND):
+                    with _vf_cache_lock:
+                        _vf_cache[new_key] = raw2
+                content = raw2
+            else:
+                content = new_cached
         if not content:
             continue
         new_rev, vstatus = _extract_chart_version_checked(content)
@@ -2260,7 +2387,7 @@ def _render_reason(render_err: str) -> str:
     return REASON_RENDER
 
 
-def _run_one_diff(app, pr_sha, main_sha, chart_revision=None, changed_paths=None):
+def _run_one_diff(app, pr_sha, main_sha, chart_revision=None, changed_paths=None, renames=None):
     """Diff PR vs main using pure helm template — no ArgoCD agent access at all.
 
     Strategy:
@@ -2347,6 +2474,26 @@ def _run_one_diff(app, pr_sha, main_sha, chart_revision=None, changed_paths=None
             # dict.update() would append new keys at the end, breaking -f ordering
             # for files present in PR but absent in main (new environment files).
             pr_fresh = pr_changed_fut.result(timeout=DIFF_TIMEOUT) if pr_changed_fut else {}
+
+            # v2.5.4 (Finding 6): a changed value file that 404s at pr_sha might
+            # not be DELETED — it might have been RENAMED/MOVED within this PR
+            # (renames carries the old->new pairing from the raw Bitbucket
+            # diffstat). Resolve those up front, batched in one call, so
+            # following a rename costs one extra round trip total for this
+            # app, not one per renamed file. Confirmed live before this fix:
+            # a pure folder rename made helm template fail entirely for that
+            # customer (PRs #6647/#6648/#6649/#6654) because customer.yaml's
+            # required values simply vanished from the render inputs.
+            rename_targets = []
+            if renames:
+                for vf in pr_changed_vf:
+                    if vf in pr_fresh:
+                        continue
+                    cp = posixpath.normpath(vf.replace("$config/", "").lstrip("/"))
+                    if cp in renames:
+                        rename_targets.append(renames[cp])
+            renamed_vals = _fetch_value_files(rename_targets, pr_sha) if rename_targets else {}
+
             pr_vals = {}
             # Track which vf paths were changed by this PR (normalized form)
             changed_vf_set = {
@@ -2359,11 +2506,14 @@ def _run_one_diff(app, pr_sha, main_sha, chart_revision=None, changed_paths=None
                     # Changed file present at pr_sha — use fresh fetch
                     pr_vals[vf] = pr_fresh[vf]
                 elif clean_path in changed_vf_set:
-                    # Changed file returned 404 at pr_sha: the file was deleted or
-                    # moved by this PR. Do NOT fall back to main content — that would
-                    # make helm render as if the file still exists → false no_diff.
-                    # Omit: helm template runs without this -f (reflects deletion).
-                    pass
+                    new_path = renames.get(clean_path) if renames else None
+                    if new_path and new_path in renamed_vals:
+                        # Renamed, not deleted: follow it to the new path so
+                        # the overrides it carries (often appspace.version,
+                        # every service tag for that customer) still apply.
+                        pr_vals[vf] = renamed_vals[new_path]
+                    # else: genuine deletion (or the new path 404s too, which
+                    # would be unusual) — omit as before, reflects deletion.
                 elif vf in main_vals:
                     # Unchanged file — reuse main sha content safely
                     pr_vals[vf] = main_vals[vf]
@@ -2448,7 +2598,7 @@ def _diff_backoff(attempt):
     return base + random.uniform(0, base * 0.5)
 
 
-def argocd_diff(app, pr_sha, main_sha, chart_revision=None, changed_paths=None):
+def argocd_diff(app, pr_sha, main_sha, chart_revision=None, changed_paths=None, renames=None):
     """Compute the manifest diff between PR sha and main sha for one app.
 
     Returns a DiffResult. Never raises.
@@ -2469,7 +2619,7 @@ def argocd_diff(app, pr_sha, main_sha, chart_revision=None, changed_paths=None):
     for attempt in range(DIFF_RETRIES):
         diff_text, reason, detail = _run_one_diff(
             app, pr_sha, main_sha,
-            chart_revision=chart_revision, changed_paths=changed_paths)
+            chart_revision=chart_revision, changed_paths=changed_paths, renames=renames)
 
         if reason is not None:
             last_detail, last_reason = detail or reason, reason
@@ -2575,7 +2725,7 @@ def get_open_prs():
 
 
 def get_pr_changed_files(pr_id):
-    files, path, pages = [], f"pullrequests/{pr_id}/diffstat?pagelen=100", 0
+    files, renames, path, pages = [], {}, f"pullrequests/{pr_id}/diffstat?pagelen=100", 0
     while path and pages < _BB_MAX_PAGES:
         data = bb("GET", path)
         for item in data.get("values", []):
@@ -2589,6 +2739,15 @@ def get_pr_changed_files(pr_id):
             for p in (old_p, new_p):
                 if p and p not in files:
                     files.append(p)
+            # v2.5.4 (Finding 6): remember the old->new pairing too. A rename
+            # means the OLD path's content is NOT gone, it moved — the value
+            # fetch layer needs this to follow it instead of treating the
+            # old path's 404-at-pr_sha as a deletion (confirmed live: a pure
+            # folder rename made helm template fail entirely for that
+            # customer, PRs #6647/#6648/#6649/#6654).
+            if old_p and new_p and old_p != new_p:
+                renames[posixpath.normpath(old_p.lstrip("/"))] = \
+                    posixpath.normpath(new_p.lstrip("/"))
         nxt  = data.get("next", "")
         path = nxt.replace(f"{_BB_API_BASE}/", "") if nxt else ""
         pages += 1
@@ -2599,7 +2758,7 @@ def get_pr_changed_files(pr_id):
             f"remaining — {len(files)} files captured; PR has >10k changed files. "
             f"App detection is incomplete for this PR.",
             "WARNING", pr=pr_id)
-    return files
+    return files, renames
 
 def find_existing_comment(pr_id):
     """Find our comment on a PR, cheaply when possible.
@@ -2723,7 +2882,12 @@ def fix_stuck_inprogress(pr_sha, pr_id, comment_raw):
             else:
                 state, desc = "SUCCESSFUL", "No manifest changes"
         elif _token == "transient":
-            state, desc = "SUCCESSFUL", "Diff unavailable - review comment"
+            # v2.5.4 (Finding 3): same rule as the main status path — any
+            # indeterminate outcome is red, never green, even mid-recovery
+            # from a killed pod. The retry itself is unaffected: this only
+            # fixes the color of a stuck-INPROGRESS status being resolved,
+            # it does not change whether the PR gets re-diffed next iteration.
+            state, desc = "FAILED", "Diff unavailable - review comment (will retry automatically if transient)"
         elif "Error running diff" in comment_raw or "\u274c" in comment_raw:
             state, desc = "FAILED", "Diff failed - check PR comment"
         elif "not found in OCI registry" in comment_raw:
@@ -2733,7 +2897,9 @@ def fix_stuck_inprogress(pr_sha, pr_id, comment_raw):
             n = m.group(1) if m else "?"
             state, desc = "SUCCESSFUL", f"{n} resource(s) will change - review comment"
         elif "Diff incomplete" in comment_raw:
-            state, desc = "SUCCESSFUL", "Diff unavailable - review comment"
+            # v2.5.4 (Finding 3): legacy fallback for a comment posted before
+            # the [transient]/[permanent]/[clean] token existed. Same rule.
+            state, desc = "FAILED", "Diff unavailable - review comment"
         else:
             state, desc = "SUCCESSFUL", "No manifest changes"
         post_build_status(pr_sha, state, desc, pr_id=pr_id)
@@ -3222,11 +3388,21 @@ def _format_app_diff_block(app, sections, diff_text, show_diff=True, n_res=None)
     return out
 
 
-def format_comment(pr_sha, app_results, skipped_apps=None, base_sha=""):
+def format_comment(pr_sha, app_results, skipped_apps=None, base_sha="",
+                    new_env_lines=None, new_env_structural=False, new_env_desc=""):
     """Format the full PR comment. Never uses <details>/<summary> — Bitbucket
     does not render them. Large changesets get a compact summary table at the
     top (all apps, one row each) and inline diffs for the top-N most-changed
-    apps only to stay well inside the 245KB comment limit."""
+    apps only to stay well inside the 245KB comment limit.
+
+    new_env_lines/new_env_structural/new_env_desc (v2.5.4, Finding 4): a PR
+    can touch existing apps AND add brand-new environments in the same
+    commit. new_env_lines is the markdown block from _evaluate_new_envs to
+    splice into this comment; new_env_structural forces the footer to treat
+    a broken new environment as blocking even if every existing app's own
+    diff is perfectly clean — a reviewer must never see a plain green check
+    while an unvalidated new environment rode along in the same PR.
+    """
     skipped_apps  = skipped_apps or []
     results       = {app: _result(v) for app, v in app_results.items()}
     any_change    = False
@@ -3362,6 +3538,13 @@ def format_comment(pr_sha, app_results, skipped_apps=None, base_sha=""):
             f"*{len(skipped_apps)} app(s) skipped (cap {MAX_APPS_PER_RUN}): "
             f"{', '.join(skipped_apps[:5])}{'...' if len(skipped_apps) > 5 else ''}*", ""]
 
+    # ── New environment(s) section (v2.5.4, Finding 4) ────────────────
+    # Bundled new environments (added in the same commit as an existing-app
+    # change) get their own section here, using the exact same rendering
+    # and classification path as a new-env-only PR (_evaluate_new_envs).
+    if new_env_lines:
+        lines += ["---"] + new_env_lines
+
     # ── Footer ───────────────────────────────────────────────────────
     unknown_note = ""
     if any_unknown:
@@ -3369,8 +3552,13 @@ def format_comment(pr_sha, app_results, skipped_apps=None, base_sha=""):
             f" \u2014 \u2754 {len(unknown_apps)} app(s) could not be evaluated "
             f"(diff unavailable, NOT confirmed unchanged)"
         )
-    if any_error:
-        status = "\u274c Error running diff"
+    if any_error or new_env_structural:
+        if any_error and new_env_structural:
+            status = (f"\u274c Error running diff, AND {new_env_desc or 'new environment(s) have a structural problem'}")
+        elif new_env_structural:
+            status = f"\u274c {new_env_desc or 'New environment(s) have a structural problem that must be fixed before merge'}"
+        else:
+            status = "\u274c Error running diff"
     elif any_change:
         status = f"\u26a0\ufe0f {total_changed} resource(s) will change{unknown_note}"
     elif any_unknown:
@@ -3385,7 +3573,7 @@ def format_comment(pr_sha, app_results, skipped_apps=None, base_sha=""):
     # - clean     : all apps diffed successfully (no retry, mark seen)
     # - permanent : oci_not_found or hard error (no retry, mark seen)
     # - transient : diff unavailable on transient blip (retry next loop)
-    if any_error:
+    if any_error or new_env_structural:
         _status_token = "permanent"
     elif any_unknown:
         # Distinguish oci_not_found (permanent) from soft indeterminate (transient)
@@ -3479,106 +3667,37 @@ def process_pr(pr, path_map, base_sha=""):
             return
 
     try:
-        changed  = get_pr_changed_files(pr_id)
+        changed, renames = get_pr_changed_files(pr_id)
         # Single O(files x paths) match for the whole PR (v2.4.8 perf fix) —
         # _app_to_files is reused below for the version-bump detection pass
         # instead of every app independently rescanning changed x path_map.
         affected, _app_to_files = _match_files_to_apps(changed, path_map)
         print(f"    Changed files: {len(changed)} | Affected apps: {len(affected)}")
 
+        # v2.5.4 (Finding 4): always check for new-env candidates, not just
+        # when `affected` is empty. _detect_new_env_candidates already
+        # excludes any file matching an existing app's path_map entry, so
+        # this is safe to run unconditionally. Before this fix, a PR that
+        # ALSO touched an existing app never ran this check at all, silently
+        # dropping a bundled new environment from evaluation entirely —
+        # confirmed live with both a broken (#6646) and a fully valid
+        # (#6652) new environment.
+        new_env_candidates = _detect_new_env_candidates(changed, path_map)
+        if new_env_candidates:
+            log(f"PR #{pr_id}: {len(new_env_candidates)} new env candidate(s): "
+                f"{[e['name'] for e in new_env_candidates]}", pr=pr_id)
+
         if not affected:
             # No existing ArgoCD app matched the changed files.
-            # Check if any changed file looks like a new environment being added.
-            new_env_candidates = _detect_new_env_candidates(changed, path_map)
             if new_env_candidates:
-                log(f"PR #{pr_id}: {len(new_env_candidates)} new env candidate(s): "
-                    f"{[e['name'] for e in new_env_candidates]}", pr=pr_id)
                 post_build_status(pr_sha, "INPROGRESS", "Rendering new environment(s)...", pr_id=pr_id)
-                new_env_sections = []
-                any_render_ok = False
-                for env_info in new_env_candidates:
-                    render_result = _render_new_env_diff(env_info, pr_sha)
-                    # Returns (diff_text, error [, n_res [, version]])
-                    diff_text  = render_result[0]
-                    render_err = render_result[1]
-                    n_res      = render_result[2] if len(render_result) > 2 else 0
-                    detected_version = render_result[3] if len(render_result) > 3 else None
-                    env_name = env_info["name"]
-                    display_version = detected_version or env_info.get("version", "unknown")
-                    if diff_text:
-                        any_render_ok = True
-                        log(f"  new env {env_name}: rendered {n_res} resource(s)")
-                        diff_preview_text = diff_text[:30_000] + ("\n...(truncated)" if len(diff_text) > 30_000 else "")
-                        new_env_sections.append({
-                            "name":    env_name,
-                            "version": display_version,
-                            "files":   env_info["all_yaml_files"],
-                            "n_res":   n_res,
-                            "diff":    diff_preview_text,
-                            "error":   None,
-                        })
-                    else:
-                        log(f"  new env {env_name}: render failed - {render_err}", "WARNING")
-                        new_env_sections.append({
-                            "name":    env_name,
-                            "version": display_version,
-                            "files":   env_info["all_yaml_files"],
-                            "n_res":   0,
-                            "diff":    None,
-                            "error":   render_err,
-                        })
+                new_env_lines, structural_envs, total_new = _evaluate_new_envs(new_env_candidates, pr_sha)
 
                 lines = [
                     f"## \U0001f52d {STATUS_NAME}", "",
                     f"**Commit** `{pr_sha[:8]}` \u2192 `main` | `{BB_REPO}`", "",
-                    f"### \U0001f195 New Environment(s) Detected", "",
-                    f"This PR adds configuration for **{len(new_env_candidates)} new "
-                    f"environment(s)** that do not yet exist in ArgoCD. "
-                    f"The ApplicationSet will create them automatically after merge. "
-                    f"Below is a preview of the resources that will be provisioned.", "",
-                ]
-                for sec in new_env_sections:
-                    lines.append(f"#### `{sec['name']}` (chart `{sec['version']}`)")
-                    lines.append("")
-                    if sec["files"]:
-                        lines.append("**Files added:**")
-                        for f in sorted(sec["files"])[:15]:
-                            lines.append(f"- `{f}`")
-                        if len(sec["files"]) > 15:
-                            lines.append(f"- *... {len(sec['files'])-15} more files*")
-                        lines.append("")
-                    if sec["diff"]:
-                        lines.append(f"**Preview ({sec['n_res']} resource(s) will be created):**")
-                        lines.append("")
-                        lines.append("```diff")
-                        lines.append(sec["diff"])
-                        lines.append("```")
-                    else:
-                        lines.append(
-                            "\U0001f4cb **Resource preview not available for new environments.**  \n"
-                            "The chart requires additional constellation files and credentials that "
-                            "are provisioned after the first deployment. This is expected.  \n"
-                            "All resources will be created from scratch when this PR is merged."
-                        )
-                        if sec["error"]:
-                            state, expected = _new_env_status(sec["error"])
-                            if not expected:
-                                lines.append(
-                                    f"  \n\u26a0\ufe0f **This is a structural problem, not the "
-                                    f"usual first-deploy case — it must be fixed before merge:** "
-                                    f"{sec['error'][:160]}")
-                            elif "helm template failed" not in sec["error"]:
-                                lines.append(f"  \n*Technical detail: {sec['error'][:120]}*")
-                    lines.append("")
+                ] + new_env_lines
 
-                total_new = sum(s["n_res"] for s in new_env_sections)
-                # FIX E (v2.4.9): classify each new-env failure. A structural
-                # failure (missing version, unparseable config, chart missing)
-                # must NOT get the green "will be created on merge" status.
-                structural_envs = [
-                    s["name"] for s in new_env_sections
-                    if s["error"] and _new_env_status(s["error"])[1] is False
-                ]
                 if structural_envs:
                     desc = (f"{len(structural_envs)} new environment(s) have a "
                             f"structural config problem: {', '.join(structural_envs)}")
@@ -3655,7 +3774,7 @@ def process_pr(pr, path_map, base_sha=""):
         pr_chart_revisions = {}
         invalid_version_apps = set()
         with ThreadPoolExecutor(max_workers=max(1, min(DIFF_WORKERS, len(affected)))) as ex:
-            rev_futs = {ex.submit(_pr_chart_revision_checked, app, _app_to_files.get(app, []), pr_sha): app
+            rev_futs = {ex.submit(_pr_chart_revision_checked, app, _app_to_files.get(app, []), pr_sha, renames): app
                         for app in affected}
             for fut in as_completed(rev_futs):
                 app = rev_futs[fut]
@@ -3710,7 +3829,8 @@ def process_pr(pr, path_map, base_sha=""):
             chart_rev = pr_chart_revisions.get(app)
             result = argocd_diff(app, pr_sha, main_sha=base_sha,
                                  chart_revision=chart_rev,
-                                 changed_paths=_changed_paths_set)
+                                 changed_paths=_changed_paths_set,
+                                 renames=renames)
             elapsed = round(time.monotonic() - t0, 1)
             return app, result, elapsed
 
@@ -3836,7 +3956,23 @@ def process_pr(pr, path_map, base_sha=""):
             + (f" | reasons: {reasons}" if reasons else ""),
             pr=pr_id, **{f"n_{k}": v for k, v in outcome_counts.items()})
 
-        body = format_comment(pr_sha, app_results, skipped_apps, base_sha=base_sha)
+        # v2.5.4 (Finding 4): render any new-env candidates bundled with this
+        # PR's existing-app changes, using the same path a new-env-only PR
+        # uses. structural_envs forces the comment footer and, below, the
+        # Bitbucket build status to block — a broken or unvalidated new
+        # environment must never hide behind an unrelated app's clean diff.
+        new_env_lines, structural_envs, total_new = ([], [], 0)
+        if new_env_candidates:
+            new_env_lines, structural_envs, total_new = _evaluate_new_envs(new_env_candidates, pr_sha)
+        new_env_desc = (
+            f"{len(structural_envs)} new environment(s) have a structural "
+            f"config problem: {', '.join(structural_envs)}"
+        ) if structural_envs else ""
+
+        body = format_comment(pr_sha, app_results, skipped_apps, base_sha=base_sha,
+                               new_env_lines=new_env_lines or None,
+                               new_env_structural=bool(structural_envs),
+                               new_env_desc=new_env_desc)
         comment_kb = round(len(body.encode()) / 1024, 1)
         upsert_comment(pr_id, body, existing_id)
         action = "updated" if existing_id else "posted"
@@ -3854,7 +3990,18 @@ def process_pr(pr, path_map, base_sha=""):
             1 for r in app_results.values()
             if r.outcome == OUT_INDETERMINATE and r.reason == REASON_OCI_NOT_FOUND
         )
-        has_blocking_indet = oci_not_found_count > 0
+        # v2.5.4 (Findings 1+3): PERMANENT_REASONS also includes invalid_yaml and
+        # invalid_version, not just oci_not_found. Before this fix only
+        # oci_not_found was ever checked here, so an invalid-YAML PR retried
+        # forever every ~60s (is_transient_failure stayed True) instead of being
+        # left alone like every other permanent error, and its status went
+        # green via the generic "any_unknown" branch below. permanent_indet_count
+        # is the general form has_blocking_indet always should have been.
+        permanent_indet_count = sum(
+            1 for r in app_results.values()
+            if r.outcome == OUT_INDETERMINATE and r.reason in PERMANENT_REASONS
+        )
+        has_blocking_indet = permanent_indet_count > 0
 
         # Update global diff counters for /diff-preview/stats
         with _diff_stats_lock:
@@ -3869,13 +4016,43 @@ def process_pr(pr, path_map, base_sha=""):
             _diff_stats["apps_render_failed"] += reason_counts.get(REASON_RENDER, 0)
             _diff_stats["apps_timeout"] += reason_counts.get(REASON_TIMEOUT, 0)
 
-        if any_hard_error or has_blocking_indet:
-            if oci_not_found_count:
+        # v2.5.4 (Finding 1): traffic-light rule agreed with Marcos — green ONLY
+        # when the diff was actually computed (with or without changes); ANY
+        # error, transient or permanent, is red. No orange/warning state.
+        # Before this fix, only oci_not_found blocked; render_failed, timeout,
+        # oci_pull_failed, metadata_pending, unexpected_error, invalid_yaml and
+        # invalid_version all fell through to a green "diff unavailable"
+        # status — confirmed live on real PRs (#6644 invalid_yaml, #6645
+        # render_failed, #6647/#6648/#6649/#6654 renames) reporting SUCCESSFUL
+        # while the comment itself said "NOT confirmed unchanged". A retryable
+        # transient error still gets retried automatically on the next
+        # iteration (see is_transient_failure below) — only the COLOR changes,
+        # never the retry behavior.
+        if any_hard_error or has_blocking_indet or structural_envs:
+            if structural_envs:
+                base_desc = (f"{len(structural_envs)} new environment(s) have a "
+                             f"structural config problem: {', '.join(structural_envs)}")
+                if oci_not_found_count:
+                    desc = f"{base_desc} | {oci_not_found_count} existing app(s): chart version not found in OCI registry"
+                elif any_hard_error:
+                    desc = f"{base_desc} | existing app diff also failed - check PR comment"
+                elif permanent_indet_count:
+                    desc = f"{base_desc} | {permanent_indet_count} existing app(s): invalid config"
+                else:
+                    desc = base_desc
+                post_build_status(pr_sha, "FAILED", desc, pr_id=pr_id)
+            elif oci_not_found_count:
                 post_build_status(pr_sha, "FAILED",
                     f"{oci_not_found_count} app(s): chart version not found in OCI registry",
                     pr_id=pr_id)
-            else:
+            elif any_hard_error:
                 post_build_status(pr_sha, "FAILED", "Diff failed - check PR comment", pr_id=pr_id)
+            else:
+                # Permanent indeterminate reason other than oci_not_found
+                # (invalid_yaml, invalid_version) — author must fix the file.
+                post_build_status(pr_sha, "FAILED",
+                    f"{permanent_indet_count} app(s): invalid config — fix and push again "
+                    f"(check PR comment for details)", pr_id=pr_id)
         elif skipped_apps:
             # Apps beyond MAX_APPS_PER_RUN were never evaluated — never post SUCCESSFUL
             # with a coverage gap, as reviewers assume full coverage.
@@ -3884,27 +4061,47 @@ def process_pr(pr, path_map, base_sha=""):
             post_build_status(pr_sha, "FAILED",
                 f"{n_skipped} app(s) not evaluated (cap={MAX_APPS_PER_RUN}){extra} — review comment",
                 pr_id=pr_id)
-        elif sections_total > 0:
-            extra = f" ({n_unknown} unavailable)" if any_unknown else ""
-            post_build_status(pr_sha, "SUCCESSFUL",
-                f"{sections_total} resource(s) will change - review comment{extra}",
-                pr_id=pr_id)
         elif any_unknown:
-            # Soft indeterminate (transient timeout, etc.) - not a hard block but
-            # operator should review. Use SUCCESSFUL so it does not block merge
-            # gates on a transient failure; the next iteration will retry.
+            # v2.5.4 (Finding 1): ANY indeterminate app blocks now, whether or
+            # not other apps in the same PR produced a real diff. Before this
+            # fix, a real diff alongside a transient failure on another app
+            # (e.g. render_failed) posted a green "(N unavailable)" suffix —
+            # confirmed live: PR #6645 showed SUCCESSFUL while the comment
+            # said "NOT confirmed unchanged" for the failed app. A transient
+            # reason still retries automatically next iteration (unchanged
+            # below); only the color is different now.
+            extra = f" | {sections_total} resource(s) confirmed changed" if sections_total else ""
+            post_build_status(pr_sha, "FAILED",
+                f"Diff unavailable for {n_unknown} app(s){extra} - review comment "
+                f"(will retry automatically if transient)", pr_id=pr_id)
+        elif sections_total > 0:
+            extra = f" | +{len(new_env_candidates)} new environment(s) will be created" if new_env_candidates else ""
             post_build_status(pr_sha, "SUCCESSFUL",
-                f"Diff unavailable for {n_unknown} app(s) - review comment", pr_id=pr_id)
+                f"{sections_total} resource(s) will change{extra} - review comment",
+                pr_id=pr_id)
         else:
-            post_build_status(pr_sha, "SUCCESSFUL", "No manifest changes", pr_id=pr_id)
+            if new_env_candidates:
+                post_build_status(pr_sha, "SUCCESSFUL",
+                    f"No manifest changes to existing apps | +{len(new_env_candidates)} "
+                    f"new environment(s) will be created", pr_id=pr_id)
+            else:
+                post_build_status(pr_sha, "SUCCESSFUL", "No manifest changes", pr_id=pr_id)
 
         # Mark as seen logic:
         # - Clean run (no error, no indeterminate): mark seen -> skip next iteration
-        # - Soft indeterminate (transient timeout): leave unseen -> retry next iteration
-        # - oci_not_found / hard error: mark seen -> DO NOT retry (permanent failure;
-        #   the version does not exist and retrying is wasteful + misleading)
-        is_permanent_failure = any_hard_error or has_blocking_indet
-        is_transient_failure = any_unknown and not has_blocking_indet
+        # - Soft indeterminate (transient timeout, render_failed, etc. — NOT in
+        #   PERMANENT_REASONS): leave unseen -> retry next iteration. This is
+        #   independent of the v2.5.4 status-color change above: a transient
+        #   reason is still red now, but still retried the same as before.
+        # - oci_not_found / invalid_yaml / invalid_version / hard error /
+        #   structural new-env problem: mark seen -> DO NOT retry (permanent
+        #   failure; a human must fix the config, retrying is wasteful +
+        #   misleading). v2.5.4 fixes a real bug here too: before this, only
+        #   oci_not_found stopped the retry loop, so an invalid_yaml PR was
+        #   silently re-diffed every ~60s forever even though it can never
+        #   resolve itself.
+        is_permanent_failure = any_hard_error or has_blocking_indet or bool(structural_envs)
+        is_transient_failure = any_unknown and not is_permanent_failure
         if not is_transient_failure:
             # Mark seen for both clean runs AND permanent failures so we don't
             # spam the PR with repeated "not found" comments every 60s.
