@@ -1850,30 +1850,32 @@ def _detect_new_env_candidates(changed_files: list, path_map: dict, renames: dic
     # user-content), each holding its own customer.yaml. The loop above saw
     # every one of those as a separate new environment with "no
     # appspace.version" -> 6 fake structural failures and a RED status for a
-    # perfectly valid new environment. Two rules fix this:
+    # perfectly valid new environment. Collapse nesting between candidates:
+    # if a candidate's env_dir sits inside another candidate's env_dir, it is
+    # a sub-app folder of that env, not an environment of its own. Drop the
+    # child; the parent's all_yaml_files collection below already picks up
+    # the whole tree.
     #
-    # Rule 1 — collapse nesting between candidates: if a candidate's env_dir
-    # sits inside another candidate's env_dir, it is a sub-app folder of that
-    # env, not an environment of its own. Drop the child; the parent's
-    # all_yaml_files collection below already picks up the whole tree.
+    # v2.5.7 NOTE — do NOT add ancestor-based exclusion against path_map:
+    # v2.5.6 shipped a "Rule 2" that excluded candidates nested under the
+    # directory of any existing customer.yaml/config.yaml key in path_map,
+    # to avoid flagging a new sub-app folder of an EXISTING env as a new
+    # environment. Live re-verification (PRs #6660/#6661 on the 2.5.6 pod)
+    # showed the repo has hierarchical defaults named config.yaml at every
+    # ancestor level (gcp/config.yaml, gcp/qa/config.yaml, ...ap1/
+    # config.yaml), all present in path_map — so gcp/ itself became an
+    # "existing env root" and EVERY new environment was silently excluded,
+    # producing a false green "No ArgoCD apps affected" for PRs that create
+    # whole environments. No directory-shape rule can tell an env root from
+    # a defaults level in this layout, so no such exclusion exists anymore.
+    # The (never observed) new-sub-app-in-existing-env case keeps its
+    # pre-v2.5.6 behavior: a red structural finding — a conservative false
+    # alarm a human will look at, never a silent skip.
     nested_children = {
         d for d in candidates
         if any(d.startswith(parent + "/") for parent in candidates if parent != d)
     }
     for d in nested_children:
-        del candidates[d]
-    # Rule 2 — exclude sub-folders of EXISTING environments: adding a new
-    # sub-app folder to an env that already exists in ArgoCD is not a new
-    # environment either. An env root is identified by a customer.yaml or
-    # config.yaml key in path_map; ONLY those keys are used as ancestors here
-    # (a shared value file at a shallow directory, mapped to many apps, must
-    # not make every env under that directory look "existing").
-    existing_env_dirs = {
-        "/".join(k.split("/")[:-1]) for k in path_map_keys
-        if k.split("/")[-1] in ("customer.yaml", "config.yaml")
-    }
-    for d in [d for d in candidates
-              if any(d.startswith(e + "/") for e in existing_env_dirs)]:
         del candidates[d]
     # Collect all YAML files from changed_files that belong to each candidate env
     for f in changed_files:

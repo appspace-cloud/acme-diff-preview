@@ -47,14 +47,31 @@ def test_detect_collapses_cl_subfolders_into_parent_env():
     assert sorted(candidates[0]["all_yaml_files"]) == sorted(CL_FILES)
 
 
-def test_detect_excludes_subfolder_of_existing_env():
-    # Adding a NEW sub-app folder to an EXISTING env must not be flagged
-    # as a new environment: the env root config is already in path_map.
-    existing_root = "gcp/qa/public-cloud/ap1/cl-qa-14-a/config.yaml"
-    new_subapp = "gcp/qa/public-cloud/ap1/cl-qa-14-a/app3/customer.yaml"
-    path_map = {existing_root: ["cl-qa-14-a-ms"]}
-    candidates = m._detect_new_env_candidates([new_subapp], path_map)
-    assert candidates == [], f"sub-app of an existing env is not a new env, got {candidates}"
+def test_detect_hierarchical_defaults_do_not_hide_new_envs():
+    # v2.5.7 LIVE REGRESSION (v2.5.6, PRs #6660/#6661 re-run): the config
+    # repo has hierarchical defaults named config.yaml at EVERY ancestor
+    # level (gcp/config.yaml, gcp/qa/config.yaml, gcp/qa/private-cloud/
+    # ap1/config.yaml, ...). They are value files of existing apps, so they
+    # are in path_map. v2.5.6's "Rule 2" treated each of their directories
+    # as an existing env root, and since gcp/ is an ancestor of everything,
+    # EVERY new-env candidate was excluded -> a false green "No ArgoCD apps
+    # affected" for PRs creating whole environments. Any ancestor-based
+    # exclusion is unsafe in this repo layout; this test pins that both the
+    # pv and the cl shape survive a realistic path_map full of defaults.
+    path_map = {
+        "gcp/config.yaml": ["many"],
+        "gcp/qa/config.yaml": ["many"],
+        "gcp/qa/private-cloud/config.yaml": ["many"],
+        "gcp/qa/private-cloud/ap1/config.yaml": ["many"],
+        "gcp/qa/public-cloud/ap1/config.yaml": ["many"],
+        "gcp/qa/private-cloud/ap1/custom/pv-qa-15-a/customer.yaml": ["pv-qa-15-a-ms"],
+        "gcp/qa/public-cloud/ap1/cl-qa-14-a/config.yaml": ["cl-qa-14-a-ms"],
+    }
+    pv_new = "gcp/qa/private-cloud/ap1/custom/pv-test-nes1-a/customer.yaml"
+    candidates = m._detect_new_env_candidates([pv_new] + CL_FILES, path_map)
+    names = sorted(c["name"] for c in candidates)
+    assert names == ["cl-test-nes2-a", "pv-test-nes1-a"], (
+        f"hierarchical defaults in path_map must not hide new envs, got {names}")
 
 
 def test_detect_shared_value_file_in_path_map_does_not_hide_new_envs():
