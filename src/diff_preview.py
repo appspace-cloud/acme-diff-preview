@@ -1845,6 +1845,36 @@ def _detect_new_env_candidates(changed_files: list, path_map: dict, renames: dic
                 "env_dir":       env_dir,
                 "all_yaml_files": [],
             }
+    # v2.5.6 (Finding A, PR #6661): a public-cloud (cl-*) environment is ONE
+    # environment with sub-app folders (api, app1, app2, cloud, constellation,
+    # user-content), each holding its own customer.yaml. The loop above saw
+    # every one of those as a separate new environment with "no
+    # appspace.version" -> 6 fake structural failures and a RED status for a
+    # perfectly valid new environment. Two rules fix this:
+    #
+    # Rule 1 — collapse nesting between candidates: if a candidate's env_dir
+    # sits inside another candidate's env_dir, it is a sub-app folder of that
+    # env, not an environment of its own. Drop the child; the parent's
+    # all_yaml_files collection below already picks up the whole tree.
+    nested_children = {
+        d for d in candidates
+        if any(d.startswith(parent + "/") for parent in candidates if parent != d)
+    }
+    for d in nested_children:
+        del candidates[d]
+    # Rule 2 — exclude sub-folders of EXISTING environments: adding a new
+    # sub-app folder to an env that already exists in ArgoCD is not a new
+    # environment either. An env root is identified by a customer.yaml or
+    # config.yaml key in path_map; ONLY those keys are used as ancestors here
+    # (a shared value file at a shallow directory, mapped to many apps, must
+    # not make every env under that directory look "existing").
+    existing_env_dirs = {
+        "/".join(k.split("/")[:-1]) for k in path_map_keys
+        if k.split("/")[-1] in ("customer.yaml", "config.yaml")
+    }
+    for d in [d for d in candidates
+              if any(d.startswith(e + "/") for e in existing_env_dirs)]:
+        del candidates[d]
     # Collect all YAML files from changed_files that belong to each candidate env
     for f in changed_files:
         if not f.endswith((".yaml", ".yml")):
@@ -1902,6 +1932,49 @@ def _new_env_status(render_error: str):
 
 
 
+def _summarize_rendered_manifest(rendered: str) -> tuple:
+    """Summarize a rendered multi-document manifest for the PR comment.
+
+    v2.5.6 (Finding B): a successfully rendered NEW environment used to be
+    posted as up to 30,000 chars of raw "+" pseudo-diff — a wall of text
+    with no review value (everything is new, there is nothing to compare).
+    What a reviewer needs instead: how many resources, of which kinds, and
+    which applications. This helper extracts exactly that.
+
+    Line-based parsing on purpose: PyYAML is not in the container (H9 was
+    deferred for that same reason) and helm's own output is stable enough
+    for top-level `kind:` and `metadata: -> name:` extraction.
+
+    Returns (total_resources, kind_counts: dict, workload_names: sorted list).
+    Workloads are Deployment/StatefulSet/DaemonSet/CronJob/Job — the names a
+    reviewer recognizes as "applications".
+    """
+    WORKLOAD_KINDS = {"Deployment", "StatefulSet", "DaemonSet", "CronJob", "Job"}
+    total = 0
+    kind_counts = {}
+    workloads = set()
+    for doc in rendered.split("\n---"):
+        kind = None
+        name = None
+        in_metadata = False
+        for line in doc.splitlines():
+            if line.startswith("kind:") and kind is None:
+                kind = line.split(":", 1)[1].strip()
+            elif line.startswith("metadata:"):
+                in_metadata = True
+            elif in_metadata and name is None and line.startswith("  name:"):
+                name = line.split(":", 1)[1].strip().strip("'\"")
+            elif in_metadata and line and not line.startswith(" "):
+                in_metadata = False
+        if not kind:
+            continue
+        total += 1
+        kind_counts[kind] = kind_counts.get(kind, 0) + 1
+        if kind in WORKLOAD_KINDS and name:
+            workloads.add(name)
+    return total, kind_counts, sorted(workloads)
+
+
 def _evaluate_new_envs(new_env_candidates: list, pr_sha: str) -> tuple:
     """Render and classify a list of new-environment candidates.
 
@@ -1927,35 +2000,35 @@ def _evaluate_new_envs(new_env_candidates: list, pr_sha: str) -> tuple:
     new_env_sections = []
     for env_info in new_env_candidates:
         render_result = _render_new_env_diff(env_info, pr_sha)
-        # Returns (diff_text, error [, n_res [, version]])
-        diff_text  = render_result[0]
+        # Returns (rendered_manifest, error [, n_res [, version]])
+        rendered   = render_result[0]
         render_err = render_result[1]
         n_res      = render_result[2] if len(render_result) > 2 else 0
         detected_version = render_result[3] if len(render_result) > 3 else None
         env_name = env_info["name"]
         display_version = detected_version or env_info.get("version", "unknown")
-        if diff_text:
+        if rendered:
             log(f"  new env {env_name}: rendered {n_res} resource(s)")
-            diff_preview_text = diff_text[:30_000] + ("\n...(truncated)" if len(diff_text) > 30_000 else "")
+            # v2.5.6 (Finding B): summarize instead of dumping the manifest.
+            total, kind_counts, workloads = _summarize_rendered_manifest(rendered)
             new_env_sections.append({
                 "name": env_name, "version": display_version,
-                "files": env_info["all_yaml_files"], "n_res": n_res,
-                "diff": diff_preview_text, "error": None,
+                "files": env_info["all_yaml_files"], "n_res": total or n_res,
+                "kind_counts": kind_counts, "workloads": workloads, "error": None,
             })
         else:
             log(f"  new env {env_name}: render failed - {render_err}", "WARNING")
             new_env_sections.append({
                 "name": env_name, "version": display_version,
                 "files": env_info["all_yaml_files"], "n_res": 0,
-                "diff": None, "error": render_err,
+                "kind_counts": None, "workloads": None, "error": render_err,
             })
 
     lines = [
         f"### \U0001f195 New Environment(s) Detected", "",
         f"This PR adds configuration for **{len(new_env_candidates)} new "
         f"environment(s)** that do not yet exist in ArgoCD. "
-        f"The ApplicationSet will create them automatically after merge. "
-        f"Below is a preview of the resources that will be provisioned.", "",
+        f"The ApplicationSet will create them automatically after merge.", "",
     ]
     for sec in new_env_sections:
         lines.append(f"#### `{sec['name']}` (chart `{sec['version']}`)")
@@ -1967,12 +2040,28 @@ def _evaluate_new_envs(new_env_candidates: list, pr_sha: str) -> tuple:
             if len(sec["files"]) > 15:
                 lines.append(f"- *... {len(sec['files'])-15} more files*")
             lines.append("")
-        if sec["diff"]:
-            lines.append(f"**Preview ({sec['n_res']} resource(s) will be created):**")
+        if sec["kind_counts"] is not None:
+            # v2.5.6 (Finding B): a completely new environment has nothing to
+            # compare against — the full manifest is a wall of "+" lines with
+            # no review value. Show what a reviewer actually needs instead.
+            kind_breakdown = ", ".join(
+                f"{n} {k}" for k, n in sorted(
+                    sec["kind_counts"].items(), key=lambda kv: (-kv[1], kv[0])))
+            lines.append(
+                "\U0001f680 **A completely new environment will be provisioned "
+                "from scratch.** The full rendered output is too large to "
+                "display here, so this is a summary of what will be created "
+                "on merge:")
             lines.append("")
-            lines.append("```diff")
-            lines.append(sec["diff"])
-            lines.append("```")
+            lines.append(f"- **Chart version:** `{sec['version']}`")
+            lines.append(f"- **Resources:** {sec['n_res']} total — {kind_breakdown}")
+            if sec["workloads"]:
+                shown = sec["workloads"][:40]
+                apps = ", ".join(f"`{w}`" for w in shown)
+                more = (f" *(+{len(sec['workloads'])-40} more)*"
+                        if len(sec["workloads"]) > 40 else "")
+                lines.append(
+                    f"- **Applications ({len(sec['workloads'])}):** {apps}{more}")
         else:
             lines.append(
                 "\U0001f4cb **Resource preview not available for new environments.**  \n"
@@ -2085,15 +2174,12 @@ def _render_new_env_diff(env_info: dict, pr_sha: str) -> tuple:
         # comment body still happens separately in _evaluate_new_envs.
         return None, f"helm template failed: {err or 'no output'}", 0, version
 
-    # 7. Format all resources as additions (entirely new — no prior state)
-    diff_lines = []
-    for line in rendered.splitlines():
-        diff_lines.append(f"+{line}" if line else "+")
-
-    diff_text = "\n".join(diff_lines)
-    # Count distinct resource kinds/names for summary
+    # 7. Return the raw rendered manifest. v2.5.6 (Finding B): the caller
+    # (_evaluate_new_envs) now builds a compact provisioning summary from it
+    # instead of posting the manifest as a "+" pseudo-diff — everything in a
+    # brand-new environment is new, so a diff view has no review value.
     resource_count = rendered.count("\nkind: ") + (1 if rendered.startswith("kind: ") else 0)
-    return diff_text, None, resource_count, version
+    return rendered, None, resource_count, version
 
 
 def _pr_chart_revision(app, candidate_files, pr_sha):
