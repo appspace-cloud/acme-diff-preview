@@ -280,7 +280,7 @@ def test_run_one_diff_follows_renamed_value_file_into_render(monkeypatch):
     m._vf_cache.clear()
     m._vf_inflight.clear()
 
-    diff_text, reason, detail = m._run_one_diff(
+    diff_text, reason, detail, *_vc = m._run_one_diff(
         app, pr_sha="prsha000", main_sha="mainsha000",
         changed_paths=[old_path, new_path],
         renames={old_path: new_path},
@@ -324,7 +324,7 @@ def test_run_one_diff_genuine_deletion_still_omitted(monkeypatch):
     m._vf_cache.clear()
     m._vf_inflight.clear()
 
-    diff_text, reason, detail = m._run_one_diff(
+    diff_text, reason, detail, *_vc = m._run_one_diff(
         app, pr_sha="prsha001", main_sha="mainsha001",
         changed_paths=[deleted_path],
         renames={},  # no rename pairing -- genuine deletion

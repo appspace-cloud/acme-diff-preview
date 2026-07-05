@@ -167,6 +167,10 @@ LOG_LEVEL          = os.environ.get("LOG_LEVEL", "INFO").upper()
 DEBUG              = LOG_LEVEL == "DEBUG"
 MAX_RESOURCES_FULL = 5       # resources shown with full diff block
 MAX_DIFF_CHARS     = 2000    # chars per resource diff block
+DISPLAY_BODY_MAX_CHARS = 6000  # v2.5.8: hard cap per resource body in the PR
+                               # comment, WITH an explicit marker (protects
+                               # the footer/status token from the blunt
+                               # MAX_COMMENT_BYTES global cut)
 # Capacity knobs (env-overridable). Defaults sized for a single PR that diffs
 # hundreds of apps (a chart version bump rolled out to many clusters at once).
 # The diff is a pure local `helm template` render (no ArgoCD agent round-trips),
@@ -1115,7 +1119,13 @@ OUT_ERROR         = "error"
 #   outcome  : one of the OUT_* constants
 #   reason   : short machine code for logs/metrics
 DiffResult = namedtuple("DiffResult",
-                        ["text", "sections", "n_res", "has_diff", "error", "outcome", "reason"])
+                        ["text", "sections", "n_res", "has_diff", "error", "outcome", "reason",
+                         "version_change"],
+                        defaults=[None])
+# version_change (v2.5.8): (main_rev, pr_rev) when the PR changes this app's
+# chart targetRevision, else None. Lets format_comment shout on downgrades.
+# It has a default so the many existing 7-positional-arg constructions keep
+# working unchanged.
 
 # ── Diff failure reasons (helm-template architecture) ─────────────────
 # The diff is a pure local `helm pull` + `helm template` + Python YAML diff.
@@ -2500,6 +2510,104 @@ def _render_reason(render_err: str) -> str:
     return REASON_RENDER
 
 
+def _detect_env_move(value_files: list, renames: dict):
+    """Detect whether this app's environment folder was moved in the PR.
+
+    v2.5.8 (T2b, live PR #6666, mirrors prod #3597 'move envs into monthly
+    cadence'): a folder move changes WHICH tier/region defaults apply,
+    because the app's valueFiles carry relative parent references
+    (<env>/../config.yaml). The per-file rename-following (Finding 6) only
+    remaps the moved files themselves; the parent refs kept resolving to
+    the OLD tier — whose config.yaml still exists — so both diff sides
+    rendered with identical inputs and a real chart-version change showed
+    as "No manifest changes" (false clean).
+
+    Returns (old_env_dir, new_env_dir) when some rename's old side is one
+    of this app's value files AND the directory actually changed, else None.
+    """
+    if not renames:
+        return None
+    clean_vfs = {
+        posixpath.normpath(vf.replace("$config/", "").lstrip("/"))
+        for vf in value_files
+    }
+    for old_p, new_p in renames.items():
+        if old_p in clean_vfs:
+            old_dir = posixpath.dirname(old_p)
+            new_dir = posixpath.dirname(new_p)
+            if old_dir != new_dir:
+                return old_dir, new_dir
+    return None
+
+
+def _rebase_value_files(value_files: list, old_env_dir: str, new_env_dir: str) -> list:
+    """Return value_files with the old env dir prefix replaced by the new one.
+
+    Applied BEFORE path normalization on purpose: rebasing
+    '<old>/../config.yaml' to '<new>/../config.yaml' makes the relative
+    parent reference resolve to the NEW location's tier defaults — exactly
+    what the ApplicationSet will generate after merge. Paths that do not
+    start with the old env dir (absolute shared defaults like
+    gcp/config.yaml) are returned unchanged.
+    """
+    rebased = []
+    for vf in value_files:
+        prefix = "$config/" if vf.startswith("$config/") else ""
+        clean  = vf[len(prefix):].lstrip("/")
+        if clean == old_env_dir or clean.startswith(old_env_dir + "/"):
+            clean = new_env_dir + clean[len(old_env_dir):]
+        rebased.append(prefix + clean)
+    return rebased
+
+
+def _effective_chart_version(ordered_value_files: list, vals: dict):
+    """Effective appspace.version across ordered value files (last wins).
+
+    Mirrors helm -f semantics: a later file overrides an earlier one. Files
+    missing from vals (404s) are skipped. Returns None when no file sets
+    appspace.version.
+    """
+    version = None
+    for vf in ordered_value_files:
+        content = vals.get(vf)
+        if not content:
+            continue
+        v = _extract_chart_version(content)
+        if v:
+            version = v
+    return version
+
+
+def _parse_version_tuple(version: str):
+    """Leading dotted-numeric part of a chart version as an int tuple.
+
+    '2602.4.9-dev' -> (2602, 4, 9). Returns None when the version does not
+    start with a number (unparseable — comparisons are skipped)."""
+    if not version:
+        return None
+    mnum = re.match(r"^(\d+(?:\.\d+)*)", version.strip())
+    if not mnum:
+        return None
+    return tuple(int(x) for x in mnum.group(1).split("."))
+
+
+def _is_version_downgrade(current: str, new: str) -> bool:
+    """True when `new` is a strictly LOWER chart version than `current`.
+
+    v2.5.8: downgrades are legal but dangerous (schema regressions, data
+    migrations that do not run backwards), so the PR comment must shout.
+    Unparseable versions return False — never block on noise."""
+    cur_t = _parse_version_tuple(current)
+    new_t = _parse_version_tuple(new)
+    if cur_t is None or new_t is None:
+        return False
+    # Pad to equal length so 2602.4 vs 2602.4.1 compares sanely.
+    length = max(len(cur_t), len(new_t))
+    cur_t += (0,) * (length - len(cur_t))
+    new_t += (0,) * (length - len(new_t))
+    return new_t < cur_t
+
+
 def _run_one_diff(app, pr_sha, main_sha, chart_revision=None, changed_paths=None, renames=None):
     """Diff PR vs main using pure helm template — no ArgoCD agent access at all.
 
@@ -2534,6 +2642,32 @@ def _run_one_diff(app, pr_sha, main_sha, chart_revision=None, changed_paths=None
 
     pr_rev = chart_revision or main_rev
 
+    # v2.5.8 (T2b, live PR #6666): the env folder was MOVED in this PR. The
+    # PR side must render with the NEW location's value-file chain, so the
+    # relative parent refs (<env>/../config.yaml) resolve to the new
+    # tier/region defaults — exactly what the ApplicationSet generates after
+    # merge. The PR chart version must also come from that rebased chain
+    # (last file wins, helm -f semantics): after a move the env's own
+    # customer.yaml may no longer set appspace.version, deferring to a tier
+    # default the old path-based detection could never see.
+    env_move       = _detect_env_move(value_files, renames)
+    moved_pr_vals  = None
+    pr_value_files = value_files
+    if env_move:
+        old_env_dir, new_env_dir = env_move
+        pr_value_files = _rebase_value_files(value_files, old_env_dir, new_env_dir)
+        log(f"  [{app}] env folder moved {old_env_dir} -> {new_env_dir}; "
+            f"rendering PR side against the new location's value-file chain")
+        try:
+            moved_pr_vals = _fetch_value_files(pr_value_files, pr_sha)
+        except Exception as e:
+            return None, REASON_UNEXPECTED, f"value fetch after folder move failed: {str(e)[:150]}"
+        if not moved_pr_vals:
+            return None, REASON_RENDER, "no value files found at moved location"
+        effective = _effective_chart_version(pr_value_files, moved_pr_vals)
+        if effective:
+            pr_rev = effective
+
     # Pull both chart versions in parallel (each is per-key locked to prevent
     # concurrent downloads of the same version).
     try:
@@ -2567,7 +2701,13 @@ def _run_one_diff(app, pr_sha, main_sha, chart_revision=None, changed_paths=None
         pool = _get_subtask_pool()
         main_vf_fut = pool.submit(_fetch_value_files, value_files, main_sha)
 
-        if changed_paths:
+        if moved_pr_vals is not None:
+            # v2.5.8: env folder moved — PR-side values were already fetched
+            # against the rebased (new-location) file chain above. Only the
+            # main side (old paths, pre-merge reality) is fetched here.
+            main_vals = main_vf_fut.result(timeout=DIFF_TIMEOUT)
+            pr_vals   = moved_pr_vals
+        elif changed_paths:
             # Split: files touched by this PR fetch fresh at pr_sha; others reuse.
             changed_clean = {
                 posixpath.normpath(p.lstrip("/")) for p in changed_paths}
@@ -2683,7 +2823,11 @@ def _run_one_diff(app, pr_sha, main_sha, chart_revision=None, changed_paths=None
         return None, REASON_RENDER, str(e)[:200]
 
     pr_resources = _parse_manifest_resources(pr_yaml)
-    return _diff_resources(main_resources, pr_resources), None, None
+    # v2.5.8: report the effective chart-version change (if any) so the
+    # comment can shout on downgrades. pr_rev is final here — including a
+    # tier-default version discovered after a folder move.
+    version_change = (main_rev, pr_rev) if pr_rev != main_rev else None
+    return _diff_resources(main_resources, pr_resources), None, None, version_change
 
 
 def _indeterminate(reason, detail):
@@ -2730,9 +2874,13 @@ def argocd_diff(app, pr_sha, main_sha, chart_revision=None, changed_paths=None, 
     last_reason = "retry_exhausted"
     last_attempt = DIFF_RETRIES - 1
     for attempt in range(DIFF_RETRIES):
-        diff_text, reason, detail = _run_one_diff(
+        step = _run_one_diff(
             app, pr_sha, main_sha,
             chart_revision=chart_revision, changed_paths=changed_paths, renames=renames)
+        # v2.5.8: success returns a 4-tuple with the version change; failure
+        # paths keep returning 3-tuples.
+        diff_text, reason, detail = step[0], step[1], step[2]
+        version_change = step[3] if len(step) > 3 else None
 
         if reason is not None:
             last_detail, last_reason = detail or reason, reason
@@ -2753,12 +2901,14 @@ def argocd_diff(app, pr_sha, main_sha, chart_revision=None, changed_paths=None, 
 
         # diff_text == "" means manifests are identical
         if not diff_text:
-            return DiffResult("", [], 0, False, None, OUT_NO_DIFF, "clean")
+            return DiffResult("", [], 0, False, None, OUT_NO_DIFF, "clean",
+                              version_change)
 
         # Filter noise sections (checksums, version annotations that always drift)
         filtered_sections = _filter_diff_sections(parse_diff_sections(diff_text))
         if not filtered_sections:
-            return DiffResult("", [], 0, False, None, OUT_NO_DIFF, "noise_only")
+            return DiffResult("", [], 0, False, None, OUT_NO_DIFF, "noise_only",
+                              version_change)
 
         n_res = len(filtered_sections)
         # Truncate to display budget NOW so we never hold the full YAML in memory.
@@ -2770,7 +2920,7 @@ def argocd_diff(app, pr_sha, main_sha, chart_revision=None, changed_paths=None, 
             truncated_parts.append(f"===== {hdr} =====\n{body_t}")
         clean_diff = "\n".join(truncated_parts)
         return DiffResult(clean_diff, filtered_sections[:AI_MAX_SECTIONS_PER_APP],
-                          n_res, True, None, OUT_DIFF, "changes")
+                          n_res, True, None, OUT_DIFF, "changes", version_change)
     # Exhausted retries
     return _indeterminate(last_reason, last_detail or "unknown error")
 
@@ -3492,10 +3642,22 @@ def _format_app_diff_block(app, sections, diff_text, show_diff=True, n_res=None)
                 "",
             ]
         for hdr, body in sections:
-            # body is already truncated at DiffResult creation time.
             # Redaction happens here, at display time, so the diff engine
             # still compares real values and detects Secret changes.
-            out += [f"**`{hdr}`**", "", "```diff", _redact_for_display(hdr, body).rstrip(), "```", ""]
+            # v2.5.8: sections bodies are NOT pre-truncated (only
+            # DiffResult.text is) — this docstring used to claim otherwise.
+            # A single giant resource diff (huge ConfigMap rewrite) could
+            # push the whole comment past MAX_COMMENT_BYTES, whose blunt
+            # global cut chops off the footer and its status token. Cap
+            # each body here WITH an explicit marker. Redact BEFORE the
+            # cut so truncation can never split a value a redaction rule
+            # would have caught.
+            body_disp = _redact_for_display(hdr, body).rstrip()
+            if len(body_disp) > DISPLAY_BODY_MAX_CHARS:
+                body_disp = (body_disp[:DISPLAY_BODY_MAX_CHARS].rstrip()
+                             + "\n... (diff truncated for display \u2014 see "
+                               "ArgoCD for the full resource diff)")
+            out += [f"**`{hdr}`**", "", "```diff", body_disp, "```", ""]
     elif diff_text:
         out += ["```diff", _redact_sensitive(diff_text).rstrip(), "```", ""]
     return out
@@ -3546,6 +3708,29 @@ def format_comment(pr_sha, app_results, skipped_apps=None, base_sha="",
         f"## \U0001f52d {STATUS_NAME}", "",
         f"**Commit** `{pr_sha[:8]}` \u2192 `main` | `{BB_REPO}`{large_label}", "",
     ]
+
+    # ── Chart downgrade warning (v2.5.8) ─────────────────────────────
+    # A chart version going DOWN is legal but dangerous (schema regressions,
+    # migrations that do not run backwards), and it is easy to miss inside a
+    # long diff — or invisible entirely when it comes from a tier default
+    # after a folder move. Shout it at the very top, in big letters, before
+    # anything else.
+    downgrades = [
+        (app, r.version_change) for app, r in results.items()
+        if r.version_change and _is_version_downgrade(*r.version_change)
+    ]
+    if downgrades:
+        lines += [
+            "# \U0001f53b\u26a0\ufe0f CHART VERSION DOWNGRADE \u26a0\ufe0f\U0001f53b",
+            "",
+            "**This PR moves the chart to a LOWER version. Downgrades can break "
+            "schema/data migrations that do not run backwards. Verify this is "
+            "intentional before merging.**",
+            "",
+        ]
+        for app, (cur_v, new_v) in downgrades:
+            lines.append(f"### \U0001f53b `{app}`: `{cur_v}` \u2192 **`{new_v}`**")
+        lines += [""]
 
     # ── AI Analysis block ────────────────────────────────────────────
     if ai_summary:
@@ -3679,6 +3864,12 @@ def format_comment(pr_sha, app_results, skipped_apps=None, base_sha="",
                   f"be evaluated (NOT confirmed unchanged)")
     else:
         status = "\u2705 No manifest changes"
+
+    # v2.5.8: the downgrade must also be visible in the one-line status —
+    # including the case where manifests are identical but the chart
+    # targetRevision still moves DOWN (ArgoCD will redeploy on merge).
+    if downgrades:
+        status += " | \U0001f53b CHART DOWNGRADE \u2014 verify intentional"
 
     # Machine-readable token embedded in the footer. Used by process_pr to decide
     # whether to re-run without parsing the human-readable status string.
