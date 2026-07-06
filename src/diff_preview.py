@@ -658,7 +658,8 @@ def _jfrog_hard_refresh(chart_name: str, chart_version: str) -> None:
         env=_argocd_subprocess_env())
 
     if r.returncode != 0:
-        log(f"JFrog webhook: app list failed: {r.stderr[:200]}", "ERROR")
+        log(f"JFrog webhook: app list failed: {r.stderr[:200]}"
+            + ("..." if len(r.stderr) > 200 else ""), "ERROR")
         return
 
     try:
@@ -699,7 +700,8 @@ def _jfrog_hard_refresh(chart_name: str, chart_version: str) -> None:
             if r.returncode == 0:
                 log(f"  hard-refresh OK: {app_name}")
                 return True
-            log(f"  hard-refresh FAILED: {app_name}: {r.stderr[:100]}", "WARNING")
+            log(f"  hard-refresh FAILED: {app_name}: {r.stderr[:100]}"
+                + ("..." if len(r.stderr) > 100 else ""), "WARNING")
             return False
         except subprocess.TimeoutExpired:
             log(f"  hard-refresh timed out: {app_name}", "WARNING")
@@ -1431,7 +1433,8 @@ def _helm_login(registry: str) -> bool:
             return True
         # Login failure: clear the cached state so the next call retries.
         _helm_logged_in.discard(registry)
-        log(f"Helm OCI login failed for {registry}: {r.stderr[:200]}", "WARNING")
+        log(f"Helm OCI login failed for {registry}: {r.stderr[:200]}"
+            + ("..." if len(r.stderr) > 200 else ""), "WARNING")
         return False
 
 
@@ -4152,7 +4155,9 @@ def process_pr(pr, path_map, base_sha=""):
     pr_id  = pr["id"]
     pr_sha = pr["source"]["commit"]["hash"]
     dest   = pr["destination"]["branch"]["name"]
-    print(f"  PR #{pr_id}: {pr['title'][:50]!r} -> {dest} ({pr_sha[:8]})")
+    _title = pr['title']
+    _title_disp = _title if len(_title) <= 80 else _title[:80] + "..."
+    print(f"  PR #{pr_id}: {_title_disp!r} -> {dest} ({pr_sha[:8]})")
 
     if dest != "main":
         return
