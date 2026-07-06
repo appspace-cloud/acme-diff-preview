@@ -189,3 +189,51 @@ def test_format_comment_splices_decommission_block():
 def test_format_comment_no_decommission_block_by_default():
     body = m.format_comment("deadbeef01234567", {})
     assert "DECOMMISSION" not in body
+
+
+# ── v2.5.11: a CONFIRMED decommission must not surface as a build failure ──
+
+# Live finding (PR #6677 on acme-config-dev): a confirmed environment
+# decommission's own apps (glb/ms/ss) fell through the NORMAL diff pipeline,
+# failed to render (their customer.yaml is genuinely gone), and landed as
+# OUT_INDETERMINATE/render_failed. That is a RETRYABLE, non-permanent
+# outcome, so the PR was never marked "seen": the pod re-diffed it forever,
+# re-attempting a render that can never succeed, and the build status said
+# "Diff incomplete... NOT confirmed unchanged (will retry automatically)" —
+# actively misleading once the decommission warning has ALREADY confirmed
+# and explained exactly what is happening. A confirmed decommission is not
+# an error to retry; it is a settled, understood fact.
+
+def test_apps_to_skip_for_decommission_returns_confirmed_apps_only():
+    candidates = [
+        {"env_name": "pv-qa-14-a", "identity_file": "x", "apps": ["pv-qa-14-a-ms", "pv-qa-14-a-ss"]},
+        {"env_name": "pv-qa-99-a", "identity_file": "y", "apps": ["pv-qa-99-a-ms"]},
+    ]
+    # Only pv-qa-14-a was actually confirmed deleted (BB_NOT_FOUND);
+    # pv-qa-99-a's candidate existed structurally but was never confirmed
+    # (e.g. a false positive, or a transient fetch issue) — its apps must
+    # still go through the normal diff pipeline, not be silently skipped.
+    confirmed_envs = ["pv-qa-14-a"]
+    apps = m._apps_to_skip_for_decommission(candidates, confirmed_envs)
+    assert apps == {"pv-qa-14-a-ms", "pv-qa-14-a-ss"}
+
+
+def test_apps_to_skip_for_decommission_empty_when_nothing_confirmed():
+    candidates = [{"env_name": "pv-qa-14-a", "identity_file": "x", "apps": ["pv-qa-14-a-ms"]}]
+    assert m._apps_to_skip_for_decommission(candidates, []) == set()
+
+
+def test_format_comment_renders_decommissioned_app_specially():
+    result = m.DiffResult("", [], 0, False, None, m.OUT_DECOMMISSIONED, "confirmed_decommission")
+    body = m.format_comment("deadbeef01234567", {"pv-qa-14-a-ms": result})
+    assert "diff unavailable" not in body.lower()
+    assert "decommission" in body.lower()
+    assert "pv-qa-14-a-ms" in body
+
+
+def test_out_decommissioned_is_not_permanent_or_retryable_reason():
+    # Its reason must be excluded from BOTH buckets: not permanent (would
+    # force a FAILED/blocked status like oci_not_found does) and not
+    # retryable (would keep it un-seen and re-diffed forever).
+    assert "confirmed_decommission" not in m.PERMANENT_REASONS
+    assert "confirmed_decommission" not in m.RETRYABLE_REASONS

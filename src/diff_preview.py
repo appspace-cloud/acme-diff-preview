@@ -1106,6 +1106,7 @@ OUT_DIFF          = "diff"
 OUT_NO_DIFF       = "no_diff"
 OUT_INDETERMINATE = "indeterminate"
 OUT_ERROR         = "error"
+OUT_DECOMMISSIONED = "decommissioned"
 
 # Structured result of a single argocd_diff() call.
 #   text     : reconstructed diff text, already truncated to MAX_RESOURCES_FULL
@@ -2749,6 +2750,25 @@ def _evaluate_env_decommissions(candidates: list, pr_sha: str, main_sha: str) ->
     return lines, envs_reported
 
 
+def _apps_to_skip_for_decommission(candidates: list, confirmed_envs: list) -> set:
+    """Apps belonging to a CONFIRMED decommissioned environment.
+
+    v2.5.11 (live PR #6677): these apps must be excluded from the normal
+    diff pipeline entirely — their identity file is confirmed gone, so a
+    real render can never succeed. Left to run normally, they land as
+    OUT_INDETERMINATE/render_failed: a RETRYABLE reason, so the PR is never
+    marked "seen" and the pod re-diffs it forever, and the build status
+    misleadingly says "will retry automatically" for something that is
+    settled, confirmed fact, already fully explained by the decommission
+    warning. Only candidates whose env_name is in confirmed_envs (i.e.
+    _evaluate_env_decommissions actually verified the 404, not just a
+    structural guess) are included — an unconfirmed candidate's apps must
+    still go through the normal pipeline.
+    """
+    confirmed = set(confirmed_envs)
+    return {a for c in candidates if c["env_name"] in confirmed for a in c["apps"]}
+
+
 def _rebase_value_files(value_files: list, old_env_dir: str, new_env_dir: str) -> list:
     """Return value_files with the old env dir prefix replaced by the new one.
 
@@ -3981,6 +4001,8 @@ def format_comment(pr_sha, app_results, skipped_apps=None, base_sha="",
         for app, r in results.items():
             if r.outcome == OUT_DIFF:
                 lines.append(f"| `{app}` | \u26a0\ufe0f changed | {r.n_res} |")
+            elif r.outcome == OUT_DECOMMISSIONED:
+                lines.append(f"| `{app}` | \U0001f5d1\ufe0f decommissioned | \u2014 |")
             elif r.outcome == OUT_INDETERMINATE:
                 lines.append(f"| `{app}` | \u2754 diff unavailable | \u2014 |")
             elif r.outcome == OUT_ERROR:
@@ -4016,6 +4038,14 @@ def format_comment(pr_sha, app_results, skipped_apps=None, base_sha="",
         if r.outcome == OUT_ERROR:
             any_error = True
             lines += [f"\u274c **`{app}`** \u2014 error: {(r.error or '')[:200]}", ""]
+
+        elif r.outcome == OUT_DECOMMISSIONED:
+            # v2.5.11: this app's environment was confirmed decommissioned —
+            # the big warning block above already explains it fully. Do NOT
+            # render "diff unavailable"/"error" here: that would look like an
+            # unresolved problem when this is a settled, understood fact.
+            lines += [f"\U0001f5d1\ufe0f **`{app}`** \u2014 environment decommissioned "
+                      f"(see warning above)", ""]
 
         elif r.outcome == OUT_INDETERMINATE:
             any_unknown = True
@@ -4285,18 +4315,52 @@ def process_pr(pr, path_map, base_sha=""):
         print(f"    Apps: {affected}")
         post_build_status(pr_sha, "INPROGRESS", "Running ArgoCD diff...", pr_id=pr_id)
 
+        # v2.5.11 (live PR #6677): apps whose environment was CONFIRMED
+        # decommissioned above must never enter the normal diff pipeline —
+        # their identity file is confirmed gone, so a real render can only
+        # ever fail. Left in, they land as OUT_INDETERMINATE/render_failed
+        # (a RETRYABLE reason), so the PR is never marked seen and the pod
+        # re-diffs it forever, with a build status that misleadingly says
+        # "will retry automatically" for something already fully explained
+        # by the decommission warning. Give them their own dedicated,
+        # non-retried, non-blocking result directly instead.
+        decommissioned_apps = _apps_to_skip_for_decommission(
+            decommission_candidates, decommissioned_envs)
+        app_results = {}
+        if decommissioned_apps:
+            log(f"PR #{pr_id}: skipping normal diff for {len(decommissioned_apps)} "
+                f"confirmed-decommissioned app(s): {sorted(decommissioned_apps)}",
+                pr=pr_id)
+            for app in decommissioned_apps:
+                app_results[app] = DiffResult(
+                    "", [], 0, False, None, OUT_DECOMMISSIONED, "confirmed_decommission")
+            affected = [a for a in affected if a not in decommissioned_apps]
+
         skipped_apps = []
         if len(affected) > MAX_APPS_PER_RUN:
             skipped_apps = affected[MAX_APPS_PER_RUN:]
             affected    = affected[:MAX_APPS_PER_RUN]
             print(f"    Capped to {MAX_APPS_PER_RUN} apps "
                   f"({len(skipped_apps)} skipped)")
+        # v2.5.11: total app count this run is actually responsible for,
+        # for the SIGTERM-drain safety check below — affected was reduced by
+        # decommissioned_apps above, but those already have a final result
+        # pre-populated in app_results, so they must still count toward the
+        # expected total or a genuine partial-batch abort on the REMAINING
+        # apps would go undetected (len(app_results) would look "complete"
+        # too early).
+        total_apps_this_run = len(affected) + len(decommissioned_apps)
 
-        app_results   = {}
+        app_results   = app_results  # pre-populated above with any confirmed-decommission results
         any_hard_error = False   # OUT_ERROR — unexpected failure
         any_unknown    = False   # OUT_INDETERMINATE — diff not computable
         outcome_counts = Counter()
         reason_counts  = Counter()
+        # Seed with the pre-populated confirmed-decommission results (never
+        # went through run_diff, so the normal per-app counting loop below
+        # never sees them).
+        for _r in app_results.values():
+            outcome_counts[_r.outcome] += 1
 
         # The value-file cache is keyed by (commit_sha, path). Commit shas are
         # immutable, so an entry is always valid for that sha — no per-PR clear is
@@ -4481,9 +4545,9 @@ def process_pr(pr, path_map, base_sha=""):
         # If SIGTERM arrived mid-batch, results are incomplete — do NOT post them
         # as a final comment (could show false green on partial evaluation). Leave
         # the PR un-seen; it will be re-evaluated on the next pod if one starts.
-        if _shutdown and len(app_results) < len(affected):
+        if _shutdown and len(app_results) < total_apps_this_run:
             n_done  = len(app_results)
-            n_total = len(affected)
+            n_total = total_apps_this_run
             log(f"PR #{pr_id}: SIGTERM mid-diff ({n_done}/{n_total} apps evaluated) "
                 f"— skipping comment/status to avoid false result", "WARNING", pr=pr_id)
             return  # _seen NOT set → will retry next iteration or pod
