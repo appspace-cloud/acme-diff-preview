@@ -1,0 +1,51 @@
+name: Deploy Helm chart index to Pages
+
+# Replaces GitHub's legacy "Deploy from a branch" Pages build, which runs an
+# internal workflow we do not control, forces Node.js 20 (deprecated,
+# https://github.blog/changelog/2025-09-19-deprecation-of-node-20-on-github-actions-runners/),
+# and has intermittently failed with a generic "Deployment failed, try again
+# later" error requiring a manual re-run (hit twice: v2.5.6 and v2.5.10
+# releases). This workflow deploys the SAME gh-pages branch content (chart
+# .tgz files + index.yaml, published by chart-releaser-action in
+# release.yml) via the modern GitHub Actions Pages deployment method —
+# same final URL (https://appspace-cloud.github.io/acme-diff-preview/),
+# no change for ArgoCD/helm consumers of the chart repo.
+#
+# Requires the repo's Settings > Pages > Source to be set to "GitHub
+# Actions" (done once, alongside this workflow).
+
+on:
+  push:
+    branches:
+      - gh-pages
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+concurrency:
+  group: pages
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - name: Checkout gh-pages
+        uses: actions/checkout@v5.0.0
+        with:
+          ref: gh-pages
+
+      - name: Upload Pages artifact
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: .
+
+      - name: Deploy to GitHub Pages
+        id: deployment
+        uses: actions/deploy-pages@v4
