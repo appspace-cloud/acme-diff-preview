@@ -1558,6 +1558,18 @@ def _ensure_chart(registry: str, chart: str, version: str) -> str:
                     time.sleep(wait)
                 else:
                     log(f"helm pull failed for {chart}:{version}: {last_err}", "WARNING")
+                    # v2.5.14: tmp_dir is only renamed into chart_dir on success
+                    # (below) or removed by the `except` handler on a raised
+                    # exception. A plain `return` here does neither -- it does
+                    # not trigger `except`, so every exhausted-retry failure
+                    # (oci_pull_failed: network blip, registry outage, expired
+                    # credentials) leaked one mkdtemp() directory permanently.
+                    # _prune_helm_cache never finds these either: it only walks
+                    # the registry/chart/version 3-level hierarchy, and this
+                    # dir sits directly under HELM_CACHE_DIR. Confirmed live:
+                    # a single simulated transient failure left one orphan
+                    # directory that no cleanup path ever removed.
+                    shutil.rmtree(tmp_dir, ignore_errors=True)
                     return None
 
             # Move from tmp to final location atomically
@@ -3499,12 +3511,46 @@ def _redact_secret_section(text: str) -> str:
     line is masked, keeping keys and diff markers so the reader still sees
     WHICH entries changed. Runs at display time only - the diff engine
     compares the real values, so changes are still detected.
+
+    v2.5.14: a Secret data value rendered as a YAML block scalar (`key: |`,
+    `|-`, `>`, ...) -- a common shape for multi-line secrets such as TLS
+    certs, PEM keys, or a multi-line .env blob -- only had its OPENER line
+    masked. The continuation lines (the actual secret bytes) matched neither
+    `key: value` nor anything else this function checked, so they fell
+    through to the `else` branch and were emitted verbatim. Confirmed live:
+    a `tls.crt: |-` value with base64 content on the following indented
+    lines leaked that content in full into the Bitbucket PR comment. Reuses
+    the same in-block/dedent tracking already proven correct in
+    _redact_k8s_env_pairs / _mask_block_line.
     """
     out = []
+    in_block = False
+    block_indent = 0
     for line in text.splitlines():
+        if in_block:
+            marker_len = 1 if line[:1] in "+- " else 0
+            rest = line[marker_len:]
+            content_indent = len(rest) - len(rest.lstrip())
+            if line.strip() == "":
+                out.append(line)
+                continue
+            if content_indent > block_indent:
+                out.append(_mask_block_line(line))
+                continue
+            in_block = False  # dedented out of the block -> normal handling
+
         m = re.match(r'^([+\- ]*)([\w.\-/]+\s*[:=]\s*)(.+)$', line)
-        if m and m.group(3).strip() not in ("{}", "[]", "|", ">", "Opaque"):
+        if m and m.group(3).strip() not in ("{}", "[]", "Opaque"):
+            val = m.group(3).strip()
             out.append(f"{m.group(1)}{m.group(2)}[REDACTED]")
+            if val in ("|", "|-", "|+", ">", ">-", ">+"):
+                # Block scalar opener: the value itself is on the following
+                # indented lines, not on this line. Enter block mode so those
+                # continuation lines get masked too instead of leaking.
+                marker_len = 1 if line[:1] in "+- " else 0
+                rest = line[marker_len:]
+                block_indent = len(rest) - len(rest.lstrip())
+                in_block = True
         else:
             out.append(line)
     return "\n".join(out)
@@ -3711,7 +3757,25 @@ def generate_ai_summary(app_results: dict) -> str | None:
         for app, sections in changed.items():
             sections_parts.append(f"### App: {app}")
             for header, body in sections[:AI_MAX_SECTIONS_PER_APP]:
-                trimmed = _redact_sensitive(body[:AI_MAX_BODY_CHARS])
+                # v2.5.14: this used to call _redact_sensitive() directly,
+                # which only masks a value when the KEY NAME matches
+                # _SENSITIVE_KEYS. That is exactly the check
+                # _redact_secret_section's own docstring says is unreliable
+                # inside a Secret (ca.crt, tls.crt, ca.bundle, or any
+                # custom-named data key do not contain "password/token/
+                # secret/key/..."). The Bitbucket-comment path already
+                # special-cases `kind: Secret` for whole-value masking via
+                # _redact_for_display -- this prompt-building path never did,
+                # so real Secret values with an unremarkable-looking key name
+                # were sent to Vertex AI (an external API) in full. Confirmed
+                # live: a Secret section with tls.crt/ca.bundle keys passed
+                # through _redact_sensitive completely unredacted.
+                # _redact_for_display is kind-aware (whole-masks Secret
+                # bodies, including block scalars since the fix above) and
+                # falls back to the same _redact_sensitive + env-pairs
+                # redaction for every other kind, so no other section's
+                # behavior changes.
+                trimmed = _redact_for_display(header, body[:AI_MAX_BODY_CHARS])
                 if len(body) > AI_MAX_BODY_CHARS:
                     trimmed += "\n... (truncated)"
                 sections_parts.append(f"Resource: {header}\n{trimmed}")
