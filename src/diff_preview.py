@@ -2265,6 +2265,7 @@ def _pr_chart_revision_checked(app, candidate_files, pr_sha, renames=None):
     if not current_rev:
         return None, False
     invalid = False
+    trusted_dirs = _trusted_rename_dirs(renames) if renames else set()
     for filepath in candidate_files:
         clean = posixpath.normpath(filepath.lstrip("/"))
         cache_key = (pr_sha, clean)
@@ -2280,6 +2281,12 @@ def _pr_chart_revision_checked(app, candidate_files, pr_sha, renames=None):
             content = cached
         if not content and renames and clean in renames:
             new_clean = renames[clean]
+            # v2.5.9: only follow when this specific pairing is trustworthy
+            # (see _trusted_rename_dirs) — an ancillary file's coincidental
+            # content match with an unrelated environment must not be read
+            # as that app's own version.
+            if not _is_trusted_rename(clean, new_clean, trusted_dirs):
+                continue
             new_key = (pr_sha, new_clean)
             with _vf_cache_lock:
                 new_cached = _vf_cache.get(new_key, ...)
@@ -2510,6 +2517,44 @@ def _render_reason(render_err: str) -> str:
     return REASON_RENDER
 
 
+_IDENTITY_BASENAMES = ("customer.yaml", "config.yaml")
+
+
+def _trusted_rename_dirs(renames: dict) -> set:
+    """(old_dir, new_dir) pairs corroborated by an identity-file rename.
+
+    v2.5.9 (live PR #6673, mirrors prod #3604 'renamed hsbc to -b for decom
+    and rebuild'): Bitbucket's rename detection is CONTENT-SIMILARITY based,
+    not identity based. A genuine decommission+rebuild (old env deleted, a
+    differently-named new env added, deliberately different content) is
+    correctly reported as delete+add for the identity file (customer.yaml /
+    config.yaml) — but an ancillary file like cicd-versions.yaml is often
+    boilerplate, byte-identical across unrelated environments, so Bitbucket
+    pairs THAT as a 'rename' anyway. Trusting it wholesale-swapped the
+    DELETED app's PR-side render for the UNRELATED new environment's
+    identity: a nonsensical mixed-identity diff and a wrong chart-downgrade
+    attribution (observed live). An ancillary-file rename is only believable
+    when an identity file was ALSO renamed between the exact same two
+    directories — that is real corroborating evidence of an actual move.
+    """
+    return {
+        (posixpath.dirname(old_p), posixpath.dirname(new_p))
+        for old_p, new_p in renames.items()
+        if posixpath.basename(old_p) in _IDENTITY_BASENAMES
+    }
+
+
+def _is_trusted_rename(old_clean: str, new_clean: str, trusted_dirs: set) -> bool:
+    """True when a specific file's rename pairing is safe to follow.
+
+    Either the file itself IS the identity file (direct evidence), or its
+    directory pair is corroborated by a separate identity-file rename
+    (see _trusted_rename_dirs)."""
+    if posixpath.basename(old_clean) in _IDENTITY_BASENAMES:
+        return True
+    return (posixpath.dirname(old_clean), posixpath.dirname(new_clean)) in trusted_dirs
+
+
 def _detect_env_move(value_files: list, renames: dict):
     """Detect whether this app's environment folder was moved in the PR.
 
@@ -2522,6 +2567,10 @@ def _detect_env_move(value_files: list, renames: dict):
     rendered with identical inputs and a real chart-version change showed
     as "No manifest changes" (false clean).
 
+    v2.5.9: only trust the rename when the matched file IS the identity file
+    (customer.yaml/config.yaml) — see _trusted_rename_dirs for why an
+    ancillary-file-only match must never imply a move.
+
     Returns (old_env_dir, new_env_dir) when some rename's old side is one
     of this app's value files AND the directory actually changed, else None.
     """
@@ -2532,11 +2581,14 @@ def _detect_env_move(value_files: list, renames: dict):
         for vf in value_files
     }
     for old_p, new_p in renames.items():
-        if old_p in clean_vfs:
-            old_dir = posixpath.dirname(old_p)
-            new_dir = posixpath.dirname(new_p)
-            if old_dir != new_dir:
-                return old_dir, new_dir
+        if old_p not in clean_vfs:
+            continue
+        if posixpath.basename(old_p) not in _IDENTITY_BASENAMES:
+            continue
+        old_dir = posixpath.dirname(old_p)
+        new_dir = posixpath.dirname(new_p)
+        if old_dir != new_dir:
+            return old_dir, new_dir
     return None
 
 
@@ -2739,11 +2791,14 @@ def _run_one_diff(app, pr_sha, main_sha, chart_revision=None, changed_paths=None
             # required values simply vanished from the render inputs.
             rename_targets = []
             if renames:
+                trusted_dirs_vf = _trusted_rename_dirs(renames)
                 for vf in pr_changed_vf:
                     if vf in pr_fresh:
                         continue
                     cp = posixpath.normpath(vf.replace("$config/", "").lstrip("/"))
-                    if cp in renames:
+                    # v2.5.9: same corroboration requirement as
+                    # _pr_chart_revision_checked — see _trusted_rename_dirs.
+                    if cp in renames and _is_trusted_rename(cp, renames[cp], trusted_dirs_vf):
                         rename_targets.append(renames[cp])
             renamed_vals = _fetch_value_files(rename_targets, pr_sha) if rename_targets else {}
 
