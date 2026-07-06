@@ -1224,8 +1224,10 @@ def _bb_fetch_status(filepath, sha):
     return None, BB_ERROR
 
 
-_appspace_key_re = re.compile(r"^\s*appspace:\s*(#.*)?$")
-_version_key_re  = re.compile(r"^\s*version:\s*([^\s#]+)")
+_appspace_key_re      = re.compile(r"^\s*appspace:\s*(#.*)?$")
+_version_key_re       = re.compile(r"^\s*version:\s*([^\s#]+)")
+_customer_name_key_re = re.compile(r"^\s*customerName:\s*([^\s#]+)")
+_suffix_key_re        = re.compile(r"^\s*suffix:\s*([^\s#]+)")
 
 # A chart targetRevision is an OCI tag / semver-ish string. It flows from a
 # PR-authored config file into `helm pull --version <v>` and into
@@ -1331,6 +1333,56 @@ def _extract_chart_version(content: str):
     """
     version, _status = _extract_chart_version_checked(content)
     return version
+
+
+def _extract_appspace_identity(content: str) -> tuple:
+    """Return (customer_name, suffix) as declared directly under the
+    top-level `appspace:` mapping in a customer.yaml/config.yaml file.
+
+    v2.5.15 (Finding 7). Mirrors _extract_chart_version_checked's
+    direct-child-of-appspace tracking (last-key-wins on a duplicate key),
+    applied to customerName and suffix instead of version.
+
+    customerName is the true identity of an environment (drives the
+    namespace and related wiring). suffix is the variant (a/b/c...); it can
+    be declared locally in this file OR inherited from a parent config.yaml
+    higher in the tier. instanceName is NOT read here -- it names virtual
+    machines only and is not an environment identity signal.
+
+    Either element of the returned tuple is None when not declared in THIS
+    file. A None suffix does not mean "no suffix", only "not declared here"
+    -- a caller that needs the chain-resolved effective value must fetch and
+    check ancestor config.yaml files separately; this function only reads
+    what one specific file states.
+    """
+    in_appspace     = False
+    appspace_indent = -1
+    child_indent    = None
+    customer_name = None
+    suffix        = None
+    for line in (content or "").splitlines():
+        if not line.strip() or line.lstrip().startswith("#"):
+            continue
+        indent = len(line) - len(line.lstrip())
+        if in_appspace and indent <= appspace_indent:
+            in_appspace  = False
+            child_indent = None
+        if _appspace_key_re.match(line):
+            in_appspace     = True
+            appspace_indent = indent
+            child_indent    = None
+            continue
+        if in_appspace:
+            if child_indent is None and indent > appspace_indent:
+                child_indent = indent
+            if indent == child_indent:
+                cm = _customer_name_key_re.match(line)
+                if cm:
+                    customer_name = cm.group(1).strip("'\"")
+                sm = _suffix_key_re.match(line)
+                if sm:
+                    suffix = sm.group(1).strip("'\"")
+    return customer_name, suffix
 
 
 # ── Helm-template local diff ─────────────────────────────────────────────────
@@ -2259,7 +2311,7 @@ def _pr_chart_revision(app, candidate_files, pr_sha):
     return None
 
 
-def _pr_chart_revision_checked(app, candidate_files, pr_sha, renames=None):
+def _pr_chart_revision_checked(app, candidate_files, pr_sha, main_sha=None, renames=None):
     """Like _pr_chart_revision, but also reports a rejected version.
 
     Returns (new_rev, invalid):
@@ -2276,12 +2328,16 @@ def _pr_chart_revision_checked(app, candidate_files, pr_sha, renames=None):
     a version bump bundled with a folder move (a real, common prod pattern:
     "monthly ver caught up ... moving to regular monthly cadence dir") is
     silently missed and the diff renders the OLD chart version.
+
+    main_sha (v2.5.15, Finding 7): required to identity-verify an
+    identity-file rename before following it (see _rename_identity_confirmed)
+    — without it, this falls back to the pre-v2.5.15 unconditional trust.
     """
     current_rev = _app_chart_revision_map.get(app)
     if not current_rev:
         return None, False
     invalid = False
-    trusted_dirs = _trusted_rename_dirs(renames) if renames else set()
+    trusted_dirs = _trusted_rename_dirs(renames, main_sha, pr_sha) if renames else set()
     for filepath in candidate_files:
         clean = posixpath.normpath(filepath.lstrip("/"))
         cache_key = (pr_sha, clean)
@@ -2300,8 +2356,9 @@ def _pr_chart_revision_checked(app, candidate_files, pr_sha, renames=None):
             # v2.5.9: only follow when this specific pairing is trustworthy
             # (see _trusted_rename_dirs) — an ancillary file's coincidental
             # content match with an unrelated environment must not be read
-            # as that app's own version.
-            if not _is_trusted_rename(clean, new_clean, trusted_dirs):
+            # as that app's own version. v2.5.15: an identity-file pairing
+            # must ALSO carry the same declared identity on both sides.
+            if not _is_trusted_rename(clean, new_clean, trusted_dirs, main_sha, pr_sha):
                 continue
             new_key = (pr_sha, new_clean)
             with _vf_cache_lock:
@@ -2536,7 +2593,104 @@ def _render_reason(render_err: str) -> str:
 _IDENTITY_BASENAMES = ("customer.yaml", "config.yaml")
 
 
-def _trusted_rename_dirs(renames: dict) -> set:
+def _same_env_identity(old_identity: tuple, new_identity: tuple) -> bool:
+    """True when two (customer_name, suffix) pairs look like the SAME
+    environment (v2.5.15, Finding 7).
+
+    customer_name is the primary key: it drives the namespace and is the
+    real identity signal (confirmed on real prod renames: 'seagal'->'segal'
+    is a typo fix to a DIFFERENT identity even with the same suffix, and
+    'bnym--aec1'->'bny--aec1' likewise). A mismatch there is decisive
+    regardless of suffix.
+
+    suffix is compared only when BOTH sides declare one. An undeclared
+    suffix on either side is UNKNOWN, not "no suffix" -- treating it as a
+    mismatch would make an ordinary same-identity rename (suffix inherited
+    from a parent config.yaml, not stated in the leaf file) look like a
+    decommission. Missing/unparseable data on both customer_name and suffix
+    degrades to trusting the rename, the same conservative-default posture
+    already used elsewhere in this module (_is_version_downgrade returns
+    False rather than block on noise it cannot interpret).
+    """
+    old_name, old_suffix = old_identity
+    new_name, new_suffix = new_identity
+    if old_name and new_name and old_name != new_name:
+        return False
+    if old_suffix and new_suffix and old_suffix != new_suffix:
+        return False
+    return True
+
+
+# Memoizes _rename_identity_confirmed so the SAME (old, new, main_sha, pr_sha)
+# question asked repeatedly within one PR run (once per app sharing an
+# environment's ms/ss/glb components, plus again from
+# _pr_chart_revision_checked) costs one Bitbucket fetch pair, not several.
+# Shas are immutable, so a cached verdict is valid forever; bounded the same
+# way _main_render_cache is (evict oldest half past the cap) since renames
+# are rare but a pod can run for weeks.
+_IDENTITY_RENAME_CACHE_MAX = 500
+_identity_rename_verdict_cache: dict = {}
+_identity_rename_verdict_lock       = threading.Lock()
+
+
+def _rename_identity_confirmed(old_clean: str, new_clean: str,
+                                main_sha: str, pr_sha: str) -> bool:
+    """True when the identity file renamed old_clean -> new_clean describes
+    the SAME environment on both sides (v2.5.15, Finding 7).
+
+    Bitbucket's rename pairing is content-similarity based, not identity
+    based (see _trusted_rename_dirs' docstring for the ancillary-file case
+    this mirrors). Before this check, ANY rename of customer.yaml/
+    config.yaml was trusted unconditionally as "direct evidence" of a real
+    move -- correct for a folder-name-to-suffix path fix (real prod
+    precedent: 'Rename folders' commit 655546c96, pv-allianzna-a ->
+    pv-allianzna-c, same customerName+suffix inside both files), but wrong
+    for a decommission+rebuild or region migration under a new suffix,
+    which Bitbucket pairs anyway when the two customer.yaml files are
+    similar enough (real prod precedents, all confirmed R53-R99 similarity
+    with a changed customerName and/or suffix inside: pv-manulife-a/b,
+    pv-takeda-a(na3-a)/pv-takeda-b(eu1-b), pv-asxo-a/b/c, pv-onr, pv-smbc,
+    pv-seagal->pv-segal, pv-bnym--aec1->pv-bny--aec1 -- 49 such cases found
+    across 600 commits of acme-config-prod history, see
+    bughunt/FINDINGS_IDENTITY_AWARE_RENAME.md). Trusting those wholesale
+    swapped the deleted app's PR-side render for the unrelated new
+    environment's content and suppressed the decommission warning for the
+    old one.
+
+    Fetches the OLD file at main_sha and the NEW file at pr_sha and compares
+    the identity each declares (_extract_appspace_identity +
+    _same_env_identity). A fetch failure on either side degrades to
+    trusting the rename (see _same_env_identity) rather than block on a
+    transient blip.
+    """
+    cache_key = (old_clean, new_clean, main_sha, pr_sha)
+    with _identity_rename_verdict_lock:
+        cached = _identity_rename_verdict_cache.get(cache_key)
+    if cached is not None:
+        return cached
+    try:
+        old_content, _old_status = _bb_fetch_status(old_clean, main_sha)
+        new_content, _new_status = _bb_fetch_status(new_clean, pr_sha)
+    except Exception as e:
+        debug(f"identity check fetch failed for {old_clean} -> {new_clean}: {e}")
+        old_content = new_content = None
+    old_identity = _extract_appspace_identity(old_content or "")
+    new_identity = _extract_appspace_identity(new_content or "")
+    verdict = _same_env_identity(old_identity, new_identity)
+    if not verdict:
+        log(f"identity-file rename {old_clean} -> {new_clean} rejected: "
+            f"declared identity changed ({old_identity} -> {new_identity}); "
+            f"treating as unrelated environments, not a move", "WARNING")
+    with _identity_rename_verdict_lock:
+        _identity_rename_verdict_cache[cache_key] = verdict
+        if len(_identity_rename_verdict_cache) > _IDENTITY_RENAME_CACHE_MAX:
+            drop = len(_identity_rename_verdict_cache) - _IDENTITY_RENAME_CACHE_MAX // 2
+            for k in list(_identity_rename_verdict_cache.keys())[:drop]:
+                del _identity_rename_verdict_cache[k]
+    return verdict
+
+
+def _trusted_rename_dirs(renames: dict, main_sha: str = None, pr_sha: str = None) -> set:
     """(old_dir, new_dir) pairs corroborated by an identity-file rename.
 
     v2.5.9 (live PR #6673, mirrors prod #3604 'renamed hsbc to -b for decom
@@ -2552,26 +2706,48 @@ def _trusted_rename_dirs(renames: dict) -> set:
     attribution (observed live). An ancillary-file rename is only believable
     when an identity file was ALSO renamed between the exact same two
     directories — that is real corroborating evidence of an actual move.
+
+    v2.5.15 (Finding 7): the corroborating identity-file rename must ALSO
+    pass the identity check (_rename_identity_confirmed) when main_sha/
+    pr_sha are given -- a Class 2 false pairing (different customerName/
+    suffix) is not real corroborating evidence of an actual move, so an
+    ancillary file paired between the SAME two directories must not be
+    trusted either. Omitting either sha keeps the pre-v2.5.15 behavior
+    (presence-only, no content check) for legacy call sites.
     """
-    return {
-        (posixpath.dirname(old_p), posixpath.dirname(new_p))
-        for old_p, new_p in renames.items()
-        if posixpath.basename(old_p) in _IDENTITY_BASENAMES
-    }
+    pairs = set()
+    for old_p, new_p in renames.items():
+        if posixpath.basename(old_p) not in _IDENTITY_BASENAMES:
+            continue
+        if main_sha and pr_sha and not _rename_identity_confirmed(old_p, new_p, main_sha, pr_sha):
+            continue
+        pairs.add((posixpath.dirname(old_p), posixpath.dirname(new_p)))
+    return pairs
 
 
-def _is_trusted_rename(old_clean: str, new_clean: str, trusted_dirs: set) -> bool:
+def _is_trusted_rename(old_clean: str, new_clean: str, trusted_dirs: set,
+                        main_sha: str = None, pr_sha: str = None) -> bool:
     """True when a specific file's rename pairing is safe to follow.
 
     Either the file itself IS the identity file (direct evidence), or its
     directory pair is corroborated by a separate identity-file rename
-    (see _trusted_rename_dirs)."""
+    (see _trusted_rename_dirs).
+
+    v2.5.15 (Finding 7): the identity file being the file itself is no
+    longer unconditional "direct evidence" -- see _rename_identity_confirmed
+    for why a content-similarity pairing across a changed customerName/
+    suffix must be refused even though it IS the identity file. Omitting
+    main_sha/pr_sha keeps the pre-v2.5.15 unconditional-trust behavior for
+    legacy call sites that cannot practically provide the shas.
+    """
     if posixpath.basename(old_clean) in _IDENTITY_BASENAMES:
+        if main_sha and pr_sha:
+            return _rename_identity_confirmed(old_clean, new_clean, main_sha, pr_sha)
         return True
     return (posixpath.dirname(old_clean), posixpath.dirname(new_clean)) in trusted_dirs
 
 
-def _detect_env_move(value_files: list, renames: dict):
+def _detect_env_move(value_files: list, renames: dict, main_sha: str = None, pr_sha: str = None):
     """Detect whether this app's environment folder was moved in the PR.
 
     v2.5.8 (T2b, live PR #6666, mirrors prod #3597 'move envs into monthly
@@ -2587,8 +2763,19 @@ def _detect_env_move(value_files: list, renames: dict):
     (customer.yaml/config.yaml) — see _trusted_rename_dirs for why an
     ancillary-file-only match must never imply a move.
 
+    v2.5.15 (Finding 7): being the identity file is no longer enough by
+    itself -- a path-based candidate is also required to pass
+    _rename_identity_confirmed (same declared customerName/suffix on both
+    sides) before being trusted as a real move. A path-only candidate that
+    fails this check is not returned; the caller's normal per-file fallback
+    then treats the old path as a genuine deletion (correct: the identity
+    changed, so this is a decommission+rebuild or migration, not a move of
+    THIS environment). Omitting main_sha/pr_sha keeps the pre-v2.5.15
+    path-only behavior for legacy call sites.
+
     Returns (old_env_dir, new_env_dir) when some rename's old side is one
-    of this app's value files AND the directory actually changed, else None.
+    of this app's value files AND the directory actually changed AND (when
+    shas are given) the identity check passes, else None.
     """
     if not renames:
         return None
@@ -2603,12 +2790,16 @@ def _detect_env_move(value_files: list, renames: dict):
             continue
         old_dir = posixpath.dirname(old_p)
         new_dir = posixpath.dirname(new_p)
-        if old_dir != new_dir:
-            return old_dir, new_dir
+        if old_dir == new_dir:
+            continue
+        if main_sha and pr_sha and not _rename_identity_confirmed(old_p, new_p, main_sha, pr_sha):
+            continue
+        return old_dir, new_dir
     return None
 
 
-def _detect_env_decommission_candidates(changed_files: list, path_map: dict, renames: dict) -> list:
+def _detect_env_decommission_candidates(changed_files: list, path_map: dict, renames: dict,
+                                         main_sha: str = None, pr_sha: str = None) -> list:
     """Identify environments fully decommissioned (deleted, no successor).
 
     v2.5.10 (explicit request): distinct from a tier move (v2.5.8, identity
@@ -2627,6 +2818,18 @@ def _detect_env_decommission_candidates(changed_files: list, path_map: dict, ren
     directory (gcp/qa/config.yaml) maps to apps whose names do NOT start
     with its own directory's basename ("qa"), so it is naturally excluded.
 
+    v2.5.15 (Finding 7): a rename pairing on the identity file only excludes
+    a candidate here when it is a CONFIRMED same-environment move
+    (_rename_identity_confirmed). A Class 2 pairing (decommission+rebuild or
+    a migration under a new suffix — content-similar enough for Bitbucket
+    to pair, but a genuinely DIFFERENT environment; real prod precedents in
+    bughunt/FINDINGS_IDENTITY_AWARE_RENAME.md) must still be evaluated as a
+    decommission of the OLD environment: _detect_env_move already refuses
+    to treat this as a move, so without this change nothing would ever flag
+    the old side as going away — it would just silently fail to render.
+    Omitting main_sha/pr_sha keeps the pre-v2.5.15 behavior (any presence in
+    renames excludes the candidate) for legacy call sites.
+
     Returns a list of {"env_name", "identity_file", "apps"} dicts.
     """
     renames = renames or {}
@@ -2639,7 +2842,13 @@ def _detect_env_decommission_candidates(changed_files: list, path_map: dict, ren
         if posixpath.basename(clean) not in _IDENTITY_BASENAMES:
             continue
         if clean in renames:
-            continue  # real move (v2.5.8) — not a decommission
+            if main_sha and pr_sha:
+                if _rename_identity_confirmed(clean, renames[clean], main_sha, pr_sha):
+                    continue  # confirmed real move (v2.5.8) — not a decommission
+                # else: paired by Bitbucket, but the declared identity
+                # changed — fall through, evaluate as a decommission below.
+            else:
+                continue  # legacy behavior: presence alone excludes it
         apps = path_map.get(clean)
         if not apps:
             continue  # not a currently-live environment
@@ -2894,7 +3103,7 @@ def _run_one_diff(app, pr_sha, main_sha, chart_revision=None, changed_paths=None
     # (last file wins, helm -f semantics): after a move the env's own
     # customer.yaml may no longer set appspace.version, deferring to a tier
     # default the old path-based detection could never see.
-    env_move       = _detect_env_move(value_files, renames)
+    env_move       = _detect_env_move(value_files, renames, main_sha, pr_sha)
     moved_pr_vals  = None
     pr_value_files = value_files
     if env_move:
@@ -2983,14 +3192,15 @@ def _run_one_diff(app, pr_sha, main_sha, chart_revision=None, changed_paths=None
             # required values simply vanished from the render inputs.
             rename_targets = []
             if renames:
-                trusted_dirs_vf = _trusted_rename_dirs(renames)
+                trusted_dirs_vf = _trusted_rename_dirs(renames, main_sha, pr_sha)
                 for vf in pr_changed_vf:
                     if vf in pr_fresh:
                         continue
                     cp = posixpath.normpath(vf.replace("$config/", "").lstrip("/"))
                     # v2.5.9: same corroboration requirement as
                     # _pr_chart_revision_checked — see _trusted_rename_dirs.
-                    if cp in renames and _is_trusted_rename(cp, renames[cp], trusted_dirs_vf):
+                    # v2.5.15: identity-file pairings are also content-verified.
+                    if cp in renames and _is_trusted_rename(cp, renames[cp], trusted_dirs_vf, main_sha, pr_sha):
                         rename_targets.append(renames[cp])
             renamed_vals = _fetch_value_files(rename_targets, pr_sha) if rename_targets else {}
 
@@ -4312,10 +4522,11 @@ def process_pr(pr, path_map, base_sha=""):
         # (identity file deleted, no successor anywhere — distinct from a
         # tier move or a rebuild under a new name) so the comment can shout
         # a dedicated warning: which environment, what version, what is
-        # being removed. Structural detection is free (no network); the
-        # confirming fetch + best-effort render happens only if any
-        # candidate is found.
-        decommission_candidates = _detect_env_decommission_candidates(changed, path_map, renames)
+        # being removed. Structural detection needs no network UNLESS the
+        # identity file has a rename pairing (v2.5.15: that pairing is then
+        # identity-verified via one cached fetch pair, not assumed).
+        decommission_candidates = _detect_env_decommission_candidates(
+            changed, path_map, renames, main_sha=base_sha, pr_sha=pr_sha)
         decommission_lines, decommissioned_envs = ([], [])
         if decommission_candidates:
             decommission_lines, decommissioned_envs = _evaluate_env_decommissions(
@@ -4445,7 +4656,8 @@ def process_pr(pr, path_map, base_sha=""):
         pr_chart_revisions = {}
         invalid_version_apps = set()
         with ThreadPoolExecutor(max_workers=max(1, min(DIFF_WORKERS, len(affected)))) as ex:
-            rev_futs = {ex.submit(_pr_chart_revision_checked, app, _app_to_files.get(app, []), pr_sha, renames): app
+            rev_futs = {ex.submit(_pr_chart_revision_checked, app, _app_to_files.get(app, []),
+                                   pr_sha, main_sha=base_sha, renames=renames): app
                         for app in affected}
             for fut in as_completed(rev_futs):
                 app = rev_futs[fut]
