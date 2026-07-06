@@ -4,20 +4,38 @@ name: Deploy Helm chart index to Pages
 # internal workflow we do not control, forces Node.js 20 (deprecated,
 # https://github.blog/changelog/2025-09-19-deprecation-of-node-20-on-github-actions-runners/),
 # and has intermittently failed with a generic "Deployment failed, try again
-# later" error requiring a manual re-run (hit twice: v2.5.6 and v2.5.10
-# releases). This workflow deploys the SAME gh-pages branch content (chart
-# .tgz files + index.yaml, published by chart-releaser-action in
-# release.yml) via the modern GitHub Actions Pages deployment method —
-# same final URL (https://appspace-cloud.github.io/acme-diff-preview/),
-# no change for ArgoCD/helm consumers of the chart repo.
+# later" error requiring a manual re-run (hit on v2.5.6, v2.5.10, v2.5.13).
+# This workflow deploys the SAME gh-pages branch content (chart .tgz files +
+# index.yaml, published by chart-releaser-action in release.yml) via the
+# modern GitHub Actions Pages deployment method — same final URL
+# (https://appspace-cloud.github.io/acme-diff-preview/), no change for
+# ArgoCD/helm consumers of the chart repo.
+#
+# Trigger: workflow_run on Release Charts, not push. chart-releaser-action
+# pushes to gh-pages using the default GITHUB_TOKEN, and GitHub does not
+# cascade-trigger other workflows from a push made with that token — a plain
+# "on: push: branches: gh-pages" trigger here never fires for that push
+# (confirmed live: v2.5.11 release ran Release Charts successfully with no
+# cascading Pages deploy). workflow_run fires on the named workflow's
+# completion regardless of what token drove it, so it works.
+#
+# Trigger, not steps-in-the-same-job: v2.5.11 briefly ran this as extra steps
+# inside release.yml's own job. Re-running that job's failed steps left a
+# stale "github-pages" artifact from the earlier attempt; the retry's fresh
+# upload then collided with it and actions/deploy-pages errored with
+# "Multiple artifacts named 'github-pages' were unexpectedly found for this
+# workflow run" (confirmed live, v2.5.13). A workflow_run-triggered run — or
+# a manual workflow_dispatch re-run of THIS workflow — always starts a fresh
+# run with its own artifact namespace, so a Pages retry can never collide
+# with a previous attempt's leftover artifact.
 #
 # Requires the repo's Settings > Pages > Source to be set to "GitHub
 # Actions" (done once, alongside this workflow).
 
 on:
-  push:
-    branches:
-      - gh-pages
+  workflow_run:
+    workflows: ["Release Charts"]
+    types: [completed]
   workflow_dispatch:
 
 permissions:
@@ -32,6 +50,9 @@ concurrency:
 jobs:
   deploy:
     runs-on: ubuntu-latest
+    # Only proceed on a successful Release Charts run (workflow_dispatch has
+    # no event.workflow_run, so this condition is skipped — always runs).
+    if: ${{ github.event_name != 'workflow_run' || github.event.workflow_run.conclusion == 'success' }}
     environment:
       name: github-pages
       url: ${{ steps.deployment.outputs.page_url }}

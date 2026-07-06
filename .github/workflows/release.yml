@@ -10,11 +10,6 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       contents: write
-      pages: write
-      id-token: write
-    environment:
-      name: github-pages
-      url: ${{ steps.deployment.outputs.page_url }}
     steps:
       - name: Checkout
         uses: actions/checkout@v5.0.0
@@ -39,27 +34,16 @@ jobs:
         env:
           CR_TOKEN: "${{ secrets.GITHUB_TOKEN }}"
 
-      # chart-releaser-action pushes the updated index.yaml to gh-pages using
-      # the default GITHUB_TOKEN. Pushes made with that token do NOT trigger
-      # other workflows (GitHub's built-in loop-prevention), so deploy-pages.yml's
-      # "on: push: branches: gh-pages" trigger never fires for this — confirmed
-      # live (v2.5.11 release: Release Charts succeeded, no cascading Pages
-      # deploy run ever appeared). Deploy directly in THIS job instead, right
-      # after the push above, in the same run.
-      - name: Checkout gh-pages for Pages deployment
-        uses: actions/checkout@v5.0.0
-        with:
-          ref: gh-pages
-          path: gh-pages-checkout
-
-      - name: Upload Pages artifact
-        uses: actions/upload-pages-artifact@v5.0.0
-        with:
-          path: gh-pages-checkout
-
-      - name: Deploy to GitHub Pages
-        id: deployment
-        uses: actions/deploy-pages@v5.0.0
+      # Pages deployment used to run as extra steps in THIS job (v2.5.11).
+      # Moved out to deploy-pages.yml, triggered via workflow_run (v2.5.14):
+      # re-running a failed step here left a stale "github-pages" artifact
+      # from the earlier attempt, and a retry's fresh upload collided with it
+      # — actions/deploy-pages then errored with "Multiple artifacts named
+      # 'github-pages' were unexpectedly found for this workflow run" —
+      # confirmed live during the v2.5.13 release. workflow_run starts a
+      # brand-new run (fresh artifact namespace) every time, whether it fires
+      # automatically after this job or is re-dispatched by hand, so a Pages
+      # retry can never collide with a previous attempt's leftover artifact.
 
   # Human-readable GitHub Release per v* tag (separate from the
   # chart-releaser-action job above, which publishes "acme-diff-preview-X.Y.Z"
