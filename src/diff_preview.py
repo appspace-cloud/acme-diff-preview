@@ -2592,6 +2592,163 @@ def _detect_env_move(value_files: list, renames: dict):
     return None
 
 
+def _detect_env_decommission_candidates(changed_files: list, path_map: dict, renames: dict) -> list:
+    """Identify environments fully decommissioned (deleted, no successor).
+
+    v2.5.10 (explicit request): distinct from a tier move (v2.5.8, identity
+    file renamed to a new dir — handled by _detect_env_move) and from a
+    rebuild under a new name (v2.5.9, old identity file genuinely deleted
+    but a DIFFERENT new one is added elsewhere — that shows up as its own
+    new-env section). This is the narrower "an environment is simply going
+    away, nothing replaces it" case, which deserves its own loud warning:
+    which environment, what version, what is being removed.
+
+    An identity file (customer.yaml/config.yaml) qualifies as a per-env
+    root — not a shared ancestor default that happens to share the
+    basename — only when EVERY app it maps to is named "<env_name>-...",
+    matching this codebase's app-naming convention observed throughout
+    (pv-qa-15-a-ms, cl-qa-14-a-glb, etc.). A shared default at a shallow
+    directory (gcp/qa/config.yaml) maps to apps whose names do NOT start
+    with its own directory's basename ("qa"), so it is naturally excluded.
+
+    Returns a list of {"env_name", "identity_file", "apps"} dicts.
+    """
+    renames = renames or {}
+    candidates = []
+    seen_identity_files = set()
+    for f in changed_files:
+        clean = posixpath.normpath(f.lstrip("/"))
+        if clean in seen_identity_files:
+            continue
+        if posixpath.basename(clean) not in _IDENTITY_BASENAMES:
+            continue
+        if clean in renames:
+            continue  # real move (v2.5.8) — not a decommission
+        apps = path_map.get(clean)
+        if not apps:
+            continue  # not a currently-live environment
+        env_name = posixpath.basename(posixpath.dirname(clean))
+        if not all(a.split("/")[-1].startswith(env_name + "-") for a in apps):
+            continue  # shared ancestor default, not this env's own identity file
+        seen_identity_files.add(clean)
+        candidates.append({"env_name": env_name, "identity_file": clean, "apps": list(apps)})
+    return candidates
+
+
+def _render_main_side_resources(app: str, main_sha: str) -> dict:
+    """Render an app's CURRENT (main-side, pre-merge) manifest.
+
+    Used only by the decommission warning to show what a full environment
+    deletion would remove. Reuses _main_render_cache when a normal diff for
+    this app already populated it this run (common: an env's glb/ms/ss apps
+    are usually ALL affected by the same PR, so one of them likely already
+    rendered). Raises on failure — the caller treats this as best-effort and
+    degrades gracefully (the confirmed deletion is the important fact; a
+    resource list is a nice-to-have).
+    """
+    chart_name  = _app_chart_map.get(app)
+    main_rev    = _app_chart_revision_map.get(app)
+    registry    = _app_chart_registry_map.get(app, "")
+    value_files = _app_value_files_map.get(app, [])
+    namespace   = _app_namespace_map.get(app, "")
+    release     = app.split("/")[-1]
+    if not (chart_name and main_rev and registry and value_files):
+        raise RuntimeError(f"app metadata not in cache for {app}")
+    main_pull_gen = _helm_chart_pull_ts.get(f"{registry}/{chart_name}:{main_rev}", 0)
+    cache_key = (app, main_sha, main_rev, main_pull_gen)
+    with _main_render_lock:
+        cached = _main_render_cache.get(cache_key)
+    if cached is not None:
+        return cached
+    main_chart = _ensure_chart(registry, chart_name, main_rev)
+    if not main_chart:
+        raise RuntimeError(f"chart pull failed for {chart_name}:{main_rev}")
+    main_vals = _fetch_value_files(value_files, main_sha)
+    main_yaml, err = _helm_template(main_chart, release, namespace, main_vals)
+    if err or not main_yaml:
+        raise RuntimeError(err or "empty render")
+    resources = _parse_manifest_resources(main_yaml)
+    with _main_render_lock:
+        _main_render_cache[cache_key] = resources
+    return resources
+
+
+_DECOM_WORKLOAD_KINDS = ("Deployment", "StatefulSet", "DaemonSet", "CronJob", "Job")
+DECOM_WORKLOADS_MAX_SHOWN = 40
+
+
+def _summarize_resources_dict(resources: dict) -> tuple:
+    """(total, kind_counts, workload_names) from a _parse_manifest_resources dict."""
+    kind_counts = {}
+    workloads = set()
+    for (type_key, _ns, name) in resources:
+        kind_counts[type_key] = kind_counts.get(type_key, 0) + 1
+        if type_key.split("/")[-1] in _DECOM_WORKLOAD_KINDS:
+            workloads.add(name)
+    return len(resources), kind_counts, sorted(workloads)
+
+
+def _evaluate_env_decommissions(candidates: list, pr_sha: str, main_sha: str) -> tuple:
+    """Build the decommission warning block for confirmed deletions.
+
+    Confirms each candidate's identity file is genuinely gone at pr_sha
+    before saying anything (defense in depth — never warn on a guess).
+    Best-effort resource listing: a render failure does not suppress the
+    warning, since the deletion itself is already confirmed fact.
+
+    Returns (markdown_lines, env_names_reported).
+    """
+    lines, envs_reported = [], []
+    for c in candidates:
+        _content, status = _bb_fetch_status(c["identity_file"], pr_sha)
+        if status != BB_NOT_FOUND:
+            continue  # not actually deleted — do not warn on a false positive
+        versions = sorted({
+            _app_chart_revision_map[a] for a in c["apps"]
+            if _app_chart_revision_map.get(a)
+        })
+        total = 0
+        kind_counts: dict = {}
+        workloads: set = set()
+        any_rendered = False
+        for app in c["apps"]:
+            try:
+                resources = _render_main_side_resources(app, main_sha)
+            except Exception as e:
+                debug(f"decommission resource listing failed for {app}: {e}")
+                continue
+            any_rendered = True
+            n, kc, wl = _summarize_resources_dict(resources)
+            total += n
+            for k, v in kc.items():
+                kind_counts[k] = kind_counts.get(k, 0) + v
+            workloads.update(wl)
+
+        lines += [
+            f"# \U0001f5d1\ufe0f\u26a0\ufe0f ENVIRONMENT DECOMMISSION \u26a0\ufe0f\U0001f5d1\ufe0f",
+            "",
+            f"**`{c['env_name']}` is being deleted by this PR "
+            f"(was running chart version `{', '.join(versions) or 'unknown'}`). "
+            f"This is a destructive, hard-to-reverse change — verify this is intentional.**",
+            "",
+        ]
+        if any_rendered and total:
+            kind_breakdown = ", ".join(
+                f"{n} {k}" for k, n in sorted(kind_counts.items(), key=lambda kv: (-kv[1], kv[0])))
+            lines.append(f"- **Resources that will be removed:** {total} total \u2014 {kind_breakdown}")
+            if workloads:
+                shown = sorted(workloads)[:DECOM_WORKLOADS_MAX_SHOWN]
+                apps_str = ", ".join(f"`{w}`" for w in shown)
+                more = (f" *(+{len(workloads) - DECOM_WORKLOADS_MAX_SHOWN} more, truncated)*"
+                        if len(workloads) > DECOM_WORKLOADS_MAX_SHOWN else "")
+                lines.append(f"- **Applications removed:** {apps_str}{more}")
+        else:
+            lines.append("- *(resource preview unavailable \u2014 the deletion itself is confirmed)*")
+        lines.append("")
+        envs_reported.append(c["env_name"])
+    return lines, envs_reported
+
+
 def _rebase_value_files(value_files: list, old_env_dir: str, new_env_dir: str) -> list:
     """Return value_files with the old env dir prefix replaced by the new one.
 
@@ -3719,7 +3876,8 @@ def _format_app_diff_block(app, sections, diff_text, show_diff=True, n_res=None)
 
 
 def format_comment(pr_sha, app_results, skipped_apps=None, base_sha="",
-                    new_env_lines=None, new_env_structural=False, new_env_desc=""):
+                    new_env_lines=None, new_env_structural=False, new_env_desc="",
+                    decommission_lines=None):
     """Format the full PR comment. Never uses <details>/<summary> — Bitbucket
     does not render them. Large changesets get a compact summary table at the
     top (all apps, one row each) and inline diffs for the top-N most-changed
@@ -3763,6 +3921,12 @@ def format_comment(pr_sha, app_results, skipped_apps=None, base_sha="",
         f"## \U0001f52d {STATUS_NAME}", "",
         f"**Commit** `{pr_sha[:8]}` \u2192 `main` | `{BB_REPO}`{large_label}", "",
     ]
+
+    # ── Environment decommission warning (v2.5.10) ───────────────────
+    # Most critical/destructive possible finding — shown before even the
+    # downgrade warning.
+    if decommission_lines:
+        lines += decommission_lines
 
     # ── Chart downgrade warning (v2.5.8) ─────────────────────────────
     # A chart version going DOWN is legal but dangerous (schema regressions,
@@ -4045,6 +4209,22 @@ def process_pr(pr, path_map, base_sha=""):
         if new_env_candidates:
             log(f"PR #{pr_id}: {len(new_env_candidates)} new env candidate(s): "
                 f"{[e['name'] for e in new_env_candidates]}", pr=pr_id)
+
+        # v2.5.10 (explicit request): detect FULL environment decommissions
+        # (identity file deleted, no successor anywhere — distinct from a
+        # tier move or a rebuild under a new name) so the comment can shout
+        # a dedicated warning: which environment, what version, what is
+        # being removed. Structural detection is free (no network); the
+        # confirming fetch + best-effort render happens only if any
+        # candidate is found.
+        decommission_candidates = _detect_env_decommission_candidates(changed, path_map, renames)
+        decommission_lines, decommissioned_envs = ([], [])
+        if decommission_candidates:
+            decommission_lines, decommissioned_envs = _evaluate_env_decommissions(
+                decommission_candidates, pr_sha, base_sha)
+            if decommissioned_envs:
+                log(f"PR #{pr_id}: environment decommission detected: "
+                    f"{decommissioned_envs}", "WARNING", pr=pr_id)
 
         if not affected:
             # No existing ArgoCD app matched the changed files.
@@ -4331,7 +4511,8 @@ def process_pr(pr, path_map, base_sha=""):
         body = format_comment(pr_sha, app_results, skipped_apps, base_sha=base_sha,
                                new_env_lines=new_env_lines or None,
                                new_env_structural=bool(structural_envs),
-                               new_env_desc=new_env_desc)
+                               new_env_desc=new_env_desc,
+                               decommission_lines=decommission_lines or None)
         comment_kb = round(len(body.encode()) / 1024, 1)
         upsert_comment(pr_id, body, existing_id)
         action = "updated" if existing_id else "posted"
@@ -4374,6 +4555,15 @@ def process_pr(pr, path_map, base_sha=""):
             # usually means registry/network slowness — different owners.
             _diff_stats["apps_render_failed"] += reason_counts.get(REASON_RENDER, 0)
             _diff_stats["apps_timeout"] += reason_counts.get(REASON_TIMEOUT, 0)
+
+        # v2.5.10: surface confirmed environment decommissions in the build
+        # status too, not just the comment — informational, never blocking
+        # on its own (a decommission is often EXPECTED to render as
+        # indeterminate for its own now-gone apps; that's a separate,
+        # already-correct signal, not something this note should duplicate).
+        decom_extra = (
+            f" | \U0001f5d1\ufe0f {len(decommissioned_envs)} environment(s) being decommissioned"
+            if decommissioned_envs else "")
 
         # v2.5.4 (Finding 1): traffic-light rule agreed with Marcos — green ONLY
         # when the diff was actually computed (with or without changes); ANY
@@ -4431,20 +4621,20 @@ def process_pr(pr, path_map, base_sha=""):
             # below); only the color is different now.
             extra = f" | {sections_total} resource(s) confirmed changed" if sections_total else ""
             post_build_status(pr_sha, "FAILED",
-                f"Diff unavailable for {n_unknown} app(s){extra} - review comment "
+                f"Diff unavailable for {n_unknown} app(s){extra}{decom_extra} - review comment "
                 f"(will retry automatically if transient)", pr_id=pr_id)
         elif sections_total > 0:
             extra = f" | +{len(new_env_candidates)} new environment(s) will be created" if new_env_candidates else ""
             post_build_status(pr_sha, "SUCCESSFUL",
-                f"{sections_total} resource(s) will change{extra} - review comment",
+                f"{sections_total} resource(s) will change{extra}{decom_extra} - review comment",
                 pr_id=pr_id)
         else:
             if new_env_candidates:
                 post_build_status(pr_sha, "SUCCESSFUL",
                     f"No manifest changes to existing apps | +{len(new_env_candidates)} "
-                    f"new environment(s) will be created", pr_id=pr_id)
+                    f"new environment(s) will be created{decom_extra}", pr_id=pr_id)
             else:
-                post_build_status(pr_sha, "SUCCESSFUL", "No manifest changes", pr_id=pr_id)
+                post_build_status(pr_sha, "SUCCESSFUL", f"No manifest changes{decom_extra}", pr_id=pr_id)
 
         # Mark as seen logic:
         # - Clean run (no error, no indeterminate): mark seen -> skip next iteration
