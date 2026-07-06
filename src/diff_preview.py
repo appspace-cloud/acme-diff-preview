@@ -3976,7 +3976,6 @@ def format_comment(pr_sha, app_results, skipped_apps=None, base_sha="",
         lines += [
             "---",
             "### \U0001f916 AI Analysis",
-            "> *Powered by Gemini 2.5 Flash \u2014 always verify before merging*",
             "",
             ai_summary,
             "",
