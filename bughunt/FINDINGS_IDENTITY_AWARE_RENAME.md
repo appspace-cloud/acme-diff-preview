@@ -215,3 +215,71 @@ ArgoCD apps, structurally identical to a prod customer folder.
 Confirm the live ArgoCD app valueFiles for the target still point at the OLD
 folder before testing (`argocd app get pv-dev-06-a-ms`), since that is what
 makes the app get matched via the old path in the first place.
+
+---
+
+## RESOLUTION (2026-07-06, same day) — implemented, tested, deployed, and
+live-verified against two real acme-config-dev branches
+
+Marcos gave the go-ahead to implement with full TDD discipline. Done end
+to end: 29 new tests first (all red against the pre-fix code — every one
+failed with AttributeError since none of the new functions/cache existed
+yet), implementation across all five identified call sites, full suite
+green (316, was 287), a 30-thread concurrency check on the new memoization
+cache (all threads get the correct verdict, cache ends with exactly one
+entry), release v2.5.15, deploy, and live re-verification with two real
+branches mirroring the exact prod shapes this finding was based on.
+
+**Shipped as v2.5.15 (commit 6ec8e70).** Pod running 2.5.15, 0 restarts,
+clean logs, OCI credentials present.
+
+### Fix summary
+
+Added `_extract_appspace_identity` (customerName + suffix, mirrors the
+existing appspace.version extractor) and `_same_env_identity`
+(customerName is the primary key; missing/unparseable data on both sides
+degrades to trusting the rename). `_rename_identity_confirmed` does the
+fetch+compare, memoized per (old, new, main_sha, pr_sha). Applied to all
+three places that ever followed an identity-file rename
+(`_detect_env_move`, `_is_trusted_rename`/`_trusted_rename_dirs`,
+`_pr_chart_revision_checked`), plus `_detect_env_decommission_candidates`
+now falls through to decommission evaluation instead of silently excluding
+a rejected pairing — otherwise a Class 2 case would neither be trusted as
+a move NOR flagged as a decommission, and the reviewer would get no signal
+at all beyond a generic render failure.
+
+### Live verification (real branches, declined after capture, no merge)
+
+- **PR #6691 — Class 2 repro.** `pv-qa-13-a` renamed to `pv-qa-13-b` with
+  `suffix: a` -> `suffix: b` inside customer.yaml (real prod shape:
+  pv-manulife-a/b, pv-takeda, pv-onr). Bitbucket paired customer.yaml at
+  R081 similarity, cicd-versions.yaml at R100 — the exact range confirmed
+  across the 49 real prod cases. Bot result: **SUCCESSFUL | No manifest
+  changes | 🗑️ 1 environment(s) being decommissioned**. The comment showed
+  the full ENVIRONMENT DECOMMISSION block (452 resources, real application
+  names) and marked pv-qa-13-a-ms/-glb/-ss as "environment decommissioned"
+  — no cross-contaminated content from pv-qa-13-b, no false render error,
+  no silently-missing warning.
+- **PR #6692 — Class 1 control.** `pv-qa-14-a` renamed to
+  `pv-qa-14-pathfix-a` with ZERO content change (R100 on both files, the
+  pv-allianzna-a/c / pv-nike-a/b shape). Bot result: **SUCCESSFUL | No
+  manifest changes**, clean `✅ no manifest changes` for all three apps
+  (ms/ss/glb), `[clean]` token. The rename was followed correctly (a
+  render failure would have shown here if the fetch had not used the new
+  path's content) with no false decommission warning.
+
+Both outcomes match the fix's design exactly. Test branches and PRs
+deleted after capture; main was never touched.
+
+### Deferred (documented, not silently dropped)
+
+The shared-`config.yaml`-as-ancestor-default sub-case (a shared tier
+default renamed without customerName/suffix to compare against) is not
+covered by this fix — `_extract_appspace_identity` returns (None, None)
+for a file that never declares either, which degrades to trusting the
+rename by design. Catching this needs a different signal (whether the
+renamed file's directory maps to real apps in path_map, the same check
+`_detect_env_decommission_candidates` already uses to exclude shared
+defaults). Left for a future session; no live prod evidence was found for
+this specific sub-case during the mining pass, unlike the 49 confirmed
+customerName/suffix cases.
