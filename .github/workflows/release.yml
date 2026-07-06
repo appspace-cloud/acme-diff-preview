@@ -10,6 +10,11 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       contents: write
+      pages: write
+      id-token: write
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
     steps:
       - name: Checkout
         uses: actions/checkout@v5.0.0
@@ -33,6 +38,28 @@ jobs:
           skip_existing: true
         env:
           CR_TOKEN: "${{ secrets.GITHUB_TOKEN }}"
+
+      # chart-releaser-action pushes the updated index.yaml to gh-pages using
+      # the default GITHUB_TOKEN. Pushes made with that token do NOT trigger
+      # other workflows (GitHub's built-in loop-prevention), so deploy-pages.yml's
+      # "on: push: branches: gh-pages" trigger never fires for this — confirmed
+      # live (v2.5.11 release: Release Charts succeeded, no cascading Pages
+      # deploy run ever appeared). Deploy directly in THIS job instead, right
+      # after the push above, in the same run.
+      - name: Checkout gh-pages for Pages deployment
+        uses: actions/checkout@v5.0.0
+        with:
+          ref: gh-pages
+          path: gh-pages-checkout
+
+      - name: Upload Pages artifact
+        uses: actions/upload-pages-artifact@v5.0.0
+        with:
+          path: gh-pages-checkout
+
+      - name: Deploy to GitHub Pages
+        id: deployment
+        uses: actions/deploy-pages@v5.0.0
 
   # Human-readable GitHub Release per v* tag (separate from the
   # chart-releaser-action job above, which publishes "acme-diff-preview-X.Y.Z"
