@@ -4,7 +4,9 @@ name: Deploy Helm chart index to Pages
 # internal workflow we do not control, forces Node.js 20 (deprecated,
 # https://github.blog/changelog/2025-09-19-deprecation-of-node-20-on-github-actions-runners/),
 # and has intermittently failed with a generic "Deployment failed, try again
-# later" error requiring a manual re-run (hit on v2.5.6, v2.5.10, v2.5.13).
+# later" error requiring a manual re-run (hit on v2.5.6, v2.5.10, v2.5.13,
+# v2.5.14). An in-workflow retry (see the Deploy to GitHub Pages steps
+# below) was added so this self-heals instead of needing a manual re-run.
 # This workflow deploys the SAME gh-pages branch content (chart .tgz files +
 # index.yaml, published by chart-releaser-action in release.yml) via the
 # modern GitHub Actions Pages deployment method — same final URL
@@ -67,6 +69,71 @@ jobs:
         with:
           path: .
 
-      - name: Deploy to GitHub Pages
-        id: deployment
+      # actions/deploy-pages has its own internal retry (error_count, default
+      # 10) but that only covers polling an IN-PROGRESS deployment's status.
+      # The failure we actually hit (v2.5.6, v2.5.10, v2.5.13, v2.5.14) is a
+      # flat "Error: Deployment failed, try again later." returned
+      # immediately when CREATING the deployment — a transient backend
+      # rejection the action does not retry on its own (confirmed: GitHub's
+      # own community discussion #200823 on this exact message has no fix
+      # beyond "re-run manually" or open a support ticket). So the retry has
+      # to happen at the step level, around the whole action.
+      #
+      # Deliberately NOT using a third-party retry-wrapper action
+      # (nick-fields/retry only retries a shell `command:`, not a `uses:`
+      # step, by its own README; a wrapper that CAN retry a `uses:` step,
+      # e.g. Wandalen/wretry.action, would need to relay this job's
+      # sensitive `id-token: write` OIDC permission through an
+      # unofficial action). Repeating the same first-party
+      # actions/deploy-pages step 3x with continue-on-error keeps every
+      # permission relay first-party.
+      - name: Deploy to GitHub Pages (attempt 1)
+        id: deploy1
+        continue-on-error: true
         uses: actions/deploy-pages@v5.0.0
+        with:
+          error_count: 15
+
+      - name: Wait before retry 1
+        if: steps.deploy1.outcome == 'failure'
+        run: |
+          echo "::warning::Pages deploy attempt 1 failed (${{ steps.deploy1.outputs.status || 'no status' }}), retrying in 30s"
+          sleep 30
+
+      - name: Deploy to GitHub Pages (attempt 2)
+        id: deploy2
+        if: steps.deploy1.outcome == 'failure'
+        continue-on-error: true
+        uses: actions/deploy-pages@v5.0.0
+        with:
+          error_count: 15
+
+      - name: Wait before retry 2
+        if: steps.deploy1.outcome == 'failure' && steps.deploy2.outcome == 'failure'
+        run: |
+          echo "::warning::Pages deploy attempt 2 failed, retrying in 90s"
+          sleep 90
+
+      - name: Deploy to GitHub Pages (attempt 3)
+        id: deploy3
+        if: steps.deploy1.outcome == 'failure' && steps.deploy2.outcome == 'failure'
+        uses: actions/deploy-pages@v5.0.0
+        with:
+          error_count: 15
+
+      # actions/deploy-pages@v5.0.0's own page_url output is read by the
+      # `environment:` block above via `steps.deployment.outputs.page_url`,
+      # so whichever attempt actually succeeded must surface its output
+      # under that same step id, regardless of which of the 3 attempts it
+      # was.
+      - name: Resolve deployment output
+        id: deployment
+        run: |
+          URL="${{ steps.deploy1.outputs.page_url }}"
+          if [ -z "$URL" ]; then URL="${{ steps.deploy2.outputs.page_url }}"; fi
+          if [ -z "$URL" ]; then URL="${{ steps.deploy3.outputs.page_url }}"; fi
+          if [ -z "$URL" ]; then
+            echo "::error::All 3 Pages deploy attempts failed"
+            exit 1
+          fi
+          echo "page_url=$URL" >> "$GITHUB_OUTPUT"
