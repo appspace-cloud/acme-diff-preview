@@ -720,9 +720,15 @@ def test_process_pr_sigterm_mid_diff_drains_without_marking_seen(world, monkeypa
 def test_main_iteration_discovery_failure_relogs_and_returns(monkeypatch):
     monkeypatch.setattr(m, "_prune_helm_cache", lambda: None)
     monkeypatch.setattr(m, "_touch_progress", lambda: None)
-    # Stale token forces the proactive JWT refresh branch first.
+    # Stale token forces the proactive JWT refresh branch first. The age must
+    # be expressed RELATIVE to time.monotonic(): an absolute 0.0 only looks
+    # old on a long-uptime machine (monotonic counts from boot) — on a
+    # freshly booted CI runner monotonic() can be smaller than the 12h TTL,
+    # silently skipping the branch. Caught live: passed on the Mac, failed
+    # on the GitHub runner.
     monkeypatch.setattr(m, "_argocd_token", "tok", raising=False)
-    monkeypatch.setattr(m, "_argocd_token_ts", 0.0, raising=False)
+    monkeypatch.setattr(m, "_argocd_token_ts",
+                        time.monotonic() - m.ARGOCD_TOKEN_TTL - 10, raising=False)
     logins = []
     monkeypatch.setattr(m, "argocd_login", lambda: logins.append(1))
 
@@ -740,7 +746,9 @@ def test_main_iteration_jwt_refresh_failure_is_nonfatal(monkeypatch):
     monkeypatch.setattr(m, "_prune_helm_cache", lambda: None)
     monkeypatch.setattr(m, "_touch_progress", lambda: None)
     monkeypatch.setattr(m, "_argocd_token", "tok", raising=False)
-    monkeypatch.setattr(m, "_argocd_token_ts", 0.0, raising=False)
+    # Relative age, same uptime caveat as the test above.
+    monkeypatch.setattr(m, "_argocd_token_ts",
+                        time.monotonic() - m.ARGOCD_TOKEN_TTL - 10, raising=False)
     calls = {"n": 0}
 
     def flaky_login():
