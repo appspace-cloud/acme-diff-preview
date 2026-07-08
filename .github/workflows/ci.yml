@@ -17,10 +17,10 @@ jobs:
         with:
           python-version: "3.12"
 
-      - name: Run tests
+      - name: Run tests with coverage
         run: |
           pip install -r requirements-dev.txt --quiet
-          pytest tests/ -v
+          pytest tests/ -q --cov=src --cov-report=term
 
       - name: Syntax check Python
         run: |

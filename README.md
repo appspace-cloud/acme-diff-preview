@@ -117,8 +117,10 @@ acme-diff-preview/
 ├── src/
 │   ├── diff_preview.py        Main service (Deployment)
 │   └── dev_hard_refresh.py    Full hard-refresh of all dev/QA apps (CronJob)
-├── tests/
-│   └── test_diff_preview.py   Unit tests (no external dependencies)
+├── tests/                     367 tests, 3 layers — see "Tests" below
+│   ├── test_diff_preview.py           Core unit tests
+│   ├── test_v2*.py                    Per-release regression suites
+│   └── test_coverage_*.py             Synthetic-infrastructure layer
 ├── charts/
 │   └── acme-diff-preview/     Helm chart
 │       ├── Chart.yaml
@@ -139,6 +141,23 @@ acme-diff-preview/
     ├── release.yml            Push to main: publish Helm chart to GitHub Pages
     └── docker.yml             Push of v* tag: build + push image to JFrog
 ```
+
+---
+
+## Tests
+
+```bash
+python3 -m pytest tests/ -q                                  # full suite (367 tests)
+python3 -m pytest tests/ -q --cov=src --cov-report=term      # with the coverage report
+```
+
+**Coverage: 81% of `src/` overall — `dev_hard_refresh.py` at 97%, `diff_preview.py` at 81%** — measured over three complementary layers, all of which run with **zero external infrastructure** (no cluster, no Bitbucket account, no registry), on any machine and in CI:
+
+- **Core unit tests** — the pure logic: diff parsing and filtering, secret redaction, comment formatting, rename/decommission/tier-move classification, the traffic-light coherence rules. Every rule that has ever been wrong in production has a regression test pinning the fix.
+- **Per-release regression suites** (`test_v2*.py`) — each hardening release since v2.4.5 ships with the tests that first reproduced its bugs (red) and now guard them (green): webhook memory caps, HMAC non-ASCII crashes, identity-aware rename following, decommission warnings, downgrade visibility, Pages-deploy races.
+- **Synthetic-infrastructure layer** (`test_coverage_*.py`) — the previously live-only surface, now deterministic: the REAL `http()` retry/backoff engine against a local stub server (5xx retries, 429 `Retry-After` honoring, network failures); both webhook endpoints driven with genuinely HMAC-signed requests against the real health server on an ephemeral port; ArgoCD discovery and the JFrog hard-refresh path through fake `argocd` binaries; the CronJob script end to end (auth, listing, per-app refresh, the timeout guard); and — the centerpiece — **`process_pr`, the ~600-line orchestrator, walked end to end** through a scripted PR world: happy diffs, SHA dedup, republish-forced recomputes, the indeterminate-means-FAILED traffic-light rule, visible-but-non-blocking downgrades, new-environment rendering and structural blocks, and a per-PR crash that must never take down the polling loop.
+
+The discipline that keeps this trustworthy is in [RELEASING.md](RELEASING.md): every change ships with a regression test written first and confirmed failing, then the full suite, then live pod verification.
 
 ---
 
@@ -205,7 +224,7 @@ https://appspace-cloud.github.io/acme-diff-preview
 
 | Trigger | What runs |
 |---|---|
-| PR to `main` | Tests, helm lint, docker build (no push) |
+| PR to `main` | Tests + coverage report, helm lint, docker build (no push) |
 | Push to `main` | Helm chart published to GitHub Pages |
 | Tag `v*` | Docker image built and pushed to JFrog |
 
