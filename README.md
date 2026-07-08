@@ -1,5 +1,10 @@
 # acme-diff-preview
 
+![CI](https://github.com/appspace-cloud/acme-diff-preview/actions/workflows/ci.yml/badge.svg)
+![Release](https://github.com/appspace-cloud/acme-diff-preview/actions/workflows/release.yml/badge.svg)
+![Coverage](badges/coverage.svg)
+![Version](badges/version.svg)
+
 ACME Diff Preview service for Appspace. A long-running Kubernetes Deployment
 that does two distinct jobs:
 
