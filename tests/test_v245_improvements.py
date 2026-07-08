@@ -56,9 +56,9 @@ def test_n1_dispatch_pool_uses_new_env_var(monkeypatch):
 
 
 # ── N2: large-PR table omits no-change rows, keeps a single count line ──────
-def test_n2_no_change_apps_collapsed_to_one_row():
+def test_n2_no_change_apps_collapsed_to_one_row(monkeypatch):
     mod = _import_module()
-    mod.generate_ai_summary = lambda *a, **k: None
+    monkeypatch.setattr(mod, "generate_ai_summary", lambda *a, **k: None)
 
     def mkres(outcome, n=0, text=""):
         secs = mod.parse_diff_sections(text) if text else []
@@ -83,10 +83,10 @@ def test_n2_no_change_apps_collapsed_to_one_row():
     )
 
 
-def test_n2_small_pr_unaffected():
+def test_n2_small_pr_unaffected(monkeypatch):
     """The collapse only applies in large mode; small PRs are unchanged."""
     mod = _import_module()
-    mod.generate_ai_summary = lambda *a, **k: None
+    monkeypatch.setattr(mod, "generate_ai_summary", lambda *a, **k: None)
 
     def mkres(outcome, n=0, text=""):
         secs = mod.parse_diff_sections(text) if text else []

@@ -139,49 +139,49 @@ def test_status_structural_new_env_forces_red_even_with_clean_diff():
     assert _decide_status(result, structural_envs=["pv-broken-a"]) == "FAILED"
 
 # ── Finding 3: fix_stuck_inprogress must resolve "transient" to FAILED ────
-def test_fix_stuck_inprogress_transient_token_resolves_to_failed():
-    m.http = lambda *a, **k: {"state": "INPROGRESS"}
+def test_fix_stuck_inprogress_transient_token_resolves_to_failed(monkeypatch):
+    monkeypatch.setattr(m, "http", lambda *a, **k: {"state": "INPROGRESS"})
     captured = {}
     def fake_post(pr_sha, state, desc, pr_id=None):
         captured["state"] = state
-    m.post_build_status = fake_post
+    monkeypatch.setattr(m, "post_build_status", fake_post)
 
     body = m.format_comment("deadbeef01234567", {"a": _mk_result(m.OUT_INDETERMINATE, m.REASON_RENDER)})
     m.fix_stuck_inprogress("deadbeef01234567", 999, body)
     assert captured["state"] == "FAILED"
 
 
-def test_fix_stuck_inprogress_clean_token_still_successful():
-    m.http = lambda *a, **k: {"state": "INPROGRESS"}
+def test_fix_stuck_inprogress_clean_token_still_successful(monkeypatch):
+    monkeypatch.setattr(m, "http", lambda *a, **k: {"state": "INPROGRESS"})
     captured = {}
     def fake_post(pr_sha, state, desc, pr_id=None):
         captured["state"] = state
-    m.post_build_status = fake_post
+    monkeypatch.setattr(m, "post_build_status", fake_post)
 
     body = m.format_comment("deadbeef01234567", {"a": _mk_result(m.OUT_DIFF, n=1)})
     m.fix_stuck_inprogress("deadbeef01234567", 999, body)
     assert captured["state"] == "SUCCESSFUL"
 
 
-def test_fix_stuck_inprogress_permanent_token_still_failed():
-    m.http = lambda *a, **k: {"state": "INPROGRESS"}
+def test_fix_stuck_inprogress_permanent_token_still_failed(monkeypatch):
+    monkeypatch.setattr(m, "http", lambda *a, **k: {"state": "INPROGRESS"})
     captured = {}
     def fake_post(pr_sha, state, desc, pr_id=None):
         captured["state"] = state
-    m.post_build_status = fake_post
+    monkeypatch.setattr(m, "post_build_status", fake_post)
 
     body = m.format_comment("deadbeef01234567", {"a": _mk_result(m.OUT_INDETERMINATE, m.REASON_OCI_NOT_FOUND)})
     m.fix_stuck_inprogress("deadbeef01234567", 999, body)
     assert captured["state"] == "FAILED"
 
 
-def test_fix_stuck_inprogress_legacy_diff_incomplete_text_now_failed():
+def test_fix_stuck_inprogress_legacy_diff_incomplete_text_now_failed(monkeypatch):
     # Legacy fallback path (comment without a token at all).
-    m.http = lambda *a, **k: {"state": "INPROGRESS"}
+    monkeypatch.setattr(m, "http", lambda *a, **k: {"state": "INPROGRESS"})
     captured = {}
     def fake_post(pr_sha, state, desc, pr_id=None):
         captured["state"] = state
-    m.post_build_status = fake_post
+    monkeypatch.setattr(m, "post_build_status", fake_post)
 
     legacy_comment = "Some comment...\nDiff incomplete, could not evaluate.\n"
     m.fix_stuck_inprogress("deadbeef01234567", 999, legacy_comment)

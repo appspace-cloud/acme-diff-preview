@@ -94,9 +94,9 @@ def test_all_process_pr_call_sites_pass_pr_id():
 
 
 # ── 3. OCI-not-found shows the specific missing chart:version ──────────────
-def test_oci_not_found_shows_specific_chart_prominently():
+def test_oci_not_found_shows_specific_chart_prominently(monkeypatch):
     mod = _import_module()
-    mod.generate_ai_summary = lambda *a, **k: None
+    monkeypatch.setattr(mod, "generate_ai_summary", lambda *a, **k: None)
     detail = "Chart maps:1.110.0-ci.20260630007 not found in asia-east1-docker.pkg.dev/appspace-devops/artifact-engineering. Check that the version exists in the OCI registry."
     results = {"maps": mod.DiffResult("", [], 0, False, detail, mod.OUT_INDETERMINATE, mod.REASON_OCI_NOT_FOUND)}
     comment = mod.format_comment("a" * 40, results, base_sha="b" * 40)
@@ -107,11 +107,11 @@ def test_oci_not_found_shows_specific_chart_prominently():
     assert "**chart version not found in OCI registry**" in comment
 
 
-def test_other_indeterminate_reasons_unaffected():
+def test_other_indeterminate_reasons_unaffected(monkeypatch):
     """Only REASON_OCI_NOT_FOUND gets the prominent callout; other reasons
     keep the existing generic-hint format (no regression for those)."""
     mod = _import_module()
-    mod.generate_ai_summary = lambda *a, **k: None
+    monkeypatch.setattr(mod, "generate_ai_summary", lambda *a, **k: None)
     results = {"app-a": mod.DiffResult("", [], 0, False, "render blew up",
                                        mod.OUT_INDETERMINATE, mod.REASON_RENDER)}
     comment = mod.format_comment("a" * 40, results, base_sha="b" * 40)

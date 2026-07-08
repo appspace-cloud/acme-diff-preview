@@ -73,9 +73,9 @@ def test_broken_patterns_fully_retired():
 
 
 # ── Bug 1: sha extraction against REAL format_comment() output ─────────────
-def test_sha_extraction_matches_real_comment_header():
+def test_sha_extraction_matches_real_comment_header(monkeypatch):
     mod = _import_module()
-    mod.generate_ai_summary = lambda *a, **k: None
+    monkeypatch.setattr(mod, "generate_ai_summary", lambda *a, **k: None)
     results = {"app-a": mod.DiffResult("", [], 0, False, None, mod.OUT_NO_DIFF, "")}
     real_comment = mod.format_comment("deadbeef" + "0" * 32, results, base_sha="b" * 40)
     sha = mod._extract_comment_sha(real_comment)
@@ -89,17 +89,17 @@ def test_sha_extraction_empty_on_no_match():
 
 # ── Bug 2: status-token extraction against REAL format_comment() output,
 # across every outcome branch that sets a different token ──────────────────
-def test_status_token_clean_matches_real_output():
+def test_status_token_clean_matches_real_output(monkeypatch):
     mod = _import_module()
-    mod.generate_ai_summary = lambda *a, **k: None
+    monkeypatch.setattr(mod, "generate_ai_summary", lambda *a, **k: None)
     results = {"app-a": mod.DiffResult("", [], 0, False, None, mod.OUT_NO_DIFF, "")}
     comment = mod.format_comment("a" * 40, results, base_sha="b" * 40)
     assert mod._extract_status_token(comment) == "clean"
 
 
-def test_status_token_permanent_matches_real_output():
+def test_status_token_permanent_matches_real_output(monkeypatch):
     mod = _import_module()
-    mod.generate_ai_summary = lambda *a, **k: None
+    monkeypatch.setattr(mod, "generate_ai_summary", lambda *a, **k: None)
     results = {"app-a": mod.DiffResult("", [], 0, False, "chart not found",
                                        mod.OUT_INDETERMINATE, mod.REASON_OCI_NOT_FOUND)}
     comment = mod.format_comment("a" * 40, results, base_sha="b" * 40)
@@ -110,9 +110,9 @@ def test_status_token_permanent_matches_real_output():
     )
 
 
-def test_status_token_transient_matches_real_output():
+def test_status_token_transient_matches_real_output(monkeypatch):
     mod = _import_module()
-    mod.generate_ai_summary = lambda *a, **k: None
+    monkeypatch.setattr(mod, "generate_ai_summary", lambda *a, **k: None)
     results = {"app-a": mod.DiffResult("", [], 0, False, "timeout",
                                        mod.OUT_INDETERMINATE, mod.REASON_TIMEOUT)}
     comment = mod.format_comment("a" * 40, results, base_sha="b" * 40)
@@ -131,7 +131,7 @@ def test_cross_pod_dedup_actually_works_after_pod_restart(monkeypatch):
     sha X, pod A dies, pod B starts fresh (_seen empty) and sees the same
     PR still at sha X. Pod B must SKIP, not re-run the whole diff."""
     mod = _import_module()
-    mod.generate_ai_summary = lambda *a, **k: None
+    monkeypatch.setattr(mod, "generate_ai_summary", lambda *a, **k: None)
     pr_sha = "deadbeef" + "0" * 32
 
     results = {"app-a": mod.DiffResult("", [], 0, False, None, mod.OUT_NO_DIFF, "")}
@@ -161,7 +161,7 @@ def test_cross_pod_dedup_actually_works_after_pod_restart(monkeypatch):
 # FAILED, not SUCCESSFUL, when recovering a stuck INPROGRESS status ────────
 def test_stuck_inprogress_recovery_marks_permanent_error_as_failed(monkeypatch):
     mod = _import_module()
-    mod.generate_ai_summary = lambda *a, **k: None
+    monkeypatch.setattr(mod, "generate_ai_summary", lambda *a, **k: None)
     results = {"app-a": mod.DiffResult("", [], 0, False, "chart not found",
                                        mod.OUT_INDETERMINATE, mod.REASON_OCI_NOT_FOUND)}
     comment = mod.format_comment("a" * 40, results, base_sha="b" * 40)
