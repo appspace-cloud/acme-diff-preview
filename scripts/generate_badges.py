@@ -77,9 +77,22 @@ def main() -> int:
         return 1
     write_badge("badges/coverage.svg", "coverage", f"{pct}%", color_for(pct))
 
-    r = subprocess.run(["git", "describe", "--tags", "--abbrev=0", "--match", "v*"],
-                       capture_output=True, text=True)
-    version = r.stdout.strip() if r.returncode == 0 and r.stdout.strip() else "unknown"
+    # Latest v* tag by VERSION ORDER, not by ancestry: `git describe` needs
+    # the tag's commit to be reachable from HEAD, which fails on the shallow
+    # (depth=1) CI checkout even after `git fetch --tags` -- the tag refs
+    # arrive, the history behind them does not. Plain ref listing works on
+    # any checkout depth.
+    r = subprocess.run(["git", "tag", "-l", "v*"], capture_output=True, text=True)
+    version = "unknown"
+    if r.returncode == 0:
+        def _key(t: str):
+            try:
+                return [int(p) for p in t.lstrip("v").split(".")]
+            except ValueError:
+                return [-1]
+        tags = [t for t in r.stdout.split() if t.startswith("v")]
+        if tags:
+            version = max(tags, key=_key)
     write_badge("badges/version.svg", "version", version, "#007ec6")
     return 0
 
