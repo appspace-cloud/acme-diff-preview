@@ -147,11 +147,11 @@ acme-diff-preview/
 ## Tests
 
 ```bash
-python3 -m pytest tests/ -q                                  # full suite (386 tests)
+python3 -m pytest tests/ -q                                  # full suite (394 tests)
 python3 -m pytest tests/ -q --cov=src --cov-report=term      # with the coverage report
 ```
 
-**Coverage: 84% of `src/` overall — `dev_hard_refresh.py` at 97%, `diff_preview.py` at 83%** — measured over three complementary layers, all of which run with **zero external infrastructure** (no cluster, no Bitbucket account, no registry), on any machine and in CI:
+**Coverage: 84% of `src/` overall — `dev_hard_refresh.py` at 97%, `diff_preview.py` at 84%** — measured over three complementary layers, all of which run with **zero external infrastructure** (no cluster, no Bitbucket account, no registry), on any machine and in CI:
 
 - **Core unit tests** — the pure logic: diff parsing and filtering, secret redaction, comment formatting, rename/decommission/tier-move classification, the traffic-light coherence rules. Every rule that has ever been wrong in production has a regression test pinning the fix.
 - **Per-release regression suites** (`test_v2*.py`) — each hardening release since v2.4.5 ships with the tests that first reproduced its bugs (red) and now guard them (green): webhook memory caps, HMAC non-ASCII crashes, identity-aware rename following, decommission warnings, downgrade visibility, Pages-deploy races.
