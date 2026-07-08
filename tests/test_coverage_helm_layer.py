@@ -31,11 +31,13 @@ CHART = "appspace-ms"
 
 
 def _mk_fake_helm(tmp_path, *, login_rc=0, pull_mode="ok", count_file=None,
-                  fail_times=0):
+                  fail_times=0, pull_sleep=0, template_sleep=0):
     """Write a fake `helm` binary.
 
     pull_mode: 'ok' (untars a chart dir), 'notfound' (permanent error),
                'transient' (fails `fail_times` times, then succeeds).
+    pull_sleep / template_sleep: seconds each subcommand sleeps before
+              acting — used to exercise the caller's timeout branches.
     template: emits a Deployment whose replicas value is read from a
               `replicas_marker:` line in the LAST -f values file, so the
               diff the service computes is driven by OUR canned values.
@@ -48,6 +50,7 @@ case "$1" in
   registry)
     exit {login_rc};;
   pull)
+    sleep {pull_sleep}
     dest=""; prev=""
     for a in "$@"; do [ "$prev" = "-d" ] && dest="$a"; prev="$a"; done
     mode="{pull_mode}"
@@ -64,6 +67,7 @@ case "$1" in
     printf 'apiVersion: v2\\nname: {CHART}\\n' > "$dest/{CHART}/Chart.yaml"
     exit 0;;
   template)
+    sleep {template_sleep}
     vf=""; prev=""
     for a in "$@"; do [ "$prev" = "-f" ] && vf="$a"; prev="$a"; done
     if grep -q "MARKER_BOOM" "$vf" 2>/dev/null; then

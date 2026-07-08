@@ -1,0 +1,8 @@
+# Standard coverage.py exclusions (documented defaults, see
+# https://coverage.readthedocs.io/en/latest/excluding.html).
+# Only entry-point guards are excluded: `main()` under __main__ never runs
+# under pytest by definition, so counting it misstates the testable surface.
+[report]
+exclude_lines =
+    pragma: no cover
+    if __name__ == .__main__.:
