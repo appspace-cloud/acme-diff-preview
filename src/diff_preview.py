@@ -5161,6 +5161,22 @@ def main():
     else:
         log(f"OCI credentials present (user={OCI_USER})")
 
+    # Same class of silent-degradation risk as OCI_PASS above, but for
+    # request AUTHENTICITY rather than the diff engine itself: _verify_bb_hmac
+    # runs in permissive mode (accepts any unsigned request) when
+    # BB_WEBHOOK_SECRET is empty — see its docstring. That fallback exists
+    # for backward compat during rollout, but has no operational signal of
+    # its own anywhere (no log, no /readyz field) — unlike OCI_PASS, whose
+    # absence is loud both here and in /readyz. A misconfigured or rotated-
+    # away secret would silently reopen the webhook to unsigned requests
+    # with zero visibility. Log it the same way OCI_PASS is logged.
+    if not BB_WEBHOOK_SECRET:
+        log("BB_WEBHOOK_SECRET is empty — the Bitbucket webhook is running in "
+            "PERMISSIVE mode and will accept unsigned requests. Set "
+            "secrets.bbWebhookSecretKey in the chart values.", "WARNING")
+    else:
+        log("Bitbucket webhook HMAC verification is active")
+
     _start_health_server()
     _start_heartbeat()    # keep /healthz alive during long PR processing
     _get_subtask_pool()   # warm the shared thread pool before the first iteration

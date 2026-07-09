@@ -511,3 +511,53 @@ def test_ensure_chart_stale_disk_dir_park_failure_falls_back_to_rmtree(helm_worl
     monkeypatch.setattr(os, "rename", flaky_rename)
     path = m._ensure_chart(DEV_REG, CHART, "3.0.0-dev")
     assert path is not None, "a failed park must still fall back to a working pull"
+
+
+# ── main(): BB_WEBHOOK_SECRET startup visibility (repo audit finding) ────
+
+def _mk_single_iteration_main_harness(monkeypatch):
+    """Same harness as test_main_single_iteration_and_unhandled_error_survival
+    in test_coverage_last_mile.py: runs main() for exactly one iteration,
+    capturing every log() call as (message, severity), so the startup
+    self-checks (OCI_PASS, BB_WEBHOOK_SECRET) can be asserted on without
+    ever entering the real infinite poll loop."""
+    monkeypatch.setattr(m, "_start_health_server",
+                        lambda *a, **k: type("S", (), {"shutdown": lambda self: None})())
+    monkeypatch.setattr(m, "_start_heartbeat", lambda: None)
+    monkeypatch.setattr(m, "argocd_login", lambda: None)
+    monkeypatch.setattr(m, "OCI_USER", "user")
+    monkeypatch.setattr(m, "OCI_PASS", "secret")
+    logs: list = []
+    monkeypatch.setattr(m, "log", lambda msg, severity="INFO", **k: logs.append((str(msg), severity)))
+
+    def one_pass():
+        m._shutdown = True
+    monkeypatch.setattr(m, "main_iteration", one_pass)
+    monkeypatch.setattr(m.time, "sleep", lambda s: None)
+    return logs
+
+
+def test_main_warns_when_bb_webhook_secret_is_empty(monkeypatch):
+    logs = _mk_single_iteration_main_harness(monkeypatch)
+    monkeypatch.setattr(m, "BB_WEBHOOK_SECRET", "")
+    saved = m._shutdown
+    m._shutdown = False
+    try:
+        m.main()
+    finally:
+        m._shutdown = saved
+    hit = [sev for msg, sev in logs if "BB_WEBHOOK_SECRET is empty" in msg and "PERMISSIVE" in msg]
+    assert hit == ["WARNING"], f"an empty webhook secret must warn loudly, same class as OCI_PASS: {logs}"
+
+
+def test_main_confirms_bb_webhook_secret_when_present(monkeypatch):
+    logs = _mk_single_iteration_main_harness(monkeypatch)
+    monkeypatch.setattr(m, "BB_WEBHOOK_SECRET", "a-real-secret")
+    saved = m._shutdown
+    m._shutdown = False
+    try:
+        m.main()
+    finally:
+        m._shutdown = saved
+    assert any("HMAC verification is active" in msg for msg, _ in logs), \
+        f"a configured webhook secret must be confirmed at startup too, not just its absence: {logs}"

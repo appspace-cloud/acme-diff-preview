@@ -325,10 +325,19 @@ All secrets are in the `appspace-devops` project.
 | `acme-repo-username` | JFrog OCI username (`OCI_USER`) for `helm pull` |
 | `acme-repo-password` | JFrog OCI password (`OCI_PASS`) for `helm pull`, GAR proxy, CI |
 | `argocd-jfrog-webhook-shared-secret` | HMAC key for the JFrog webhook endpoint |
+| `argocd-diff-preview-bb-webhook-secret` | HMAC key for the Bitbucket webhook endpoint (`BB_WEBHOOK_SECRET`), injected via the `secrets.bbWebhookSecretKey` chart value |
 
 `OCI_USER` / `OCI_PASS` are **required** for the diff to work: without them every
 `helm pull` fails and the comment shows "diff unavailable" for every app. The pod
 logs an ERROR at startup when `OCI_PASS` is empty.
+
+`BB_WEBHOOK_SECRET` protects the Bitbucket webhook endpoint but is **not required**
+to run: `_verify_bb_hmac` falls back to permissive mode (accepts unsigned requests)
+when it's empty, for backward compatibility during rollout. `secrets.bbWebhookSecretKey`
+defaults to `""` in `values.yaml` (unlike `secrets.ociPassKey`, which ships with a real
+default) — the pod logs a WARNING at startup when it's empty, so a broken or
+never-wired ExternalSecret is visible in logs rather than silently reopening the
+webhook to unsigned requests indefinitely.
 
 To rotate the JFrog webhook secret, follow the runbook at
 `docs/runbooks/jfrog-webhook-secret-rotation.md`.
