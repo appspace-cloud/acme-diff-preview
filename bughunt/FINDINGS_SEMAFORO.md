@@ -1,4 +1,11 @@
-# FINDINGS: traffic-light status coherence (semaforo) — for next phase
+# FINDINGS: traffic-light status coherence (semaforo)
+
+> **STATUS: RESOLVED.** Every finding in this document was implemented and
+> shipped in **v2.5.4/v2.5.5** (the indeterminate-means-FAILED rule, the
+> two-color GREEN/RED model, the machine-readable `[token]` footer) and is
+> live in production. Kept for historical reference like the other files in
+> `bughunt/` — the "Do NOT implement yet" note below described the state on
+> 2026-07-05 and no longer applies.
 
 Generated 2026-07-05. Do NOT implement yet — this is the saved analysis to
 work from in the next session. All findings below were confirmed either by

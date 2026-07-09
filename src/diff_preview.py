@@ -1008,7 +1008,14 @@ ARGOCD_TOKEN_TTL = _env_int("ARGOCD_TOKEN_TTL", 12 * 3600)
 
 
 def _argocd_fetch_token() -> str:
-    """Call ArgoCD REST API to get a session JWT. Returns the raw token string."""
+    """Call ArgoCD REST API to get a session JWT. Returns the raw token string.
+
+    DUPLICATED LOGIC: dev_hard_refresh.py has an identical implementation
+    (_fetch_argocd_token). That script is deliberately standalone (the
+    CronJob runs it as a single file, no imports from this service), so the
+    duplication is accepted on purpose. If the ArgoCD session endpoint,
+    auth payload, or TLS handling changes, UPDATE BOTH copies.
+    """
     url  = f"https://{ARGOCD_SERVER}/api/v1/session"
     data = json.dumps({"username": ARGOCD_USER, "password": ARGOCD_PASS}).encode()
     req  = urllib.request.Request(

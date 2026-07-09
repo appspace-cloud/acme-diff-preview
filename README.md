@@ -181,6 +181,7 @@ All endpoints are served on port **8080** inside the pod.
 | Method | Path | Description |
 |---|---|---|
 | `POST` | `/diff-preview/webhook` | Bitbucket PR webhook (wakes the diff loop) |
+| `GET` | `/diff-preview/stats` | Diff outcome counters, main-render cache hits/misses, last iteration timing (JSON) |
 | `POST` | `/jfrog-webhook` | JFrog OCI push webhook (triggers hard-refresh) |
 | `GET` | `/jfrog-webhook/stats` | Webhook counters (JSON) |
 | `GET` | `/healthz` | Liveness probe |

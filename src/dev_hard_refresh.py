@@ -41,6 +41,13 @@ def _fetch_argocd_token() -> str:
     Uses ARGOCD_USER / ARGOCD_PASS from env (injected by ExternalSecret).
     The token is exported as ARGOCD_AUTH_TOKEN so the argocd CLI picks it up
     without needing `argocd login`, keeping ARGOCD_PASS off the process list.
+
+    DUPLICATED LOGIC: diff_preview.py has an identical implementation
+    (_argocd_fetch_token). This script is deliberately standalone — the
+    CronJob container runs it as a single file with no imports from the
+    service — so extraction into a shared module was rejected on purpose.
+    If the ArgoCD session endpoint, auth payload, or TLS handling changes,
+    UPDATE BOTH copies.
     """
     user     = os.environ.get("ARGOCD_USER", "diff-preview")
     password = os.environ["ARGOCD_PASS"]

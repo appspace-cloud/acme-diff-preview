@@ -1,6 +1,10 @@
 # Dev / CI dependencies only — no runtime deps (stdlib only in production).
-# Pin exact versions to ensure reproducible CI runs.
+# Pin exact versions to ensure reproducible CI runs, and keep them equal to
+# the versions developers actually run locally: a CI pin that lags the local
+# toolchain by a major version (pytest 8 vs 9) is the same class of silent
+# local-vs-CI divergence that has produced real bugs in this repo before
+# (machine-uptime-dependent monotonic timestamps, git init.defaultBranch).
 # To update: pip install pytest --upgrade && pip freeze > requirements-dev.txt
-pytest==8.3.5
+pytest==9.1.1
 pytest-cov==7.1.0
 coverage==7.15.0
