@@ -150,3 +150,38 @@ def test_main_exits_1_when_auth_fails(monkeypatch, capsys):
         dhr.main()
     assert exc.value.code == 1
     assert "authentication failed" in capsys.readouterr().out
+
+
+def test_main_counts_a_real_timeout_toward_the_timeouts_tally(tmp_path, monkeypatch, capsys):
+    # hard_refresh's own timeout unit test already covers the function in
+    # isolation; this closes main()'s own `if elapsed >= TIMEOUT: timeouts
+    # += 1` line, which the earlier "app-bad" happy-path test never touched
+    # because that failure returned in milliseconds, well under TIMEOUT.
+    import subprocess as _sp
+    fake = tmp_path / "argocd"
+    fake.write_text('#!/bin/bash\ncase "$*" in *"app list"*) printf "argocd/app-slow\\n"; exit 0;; *) exit 0;; esac\n')
+    fake.chmod(fake.stat().st_mode | stat.S_IEXEC)
+    monkeypatch.setattr(dhr, "ARGOCD", str(fake))
+    monkeypatch.setattr(dhr, "_fetch_argocd_token", lambda: "tok-xyz")
+
+    ticks = {"n": 0}
+    def fake_monotonic():
+        ticks["n"] += 1
+        return ticks["n"] * 100.0   # every call lands 100s after the previous
+    monkeypatch.setattr(dhr.time, "monotonic", fake_monotonic)
+
+    def fake_run(cmd, **k):
+        if "list" in cmd:
+            class R:
+                returncode = 0
+                stdout = "argocd/app-slow\n"
+                stderr = ""
+            return R()
+        raise _sp.TimeoutExpired(cmd=cmd, timeout=dhr.TIMEOUT)
+    monkeypatch.setattr(_sp, "run", fake_run)
+    try:
+        dhr.main()
+        out = capsys.readouterr().out
+        assert "1 timed out" in out, f"a >=TIMEOUT elapsed failure must be tallied: {out}"
+    finally:
+        os.environ.pop("ARGOCD_AUTH_TOKEN", None)
