@@ -3720,6 +3720,21 @@ _SENSITIVE_KEYS = re.compile(
     r'|encryption[-_]?key|signing[-_]?key)',
 )
 
+def _is_block_scalar_opener(val: str) -> bool:
+    """True if a YAML value is a block-scalar indicator (`|`, `>`), even with
+    a chomping/indentation indicator or a trailing comment.
+
+    The membership test this replaces (val in ("|", "|-", ...)) missed valid
+    openers with a trailing comment, e.g. `tls.crt: |- # PEM cert`: YAML
+    allows a comment after the indicator, so the value string was
+    "|- # PEM cert", not "|-". The opener line got masked, but in_block was
+    never entered, so the continuation lines (the real secret bytes) leaked
+    verbatim -- the same leak class as FIX D / v2.5.0 H3 / v2.5.14, confirmed
+    live. Grammar: [|>] then up to two of {digit 1-9, + , -} in any order,
+    optional whitespace, optional # comment."""
+    return bool(re.match(r'^[|>](?:[1-9]|[+-]){0,2}\s*(?:#.*)?$', val.strip()))
+
+
 def _redact_secret_section(text: str) -> str:
     """Display-time redaction for `kind: Secret` diff sections.
 
@@ -3760,10 +3775,11 @@ def _redact_secret_section(text: str) -> str:
         if m and m.group(3).strip() not in ("{}", "[]", "Opaque"):
             val = m.group(3).strip()
             out.append(f"{m.group(1)}{m.group(2)}[REDACTED]")
-            if val in ("|", "|-", "|+", ">", ">-", ">+"):
-                # Block scalar opener: the value itself is on the following
-                # indented lines, not on this line. Enter block mode so those
-                # continuation lines get masked too instead of leaking.
+            if _is_block_scalar_opener(val):
+                # Block scalar opener (incl. a trailing comment): the value
+                # itself is on the following indented lines, not on this line.
+                # Enter block mode so those continuation lines get masked too
+                # instead of leaking.
                 marker_len = 1 if line[:1] in "+- " else 0
                 rest = line[marker_len:]
                 block_indent = len(rest) - len(rest.lstrip())
@@ -3846,8 +3862,10 @@ def _redact_k8s_env_pairs(text: str) -> str:
             marker, indent_ws, val = vm.group(1), vm.group(2), vm.group(3)
             key_col = len(marker) + len(indent_ws)
             if last_name_sensitive:
-                if val.strip() in ("|", "|-", "|+", ">", ">-", ">+", ""):
-                    # Block scalar opener: keep the `value: |` line, mask body.
+                if val.strip() == "" or _is_block_scalar_opener(val):
+                    # Block scalar opener (incl. a trailing comment), or a bare
+                    # `value:` whose content is on the next lines: keep the
+                    # `value:` line, mask the body.
                     out.append(line)
                     in_block = True
                     block_indent = key_col
@@ -3902,13 +3920,38 @@ def _redact_sensitive(text: str) -> str:
 
     Only the VALUE portion (after ':', '=', or quoted assignment) is redacted;
     key names and diff markers are preserved for context.
+
+    A sensitive key whose value is a YAML block scalar (`private-key: |`) has
+    its continuation lines masked too: matching only the opener line here left
+    the indented body to leak on any non-Secret, non-env resource (e.g. a
+    ConfigMap or CRD holding a PEM key or token), since neither this pass nor
+    _redact_k8s_env_pairs covered that shape. Same block-tracking as the other
+    two redactors.
     """
     redacted_lines = []
+    in_block = False
+    block_indent = 0
     for line in text.splitlines():
+        if in_block:
+            marker_len = 1 if line[:1] in "+- " else 0
+            rest = line[marker_len:]
+            content_indent = len(rest) - len(rest.lstrip())
+            if line.strip() == "":
+                redacted_lines.append(line)
+                continue
+            if content_indent > block_indent:
+                redacted_lines.append(_mask_block_line(line))
+                continue
+            in_block = False  # dedented out of the block -> normal handling
         # Match key: value or key=value patterns (YAML / env-style).
         m = re.match(r'^([+\- ]*)([\w.\-/]+\s*[:=]\s*)(.+)$', line)
         if m and _SENSITIVE_KEYS.search(m.group(2)):
             redacted_lines.append(f"{m.group(1)}{m.group(2)}[REDACTED]")
+            if _is_block_scalar_opener(m.group(3).strip()):
+                marker_len = 1 if line[:1] in "+- " else 0
+                rest = line[marker_len:]
+                block_indent = len(rest) - len(rest.lstrip())
+                in_block = True
         else:
             redacted_lines.append(line)
     return "\n".join(redacted_lines)
