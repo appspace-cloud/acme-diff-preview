@@ -98,6 +98,32 @@ API used to fetch value files. Three mechanisms keep it fast and reliable:
 The on-disk chart cache is bounded (`HELM_CACHE_MAX_CHARTS`) and pruned at the
 start of each iteration so a long-lived pod cannot fill node ephemeral storage.
 
+Four more scale behaviors are worth knowing on very large PRs (v2.5.18,
+`bughunt/FINDINGS_SCALE.md`):
+
+- **AI summary at scale.** Only the `AI_MAX_APPS` (default 40) apps with the
+  most changed resources are included in the AI prompt, with an explicit
+  "+N omitted" note to the model. Without the cap, a 300-app PR built a
+  prompt past the model's context window and the summary silently failed on
+  exactly the PRs that most need one. The deterministic headline (apps,
+  environments, resource counts) always covers **all** apps.
+- **Comment truncation preserves the footer.** Comments over the Bitbucket
+  size limit (~245KB — an 800-app comment measures ~433KB) are cut in the
+  middle, never at the end: the footer's machine-readable `[clean|permanent|
+  transient]` and `[base:...]` tokens always survive, so SHA dedup and the
+  main-advanced check keep working and a pod restart never re-diffs an
+  unchanged mass PR.
+- **Timeout hygiene under load.** A diff that hits `DIFF_TIMEOUT` returns at
+  the timeout (chart pulls no longer block the worker until they finish in
+  the background) and cancels every subtask it had queued on the shared
+  pool, so retries cannot amplify congestion when the registry or renders
+  are already slow.
+- **Over the cap is permanent for that commit.** With more than
+  `MAX_APPS_PER_RUN` affected apps, the same deterministic overflow set is
+  never evaluated for that commit (the build status is FAILED and the
+  comment names the knob). Raise `MAX_APPS_PER_RUN` (`diff.maxAppsPerRun`)
+  or split the PR; retries will not cover them.
+
 ### Tuning knobs (env vars / Helm values)
 
 | Env | Helm value | Default | Purpose |
@@ -112,6 +138,7 @@ start of each iteration so a long-lived pod cannot fill node ephemeral storage.
 | `KUBE_VERSION` | `kubeVersion` | `1.30.0` | `--kube-version` passed to `helm template` |
 | `BB_API_CONCURRENCY` | — | `30` | Max concurrent Bitbucket API calls |
 | `HELM_CACHE_MAX_CHARTS` | — | `60` | Max pulled chart versions kept on disk |
+| `AI_MAX_APPS` | — | `40` | Max changed apps included in the AI summary prompt (largest diffs kept; the headline still counts all apps) |
 
 ---
 

@@ -3130,12 +3130,24 @@ def _run_one_diff(app, pr_sha, main_sha, chart_revision=None, changed_paths=None
 
     # Pull both chart versions in parallel (each is per-key locked to prevent
     # concurrent downloads of the same version).
+    # v2.5.18 (FINDINGS_SCALE S3): this used to be `with ThreadPoolExecutor`.
+    # On a result() timeout the exception left the `with` block, whose
+    # __exit__ calls shutdown(wait=True) — silently blocking until BOTH
+    # pulls actually finished (3 pull attempts x 120s subprocess timeout +
+    # backoff sleeps + an unbounded per-key pull-lock wait): a diff that
+    # "timed out at DIFF_TIMEOUT" really held its DIFF_WORKERS slot for
+    # 6-7+ minutes, exactly when the registry was already degraded, and the
+    # per-diff retries multiplied it. shutdown(wait=False,
+    # cancel_futures=True) in the finally cancels anything still queued and
+    # lets a running pull finish in the background (bounded by its own
+    # subprocess timeouts) without holding this worker hostage; on the
+    # success path both futures are already done, so it is a no-op.
+    _pull_ex = ThreadPoolExecutor(max_workers=2)
     try:
-        with ThreadPoolExecutor(max_workers=2) as ex:
-            pr_fut   = ex.submit(_ensure_chart, registry, chart_name, pr_rev)
-            main_fut = ex.submit(_ensure_chart, registry, chart_name, main_rev)
-            pr_chart   = pr_fut.result(timeout=DIFF_TIMEOUT)
-            main_chart = main_fut.result(timeout=DIFF_TIMEOUT)
+        pr_fut   = _pull_ex.submit(_ensure_chart, registry, chart_name, pr_rev)
+        main_fut = _pull_ex.submit(_ensure_chart, registry, chart_name, main_rev)
+        pr_chart   = pr_fut.result(timeout=DIFF_TIMEOUT)
+        main_chart = main_fut.result(timeout=DIFF_TIMEOUT)
     except OciChartNotFound as e:
         return None, REASON_OCI_NOT_FOUND, str(e)
     except concurrent.futures.TimeoutError:
@@ -3146,12 +3158,24 @@ def _run_one_diff(app, pr_sha, main_sha, chart_revision=None, changed_paths=None
         if isinstance(cause, OciChartNotFound) or isinstance(e, OciChartNotFound):
             return None, REASON_OCI_NOT_FOUND, str(cause or e)
         return None, REASON_OCI_PULL, str(e)[:200]
+    finally:
+        _pull_ex.shutdown(wait=False, cancel_futures=True)
 
     if not pr_chart:
         return None, REASON_OCI_PULL, f"helm pull failed for {chart_name}:{pr_rev}"
     if not main_chart:
         return None, REASON_OCI_PULL, f"helm pull failed for {chart_name}:{main_rev}"
 
+    # v2.5.18 (FINDINGS_SCALE S4): every future this diff submits to the
+    # SHARED subtask pool is tracked here and cancel()ed on every abnormal
+    # exit. Before this, a timed-out diff abandoned its futures in the pool
+    # (queued ones kept a slot, running ones kept a worker) and each of the
+    # up-to-5 retries stacked more on top — classic congestion amplification
+    # exactly when renders were already slow across a mass PR (3 PRs x 16
+    # diff workers = 48 waiters on 32 pool workers). cancel() removes queued
+    # work for free; running tasks are already bounded by their own
+    # subprocess timeouts, and cancel() on a done future is a no-op.
+    _diff_futs = []
     try:
         # Optimization: value files not changed in this PR are byte-identical at
         # pr_sha and main_sha. Fetch them only once (at main_sha) and reuse for
@@ -3160,6 +3184,7 @@ def _run_one_diff(app, pr_sha, main_sha, chart_revision=None, changed_paths=None
         # case of a version-only bump where a single config.yaml changes.
         pool = _get_subtask_pool()
         main_vf_fut = pool.submit(_fetch_value_files, value_files, main_sha)
+        _diff_futs.append(main_vf_fut)
 
         if moved_pr_vals is not None:
             # v2.5.8: env folder moved — PR-side values were already fetched
@@ -3180,6 +3205,8 @@ def _run_one_diff(app, pr_sha, main_sha, chart_revision=None, changed_paths=None
 
             pr_changed_fut = pool.submit(_fetch_value_files, pr_changed_vf, pr_sha) \
                              if pr_changed_vf else None
+            if pr_changed_fut is not None:
+                _diff_futs.append(pr_changed_fut)
 
             main_vals = main_vf_fut.result(timeout=DIFF_TIMEOUT)
 
@@ -3238,6 +3265,7 @@ def _run_one_diff(app, pr_sha, main_sha, chart_revision=None, changed_paths=None
         else:
             # No changed_paths info — fall back to fetching both sides in full.
             pr_vf_fut = pool.submit(_fetch_value_files, value_files, pr_sha)
+            _diff_futs.append(pr_vf_fut)
             main_vals = main_vf_fut.result(timeout=DIFF_TIMEOUT)
             pr_vals   = pr_vf_fut.result(timeout=DIFF_TIMEOUT)
 
@@ -3259,13 +3287,16 @@ def _run_one_diff(app, pr_sha, main_sha, chart_revision=None, changed_paths=None
 
         pool     = _get_subtask_pool()
         pr_fut   = pool.submit(_helm_template, pr_chart, release, namespace, pr_vals)
+        _diff_futs.append(pr_fut)
         main_fut = pool.submit(_helm_template, main_chart, release, namespace, main_vals) \
                    if needs_main_render else None
+        if main_fut is not None:
+            _diff_futs.append(main_fut)
 
         pr_yaml, pr_err = pr_fut.result(timeout=DIFF_TIMEOUT)
         if pr_err:
-            if main_fut:
-                main_fut.cancel()
+            for _f in _diff_futs:
+                _f.cancel()
             return None, _render_reason(pr_err), pr_err
 
         if needs_main_render:
@@ -3282,8 +3313,12 @@ def _run_one_diff(app, pr_sha, main_sha, chart_revision=None, changed_paths=None
                         del _main_render_cache[k]
 
     except (subprocess.TimeoutExpired, concurrent.futures.TimeoutError):
+        for _f in _diff_futs:
+            _f.cancel()   # S4: never leave zombies in the shared pool
         return None, REASON_TIMEOUT, f"render exceeded {DIFF_TIMEOUT}s"
     except Exception as e:
+        for _f in _diff_futs:
+            _f.cancel()   # S4: same rule for every abnormal exit
         return None, REASON_RENDER, str(e)[:200]
 
     pr_resources = _parse_manifest_resources(pr_yaml)
@@ -3539,15 +3574,60 @@ def find_existing_comment(pr_id):
         pages += 1
     return None, "", ""
 
+def _truncate_comment(body: str) -> str:
+    """Cap a comment body at MAX_COMMENT_BYTES, PRESERVING the footer.
+
+    v2.5.18 (FINDINGS_SCALE S2): the old truncation cut from the END, which
+    destroyed the footer on every oversized comment — and mass PRs are
+    ALWAYS oversized (measured 433KB pre-truncation at 800 apps, vs the
+    245KB Bitbucket limit). The footer carries the two machine-readable
+    tokens the whole dedup design depends on: [clean|permanent|transient]
+    (drives the retry decision) and [base:xxxxxxxx] (the F1 main-advanced
+    check). With both gone, a pod restart re-diffed the entire, unchanged
+    mass PR from scratch (measured replay: rerun=True), cross-pod dedup was
+    fully broken for these PRs, and fix_stuck_inprogress fell through all
+    its heuristics. Now the cut removes MIDDLE content (diff blocks) and
+    always re-appends the real footer, so the marker, the sha header, and
+    both tokens survive any size. If the cut lands inside a ``` fence, the
+    fence is closed so the note and footer never render as code.
+
+    Bodies without a recognizable '---\\n**Status:**' footer (legacy or
+    hand-built) keep the old end-cut behavior, marker included in the note —
+    the exact contract test_upsert_comment_truncates_oversized_bodies pins.
+    """
+    encoded = body.encode("utf-8")
+    if len(encoded) <= MAX_COMMENT_BYTES:
+        return body
+    note = (f"\n\n*... diff content truncated ({len(encoded)//1024}KB exceeds "
+            f"the Bitbucket comment limit) - see the pod logs or ArgoCD UI "
+            f"for the full diff*\n")
+    footer_at = body.rfind("\n---\n**Status:**")
+    if footer_at != -1:
+        footer = body[footer_at:]
+        # 16 spare bytes cover a possible closing ``` fence added below.
+        budget = (MAX_COMMENT_BYTES - len(footer.encode("utf-8"))
+                  - len(note.encode("utf-8")) - 16)
+        if budget > 0:
+            head = encoded[:budget].decode("utf-8", errors="ignore")
+            if head.count("```") % 2 == 1:
+                head += "\n```"
+            return head + note + footer
+    # Legacy fallback: end-cut, keeping the marker so find_existing_comment
+    # still matches the truncated comment.
+    cutoff = MAX_COMMENT_BYTES - 300
+    out = encoded[:cutoff].decode("utf-8", errors="ignore")
+    out += (f"\n\n*... comment truncated ({len(encoded)//1024}KB exceeds limit)"
+            f" - see ArgoCD UI for full diff - {COMMENT_MARKER}*")
+    return out
+
+
 def upsert_comment(pr_id, body, existing_id=None):
     """Post or update PR comment. Truncates if over limit; posts fallback on error."""
-    encoded = body.encode("utf-8")
-    if len(encoded) > MAX_COMMENT_BYTES:
-        cutoff = MAX_COMMENT_BYTES - 300
-        body   = body.encode("utf-8")[:cutoff].decode("utf-8", errors="ignore")
-        body  += (f"\n\n*... comment truncated ({len(encoded)//1024}KB exceeds limit)"
-                   f" - see ArgoCD UI for full diff - {COMMENT_MARKER}*")
-        log(f"[comment] truncated: {len(encoded)//1024}KB -> {MAX_COMMENT_BYTES//1024}KB", "WARNING")
+    orig_bytes = len(body.encode("utf-8"))
+    if orig_bytes > MAX_COMMENT_BYTES:
+        body = _truncate_comment(body)
+        log(f"[comment] truncated: {orig_bytes//1024}KB -> "
+            f"{MAX_COMMENT_BYTES//1024}KB (footer/tokens preserved)", "WARNING")
     payload = {"content": {"raw": body}}
     try:
         if existing_id:
@@ -3666,6 +3746,17 @@ LARGE_PR_INLINE_APPS     = _env_int("LARGE_PR_INLINE_APPS", 6)
 # Limits for what we send to the model.
 AI_MAX_SECTIONS_PER_APP  = 10
 AI_MAX_BODY_CHARS        = 1500
+# v2.5.18 (FINDINGS_SCALE S1): cap how many APPS go into the prompt. The two
+# caps above bound each app's contribution but not the number of apps, so a
+# mass version bump built an unbounded prompt: measured 4.3MB (~1.08M tokens)
+# at 300 changed apps and 11.6MB at 800 — past gemini-2.5-flash's ~1M-token
+# context, so exactly the PRs that most need a summary silently lost it (the
+# Vertex call failed on length and the comment posted without AI), after
+# uploading megabytes per attempt. 40 apps x 10 sections x ~1.5KB ≈ 700KB
+# (~180K tokens) — wide margin. The apps with the largest diffs are kept
+# (same top-N idea as LARGE_PR_INLINE_APPS) and the model is told how many
+# were omitted; the deterministic headline still counts ALL apps.
+AI_MAX_APPS              = _env_int("AI_MAX_APPS", 40)
 
 def _gcp_access_token() -> str:
     """Return a valid GCE access token, reusing the cached one when possible.
@@ -4013,8 +4104,22 @@ def generate_ai_summary(app_results: dict) -> str | None:
             results[app].n_res for app in changed if app in results
         )
 
+        # v2.5.18 (S1): cap the number of apps in the prompt — see AI_MAX_APPS
+        # above for the measured sizes that motivated this. Keep the apps with
+        # the most changed resources (the ones a summary matters most for);
+        # sorted() is stable, so ties keep the original dict order.
+        prompt_apps = list(changed)
+        omitted = 0
+        if len(prompt_apps) > AI_MAX_APPS:
+            prompt_apps = sorted(
+                changed, key=lambda a: results[a].n_res, reverse=True)[:AI_MAX_APPS]
+            omitted = len(changed) - AI_MAX_APPS
+            print(f"      [AI] Prompt capped to {AI_MAX_APPS} of "
+                  f"{len(changed)} changed apps ({omitted} omitted)")
+
         sections_parts = []
-        for app, sections in changed.items():
+        for app in prompt_apps:
+            sections = changed[app]
             sections_parts.append(f"### App: {app}")
             for header, body in sections[:AI_MAX_SECTIONS_PER_APP]:
                 # v2.5.14: this used to call _redact_sensitive() directly,
@@ -4039,6 +4144,14 @@ def generate_ai_summary(app_results: dict) -> str | None:
                 if len(body) > AI_MAX_BODY_CHARS:
                     trimmed += "\n... (truncated)"
                 sections_parts.append(f"Resource: {header}\n{trimmed}")
+        if omitted:
+            # Tell the model the data is a size-capped sample, so it never
+            # phrases the summary as if these were ALL the changes. The
+            # deterministic headline (built in code below) covers all apps.
+            sections_parts.append(
+                f"### {omitted} more app(s) omitted from this prompt for size. "
+                f"The headline counts cover ALL apps; treat the sections above "
+                f"as a representative sample of the largest changes.")
 
         error_note = ""
         if errors:
@@ -4247,6 +4360,22 @@ def _format_app_diff_block(app, sections, diff_text, show_diff=True, n_res=None)
     return out
 
 
+def _comment_header(pr_sha: str) -> str:
+    """The one true '**Commit**' header line for EVERY comment body.
+
+    v2.5.18 (FINDINGS_SCALE S6): _extract_comment_sha parses this exact
+    shape back out of a posted comment for the cross-pod SHA dedup. v2.4.6
+    fixed a generated-vs-parsed drift in format_comment's header; the SAME
+    bug class had been reintroduced in the hand-built no-apps and error
+    bodies, which wrote a plain 'Commit `sha`' (no bold) — invisible to the
+    extractor, so every pod restart reprocessed those PRs once (cheap for
+    no-apps, a full re-run for errored PRs). Every body builder now goes
+    through this single source of truth, and a source-grep regression test
+    (test_v2518_scale_hardening.py) blocks the plain form from returning.
+    """
+    return f"**Commit** `{pr_sha[:8]}` \u2192 `main` | `{BB_REPO}`"
+
+
 def format_comment(pr_sha, app_results, skipped_apps=None, base_sha="",
                     new_env_lines=None, new_env_structural=False, new_env_desc="",
                     decommission_lines=None):
@@ -4291,7 +4420,7 @@ def format_comment(pr_sha, app_results, skipped_apps=None, base_sha="",
     large_label = f" | \U0001f4e6 Large changeset ({len(changed_apps)} apps)" if is_large else ""
     lines = [
         f"## \U0001f52d {STATUS_NAME}", "",
-        f"**Commit** `{pr_sha[:8]}` \u2192 `main` | `{BB_REPO}`{large_label}", "",
+        f"{_comment_header(pr_sha)}{large_label}", "",
     ]
 
     # ── Environment decommission warning (v2.5.10) ───────────────────
@@ -4432,8 +4561,15 @@ def format_comment(pr_sha, app_results, skipped_apps=None, base_sha="",
 
     # ── Skipped apps note ────────────────────────────────────────────
     if skipped_apps:
+        # v2.5.18 (FINDINGS_SCALE S5): the cap cut is deterministic (affected
+        # is sorted) and a clean over-cap run IS marked seen, so these SAME
+        # apps will not be evaluated on any retry of this commit — only a new
+        # commit, a main advance, or raising MAX_APPS_PER_RUN changes the
+        # outcome. Say so plainly instead of implying a transient skip.
         lines += [
-            f"*{len(skipped_apps)} app(s) skipped (cap {MAX_APPS_PER_RUN}): "
+            f"*{len(skipped_apps)} app(s) over the cap ({MAX_APPS_PER_RUN}) "
+            f"will not be evaluated for this commit — raise MAX_APPS_PER_RUN "
+            f"(`diff.maxAppsPerRun`) to cover them: "
             f"{', '.join(skipped_apps[:5])}{'...' if len(skipped_apps) > 5 else ''}*", ""]
 
     # ── New environment(s) section (v2.5.4, Finding 4) ────────────────
@@ -4618,7 +4754,7 @@ def process_pr(pr, path_map, base_sha=""):
 
                 lines = [
                     f"## \U0001f52d {STATUS_NAME}", "",
-                    f"**Commit** `{pr_sha[:8]}` \u2192 `main` | `{BB_REPO}`", "",
+                    _comment_header(pr_sha), "",
                 ] + new_env_lines
 
                 if structural_envs:
@@ -4653,7 +4789,7 @@ def process_pr(pr, path_map, base_sha=""):
                 "No ArgoCD apps affected by this PR", pr_id=pr_id)
             no_apps_body = (
                 f"## \U0001f52d {STATUS_NAME}\n\n"
-                f"Commit `{pr_sha[:8]}` vs `main` | `{BB_REPO}`\n\n"
+                f"{_comment_header(pr_sha)}\n\n"
                 f"\u2705 **No ArgoCD apps are currently affected by the files "
                 f"changed in this commit.**\n\n"
                 f"This is expected for documentation, tooling, or script changes that "
@@ -5027,8 +5163,8 @@ def process_pr(pr, path_map, base_sha=""):
             n_skipped = len(skipped_apps)
             extra = f" | {sections_total} resource(s) changed" if sections_total else ""
             post_build_status(pr_sha, "FAILED",
-                f"{n_skipped} app(s) not evaluated (cap={MAX_APPS_PER_RUN}){extra} — review comment",
-                pr_id=pr_id)
+                f"{n_skipped} app(s) not evaluated (cap={MAX_APPS_PER_RUN} — raise "
+                f"MAX_APPS_PER_RUN to cover){extra} — review comment", pr_id=pr_id)
         elif any_unknown:
             # v2.5.4 (Finding 1): ANY indeterminate app blocks now, whether or
             # not other apps in the same PR produced a real diff. Before this
@@ -5085,7 +5221,7 @@ def process_pr(pr, path_map, base_sha=""):
             pass
         err_body = (
             f"## \U0001f52d {STATUS_NAME}\n\n"
-            f"Commit `{pr_sha[:8]}` vs `main` | `{BB_REPO}`\n\n"
+            f"{_comment_header(pr_sha)}\n\n"
             f"\u274c **Error processing diff:** {str(e)[:400]}\n\n"
             f"---\n**Status:** \u274c Error running diff\n"
             f"*{_ts()} \u2014 {COMMENT_MARKER} [permanent]" + (f" [base:{base_sha[:8]}]" if base_sha else "") + "*"
