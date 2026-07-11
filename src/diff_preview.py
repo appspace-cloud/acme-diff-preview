@@ -887,26 +887,48 @@ def _parse_retry_after(value):
 # ── HTTP connection pooling (v2.5.20, E1) ────────────────────────────
 # Every http() / raw-file call used to pay a full TCP+TLS handshake via
 # urllib.request.urlopen — ~100-300ms each, times ~2-3K Bitbucket calls
-# on a mass-PR pass. One persistent HTTPSConnection per (thread, host,
-# timeout), kept in threading.local(), removes that overhead. Design
-# constraints, in order:
+# on a mass-PR pass. One persistent HTTPSConnection per (thread, host),
+# kept in threading.local(), removes that overhead. Design constraints:
 #   1. NEVER fail a request the old path could serve: any pool problem
-#      (stale keep-alive, redirect, weird scheme) falls back to plain
-#      urlopen, transparently.
+#      (stale keep-alive, redirect, weird scheme, a configured proxy)
+#      falls back to plain urlopen, transparently.
 #   2. Error semantics identical to urlopen: non-2xx raises
 #      urllib.error.HTTPError with .code/.headers/.read(), so the retry
 #      and Retry-After logic in http() runs unchanged.
 #   3. Stdlib only, matching the rest of the service.
-# Threads from the long-lived worker pools keep their connection for the
-# pod's lifetime; short-lived webhook handler threads (ThreadingHTTPServer
-# spawns one per request) let theirs be closed by GC — no worse than the
-# old one-connection-per-call behavior.
+#
+# v2.5.21 hardening after the five-pass review of v2.5.20:
+#   F3 — raw http.client ignores HTTPS_PROXY/HTTP_PROXY; urlopen honors
+#        them. If a proxy is configured for the target, defer to urlopen.
+#   F4 — key by HOST only (timeout set per-request on the connection),
+#        not (host, timeout): the old key held two live sockets per worker
+#        to the same host (http()'s 60s vs the raw fetch's 20s).
+#   F2 — worker threads from ephemeral pools must run
+#        _close_pooled_connections() on exit so their sockets are closed
+#        deterministically instead of leaking until GC.
 # Operator escape hatch: DIFF_HTTP_POOLING=off routes everything straight
 # to urlopen (counted in http_pool_fallbacks).
 HTTP_POOLING_ENABLED = os.environ.get(
     "DIFF_HTTP_POOLING", "on").strip().lower() not in ("off", "0", "false")
 
 _http_conn_local = threading.local()
+
+
+def _close_pooled_connections():
+    """Close and drop every pooled HTTPSConnection owned by the CALLING
+    thread. v2.5.21 (F2): ephemeral ThreadPoolExecutors reap their workers
+    when torn down; without this the workers' keep-alive sockets stayed
+    open until GC, leaking file descriptors across a mass-PR pass. Cheap,
+    idempotent, and safe to call on a thread that never pooled anything."""
+    pool = getattr(_http_conn_local, "conns", None)
+    if not pool:
+        return
+    for conn in list(pool.values()):
+        try:
+            conn.close()
+        except Exception:
+            pass
+    pool.clear()
 
 
 class _PooledResponse:
@@ -929,18 +951,22 @@ class _PooledResponse:
 
 
 def _pooled_urlopen(req, timeout=60):
-    """urlopen drop-in that reuses one HTTPSConnection per (thread, host,
-    timeout). Falls back to urllib.request.urlopen(context=_ssl) whenever
-    the pooled path cannot serve the request safely."""
+    """urlopen drop-in that reuses one HTTPSConnection per (thread, host).
+    Falls back to urllib.request.urlopen(context=_ssl) whenever the pooled
+    path cannot serve the request safely (pooling off, non-HTTPS, a
+    configured proxy, redirects, or a repeated connection failure)."""
     parsed = urllib.parse.urlsplit(req.full_url)
-    if not HTTP_POOLING_ENABLED or parsed.scheme != "https":
+    # F3: if any proxy is configured, urllib.request handles it and raw
+    # http.client does not — defer so we never silently bypass egress proxy.
+    if (not HTTP_POOLING_ENABLED or parsed.scheme != "https"
+            or urllib.request.getproxies()):
         _diff_stats["http_pool_fallbacks"] += 1
         return urllib.request.urlopen(req, context=_ssl, timeout=timeout)
 
     pool = getattr(_http_conn_local, "conns", None)
     if pool is None:
         pool = _http_conn_local.conns = {}
-    key = (parsed.netloc, timeout)
+    key = parsed.netloc                       # F4: host only, not (host, timeout)
     path = parsed.path or "/"
     if parsed.query:
         path += "?" + parsed.query
@@ -958,6 +984,14 @@ def _pooled_urlopen(req, timeout=60):
                 parsed.netloc, timeout=timeout, context=_ssl)
             pool[key] = conn
             _diff_stats["http_pool_fresh_conns"] += 1
+        else:
+            # F4: reused socket — apply THIS call's timeout to it.
+            try:
+                conn.timeout = timeout
+                if conn.sock is not None:
+                    conn.sock.settimeout(timeout)
+            except Exception:
+                pass
         try:
             conn.request(req.get_method(), path, body=req.data,
                          headers=dict(req.header_items()))
@@ -967,15 +1001,17 @@ def _pooled_urlopen(req, timeout=60):
             headers = resp.headers
         except Exception:
             # Stale keep-alive, half-closed socket, anything: drop the
-            # connection. First failure retries on a fresh one; a second
-            # failure means something is genuinely wrong with the pooled
-            # path — hand the request to urllib untouched.
+            # connection. A REUSED connection retries once on a fresh one
+            # (the stale keep-alive case). A FRESH connection that fails has
+            # nothing to gain from a second fresh attempt (F1-review Pass A:
+            # that just tripled outage latency), so it goes straight to the
+            # urllib fallback.
             try:
                 conn.close()
             except Exception:
                 pass
             pool.pop(key, None)
-            if fresh:
+            if fresh or not reused:
                 _diff_stats["http_pool_fallbacks"] += 1
                 return urllib.request.urlopen(
                     req, context=_ssl, timeout=timeout)
@@ -4102,6 +4138,11 @@ _SENSITIVE_KEYS = re.compile(
     r'|encryption[-_]?key|signing[-_]?key)',
 )
 
+# v2.5.21 (F1): hard cap on the helm-error text fed to _redact_error_detail's
+# regex, applied BEFORE matching to kill the quadratic backtracking. Far above
+# the caller's own [:400] so error diagnostics keep full context.
+_REDACT_DETAIL_MAX_CHARS = 4000
+
 def _is_block_scalar_opener(val: str) -> bool:
     """True if a YAML value is a block-scalar indicator (`|`, `>`), even with
     a chomping/indentation indicator or a trailing comment.
@@ -4333,9 +4374,22 @@ def _redact_error_detail(detail: str) -> str:
     `<sensitive-key>:` or `<sensitive-key>=` token while keeping the key name
     and the surrounding message intact for diagnosis. Fail-safe: on any regex
     trouble, returns a generic string rather than risking the raw detail.
+
+    v2.5.21 (F1, ReDoS): the caller truncated with [:400] AFTER this ran, so
+    the regex saw the full untruncated helm stderr. The `[A-Za-z0-9_.\\-]*`
+    prefix backtracks quadratically on a long dashed near-miss run
+    (`aaa-aaa-...`) — content an attacker can put in a values file that helm
+    then echoes. Measured 80KB -> 132s of CPU pinning a worker thread. The
+    fix is to bound the input to a few KB BEFORE the regex: the caller only
+    keeps [:400] anyway, and a much larger head still leaves ample context
+    for masking. The bound makes the quadratic term a small constant.
     """
     if not detail:
         return detail
+    # Bound BEFORE the regex — this is the actual ReDoS fix. Well above the
+    # caller's own [:400] so diagnostics are unaffected.
+    if len(detail) > _REDACT_DETAIL_MAX_CHARS:
+        detail = detail[:_REDACT_DETAIL_MAX_CHARS]
     try:
         # key: value  and  key=value  where the key looks sensitive.
         def _mask(match):
@@ -5267,22 +5321,30 @@ def process_pr(pr, path_map, base_sha=""):
 
         def run_diff(app):
             t0 = time.monotonic()
-            # FIX A (v2.4.9): if the PR set this app's appspace.version to an
-            # unsafe/invalid value, do not diff against the current revision
-            # (that would render identically and show a misleading green "no
-            # changes"). Report it as a permanent, blocking failure instead.
-            if app in invalid_version_apps:
-                result = DiffResult("", [], 0, False,
-                                    "appspace.version was rejected as unsafe/invalid",
-                                    OUT_INDETERMINATE, REASON_INVALID_VERSION)
-                return app, result, round(time.monotonic() - t0, 1)
-            chart_rev = pr_chart_revisions.get(app)
-            result = argocd_diff(app, pr_sha, main_sha=base_sha,
-                                 chart_revision=chart_rev,
-                                 changed_paths=_changed_paths_set,
-                                 renames=renames)
-            elapsed = round(time.monotonic() - t0, 1)
-            return app, result, elapsed
+            try:
+                # FIX A (v2.4.9): if the PR set this app's appspace.version to an
+                # unsafe/invalid value, do not diff against the current revision
+                # (that would render identically and show a misleading green "no
+                # changes"). Report it as a permanent, blocking failure instead.
+                if app in invalid_version_apps:
+                    result = DiffResult("", [], 0, False,
+                                        "appspace.version was rejected as unsafe/invalid",
+                                        OUT_INDETERMINATE, REASON_INVALID_VERSION)
+                    return app, result, round(time.monotonic() - t0, 1)
+                chart_rev = pr_chart_revisions.get(app)
+                result = argocd_diff(app, pr_sha, main_sha=base_sha,
+                                     chart_revision=chart_rev,
+                                     changed_paths=_changed_paths_set,
+                                     renames=renames)
+                elapsed = round(time.monotonic() - t0, 1)
+                return app, result, elapsed
+            finally:
+                # v2.5.21 (F2): release this worker's pooled sockets before it
+                # returns to the pool, so a torn-down ThreadPoolExecutor does
+                # not leak keep-alive FDs. Reuse still happens WITHIN a single
+                # diff (which makes several BB calls); only cross-diff idle
+                # sockets are closed.
+                _close_pooled_connections()
 
         def process_batch(apps, workers):
             """Diff a list of apps with a bounded pool, accumulating results.

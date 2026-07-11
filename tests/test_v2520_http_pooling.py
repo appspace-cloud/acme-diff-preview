@@ -115,22 +115,29 @@ def test_e1_connection_reused_within_thread(monkeypatch):
 
 
 def test_e1_reconnect_on_stale_connection(monkeypatch):
-    """First request on a reused connection dies (stale keep-alive) —
-    must retry transparently on a fresh connection, not raise."""
+    """A REUSED connection whose request dies (stale keep-alive) must retry
+    transparently on a fresh connection, not raise. v2.5.21: the retry-on-
+    fresh path is specifically for reused connections; a first-time fresh
+    failure goes straight to urllib fallback instead (see
+    test_e1_fallback_to_urllib_when_pool_broken)."""
     _FakeConn.instances = []
 
-    def factory(host, timeout=None, context=None):
-        # first instance fails its first request, the replacement succeeds
-        fail = 1 if not _FakeConn.instances else 0
-        return _FakeConn(host, timeout=timeout, fail_times=fail)
-
-    monkeypatch.setattr(m._http_client, "HTTPSConnection", factory)
+    monkeypatch.setattr(m._http_client, "HTTPSConnection", _FakeConn)
     _fresh_pool()
 
+    # 1st call: fresh connection, succeeds, stays pooled.
+    with m._pooled_urlopen(_req(), timeout=60) as r:
+        assert r.read() == b'{"ok": true}'
+    assert len(_FakeConn.instances) == 1
+    # Mark the pooled connection stale so its next request raises once.
+    pooled = _FakeConn.instances[0]
+    pooled.fail_times = 1
+    # 2nd call: reuses the stale connection, it fails, retries on a fresh one
+    # (which succeeds — a plain _FakeConn with fail_times=0).
     with m._pooled_urlopen(_req(), timeout=60) as r:
         assert r.read() == b'{"ok": true}'
     assert len(_FakeConn.instances) == 2
-    assert _FakeConn.instances[0].closed, "stale connection must be closed"
+    assert pooled.closed, "stale connection must be closed"
 
 
 def test_e1_fallback_to_urllib_when_pool_broken(monkeypatch):

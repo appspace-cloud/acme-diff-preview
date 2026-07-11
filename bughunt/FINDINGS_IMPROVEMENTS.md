@@ -215,3 +215,45 @@ the renderer fetches the URL on render. Fix: `_sanitize_ai_summary()`
 strips Markdown images (keeping alt text), raw HTML tags, HTML comments,
 and neutralizes fences from the model's output before it is embedded —
 never from the deterministic, code-built head line.
+
+
+## Pass P — post-v2.5.20 five-pass adversarial review (2026-07-11)
+
+Focus: the v2.5.20 connection-pooling code (hours old) plus angles earlier
+passes did not cover (ReDoS, FD lifecycle, proxy semantics). Labels P1..P5
+to avoid colliding with the E/F/M/R prefixes above.
+
+### P1 (HIGH, DoS — FIXED v2.5.21) — ReDoS worker starvation in _redact_error_detail
+`helm template` errors echo the offending values-file content, and
+`_redact_error_detail` regexed the FULL untruncated stderr before the
+caller's `[:400]`. The `[A-Za-z0-9_.\-]*` prefix backtracks quadratically
+on a dashed near-miss run (`aaa-aaa-...`) an attacker can put in a values
+file. Measured 20K->8s, 40K->33s, 80K->132s; a ~200KB blob pinned a worker
+thread ~15 min — an unauthenticated-input DoS gated only by opening a PR.
+Fix: bound the input to `_REDACT_DETAIL_MAX_CHARS` (4000) BEFORE the regex.
+
+### P2 (LOW-MED, FD leak — FIXED v2.5.21) — pooled sockets leaked on ephemeral pools
+Per-diff/per-PR `ThreadPoolExecutor`s spawn workers that each stash an
+`HTTPSConnection` in `threading.local()`; when the pool is torn down the
+threads die with sockets still open (GC-timed close only). Fix:
+`_close_pooled_connections()` run in `run_diff`'s `finally`, releasing each
+worker's sockets before it idles. Reuse still happens within a single diff.
+
+### P3 (LOW, correctness — FIXED v2.5.21) — pool ignored HTTPS_PROXY
+Raw `http.client` does not honor proxy env vars; `urlopen` does. Proven
+with a local listener (urlopen sent CONNECT, the pool went direct). Latent
+today (no egress proxy in the pods) but breaks the drop-in guarantee. Fix:
+if `urllib.request.getproxies()` is non-empty, defer to `urlopen`.
+
+### P4 (INFO — FIXED v2.5.21, folded into P2) — two sockets per worker per host
+Keying by `(host, timeout)` held two live Bitbucket sockets per worker
+(http()'s 60s vs the raw fetch's 20s). Fix: key by host only, set the
+timeout per-request on the connection.
+
+### P5 (INFO — documented, no code change) — /stats readable cluster-wide
+The health/stats server binds all interfaces and the chart ships no
+NetworkPolicy, so any pod in the shared devops cluster can read
+`/diff-preview/stats` (counters + running version). Webhooks are
+HMAC-protected, so this is metadata exposure, not a control surface. A
+NetworkPolicy would harden it but must preserve the webhook ingress path;
+tracked here as a candidate, deliberately not changed unilaterally.
