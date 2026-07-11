@@ -62,6 +62,7 @@ jobs:
           tags: ${{ env.JFROG_REGISTRY }}/${{ env.IMAGE_NAME }}:${{ steps.meta.outputs.version }}
           build-args: |
             ARGOCD_VERSION=v3.4.3
+            APP_VERSION=${{ steps.meta.outputs.version }}
           # No registry cache — avoids the manifest write that triggers an
           # overwrite-permission error on JFrog when the tag already exists.
           cache-from: ''

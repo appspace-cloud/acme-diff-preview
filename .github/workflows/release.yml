@@ -1,12 +1,21 @@
 name: Release Charts
 
+# v2.5.19 (M1): the github-release job below used to trigger ONLY on push to
+# main, but the v* tag is pushed 1-2 minutes AFTER the merge, so the backfill
+# ran before the tag existed and did nothing — every release (v2.5.16/17/18)
+# needed a manual job re-run. Adding the tag trigger fires the release job the
+# moment the tag lands; per-job `if:` keeps each job on its correct event.
 on:
   push:
     branches:
       - main
+    tags:
+      - 'v*'
 
 jobs:
   release:
+    # Chart-releaser publishes from main only — never on a v* tag push.
+    if: startsWith(github.ref, 'refs/heads/')
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -57,6 +66,9 @@ jobs:
   # the commit in one step). Idempotent: skips any tag that already has a
   # release, so it also backfills every past v* tag the first time it runs.
   github-release:
+    # Runs on BOTH events (no `if`): on a v* tag push it creates that
+    # release immediately (no more race with the backfill); on a main push
+    # it backfills any tag still missing a release. Idempotent either way.
     runs-on: ubuntu-latest
     permissions:
       contents: write
