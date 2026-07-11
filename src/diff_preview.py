@@ -4218,7 +4218,32 @@ def _format_app_diff_block(app, sections, diff_text, show_diff=True, n_res=None)
                                "ArgoCD for the full resource diff)")
             out += [f"**`{hdr}`**", "", "```diff", body_disp, "```", ""]
     elif diff_text:
-        out += ["```diff", _redact_sensitive(diff_text).rstrip(), "```", ""]
+        # v2.5.17: this fallback (sections not supplied -- reachable through
+        # _result()'s legacy 3-tuple coercion, which rebuilds sections with
+        # parse_diff_sections() but skips _filter_diff_sections(), and can
+        # end up with an empty section list for non-empty text) used to run
+        # only the flat _redact_sensitive() pass. That pass is not kind-aware
+        # and only catches keys matching _SENSITIVE_KEYS, so a `kind: Secret`
+        # body reaching this branch was never whole-masked, and any Secret
+        # data key not in that list (tls.crt, ca.bundle, .dockerconfigjson,
+        # ...) leaked verbatim. Confirmed live with a probe. Not reachable
+        # through the real diff pipeline today (argocd_diff always keeps
+        # diff_text and sections in lockstep), but a real landmine for the
+        # legacy path or a future refactor that breaks that invariant.
+        #
+        # Fix: recover the same (hdr, body) sections the primary path above
+        # would have had and redact each one the same way. Only fall back
+        # further to the flat pass when the text has no "===== hdr ====="
+        # markers at all to key off (truly unstructured legacy diff text).
+        legacy_secs = parse_diff_sections(diff_text)
+        if legacy_secs:
+            redacted = "\n".join(
+                f"===== {hdr} =====\n{_redact_for_display(hdr, body).rstrip()}"
+                for hdr, body in legacy_secs
+            )
+        else:
+            redacted = _redact_sensitive(diff_text).rstrip()
+        out += ["```diff", redacted, "```", ""]
     return out
 
 
