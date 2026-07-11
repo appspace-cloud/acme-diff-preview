@@ -82,15 +82,44 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
+          # v2.5.20 postmortem: on a TAG-PUSH event, actions/checkout fetches
+          # the triggering ref as "+<commit-sha>:refs/tags/<tag>", silently
+          # REPLACING the annotated tag with a lightweight one that points at
+          # the commit (actions/checkout issue #290). %(contents) of a
+          # lightweight tag is the COMMIT message, so v2.5.19 and v2.5.20
+          # were both published with commit-message notes instead of the
+          # curated tag annotation — deterministically, on every tag-triggered
+          # run, not a race. The forced tag re-fetch below restores the real
+          # annotated tags from origin before anything reads them.
+          git fetch --force --tags origin
+
+          # Loud guard: if the tag that TRIGGERED this run still is not an
+          # annotated tag after the forced re-fetch, fail the job red instead
+          # of silently publishing wrong notes ever again.
+          case "$GITHUB_REF" in
+            refs/tags/v*)
+              PUSHED_TAG="${GITHUB_REF#refs/tags/}"
+              if [ "$(git cat-file -t "$PUSHED_TAG")" != "tag" ]; then
+                echo "::error::$PUSHED_TAG is not an annotated tag after" \
+                     "forced re-fetch — refusing to publish commit-message" \
+                     "notes. Push releases with 'git tag -a'."
+                exit 1
+              fi
+              ;;
+          esac
+
           for TAG in $(git tag -l 'v*' | sort -V); do
             if gh release view "$TAG" >/dev/null 2>&1; then
               continue
             fi
-            NOTES=$(git for-each-ref "refs/tags/$TAG" --format='%(contents)')
-            if [ -z "$NOTES" ]; then
-              echo "Skipping $TAG: empty tag message (lightweight tag?)."
+            # Only genuine annotated tags carry curated notes. A lightweight
+            # tag's %(contents) is the commit message (NOT empty — the old
+            # emptiness check here could never fire), so type-check instead.
+            if [ "$(git cat-file -t "$TAG")" != "tag" ]; then
+              echo "Skipping $TAG: lightweight tag, no annotation to publish."
               continue
             fi
+            NOTES=$(git for-each-ref "refs/tags/$TAG" --format='%(contents)')
             echo "Creating release for $TAG"
             gh release create "$TAG" --title "$TAG" --notes "$NOTES" --verify-tag
           done
