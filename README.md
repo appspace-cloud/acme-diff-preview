@@ -171,6 +171,7 @@ so several layers guard what reaches the Bitbucket comment (see
 | `HELM_CACHE_MAX_CHARTS` | — | `60` | Max pulled chart versions kept on disk |
 | `AI_MAX_APPS` | — | `40` | Max changed apps included in the AI summary prompt (largest diffs kept; the headline still counts all apps) |
 | `DIFF_IGNORE_RESOURCES` | — | *(empty)* | Extra comma-separated resource-name substrings to hide from every diff, on top of the built-in `micro-versions-info` |
+| `DIFF_HTTP_POOLING` | — | `on` | HTTP keep-alive connection pooling (v2.5.20, E1): one persistent TLS connection per worker thread and host instead of a fresh handshake per call. Set `off` to route every request through plain `urlopen` again. Pool behavior is visible in `/diff-preview/stats` (`http_pool_reuses` / `http_pool_fresh_conns` / `http_pool_fallbacks`) |
 
 ---
 

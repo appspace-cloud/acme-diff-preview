@@ -51,7 +51,9 @@ SHA dedup:
 - In-memory: skips same PR SHA within this pod's loop iterations
 - Cross-pod: compares comment SHA; skips and fixes stuck INPROGRESS if needed
 """
-import json, os, posixpath, random, re, shutil, signal, ssl, sys, subprocess, time, threading, urllib.error, urllib.request
+import json, os, posixpath, random, re, shutil, signal, ssl, sys, subprocess, time, threading, urllib.error, urllib.parse, urllib.request
+import io as _io
+import http.client as _http_client
 from collections import Counter, namedtuple
 from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
 import concurrent.futures
@@ -260,6 +262,13 @@ _diff_stats:      dict          = {
     "ai_prompt_capped": 0,         # AI prompts capped at AI_MAX_APPS
     "diff_retries": 0,             # per-diff transient retries performed
     "futures_cancelled": 0,        # subtask futures cancelled on abnormal exit
+    # v2.5.20 (E1): HTTP connection-pool observability. reuses vs fresh
+    # tells whether keep-alive is actually paying off in production;
+    # fallbacks counts requests the pool could not serve (redirects,
+    # double connection failures, non-HTTPS) and re-routed to urllib.
+    "http_pool_reuses": 0,         # requests served on an existing connection
+    "http_pool_fresh_conns": 0,    # new HTTPSConnections opened
+    "http_pool_fallbacks": 0,      # requests re-routed to plain urlopen
     "last_iteration_s": None,# seconds taken by most recent iteration
     "last_iteration_at": None,
 }
@@ -875,8 +884,123 @@ def _parse_retry_after(value):
     except (TypeError, ValueError, OverflowError):
         return None
 
+# ── HTTP connection pooling (v2.5.20, E1) ────────────────────────────
+# Every http() / raw-file call used to pay a full TCP+TLS handshake via
+# urllib.request.urlopen — ~100-300ms each, times ~2-3K Bitbucket calls
+# on a mass-PR pass. One persistent HTTPSConnection per (thread, host,
+# timeout), kept in threading.local(), removes that overhead. Design
+# constraints, in order:
+#   1. NEVER fail a request the old path could serve: any pool problem
+#      (stale keep-alive, redirect, weird scheme) falls back to plain
+#      urlopen, transparently.
+#   2. Error semantics identical to urlopen: non-2xx raises
+#      urllib.error.HTTPError with .code/.headers/.read(), so the retry
+#      and Retry-After logic in http() runs unchanged.
+#   3. Stdlib only, matching the rest of the service.
+# Threads from the long-lived worker pools keep their connection for the
+# pod's lifetime; short-lived webhook handler threads (ThreadingHTTPServer
+# spawns one per request) let theirs be closed by GC — no worse than the
+# old one-connection-per-call behavior.
+# Operator escape hatch: DIFF_HTTP_POOLING=off routes everything straight
+# to urlopen (counted in http_pool_fallbacks).
+HTTP_POOLING_ENABLED = os.environ.get(
+    "DIFF_HTTP_POOLING", "on").strip().lower() not in ("off", "0", "false")
+
+_http_conn_local = threading.local()
+
+
+class _PooledResponse:
+    """Minimal urlopen-response stand-in: context manager + read().
+    The body is pre-read (required to make the connection reusable), so
+    read() just returns the cached bytes."""
+    def __init__(self, status, headers, body):
+        self.status = status
+        self.headers = headers
+        self._body = body
+
+    def read(self):
+        return self._body
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        return False
+
+
+def _pooled_urlopen(req, timeout=60):
+    """urlopen drop-in that reuses one HTTPSConnection per (thread, host,
+    timeout). Falls back to urllib.request.urlopen(context=_ssl) whenever
+    the pooled path cannot serve the request safely."""
+    parsed = urllib.parse.urlsplit(req.full_url)
+    if not HTTP_POOLING_ENABLED or parsed.scheme != "https":
+        _diff_stats["http_pool_fallbacks"] += 1
+        return urllib.request.urlopen(req, context=_ssl, timeout=timeout)
+
+    pool = getattr(_http_conn_local, "conns", None)
+    if pool is None:
+        pool = _http_conn_local.conns = {}
+    key = (parsed.netloc, timeout)
+    path = parsed.path or "/"
+    if parsed.query:
+        path += "?" + parsed.query
+
+    for fresh in (False, True):
+        conn = pool.get(key)
+        reused = conn is not None and not fresh
+        if conn is None or fresh:
+            if conn is not None:
+                try:
+                    conn.close()
+                except Exception:
+                    pass
+            conn = _http_client.HTTPSConnection(
+                parsed.netloc, timeout=timeout, context=_ssl)
+            pool[key] = conn
+            _diff_stats["http_pool_fresh_conns"] += 1
+        try:
+            conn.request(req.get_method(), path, body=req.data,
+                         headers=dict(req.header_items()))
+            resp = conn.getresponse()
+            body = resp.read()   # drain fully so the connection is reusable
+            status = resp.status
+            headers = resp.headers
+        except Exception:
+            # Stale keep-alive, half-closed socket, anything: drop the
+            # connection. First failure retries on a fresh one; a second
+            # failure means something is genuinely wrong with the pooled
+            # path — hand the request to urllib untouched.
+            try:
+                conn.close()
+            except Exception:
+                pass
+            pool.pop(key, None)
+            if fresh:
+                _diff_stats["http_pool_fallbacks"] += 1
+                return urllib.request.urlopen(
+                    req, context=_ssl, timeout=timeout)
+            continue
+        if 300 <= status < 400:
+            # http.client does not follow redirects; urlopen does. Rare on
+            # the Bitbucket API, but correctness beats the saved handshake.
+            _diff_stats["http_pool_fallbacks"] += 1
+            return urllib.request.urlopen(req, context=_ssl, timeout=timeout)
+        if status >= 400:
+            raise urllib.error.HTTPError(
+                req.full_url, status, getattr(resp, "reason", ""),
+                headers, _io.BytesIO(body))
+        if reused:
+            _diff_stats["http_pool_reuses"] += 1
+        return _PooledResponse(status, headers, body)
+    # Unreachable: the fresh=True iteration always returns or raises.
+
 def http(method, url, body=None, headers=None, auth=None):
-    """HTTP call with exponential backoff on 429/503/network errors."""
+    """HTTP call with exponential backoff on 429/503/network errors.
+
+    v2.5.20 (E1): routed through _pooled_urlopen — one persistent TLS
+    connection per (thread, host) instead of a fresh handshake per call.
+    Error semantics are unchanged: non-2xx still raises HTTPError.
+    """
     hdrs = dict(headers or {})
     if auth:
         hdrs["Authorization"] = "Basic " + _base64.b64encode(
@@ -888,7 +1012,7 @@ def http(method, url, body=None, headers=None, auth=None):
     last_exc = None
     for attempt in range(3):
         try:
-            with urllib.request.urlopen(req, context=_ssl, timeout=60) as r:
+            with _pooled_urlopen(req, timeout=60) as r:
                 return json.loads(r.read())
         except urllib.error.HTTPError as e:
             if e.code in (429, 500, 502, 503, 504) and attempt < 2:
@@ -1286,8 +1410,11 @@ def _bb_fetch_status(filepath, sha):
     fact and may be cached, but a transient error must NOT be cached as "missing"
     or it would poison every app that shares the same (sha, path) key.
 
-    Uses a direct urllib call instead of bb()/http() because those helpers always
+    Uses a direct call instead of bb()/http() because those helpers always
     json.loads() the response, which fails for YAML/text files.
+    v2.5.20 (E1): pooled — this is the single hottest HTTP path on a
+    mass PR (one call per value file), so it gains the most from
+    connection reuse.
     """
     url = (f"https://api.bitbucket.org/2.0/repositories/"
            f"{BB_WORKSPACE}/{BB_REPO}/src/{sha}/{filepath}")
@@ -1295,7 +1422,7 @@ def _bb_fetch_status(filepath, sha):
     for attempt in range(3):
         with _bb_api_sem:   # global rate limiter: caps concurrent BB API calls
             try:
-                with urllib.request.urlopen(req, context=_ssl, timeout=20) as r:
+                with _pooled_urlopen(req, timeout=20) as r:
                     return r.read().decode("utf-8", errors="replace"), BB_OK
             except urllib.error.HTTPError as e:
                 if e.code == 404:

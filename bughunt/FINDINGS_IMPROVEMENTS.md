@@ -1,8 +1,11 @@
 # Improvement catalog — acme-diff-preview (2026-07-11, post-v2.5.18)
 
 > **STATUS: RESOLVED in v2.5.19** — all code/CI/Docker items below are fixed
-> and shipped, EXCEPT E1 (HTTP connection pooling), deferred to its own
-> v2.5.20 as the only medium-effort change; M7 (webhook empty-body
+> and shipped, EXCEPT E1 (HTTP connection pooling), deferred as the only
+> medium-effort change and **shipped in v2.5.20** (`_pooled_urlopen`:
+> per-thread keep-alive with urllib fallback, `DIFF_HTTP_POOLING` knob,
+> 3 new `/stats` counters, `tests/test_v2520_http_pooling.py`, 10 cases);
+> M7 (webhook empty-body
 > divergence), left as a documented intentional difference (both endpoints
 > still run the HMAC check; the divergence is harmless); and M6
 > (session/cookie in _SENSITIVE_KEYS), investigated and reverted — it broke
