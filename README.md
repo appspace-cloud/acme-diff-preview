@@ -124,6 +124,37 @@ Four more scale behaviors are worth knowing on very large PRs (v2.5.18,
   comment names the knob). Raise `MAX_APPS_PER_RUN` (`diff.maxAppsPerRun`)
   or split the PR; retries will not cover them.
 
+> **Known trade-off — retries sleep in-worker.** A transient failure
+> (`oci_pull_failed`, `metadata_pending`, `timeout`) is retried with backoff
+> inside the same `DIFF_WORKERS` slot, so during a registry blip on a mass PR
+> a worker spends most of its wall time sleeping. This keeps the retry logic
+> simple and correct; a requeue-based design would raise throughput but is a
+> larger change. Revisit only if blip-storms during mass bumps become common.
+
+### Secret-leak and comment-integrity hardening
+
+The rendered diff and the AI summary both derive from PR-controlled content,
+so several layers guard what reaches the Bitbucket comment (see
+`bughunt/FINDINGS_IMPROVEMENTS.md` for the full analysis behind each):
+
+- **Kind-aware, structural redaction.** `kind: Secret` bodies are whole-masked;
+  other kinds get key-name redaction that also handles YAML block scalars
+  (`key: |`) and the `- name:/value:` env-var shape. Redaction runs at display
+  time, before truncation, so the diff engine still compares real values.
+- **Error details are redacted too.** A `helm template` YAML error echoes the
+  offending source line; those details are masked before they can reach the
+  comment or build status.
+- **Comment-injection is neutralized.** Triple-backtick sequences in rendered
+  values can no longer break out of the bot's ```` ```diff ```` fence, so
+  untrusted content cannot inject a fake status line or hidden Markdown.
+- **AI output is sanitized.** The model summary (built from untrusted values)
+  has Markdown images, raw HTML, and HTML comments stripped before posting,
+  closing the zero-click image-exfiltration channel; the AI never sets the
+  build status.
+- **Isolated helm pulls.** Each `helm pull` runs with a private
+  `HELM_*` home so concurrent pulls of different chart versions cannot corrupt
+  helm 3.x's unlocked shared OCI blob cache.
+
 ### Tuning knobs (env vars / Helm values)
 
 | Env | Helm value | Default | Purpose |
@@ -139,6 +170,7 @@ Four more scale behaviors are worth knowing on very large PRs (v2.5.18,
 | `BB_API_CONCURRENCY` | — | `30` | Max concurrent Bitbucket API calls |
 | `HELM_CACHE_MAX_CHARTS` | — | `60` | Max pulled chart versions kept on disk |
 | `AI_MAX_APPS` | — | `40` | Max changed apps included in the AI summary prompt (largest diffs kept; the headline still counts all apps) |
+| `DIFF_IGNORE_RESOURCES` | — | *(empty)* | Extra comma-separated resource-name substrings to hide from every diff, on top of the built-in `micro-versions-info` |
 
 ---
 
