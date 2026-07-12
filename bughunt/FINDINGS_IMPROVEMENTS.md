@@ -257,3 +257,21 @@ NetworkPolicy, so any pod in the shared devops cluster can read
 HMAC-protected, so this is metadata exposure, not a control surface. A
 NetworkPolicy would harden it but must preserve the webhook ingress path;
 tracked here as a candidate, deliberately not changed unilaterally.
+
+
+## Pass P follow-up — P3 regression caught in production (2026-07-11)
+
+### P3-regression (MED, self-inflicted — FIXED v2.5.22) — proxy guard disabled all pooling
+The v2.5.21 P3 fix used `urllib.request.getproxies()`, which maps ANY env
+var whose name ends in `_proxy` to a proxy. Kubernetes injects
+service-discovery vars — e.g. `ARGOCD_AGENT_REDIS_PROXY=<pod-ip>` for a
+Service named `argocd-agent-redis-proxy` — so getproxies() returned bogus
+entries and the guard sent EVERY request down the urllib fallback,
+silently defeating E1 pooling in the pod. No functional break (fallback ==
+old correct path) but zero perf benefit. Caught immediately post-deploy via
+`/diff-preview/stats`: http_pool_fallbacks climbing while reuses/fresh
+stayed at 0 — exactly the signal those counters were added for. Fix:
+`_proxy_for_host()` checks only the canonical HTTPS_PROXY/ALL_PROXY vars and
+honors NO_PROXY, instead of the catch-all getproxies(). Lesson: verifying
+`/stats` after a deploy (not just pod health) is what surfaced this; keep
+doing it.

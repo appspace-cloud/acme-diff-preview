@@ -950,16 +950,47 @@ class _PooledResponse:
         return False
 
 
+def _proxy_for_host(host):
+    """Return a proxy URL if a REAL HTTP(S) proxy is configured for `host`,
+    else None. v2.5.22 (P3-fix): the v2.5.21 guard used
+    urllib.request.getproxies(), which treats ANY env var ending in `_proxy`
+    as a proxy. Kubernetes injects service-discovery vars like
+    ARGOCD_AGENT_REDIS_PROXY=<pod-ip> (for a Service named
+    `argocd-agent-redis-proxy`), so getproxies() returned bogus entries and
+    the guard silently disabled ALL pooling in production — observed live via
+    /stats (fallbacks climbing, reuses/fresh stuck at 0). So we check ONLY the
+    canonical proxy vars and honor NO_PROXY for the target host."""
+    def _env(*names):
+        for n in names:
+            v = os.environ.get(n) or os.environ.get(n.lower())
+            if v:
+                return v
+        return None
+    proxy = _env("HTTPS_PROXY") or _env("ALL_PROXY")
+    if not proxy:
+        return None
+    no_proxy = _env("NO_PROXY") or ""
+    if no_proxy.strip() == "*":
+        return None
+    host = (host or "").lower()
+    for entry in no_proxy.split(","):
+        entry = entry.strip().lstrip(".").lower()
+        if entry and (host == entry or host.endswith("." + entry)):
+            return None
+    return proxy
+
+
 def _pooled_urlopen(req, timeout=60):
     """urlopen drop-in that reuses one HTTPSConnection per (thread, host).
     Falls back to urllib.request.urlopen(context=_ssl) whenever the pooled
     path cannot serve the request safely (pooling off, non-HTTPS, a
     configured proxy, redirects, or a repeated connection failure)."""
     parsed = urllib.parse.urlsplit(req.full_url)
-    # F3: if any proxy is configured, urllib.request handles it and raw
-    # http.client does not — defer so we never silently bypass egress proxy.
+    # P3: if a REAL proxy applies to this host, urllib.request handles it and
+    # raw http.client does not — defer so we never silently bypass it. Uses a
+    # strict proxy check, NOT getproxies() (see _proxy_for_host / v2.5.22).
     if (not HTTP_POOLING_ENABLED or parsed.scheme != "https"
-            or urllib.request.getproxies()):
+            or _proxy_for_host(parsed.hostname)):
         _diff_stats["http_pool_fallbacks"] += 1
         return urllib.request.urlopen(req, context=_ssl, timeout=timeout)
 
