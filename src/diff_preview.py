@@ -1891,9 +1891,15 @@ def _ensure_chart(registry: str, chart: str, version: str) -> str:
             # blob-store race lives in the mutable CACHE homes below — the
             # registry config is login-write-only / pull-read-only, safe to
             # share.
+            # v2.5.24: HELM_CONFIG_HOME is deliberately NOT isolated either.
+            # helm derives the DEFAULT registry-config path from it
+            # ($HELM_CONFIG_HOME/registry/config.json), so isolating it
+            # orphaned the credentials login wrote and every pull got 403 —
+            # proven in the pod: config-home isolation -> 403, cache-only
+            # isolation -> success. The #8059 blob race lives in the cache
+            # homes below, which stay isolated per pull.
             HELM_REPOSITORY_CACHE=os.path.join(_helm_home, "repository"),
             HELM_CACHE_HOME=os.path.join(_helm_home, "cache"),
-            HELM_CONFIG_HOME=os.path.join(_helm_home, "config"),
             HELM_DATA_HOME=os.path.join(_helm_home, "data"),
         )
         last_err = ""

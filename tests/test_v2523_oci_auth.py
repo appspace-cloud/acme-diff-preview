@@ -57,7 +57,39 @@ def test_pull_env_shares_registry_config_with_login(monkeypatch, tmp_path):
         "helm pull must inherit the registry config that _helm_login wrote "
         f"(got {env.get('HELM_REGISTRY_CONFIG')!r}) — an isolated empty "
         "config means unauthenticated pulls (403 incident)")
+    # v2.5.24: HELM_CONFIG_HOME is inherited too (default registry-config
+    # path derives from it); only the three cache homes stay isolated.
     for isolated in ("HELM_REPOSITORY_CACHE", "HELM_CACHE_HOME",
-                     "HELM_CONFIG_HOME", "HELM_DATA_HOME"):
+                     "HELM_DATA_HOME"):
         assert env.get(isolated) and env[isolated] != os.environ.get(isolated), (
             f"{isolated} must stay isolated per pull (helm #8059 race)")
+
+
+def test_pull_env_does_not_isolate_config_home(monkeypatch, tmp_path):
+    """v2.5.24: HELM_CONFIG_HOME must be inherited too. helm derives the
+    DEFAULT registry-config path from it, so an isolated config home orphans
+    the credentials login wrote — proven in the production pod: config-home
+    isolation -> 403 on every pull, cache-only isolation -> success."""
+    captured = {}
+
+    def fake_run(cmd, **kw):
+        class R: returncode = 0; stdout = ""; stderr = ""
+        if cmd[:2] == [m.HELM_BIN, "pull"]:
+            captured["env"] = kw.get("env")
+        return R()
+
+    monkeypatch.setattr(m, "_helm_login", lambda registry: True)
+    monkeypatch.setattr(m.subprocess, "run", fake_run)
+    monkeypatch.setattr(m, "HELM_CACHE_DIR", str(tmp_path))
+    try:
+        m._ensure_chart("helm-oci-dev.repo.appspace.com", "appspace-ms",
+                        "0.0.0-test2")
+    except Exception:
+        pass
+    env = captured.get("env")
+    assert env is not None
+    assert env.get("HELM_CONFIG_HOME") == os.environ.get("HELM_CONFIG_HOME"), (
+        "HELM_CONFIG_HOME must be inherited — isolating it moves the default "
+        "registry-config path and produces unauthenticated pulls (403)")
+    for isolated in ("HELM_REPOSITORY_CACHE", "HELM_CACHE_HOME", "HELM_DATA_HOME"):
+        assert env.get(isolated) and env[isolated] != os.environ.get(isolated)
