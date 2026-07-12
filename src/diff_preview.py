@@ -1409,8 +1409,8 @@ OUT_DECOMMISSIONED = "decommissioned"
 #   reason   : short machine code for logs/metrics
 DiffResult = namedtuple("DiffResult",
                         ["text", "sections", "n_res", "has_diff", "error", "outcome", "reason",
-                         "version_change"],
-                        defaults=[None])
+                         "version_change", "deleted_resources", "replicas_zeroed"],
+                        defaults=[None, None, None])
 # version_change (v2.5.8): (main_rev, pr_rev) when the PR changes this app's
 # chart targetRevision, else None. Lets format_comment shout on downgrades.
 # It has a default so the many existing 7-positional-arg constructions keep
@@ -2995,6 +2995,101 @@ def _parse_manifest_resources(yaml_text):
     return resources
 
 
+# ── Deterministic risk detection (v2.5.26) ──────────────────────────
+# Field report (PR 6773): a version bump DELETED an ExternalSecret and an
+# IAMPolicyMember and the comment said "No critical changes detected". Two
+# stacked causes: the CRITICAL CHANGES block was 100% AI-generated, and
+# DiffResult.sections is capped to AI_MAX_SECTIONS_PER_APP at diff time —
+# in a 111-resource app the deletion sections were discarded before
+# anything downstream could see them. Safety-relevant facts must be
+# detected deterministically on the FULL pre-cap section list (same design
+# language as the downgrade warning v2.5.8 and decommission v2.5.10) and
+# fed to the AI as authoritative, never inferred by it.
+
+_SENSITIVE_KINDS = (
+    "Secret", "ExternalSecret", "SecretStore", "ClusterSecretStore",
+    "IAMPolicy", "IAMPolicyMember", "IAMServiceAccount", "IAMPartialPolicy",
+    "ServiceAccount", "Role", "RoleBinding", "ClusterRole",
+    "ClusterRoleBinding", "PersistentVolumeClaim", "PersistentVolume",
+    "Namespace", "CustomResourceDefinition",
+    "ValidatingWebhookConfiguration", "MutatingWebhookConfiguration",
+    "NetworkPolicy",
+)
+
+_WORKLOAD_KINDS = ("Deployment", "StatefulSet", "ReplicaSet")
+
+
+def _section_kind(header: str) -> str:
+    """'/external-secrets.io/ExternalSecret card-deployment-key' -> 'ExternalSecret'."""
+    try:
+        return header.rsplit("/", 1)[-1].split(" ", 1)[0]
+    except Exception:
+        return ""
+
+
+def _is_sensitive_kind(header: str) -> bool:
+    return _section_kind(header) in _SENSITIVE_KINDS
+
+
+def _detect_deleted_resources(sections: list) -> list:
+    """Headers of sections that DELETE a resource entirely: at least one
+    removed content line and zero added content lines (diff of full
+    manifest vs empty — see _diff_resources)."""
+    deleted = []
+    for header, body in sections:
+        minus = plus = 0
+        for line in body.splitlines():
+            if line.startswith("+++") or line.startswith("---"):
+                continue
+            if line.startswith("+"):
+                plus += 1
+            elif line.startswith("-"):
+                minus += 1
+        if minus and not plus:
+            deleted.append(header)
+    return deleted
+
+
+def _detect_replicas_zeroed(sections: list) -> list:
+    """Workload sections where replicas drop from >0 to exactly 0. Kept as
+    an AI prompt fact only (not a shouty block): zeroing can be legitimate
+    hibernation (zeroPods), but the model must reliably see it even when
+    the section did not fit its capped prompt."""
+    zeroed = []
+    for header, body in sections:
+        if _section_kind(header) not in _WORKLOAD_KINDS:
+            continue
+        had_pos = has_zero = False
+        for line in body.splitlines():
+            ls = line.strip()
+            if line.startswith("-") and ls.lstrip("- ").startswith("replicas:"):
+                try:
+                    had_pos = int(ls.split(":", 1)[1].strip()) > 0 or had_pos
+                except ValueError:
+                    pass
+            if line.startswith("+") and ls.lstrip("+ ").startswith("replicas: 0"):
+                has_zero = True
+        if had_pos and has_zero:
+            zeroed.append(header)
+    return zeroed
+
+
+def _package_sections(filtered_sections: list):
+    """Build (clean_diff, capped_sections, deleted, zeroed) from the FULL
+    filtered section list. Detection runs here — before the display and
+    AI caps — so a deletion at position 111 of a mass diff can never be
+    lost again (the PR-6773 bug)."""
+    deleted = _detect_deleted_resources(filtered_sections)
+    zeroed  = _detect_replicas_zeroed(filtered_sections)
+    display_secs = filtered_sections[:MAX_RESOURCES_FULL]
+    truncated_parts = []
+    for hdr, body in display_secs:
+        body_t = body[:MAX_DIFF_CHARS] + "\n... (truncated)" if len(body) > MAX_DIFF_CHARS else body
+        truncated_parts.append(f"===== {hdr} =====\n{body_t}")
+    clean_diff = "\n".join(truncated_parts)
+    return clean_diff, filtered_sections[:AI_MAX_SECTIONS_PER_APP], deleted, zeroed
+
+
 def _diff_resources(main_res: dict, pr_res: dict) -> str:
     """Diff two pre-parsed resource dicts (from _parse_manifest_resources).
 
@@ -3871,16 +3966,14 @@ def argocd_diff(app, pr_sha, main_sha, chart_revision=None, changed_paths=None, 
                               version_change)
 
         n_res = len(filtered_sections)
-        # Truncate to display budget NOW so we never hold the full YAML in memory.
-        # format_comment and generate_ai_summary use result.sections directly.
-        display_secs = filtered_sections[:MAX_RESOURCES_FULL]
-        truncated_parts = []
-        for hdr, body in display_secs:
-            body_t = body[:MAX_DIFF_CHARS] + "\n... (truncated)" if len(body) > MAX_DIFF_CHARS else body
-            truncated_parts.append(f"===== {hdr} =====\n{body_t}")
-        clean_diff = "\n".join(truncated_parts)
-        return DiffResult(clean_diff, filtered_sections[:AI_MAX_SECTIONS_PER_APP],
-                          n_res, True, None, OUT_DIFF, "changes", version_change)
+        # Truncate to display budget NOW so we never hold the full YAML in
+        # memory — but detect deletions/zeroings FIRST, on the full list
+        # (v2.5.26: the PR-6773 lesson, see _package_sections).
+        clean_diff, capped_sections, deleted_res, zeroed_res = \
+            _package_sections(filtered_sections)
+        return DiffResult(clean_diff, capped_sections,
+                          n_res, True, None, OUT_DIFF, "changes", version_change,
+                          deleted_res, zeroed_res)
     # Exhausted retries
     return _indeterminate(last_reason, last_detail or "unknown error")
 
@@ -4634,6 +4727,29 @@ def _envs_from_apps(apps) -> list:
     return sorted({_APP_COMPONENT_SUFFIX.sub("", a.split("/")[-1]) for a in apps})
 
 
+def _precomputed_facts_note(results: dict) -> str:
+    """Authoritative deterministic facts appended to the AI prompt (v2.5.26).
+    Computed at diff time from the FULL un-truncated section list, so a
+    deletion in a 111-resource app reaches the model even when its section
+    never fits the capped DIFF DATA (the PR-6773 bug)."""
+    deleted = [(app, h) for app, r in results.items()
+               for h in (r.deleted_resources or [])]
+    zeroed  = [(app, h) for app, r in results.items()
+               for h in (r.replicas_zeroed or [])]
+    if not deleted and not zeroed:
+        return ""
+    out = ["\n\nPRE-COMPUTED FACTS (authoritative, from the full un-truncated diff):"]
+    if deleted:
+        out.append("Resources DELETED entirely:")
+        out += [f"- {app}: {h}" for app, h in deleted[:30]]
+        if len(deleted) > 30:
+            out.append(f"- (+{len(deleted)-30} more)")
+    if zeroed:
+        out.append("Workloads with replicas dropping to 0:")
+        out += [f"- {app}: {h}" for app, h in zeroed[:30]]
+    return "\n".join(out) + "\n"
+
+
 def generate_ai_summary(app_results: dict) -> str | None:
     """Call Vertex AI Gemini to produce an operator-friendly diff summary.
 
@@ -4767,14 +4883,18 @@ def generate_ai_summary(app_results: dict) -> str | None:
             "   - `<service>`: new service added\n"
             "   - `<service>`: removed\n\n"
             "\u26a0\ufe0f **CRITICAL CHANGES:**\n"
+            "   - Resources deleted entirely (the PRE-COMPUTED FACTS list below "
+            "is authoritative and comes from the full un-truncated diff \u2014 "
+            "if it lists deletions, they are ALWAYS critical; never say 'none')\n"
             "   - Version downgrades (full version string decreasing only)\n"
-            "   - Replicas dropping to 0\n"
+            "   - Replicas dropping to 0 (see PRE-COMPUTED FACTS)\n"
             "   - Services removed\n"
             "   - Liveness/readiness probes removed\n"
-            "   If none: `No critical changes detected`\n\n"
+            "   If none of the above: `No critical changes detected`\n\n"
             "Rules: max 200 words total. Be terse \u2014 operators scan, they do not read.\n\n"
             "DIFF DATA:\n"
             + "\n".join(sections_parts)
+            + _precomputed_facts_note(results)
             + error_note
         )
 
@@ -5032,6 +5152,32 @@ def format_comment(pr_sha, app_results, skipped_apps=None, base_sha="",
         lines += [""]
 
     # ── AI Analysis block ────────────────────────────────────────────
+        # ── Deleted resources (v2.5.26) ──────────────────────────────────
+    # Deterministic, computed at diff time on the FULL pre-cap section list
+    # (PR 6773: two deletions in a 111-resource app were invisible — capped
+    # out of both the inline sections and the AI prompt, and the AI-only
+    # CRITICAL block said "none"). Same design language as the downgrade
+    # warning: deterministic safety facts never depend on the model.
+    all_deleted = [(app, hdr) for app, r in results.items()
+                   for hdr in (r.deleted_resources or [])]
+    if all_deleted:
+        n_del = len(all_deleted)
+        lines += [
+            f"## \U0001f5d1\ufe0f\u26a0\ufe0f {n_del} RESOURCE(S) DELETED \u26a0\ufe0f",
+            "",
+            "**This PR removes the following resources entirely. Verify each "
+            "deletion is intentional \u2014 \U0001f510-flagged kinds can revoke "
+            "access or destroy credentials/data.**",
+            "",
+        ]
+        shown = all_deleted[:20]
+        for app, hdr in shown:
+            flag = "\U0001f510 " if _is_sensitive_kind(hdr) else ""
+            lines.append(f"- {flag}`{app}` \u2192 `{hdr}`")
+        if n_del > len(shown):
+            lines.append(f"- *(+{n_del - len(shown)} more)*")
+        lines.append("")
+
     if ai_summary:
         lines += [
             "---",
