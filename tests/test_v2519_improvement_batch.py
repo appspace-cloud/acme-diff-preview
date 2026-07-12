@@ -181,9 +181,15 @@ def test_f2_require_env_passes_when_all_present():
 # ── R1: helm pull runs with an isolated HELM_* home ────────────────────────
 
 def test_r1_helm_pull_gets_isolated_registry_config(tmp_path, monkeypatch):
-    """The pull subprocess must receive a private HELM_REGISTRY_CONFIG /
-    HELM_CACHE_HOME under HELM_CACHE_DIR, so concurrent pulls of different
-    versions never share helm 3.x's unlocked OCI blob store."""
+    """The pull subprocess must receive a private HELM_CACHE_HOME (and the
+    other mutable cache homes) under HELM_CACHE_DIR, so concurrent pulls of
+    different versions never share helm 3.x's unlocked OCI blob store.
+
+    v2.5.23 amendment: HELM_REGISTRY_CONFIG must NOT be isolated — login
+    writes credentials to the default registry config, and an isolated empty
+    one made every pull unauthenticated (the production 403 incident). The
+    registry config is login-write-only / pull-read-only, so sharing it is
+    safe; the #8059 race lives in the cache homes, which stay isolated."""
     cache = tmp_path / "cache"
     monkeypatch.setattr(m, "HELM_CACHE_DIR", str(cache))
     monkeypatch.setattr(m, "OCI_USER", "u")
@@ -215,7 +221,11 @@ def test_r1_helm_pull_gets_isolated_registry_config(tmp_path, monkeypatch):
     assert path and os.path.isfile(os.path.join(path, "Chart.yaml"))
     logged = envlog.read_text().strip()
     reg_cfg, cache_home = logged.split("|")
-    assert reg_cfg.startswith(str(cache)) and reg_cfg.endswith("registry-config.json")
+    # v2.5.23: registry config INHERITED (credentials from login), never a
+    # per-pull path under the cache dir.
+    assert reg_cfg == (os.environ.get("HELM_REGISTRY_CONFIG") or ""), \
+        f"registry config must be inherited, got isolated path: {reg_cfg}"
+    assert not reg_cfg.startswith(str(cache))
     assert cache_home.startswith(str(cache))
     # the isolated home is scratch — it must not survive the pull
     leftover = [d for d in os.listdir(cache) if d.startswith(".helmhome-")]

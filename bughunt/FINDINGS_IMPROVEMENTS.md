@@ -275,3 +275,14 @@ stayed at 0 — exactly the signal those counters were added for. Fix:
 honors NO_PROXY, instead of the catch-all getproxies(). Lesson: verifying
 `/stats` after a deploy (not just pod health) is what surfaced this; keep
 doing it.
+
+### P6 (HIGH, production incident — FIXED v2.5.23) — R1 isolated registry config broke OCI auth
+First real PRs after the 2.5.15->2.5.2x jump: every helm pull returned 403
+unauthorized and all diffs went indeterminate. _helm_login() writes
+credentials to the DEFAULT registry config, but R1 (v2.5.19) pointed each
+pull at an isolated EMPTY HELM_REGISTRY_CONFIG — unauthenticated pulls.
+Masked locally by ambient docker/helm credentials; prod never ran R1 until
+this deploy. Fix: stop isolating the registry config (login-write-only /
+pull-read-only, safe to share); the #8059 race lives in the cache homes,
+which stay isolated. Lesson: smoke-test PRs after every deploy — pod
+health and /stats alone did not exercise the OCI path.
