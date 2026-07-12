@@ -1882,7 +1882,15 @@ def _ensure_chart(registry: str, chart: str, version: str) -> str:
         _helm_home = _tf.mkdtemp(dir=HELM_CACHE_DIR, prefix=f".helmhome-{chart}-")
         _pull_env = dict(os.environ)
         _pull_env.update(
-            HELM_REGISTRY_CONFIG=os.path.join(_helm_home, "registry-config.json"),
+            # v2.5.23: HELM_REGISTRY_CONFIG deliberately NOT isolated. Login
+            # (_helm_login) writes credentials to the DEFAULT registry config;
+            # v2.5.19-v2.5.22 pointed pulls at a fresh empty config, so every
+            # pull ran unauthenticated and the private registry answered 403
+            # (production incident on the first PRs after the 2.5.15->2.5.2x
+            # jump; masked locally by ambient docker credentials). The #8059
+            # blob-store race lives in the mutable CACHE homes below — the
+            # registry config is login-write-only / pull-read-only, safe to
+            # share.
             HELM_REPOSITORY_CACHE=os.path.join(_helm_home, "repository"),
             HELM_CACHE_HOME=os.path.join(_helm_home, "cache"),
             HELM_CONFIG_HOME=os.path.join(_helm_home, "config"),
