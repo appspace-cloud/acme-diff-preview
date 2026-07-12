@@ -170,6 +170,9 @@ so several layers guard what reaches the Bitbucket comment (see
 | `BB_API_CONCURRENCY` | — | `30` | Max concurrent Bitbucket API calls |
 | `HELM_CACHE_MAX_CHARTS` | — | `60` | Max pulled chart versions kept on disk |
 | `AI_MAX_APPS` | — | `40` | Max changed apps included in the AI summary prompt (largest diffs kept; the headline still counts all apps) |
+| `DIFF_OCI_SELFCHECK_INTERVAL` | — | `900` | Seconds between periodic OCI self-checks (`helm show chart` against a known-good ref, exercising the authenticated pull path). First check runs ~60s after start; `0` disables. Result in `/diff-preview/stats` as `oci_selfcheck`, failures log at ERROR |
+| `DIFF_OCI_SELFCHECK_REF` | — | *(last successful pull)* | Optional fixed reference `registry/chart:version` for the self-check; when unset the last successfully pulled chart is used |
+| `DIFF_OCI_FAIL_ERROR_THRESHOLD` | — | `3` | Consecutive systemic chart-pull failures (auth/network, not 404s) after which failures log at ERROR instead of WARNING, enabling log-based alerting |
 | `DIFF_IGNORE_RESOURCES` | — | *(empty)* | Extra comma-separated resource-name substrings to hide from every diff, on top of the built-in `micro-versions-info` |
 | `DIFF_HTTP_POOLING` | — | `on` | HTTP keep-alive connection pooling (v2.5.20): one persistent TLS connection per worker thread and host instead of a fresh handshake per call. Set `off` to route every request through plain `urlopen` again. Automatically defers to `urlopen` when a proxy is configured (`HTTPS_PROXY`/`HTTP_PROXY`), since the pool speaks directly to the host. Pool behavior is visible in `/diff-preview/stats` (`http_pool_reuses` / `http_pool_fresh_conns` / `http_pool_fallbacks`) |
 

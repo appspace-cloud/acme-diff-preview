@@ -286,3 +286,16 @@ this deploy. Fix: stop isolating the registry config (login-write-only /
 pull-read-only, safe to share); the #8059 race lives in the cache homes,
 which stay isolated. Lesson: smoke-test PRs after every deploy — pod
 health and /stats alone did not exercise the OCI path.
+
+### L1/L2 (HIGH, observability — FIXED v2.5.25) — OCI-pull path had zero health coverage
+During the 403 incident the pod stayed Ready, probes green, WARNING-only
+logs, while 100% of diffs failed. ArgoCD login failures had ERROR logs and
+a readiness hook; OCI failures had nothing. Fixed with (1) a periodic
+authenticated self-check (`helm show chart`, same env contract as real
+pulls, first run ~60s after start, `oci_selfcheck` in /stats, ERROR log on
+failure) and (2) escalation of consecutive systemic pull failures from
+WARNING to ERROR past DIFF_OCI_FAIL_ERROR_THRESHOLD. L3 (secret rotation)
+verified fine: reloader.stakater.com/auto restarts the pod on rotation.
+INFO, documented-only: _helm_login rewrites the now-shared registry config
+each TTL while pulls read it concurrently; the write is not atomic, but
+pull retries absorb the rare mid-write read — no code change.

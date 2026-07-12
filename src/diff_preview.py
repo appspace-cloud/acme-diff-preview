@@ -269,6 +269,11 @@ _diff_stats:      dict          = {
     "http_pool_reuses": 0,         # requests served on an existing connection
     "http_pool_fresh_conns": 0,    # new HTTPSConnections opened
     "http_pool_fallbacks": 0,      # requests re-routed to plain urlopen
+    # v2.5.25 (post-403-incident L1/L2): OCI-path health, previously
+    # invisible — a pod could be Ready with 100% of pulls failing.
+    "oci_selfcheck": None,         # ok / failed / skipped — periodic helm show chart
+    "oci_selfcheck_at": None,      # ISO timestamp of the last self-check
+    "oci_consecutive_pull_failures": 0,  # systemic pull failures since last success
     "last_iteration_s": None,# seconds taken by most recent iteration
     "last_iteration_at": None,
 }
@@ -1748,6 +1753,113 @@ class OciChartNotFound(Exception):
     """Raised when an OCI chart version does not exist in the registry."""
 
 
+# ── OCI self-check + failure escalation (v2.5.25) ───────────────────
+# Post-incident L1/L2: during the 403 outage the pod stayed Ready and only
+# ever logged WARNING while 100% of its core function was broken. Two
+# complementary signals fix that blind spot:
+#   1. Escalation — consecutive SYSTEMIC pull failures (auth/network, not
+#      404s of nonexistent versions) log at ERROR past a threshold, so
+#      log-based alerting can fire.
+#   2. Self-check — a cheap `helm show chart` against a known-good ref,
+#      run periodically with the SAME env contract as real pulls (cache
+#      homes isolated, config home inherited), surfaced in /stats and
+#      logged at ERROR on failure. Reference: DIFF_OCI_SELFCHECK_REF
+#      ("registry/chart:version") if set, else the last successful pull.
+OCI_FAIL_ERROR_THRESHOLD = int(os.environ.get("DIFF_OCI_FAIL_ERROR_THRESHOLD", "3"))
+OCI_SELFCHECK_INTERVAL   = int(os.environ.get("DIFF_OCI_SELFCHECK_INTERVAL", "900"))
+
+_last_pull_ok_ref = None          # (registry, chart, version) of last success
+_oci_health_lock = threading.Lock()
+
+
+def _record_pull_success(registry: str, chart: str, version: str):
+    global _last_pull_ok_ref
+    with _oci_health_lock:
+        _last_pull_ok_ref = (registry, chart, version)
+        _diff_stats["oci_consecutive_pull_failures"] = 0
+
+
+def _record_pull_failure(ref: str) -> str:
+    """Count a systemic pull failure and return the severity to log at:
+    WARNING below the threshold, ERROR from the threshold on."""
+    with _oci_health_lock:
+        _diff_stats["oci_consecutive_pull_failures"] += 1
+        n = _diff_stats["oci_consecutive_pull_failures"]
+    return "ERROR" if n >= OCI_FAIL_ERROR_THRESHOLD else "WARNING"
+
+
+def _oci_selfcheck():
+    """Verify the authenticated OCI-pull path with a metadata-only
+    `helm show chart`. Returns True/False, or None when skipped (no
+    reference known yet). Never raises."""
+    ref_env = os.environ.get("DIFF_OCI_SELFCHECK_REF", "").strip()
+    if ref_env and "/" in ref_env and ":" in ref_env:
+        reg, rest = ref_env.split("/", 1)
+        chart, version = rest.rsplit(":", 1)
+    elif _last_pull_ok_ref:
+        reg, chart, version = _last_pull_ok_ref
+    else:
+        _diff_stats["oci_selfcheck"] = "skipped"
+        _diff_stats["oci_selfcheck_at"] = datetime.now(timezone.utc).isoformat()
+        return None
+    ok = False
+    detail = ""
+    try:
+        import tempfile
+        _home = tempfile.mkdtemp(prefix=".oci-selfcheck-")
+        env = dict(os.environ)
+        env.update(   # same contract as real pulls: config home INHERITED
+            HELM_REPOSITORY_CACHE=os.path.join(_home, "repository"),
+            HELM_CACHE_HOME=os.path.join(_home, "cache"),
+            HELM_DATA_HOME=os.path.join(_home, "data"),
+        )
+        try:
+            if not _helm_login(reg):
+                detail = "helm registry login failed"
+            else:
+                r = subprocess.run(
+                    [HELM_BIN, "show", "chart", f"oci://{reg}/{chart}",
+                     "--version", version],
+                    capture_output=True, text=True, timeout=60, env=env)
+                ok = r.returncode == 0
+                if not ok:
+                    detail = (r.stderr or r.stdout or "")[:200]
+        finally:
+            shutil.rmtree(_home, ignore_errors=True)
+    except Exception as exc:
+        detail = f"{type(exc).__name__}: {exc}"[:200]
+        ok = False
+    _diff_stats["oci_selfcheck"] = "ok" if ok else "failed"
+    _diff_stats["oci_selfcheck_at"] = datetime.now(timezone.utc).isoformat()
+    if ok:
+        log(f"OCI self-check OK ({chart}:{version})", "DEBUG")
+    else:
+        log(f"OCI self-check FAILED for {chart}:{version} — the diff engine "
+            f"cannot pull charts. {detail}", "ERROR")
+    return ok
+
+
+def _start_oci_selfcheck_loop():
+    """Daemon loop: first check ~60s after startup (catches deploy
+    regressions like the 403 incident within a minute), then every
+    OCI_SELFCHECK_INTERVAL seconds. Disabled with interval <= 0."""
+    if OCI_SELFCHECK_INTERVAL <= 0:
+        return
+    def _loop():
+        time.sleep(60)
+        while not _shutdown:
+            try:
+                _oci_selfcheck()
+            except Exception:
+                pass
+            for _ in range(max(OCI_SELFCHECK_INTERVAL, 30)):
+                if _shutdown:
+                    return
+                time.sleep(1)
+    t = threading.Thread(target=_loop, daemon=True, name="oci-selfcheck")
+    t.start()
+
+
 def _helm_login(registry: str) -> bool:
     """Login to an OCI registry. Re-logs after HELM_LOGIN_TTL so a credential
     rotation (new OCI_PASS in the pod's secret) is picked up without a restart.
@@ -1828,6 +1940,10 @@ def _ensure_chart(registry: str, chart: str, version: str) -> str:
         # Fall through to re-pull into a fresh tmp dir (atomic rename below).
 
     if not _helm_login(registry):
+        sev = _record_pull_failure(f"{registry} (login)")
+        if sev == "ERROR":
+            log(f"helm registry login persistently failing for {registry} — "
+                f"diff engine degraded", "ERROR")
         return None
 
     # Acquire a per-chart-version lock so concurrent diff threads don't all try
@@ -1928,7 +2044,11 @@ def _ensure_chart(registry: str, chart: str, version: str) -> str:
                         f"retry {pull_attempt+1}/2 in {wait}s: {last_err[:80]}", "WARNING")
                     time.sleep(wait)
                 else:
-                    log(f"helm pull failed for {chart}:{version}: {last_err}", "WARNING")
+                    sev = _record_pull_failure(f"{registry}/{chart}:{version}")
+                    log(f"helm pull failed for {chart}:{version}: {last_err}"
+                        + (f" — {_diff_stats['oci_consecutive_pull_failures']} consecutive"
+                           f" systemic pull failures, diff engine degraded"
+                           if sev == "ERROR" else ""), sev)
                     # v2.5.14: tmp_dir is only renamed into chart_dir on success
                     # (below) or removed by the `except` handler on a raised
                     # exception. A plain `return` here does neither -- it does
@@ -1950,6 +2070,10 @@ def _ensure_chart(registry: str, chart: str, version: str) -> str:
             else:
                 # Another thread beat us to it; remove our tmp copy
                 shutil.rmtree(tmp_dir, ignore_errors=True)
+            # v2.5.25: a completed pull is the ground truth that the OCI path
+            # works — remember the ref for the self-check and reset the
+            # consecutive-failure escalation.
+            _record_pull_success(registry, chart, version)
         except Exception:
             shutil.rmtree(tmp_dir, ignore_errors=True)
             raise
@@ -5836,6 +5960,10 @@ def main():
             "ERROR")
     else:
         log(f"OCI credentials present (user={OCI_USER})")
+        # v2.5.25: periodic authenticated self-check of the OCI-pull path —
+        # first run ~60s after start, so a deploy that breaks pulls (like the
+        # 403 incident) turns into an ERROR log within a minute.
+        _start_oci_selfcheck_loop()
 
     # Same class of silent-degradation risk as OCI_PASS above, but for
     # request AUTHENTICITY rather than the diff engine itself: _verify_bb_hmac
