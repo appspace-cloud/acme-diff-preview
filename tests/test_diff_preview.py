@@ -83,24 +83,25 @@ def test_dedicated_argocd_account():
 # ── Bug-regression tests ─────────────────────────────────────────────────────
 
 def test_seen_eviction_uses_integer_ids():
-    """BUG: open_ids must NOT use str() — _seen keys are integers.
+    """BUG (historical): open_ids must NOT use str() — pr["id"] is an integer.
 
-    open_ids = {str(pr["id"]) for pr in prs}  -- WRONG: int not in set-of-str
-    open_ids = {pr["id"] for pr in prs}        -- CORRECT
+    Originally: open_ids = {str(pr["id"]) ...} silently evicted every _seen
+    entry each iteration (int not in set-of-str is always True), re-checking
+    every PR every 60s loop.
 
-    If str() is present, every _seen entry is deleted every iteration because
-    Python's `int not in {str, str, ...}` is always True, causing every PR to
-    be re-logged and re-checked on every 60s loop.
+    COPS-2507 multi-repo: keys are now (repo, pr_id) tuples built as
+    open_keys; the pr["id"] component must STILL be the raw integer, so the
+    same str() regression stays pinned against the new shape.
     """
     src = _source()
-    # Ensure the bad pattern is gone
-    assert 'open_ids = {str(pr["id"]) for pr in prs}' not in src, (
-        "REGRESSION: _seen eviction still uses str(pr['id']) — "
-        "integer IDs will never match the string set, clearing _seen every iteration."
+    # Ensure the bad pattern (in any shape) is gone
+    assert 'str(pr["id"])' not in src, (
+        "REGRESSION: eviction key uses str(pr['id']) — integer IDs will "
+        "never match the state keys, clearing state every iteration."
     )
-    # Ensure the correct pattern is present
-    assert 'open_ids = {pr["id"] for pr in prs}' in src, (
-        "_seen eviction must build open_ids from integer IDs to match _seen keys."
+    # Ensure the correct multi-repo pattern is present
+    assert 'open_keys = {(repo, pr["id"]) for repo, prs, _ in per_repo for pr in prs}' in src, (
+        "state eviction must build (repo, integer-id) keys matching _seen/_pr_chart_targets keys."
     )
 
 
@@ -1052,23 +1053,23 @@ def test_invalidate_for_republish_evicts_and_forces():
     key = f"{reg}/{chart}:{ver}"
     mod._helm_chart_cache[key] = "/cached/path"
     mod._helm_chart_pull_ts[key] = mod.time.monotonic()
-    mod._seen[42] = "aabbccdd"
-    mod._pr_chart_targets[42] = {(chart, ver)}
-    mod._pr_chart_targets[43] = {("other", "1.0.0")}
+    mod._seen[("acme-config-dev", 42)] = "aabbccdd"
+    mod._pr_chart_targets[("acme-config-dev", 42)] = {(chart, ver)}
+    mod._pr_chart_targets[("acme-config-dev", 43)] = {("other", "1.0.0")}
     mod._wake.clear()
     mod._invalidate_for_republish(chart, ver)
     assert key not in mod._helm_chart_cache, "republished build must be evicted"
-    assert 42 in mod._force_recompute and 42 not in mod._seen
-    assert 43 not in mod._force_recompute, "unrelated PR must not be forced"
+    assert ("acme-config-dev", 42) in mod._force_recompute and ("acme-config-dev", 42) not in mod._seen
+    assert ("acme-config-dev", 43) not in mod._force_recompute, "unrelated PR must not be forced"
     assert mod._wake.is_set(), "loop must be woken to recompute quickly"
 
 
 def test_force_recompute_bypasses_both_dedups():
     """process_pr must honor the force flag on both dedup checks."""
     src = _source()
-    assert "not forced and _seen.get(pr_id)" in src
+    assert "not forced and _seen.get(sk)" in src
     assert "not forced and comment_sha == pr_sha[:8]" in src
-    assert "_force_recompute.discard(pr_id)" in src
+    assert "_force_recompute.discard(sk)" in src
 
 
 def test_prune_removes_parked_and_stale_dev_dirs(tmp_path):

@@ -139,7 +139,7 @@ def stuck_world(monkeypatch):
     captured = []
     monkeypatch.setattr(m, "http", lambda *a, **k: {"state": "INPROGRESS"})
     monkeypatch.setattr(m, "post_build_status",
-                        lambda sha, state, desc, pr_id=None: captured.append((state, desc)))
+                        lambda sha, state, desc, pr_id=None, repo=None: captured.append((state, desc)))
     return captured
 
 
@@ -736,7 +736,7 @@ def test_main_iteration_discovery_failure_relogs_and_returns(monkeypatch):
         raise RuntimeError("argocd unreachable")
     monkeypatch.setattr(m, "discover_path_app_map", boom)
     called = []
-    monkeypatch.setattr(m, "get_open_prs", lambda: called.append(1) or [])
+    monkeypatch.setattr(m, "get_open_prs", lambda repo=None: called.append(1) or [])
     m.main_iteration()
     assert called == [], "a discovery failure must return before polling Bitbucket"
     assert len(logins) == 2, "proactive JWT refresh + the recovery re-login"
@@ -758,7 +758,7 @@ def test_main_iteration_jwt_refresh_failure_is_nonfatal(monkeypatch):
     monkeypatch.setattr(m, "argocd_login", flaky_login)
     monkeypatch.setattr(m, "discover_path_app_map", lambda: PATH_MAP)
     monkeypatch.setattr(m, "http", lambda *a, **k: {"target": {"hash": BASE_SHA}})
-    monkeypatch.setattr(m, "get_open_prs", lambda: [])
+    monkeypatch.setattr(m, "get_open_prs", lambda repo=None: [])
     m.main_iteration()  # must not raise
 
 
@@ -769,20 +769,20 @@ def test_main_iteration_prunes_stale_state_and_logs_rollup(monkeypatch):
     monkeypatch.setattr(m, "discover_path_app_map", lambda: PATH_MAP)
     monkeypatch.setattr(m, "http", lambda *a, **k: {"target": {"hash": BASE_SHA}})
     pr = _mk_pr(pr_id=610)
-    monkeypatch.setattr(m, "get_open_prs", lambda: [pr])
+    monkeypatch.setattr(m, "get_open_prs", lambda repo=None: [pr])
     monkeypatch.setattr(m, "process_pr",
-                        lambda p, pm, base_sha=None: {m.OUT_DIFF: 2, m.OUT_INDETERMINATE: 1})
+                        lambda p, pm, base_sha=None, repo=None: {m.OUT_DIFF: 2, m.OUT_INDETERMINATE: 1})
     with m._seen_lock:
-        m._seen[99999] = ("dead", "dead")  # a PR that is no longer open
+        m._seen[("acme-config-dev", 99999)] = ("dead", "dead")  # a PR that is no longer open
     with m._comment_id_cache_lock:
-        m._comment_id_cache[99999] = 1
+        m._comment_id_cache[("acme-config-dev", 99999)] = 1
     logs = []
     monkeypatch.setattr(m, "log", lambda msg, *a, **k: logs.append(str(msg)))
     m.main_iteration()
     with m._seen_lock:
-        pruned = 99999 not in m._seen
+        pruned = ("acme-config-dev", 99999) not in m._seen
     with m._comment_id_cache_lock:
-        pruned_c = 99999 not in m._comment_id_cache
+        pruned_c = ("acme-config-dev", 99999) not in m._comment_id_cache
     assert pruned and pruned_c, "state for closed PRs must be evicted"
     assert any("diff outcomes" in l and "could not be computed" in l for l in logs)
 

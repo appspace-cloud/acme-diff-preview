@@ -64,12 +64,12 @@ def world(monkeypatch):
     m._app_chart_revision_map.update({"pv-orch-a-ms": "2603.0.1-dev", "pv-orch-a-ss": "2603.0.1-dev"})
 
     # I/O edges.
-    monkeypatch.setattr(m, "get_pr_changed_files", lambda pr_id: ([ANCILLARY], {}))
-    monkeypatch.setattr(m, "find_existing_comment", lambda pr_id: (None, "", ""))
+    monkeypatch.setattr(m, "get_pr_changed_files", lambda pr_id, repo=None: ([ANCILLARY], {}))
+    monkeypatch.setattr(m, "find_existing_comment", lambda pr_id, repo=None: (None, "", ""))
     monkeypatch.setattr(m, "upsert_comment",
-                        lambda pr_id, body, existing_id=None: sinks.upserts.append(body) or 123)
+                        lambda pr_id, body, existing_id=None, repo=None: sinks.upserts.append(body) or 123)
     monkeypatch.setattr(m, "post_build_status",
-                        lambda pr_sha, state, description, pr_id=None:
+                        lambda pr_sha, state, description, pr_id=None, repo=None:
                         sinks.statuses.append((state, description)))
     monkeypatch.setattr(m, "fix_stuck_inprogress", lambda *a, **k: None)
     monkeypatch.setattr(m, "_touch_progress", lambda: None)
@@ -121,10 +121,10 @@ def test_process_pr_force_recompute_bypasses_dedup_once(world):
     pr = _mk_pr()
     m.process_pr(pr, PATH_MAP, base_sha=BASE_SHA)
     first_calls = len(sinks.diff_calls)
-    m._force_recompute.add(pr["id"])
+    m._force_recompute.add(("acme-config-dev", pr["id"]))
     m.process_pr(pr, PATH_MAP, base_sha=BASE_SHA)
     assert len(sinks.diff_calls) > first_calls, "republish invalidation must recompute"
-    assert pr["id"] not in m._force_recompute, "the force flag is consumed"
+    assert ("acme-config-dev", pr["id"]) not in m._force_recompute, "the force flag is consumed"
 
 
 def test_process_pr_indeterminate_render_failure_blocks_with_failed_status(world):
@@ -168,7 +168,7 @@ def test_process_pr_no_affected_apps_posts_nothing_heavy(world):
     sinks, plan = world
     with pytest.MonkeyPatch.context() as mp:
         mp.setattr(m, "get_pr_changed_files",
-                   lambda pr_id: (["docs/README-only-change.md"], {}))
+                   lambda pr_id, repo=None: (["docs/README-only-change.md"], {}))
         m.process_pr(_mk_pr(pr_id=992), PATH_MAP, base_sha=BASE_SHA)
     assert sinks.diff_calls == [], "no affected apps -> no diff computation"
 
@@ -178,7 +178,7 @@ def test_process_pr_no_affected_apps_posts_nothing_heavy(world):
 def _quiet_iteration_edges(monkeypatch, prs, recorded):
     monkeypatch.setattr(m, "argocd_login", lambda: None)
     monkeypatch.setattr(m, "discover_path_app_map", lambda: PATH_MAP)
-    monkeypatch.setattr(m, "get_open_prs", lambda: prs)
+    monkeypatch.setattr(m, "get_open_prs", lambda repo=None: prs)
     monkeypatch.setattr(m, "_prune_helm_cache", lambda *a, **k: None, raising=False)
     monkeypatch.setattr(m, "_touch_progress", lambda: None)
     # main_iteration fetches main's head sha directly via http() to know the
@@ -187,7 +187,7 @@ def _quiet_iteration_edges(monkeypatch, prs, recorded):
     monkeypatch.setattr(m, "http",
                         lambda method, url, **kw: {"target": {"hash": BASE_SHA}})
 
-    def fake_process_pr(pr, path_map, base_sha=""):
+    def fake_process_pr(pr, path_map, base_sha="", repo=None):
         recorded.append(pr["id"])
         if pr.get("title") == "BOOM":
             raise RuntimeError("synthetic per-PR crash")

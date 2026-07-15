@@ -44,12 +44,12 @@ def test_f1_recompute_when_main_advances(monkeypatch):
     pr_sha = "abcd1234" + "0" * 32
     marker_comment = f"diff ok [{mod.COMMENT_MARKER} [clean]] sha"
     monkeypatch.setattr(mod, "find_existing_comment",
-                        lambda pid: (99, pr_sha[:8], marker_comment))
+                        lambda pid, repo=None: (99, pr_sha[:8], marker_comment))
     monkeypatch.setattr(mod, "fix_stuck_inprogress", lambda *a, **k: None)
     monkeypatch.setattr(mod, "post_build_status", lambda *a, **k: None)
     monkeypatch.setattr(mod, "upsert_comment", lambda *a, **k: None)
     monkeypatch.setattr(mod, "get_pr_changed_files",
-                        lambda pid: ran.append("diff-ran") or [])
+                        lambda pid, repo=None: ran.append("diff-ran") or [])
     pr = {"id": 1, "title": "t",
           "source": {"commit": {"hash": pr_sha}},
           "destination": {"branch": {"name": "main"}}}

@@ -310,7 +310,7 @@ def test_process_pr_legacy_incomplete_comment_forces_rerun(world, monkeypatch):
     pr = _mk_pr(pr_id=702)
     pr_sha = pr["source"]["commit"]["hash"]
     monkeypatch.setattr(m, "find_existing_comment",
-                        lambda pr_id: (555, pr_sha,
+                        lambda pr_id, repo=None: (555, pr_sha,
                                        "old comment\nDiff incomplete, could not evaluate.\n"))
     m.process_pr(pr, PATH_MAP, base_sha=BASE_SHA)
     assert sinks.diff_calls, \

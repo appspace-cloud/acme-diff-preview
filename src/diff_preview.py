@@ -109,7 +109,37 @@ def _require_env(*names):
 _require_env("BB_USER", "BB_TOKEN", "ARGOCD_PASS")
 
 BB_WORKSPACE       = "appspace-cloud"
-BB_REPO            = "acme-config-dev"
+
+# ── Multi-repo support (COPS-2507) ──────────────────────────────────────────
+# DIFF_REPOS: semicolon-separated repo entries, each "slug" or "slug:scopes"
+# where scopes is a |-separated list of path prefixes the service should
+# consider inside that repo (files outside every scope are invisible to
+# affected-app matching AND new-env detection — e.g. stage/prod host azure/
+# and aws/ trees that belong to the legacy pipeline, not to ArgoCD).
+# An entry with no scopes means "whole repo" (dev's historical behavior).
+#   DIFF_REPOS="acme-config-dev;acme-config-stage:gcp/"
+# Default preserves the exact single-repo behavior this service always had.
+def _parse_diff_repos(raw: str) -> dict:
+    repos: dict = {}
+    for entry in raw.split(";"):
+        entry = entry.strip()
+        if not entry:
+            continue
+        slug, _, scope_raw = entry.partition(":")
+        slug = slug.strip()
+        if not slug:
+            continue
+        scopes = [s.strip() for s in scope_raw.split("|") if s.strip()]
+        repos[slug] = {"scopes": scopes}
+    if not repos:
+        repos["acme-config-dev"] = {"scopes": []}
+    return repos
+
+REPOS: dict = _parse_diff_repos(os.environ.get("DIFF_REPOS", "acme-config-dev"))
+# Transitional alias: single-repo code paths not yet repo-parameterized keep
+# working during the refactor; by the end of it, BB_REPO remains only as the
+# default argument for backwards-compatible call sites (tests, tools).
+BB_REPO            = next(iter(REPOS))
 BB_USER            = os.environ["BB_USER"]
 BB_TOKEN           = os.environ["BB_TOKEN"]
 # Pre-encoded Basic auth header value computed once at startup.
@@ -339,6 +369,32 @@ _path_map_cache: dict  = {}
 _path_map_ts:    float = 0.0
 _path_map_count: int   = 0    # extra invalidation: rebuild if app count changes
 PATH_MAP_TTL            = 300   # seconds
+# COPS-2507 multi-repo: app full_name -> git config repo slug (from the app's
+# git source repoURL), and the per-repo partition of the path map. A PR in
+# repo R only matches apps in _repo_path_maps[R].
+_app_repo_map: dict    = {}
+_repo_path_maps: dict  = {}
+# sha -> repo slug, registered by process_pr for the PR head and base shas.
+# Because git commit SHAs are globally unique, any sha-carrying call deep in
+# the render path (_bb_fetch_status, post_build_status) can resolve its repo
+# from the sha WITHOUT threading a repo parameter through every function in
+# between. Falls back to BB_REPO (default repo) for unregistered shas, which
+# preserves the historical single-repo behavior exactly.
+_sha_repo_map: dict    = {}
+_sha_repo_lock         = threading.Lock()
+_SHA_REPO_MAX          = 2000   # bounded: purged wholesale when exceeded
+
+def _register_sha_repo(sha, repo):
+    if not sha or not repo:
+        return
+    with _sha_repo_lock:
+        if len(_sha_repo_map) > _SHA_REPO_MAX:
+            _sha_repo_map.clear()   # cheap reset; re-registered on next PR pass
+        _sha_repo_map[sha] = repo
+
+def _repo_for_sha(sha):
+    with _sha_repo_lock:
+        return _sha_repo_map.get(sha)
 # app full_name -> OCI chart name (e.g. "appspace-micro-services"), built from
 # the same `argocd app list` call.
 _app_chart_map: dict   = {}
@@ -415,6 +471,8 @@ class _HealthHandler(BaseHTTPRequestHandler):
             with _diff_stats_lock:
                 payload = dict(_diff_stats)
             payload["version"] = APP_VERSION   # v2.5.19 (F1): running version
+            # COPS-2507: which repos (and scopes) this instance is serving.
+            payload["repos"] = {r: (c["scopes"] or ["*"]) for r, c in REPOS.items()}
             data = json.dumps(payload, indent=2).encode()
             self.send_response(200)
             self.send_header("Content-Type", "application/json")
@@ -1114,8 +1172,8 @@ def http(method, url, body=None, headers=None, auth=None):
             raise
     raise last_exc
 
-def bb(method, path, **kw):
-    url = f"https://api.bitbucket.org/2.0/repositories/{BB_WORKSPACE}/{BB_REPO}/{path}"
+def bb(method, path, repo=None, **kw):
+    url = f"https://api.bitbucket.org/2.0/repositories/{BB_WORKSPACE}/{repo or BB_REPO}/{path}"
     return http(method, url, auth=(BB_USER, BB_TOKEN), **kw)
 
 # ── ArgoCD dynamic discovery ──────────────────────────────────────────
@@ -1130,7 +1188,7 @@ def discover_path_app_map():
     """
     global _path_map_cache, _path_map_ts, _path_map_count, _path_map_app_count, \
            _app_chart_map, _app_chart_revision_map, _app_chart_registry_map, \
-           _app_value_files_map, _app_namespace_map
+           _app_value_files_map, _app_namespace_map, _app_repo_map, _repo_path_maps
     if _path_map_cache and (time.monotonic() - _path_map_ts) < PATH_MAP_TTL:
         # Within TTL: return cached map. The self-referential app-count comparison
         # (comparing cache to itself) was removed — it could never detect new apps
@@ -1155,6 +1213,9 @@ def discover_path_app_map():
     chart_reg_map = {}
     value_files_map = {}
     namespace_map = {}
+    app_repo_map = {}
+    repo_maps = {slug: {} for slug in REPOS}
+    unknown_repos_seen = set()
     for app in apps:
         name = app["metadata"]["name"]
         ns   = app["metadata"].get("namespace", "")
@@ -1171,6 +1232,17 @@ def discover_path_app_map():
         dest = app.get("spec", {}).get("destination", {})
         if dest.get("namespace"):
             namespace_map[full_name] = dest["namespace"]
+        # COPS-2507 multi-repo: record which git config repo this app renders
+        # from (sources[0], the `ref: config` git source). A PR in repo R may
+        # only ever match apps whose git source is R — makes cross-repo
+        # fetches/comments structurally impossible, not merely unlikely.
+        app_repo = _extract_app_git_repo(app)
+        if app_repo:
+            app_repo_map[full_name] = app_repo
+            if app_repo not in repo_maps and app_repo not in unknown_repos_seen:
+                unknown_repos_seen.add(app_repo)
+                debug(f"path map: app {full_name} uses unconfigured repo "
+                      f"{app_repo} — visible only if added to DIFF_REPOS")
         ann  = app.get("metadata", {}).get("annotations", {})
         raw  = ann.get("argocd.argoproj.io/manifest-generate-paths", "")
         if not raw:
@@ -1181,16 +1253,57 @@ def discover_path_app_map():
                 path_map.setdefault(p, [])
                 if full_name not in path_map[p]:
                     path_map[p].append(full_name)
+                if app_repo in repo_maps:
+                    rm = repo_maps[app_repo]
+                    rm.setdefault(p, [])
+                    if full_name not in rm[p]:
+                        rm[p].append(full_name)
     _path_map_cache          = path_map
     _app_chart_map           = chart_map
     _app_chart_revision_map  = chart_rev_map
     _app_chart_registry_map  = chart_reg_map
     _app_value_files_map     = value_files_map
     _app_namespace_map       = namespace_map
+    _app_repo_map            = app_repo_map
+    _repo_path_maps          = repo_maps
     _path_map_ts        = time.monotonic()
     _path_map_count     = len(path_map)
     _path_map_app_count = sum(len(v) for v in path_map.values())
     return path_map
+
+
+def path_map_for_repo(repo_slug):
+    """Return the per-repo partition of the path map (COPS-2507).
+
+    Calls discover_path_app_map() first so TTL/refresh semantics are shared.
+    Unknown/unconfigured repos get an empty map — a PR there can never match.
+    """
+    discover_path_app_map()
+    return _repo_path_maps.get(repo_slug, {})
+
+
+def _extract_app_git_repo(app):
+    """Return the config repo slug for an app's git source, or None.
+
+    The git source is the one WITHOUT a chart (multi-source apps: source-1 is
+    the git config repo providing value files via the $config alias). repoURL
+    formats seen live: git@bitbucket.org:appspace-cloud/acme-config-dev and
+    https://bitbucket.org/appspace-cloud/acme-config-dev(.git).
+    """
+    spec = app.get("spec", {})
+    srcs = spec.get("sources") or ([spec["source"]] if spec.get("source") else [])
+    for s in srcs:
+        if s.get("chart"):
+            continue
+        repo_url = (s.get("repoURL") or "").strip().rstrip("/")
+        if not repo_url:
+            continue
+        if repo_url.endswith(".git"):
+            repo_url = repo_url[:-4]
+        slug = repo_url.split("/")[-1]
+        # git@host:workspace/slug has the slug after the last '/', same rule.
+        return slug or None
+    return None
 
 
 def _extract_app_chart_info(app):
@@ -1474,13 +1587,16 @@ BB_NOT_FOUND = "not_found"   # 404 — file genuinely absent at this sha (cachea
 BB_ERROR     = "error"       # transient (429/5xx/network) after retries (NOT cacheable)
 
 
-def _bb_fetch_status(filepath, sha):
-    """Fetch a raw file from acme-config-dev at a commit SHA.
+def _bb_fetch_status(filepath, sha, repo=None):
+    """Fetch a raw file from a config repo at a commit SHA.
 
     Returns (content_or_None, status) where status is one of BB_OK / BB_NOT_FOUND
     / BB_ERROR. The distinction matters for caching: a genuine 404 is a stable
     fact and may be cached, but a transient error must NOT be cached as "missing"
     or it would poison every app that shares the same (sha, path) key.
+    Multi-repo note (COPS-2507): callers pass the PR's repo; the (sha, path)
+    cache key stays collision-free WITHOUT the repo because git commit SHAs
+    are globally unique across repositories.
 
     Uses a direct call instead of bb()/http() because those helpers always
     json.loads() the response, which fails for YAML/text files.
@@ -1489,7 +1605,7 @@ def _bb_fetch_status(filepath, sha):
     connection reuse.
     """
     url = (f"https://api.bitbucket.org/2.0/repositories/"
-           f"{BB_WORKSPACE}/{BB_REPO}/src/{sha}/{filepath}")
+           f"{BB_WORKSPACE}/{repo or _repo_for_sha(sha) or BB_REPO}/src/{sha}/{filepath}")
     req = urllib.request.Request(url, headers={"Authorization": _BB_AUTH_HEADER})
     for attempt in range(3):
         with _bb_api_sem:   # global rate limiter: caps concurrent BB API calls
@@ -1742,7 +1858,7 @@ _vf_inflight_lock   = threading.Lock()
 # Cleared when the base_sha changes (detected in main_iteration).
 _main_render_cache: dict = {}
 _main_render_lock        = threading.Lock()
-_main_render_sha: str    = ""   # the main_sha the cache is valid for
+_main_render_sha: dict   = {}   # per-repo: {repo: main_sha} the cache is valid for (COPS-2507)
 # Cap to prevent memory pressure during long-lived pods with many apps.
 # Each entry holds parsed YAML dicts per resource — can be several hundred KB
 # for a large micro-services chart. 200 entries ≈ a few hundred MB worst case.
@@ -2646,8 +2762,36 @@ def _render_new_env_diff(env_info: dict, pr_sha: str) -> tuple:
     if status != BB_OK or not raw_config:
         return None, f"could not fetch {config_file} from Bitbucket", 0, None
     version = _extract_chart_version(raw_config)
+    version_src = config_file
     if not version:
-        return None, "no appspace.version found in config file", 0, None
+        # COPS-2507 (Finding B): most environments do NOT define a version in
+        # their own customer.yaml — measured in acme-config-prod, only 12/265
+        # gcp envs do; the other 95% inherit it from an ancestor config.yaml
+        # (cohort/lifecycle/cloud level), exactly how the Helm hierarchy merge
+        # resolves it. Walk ancestor config.yaml files at the PR sha, most
+        # specific level wins. Only if NO level defines a version is this a
+        # structural failure. Fetches are (sha,path)-cached and each PR has
+        # at most ~6 ancestor levels, so this is cheap.
+        env_dir = env_info["env_dir"]
+        ancestors = []
+        if config_file != f"{env_dir}/config.yaml":
+            ancestors.append(f"{env_dir}/config.yaml")
+        probe = env_dir
+        while "/" in probe:
+            probe = probe.rsplit("/", 1)[0]
+            ancestors.append(f"{probe}/config.yaml")
+        for anc in ancestors:
+            raw_anc, st_anc = _bb_fetch_status(anc, pr_sha)
+            if st_anc == BB_OK and raw_anc:
+                v = _extract_chart_version(raw_anc)
+                if v:
+                    version, version_src = v, anc
+                    debug(f"new env {env_name}: version {version} inherited "
+                          f"from {anc}")
+                    break
+    if not version:
+        return None, ("no appspace.version found in config file or any "
+                      "ancestor config.yaml level"), 0, None
 
     # 2. Determine registry from the chart version tag.
     # Dev versions contain "-dev"; release versions do not.
@@ -3997,7 +4141,7 @@ def parse_diff_sections(diff_text):
     return sections
 
 # ── Bitbucket helpers ─────────────────────────────────────────────────
-def post_build_status(pr_sha, state, description, pr_id=None):
+def post_build_status(pr_sha, state, description, pr_id=None, repo=None):
     """Post build status. Swallows errors - never crashes the script.
 
     The status URL used to always point at the ArgoCD server (bughunt: this
@@ -4010,10 +4154,11 @@ def post_build_status(pr_sha, state, description, pr_id=None):
     meaningful destination (ARGOCD_SERVER), which practically never happens
     in the normal flow (pr_id is available everywhere process_pr runs).
     """
-    url = (f"https://bitbucket.org/{BB_WORKSPACE}/{BB_REPO}/pull-requests/{pr_id}"
+    repo = repo or _repo_for_sha(pr_sha)
+    url = (f"https://bitbucket.org/{BB_WORKSPACE}/{repo or BB_REPO}/pull-requests/{pr_id}"
            if pr_id else f"https://{ARGOCD_SERVER}")
     try:
-        bb("POST", f"commit/{pr_sha}/statuses/build", body={
+        bb("POST", f"commit/{pr_sha}/statuses/build", repo=repo, body={
             "state": state, "key": BUILD_KEY,
             "name": STATUS_NAME,
             "url": url,
@@ -4022,12 +4167,18 @@ def post_build_status(pr_sha, state, description, pr_id=None):
     except Exception as e:
         log(f"[build status] failed to set {state}: {e}", "WARNING")
 
-_BB_API_BASE = f"https://api.bitbucket.org/2.0/repositories/{BB_WORKSPACE}/{BB_REPO}"
+def _bb_api_base(repo=None):
+    """Per-repo Bitbucket API base URL (COPS-2507 multi-repo)."""
+    return f"https://api.bitbucket.org/2.0/repositories/{BB_WORKSPACE}/{repo or BB_REPO}"
+
+# Kept as a module-level value for legacy call sites/tests; equals the default repo's base.
+_BB_API_BASE = _bb_api_base()
 _BB_MAX_PAGES = 100   # safety guard: prevents infinite loops on malformed next-links
 
 
-def get_open_prs():
-    url = f"{_BB_API_BASE}/pullrequests?state=OPEN&pagelen=50"
+def get_open_prs(repo=None):
+    base = _bb_api_base(repo)
+    url = f"{base}/pullrequests?state=OPEN&pagelen=50"
     prs, nxt, pages = [], url, 0
     while nxt and pages < _BB_MAX_PAGES:
         data = http("GET", nxt, auth=(BB_USER, BB_TOKEN))
@@ -4035,15 +4186,16 @@ def get_open_prs():
         nxt  = data.get("next")
         pages += 1
     if pages >= _BB_MAX_PAGES:
-        log(f"get_open_prs: hit page limit ({_BB_MAX_PAGES}), results may be incomplete",
-            "WARNING")
+        log(f"get_open_prs[{repo or BB_REPO}]: hit page limit ({_BB_MAX_PAGES}), "
+            f"results may be incomplete", "WARNING")
     return prs
 
 
-def get_pr_changed_files(pr_id):
+def get_pr_changed_files(pr_id, repo=None):
     files, renames, path, pages = [], {}, f"pullrequests/{pr_id}/diffstat?pagelen=100", 0
+    base = _bb_api_base(repo)
     while path and pages < _BB_MAX_PAGES:
-        data = bb("GET", path)
+        data = bb("GET", path, repo=repo)
         for item in data.get("values", []):
             # FIX C (v2.4.9): a rename has BOTH old and new paths. The OLD
             # path is the one referenced by the live ArgoCD Application's
@@ -4065,7 +4217,7 @@ def get_pr_changed_files(pr_id):
                 renames[posixpath.normpath(old_p.lstrip("/"))] = \
                     posixpath.normpath(new_p.lstrip("/"))
         nxt  = data.get("next", "")
-        path = nxt.replace(f"{_BB_API_BASE}/", "") if nxt else ""
+        path = nxt.replace(f"{base}/", "") if nxt else ""
         pages += 1
     if pages >= _BB_MAX_PAGES and path:
         # Page limit hit and more pages exist — affected app list is INCOMPLETE.
@@ -4076,7 +4228,7 @@ def get_pr_changed_files(pr_id):
             "WARNING", pr=pr_id)
     return files, renames
 
-def find_existing_comment(pr_id):
+def find_existing_comment(pr_id, repo=None):
     """Find our comment on a PR, cheaply when possible.
 
     Returns (comment_id, sha_8, raw_text).
@@ -4086,12 +4238,14 @@ def find_existing_comment(pr_id):
     it directly (1 API call) instead of paginating every comment on the PR.
     Falls back to a full scan on first sight or if the cached id 404s
     (comment was deleted) or no longer carries our marker.
+    Cache key is (repo, pr_id) — PR ids collide across repos (COPS-2507).
     """
+    ck = (repo or BB_REPO, pr_id)
     with _comment_id_cache_lock:
-        cached_id = _comment_id_cache.get(pr_id)
+        cached_id = _comment_id_cache.get(ck)
     if cached_id:
         try:
-            c = bb("GET", f"pullrequests/{pr_id}/comments/{cached_id}")
+            c = bb("GET", f"pullrequests/{pr_id}/comments/{cached_id}", repo=repo)
             raw = c.get("content", {}).get("raw", "")
             if any(mk in raw for mk in _COMMENT_MARKERS):
                 return cached_id, _extract_comment_sha(raw), raw
@@ -4100,16 +4254,17 @@ def find_existing_comment(pr_id):
         except urllib.error.HTTPError as e:
             if e.code == 404:
                 with _comment_id_cache_lock:
-                    _comment_id_cache.pop(pr_id, None)
+                    _comment_id_cache.pop(ck, None)
             else:
                 raise  # transient — same contract as the full-scan path below
         except Exception:
             raise
 
     nxt, pages = f"pullrequests/{pr_id}/comments?pagelen=100", 0
+    base = _bb_api_base(repo)
     while nxt and pages < _BB_MAX_PAGES:
         try:
-            data = bb("GET", nxt)
+            data = bb("GET", nxt, repo=repo)
         except Exception as e:
             # Transient Bitbucket error: raise so process_pr skips this PR
             # rather than posting a duplicate comment (new ID, no update in place).
@@ -4121,10 +4276,10 @@ def find_existing_comment(pr_id):
             # older pods are updated in place instead of duplicated during rollout.
             if any(mk in raw for mk in _COMMENT_MARKERS):
                 with _comment_id_cache_lock:
-                    _comment_id_cache[pr_id] = c["id"]
+                    _comment_id_cache[ck] = c["id"]
                 return c["id"], _extract_comment_sha(raw), raw
         next_url = data.get("next", "")
-        nxt = next_url.replace(f"{_BB_API_BASE}/", "") if next_url else ""
+        nxt = next_url.replace(f"{base}/", "") if next_url else ""
         pages += 1
     return None, "", ""
 
@@ -4175,7 +4330,7 @@ def _truncate_comment(body: str) -> str:
     return out
 
 
-def upsert_comment(pr_id, body, existing_id=None):
+def upsert_comment(pr_id, body, existing_id=None, repo=None):
     """Post or update PR comment. Truncates if over limit; posts fallback on error."""
     orig_bytes = len(body.encode("utf-8"))
     if orig_bytes > MAX_COMMENT_BYTES:
@@ -4187,9 +4342,9 @@ def upsert_comment(pr_id, body, existing_id=None):
     payload = {"content": {"raw": body}}
     try:
         if existing_id:
-            bb("PUT",  f"pullrequests/{pr_id}/comments/{existing_id}", body=payload)
+            bb("PUT",  f"pullrequests/{pr_id}/comments/{existing_id}", repo=repo, body=payload)
         else:
-            bb("POST", f"pullrequests/{pr_id}/comments", body=payload)
+            bb("POST", f"pullrequests/{pr_id}/comments", repo=repo, body=payload)
     except Exception as e:
         # Only a 404 on PUT means the comment was deleted and a fresh POST is
         # correct. Any other failure (429/5xx/network) means the old comment
@@ -4205,14 +4360,14 @@ def upsert_comment(pr_id, body, existing_id=None):
             return
         log(f"[comment] comment {existing_id} was deleted; re-creating", "WARNING")
         with _comment_id_cache_lock:
-            _comment_id_cache.pop(pr_id, None)
+            _comment_id_cache.pop((repo or BB_REPO, pr_id), None)
         try:
-            bb("POST", f"pullrequests/{pr_id}/comments", body=payload)
+            bb("POST", f"pullrequests/{pr_id}/comments", repo=repo, body=payload)
             log("[comment] fallback POST succeeded", "INFO")
         except Exception as e2:
             log(f"[comment] fallback POST also failed: {e2}", "ERROR")
 
-def fix_stuck_inprogress(pr_sha, pr_id, comment_raw):
+def fix_stuck_inprogress(pr_sha, pr_id, comment_raw, repo=None):
     """If build status is stuck INPROGRESS but comment is current, fix the status.
 
     This handles the case where a previous CronJob pod was killed after posting
@@ -4220,7 +4375,7 @@ def fix_stuck_inprogress(pr_sha, pr_id, comment_raw):
     """
     try:
         st = http("GET",
-            f"https://api.bitbucket.org/2.0/repositories/{BB_WORKSPACE}/{BB_REPO}"
+            f"{_bb_api_base(repo)}"
             f"/commit/{pr_sha}/statuses/build/{BUILD_KEY}",
             auth=(BB_USER, BB_TOKEN))
         if st.get("state") != "INPROGRESS":
@@ -5072,7 +5227,7 @@ def _comment_header(pr_sha: str) -> str:
     through this single source of truth, and a source-grep regression test
     (test_v2518_scale_hardening.py) blocks the plain form from returning.
     """
-    return f"**Commit** `{pr_sha[:8]}` \u2192 `main` | `{BB_REPO}`"
+    return f"**Commit** `{pr_sha[:8]}` \u2192 `main` | `{_repo_for_sha(pr_sha) or BB_REPO}`"
 
 
 def format_comment(pr_sha, app_results, skipped_apps=None, base_sha="",
@@ -5360,14 +5515,24 @@ def format_comment(pr_sha, app_results, skipped_apps=None, base_sha="",
     return "\n".join(lines)
 
 # ── Per-PR processing (isolated) ──────────────────────────────────────
-def process_pr(pr, path_map, base_sha=""):
-    """Process one PR. All exceptions are caught so other PRs are not affected."""
+def process_pr(pr, path_map, base_sha="", repo=None):
+    """Process one PR. All exceptions are caught so other PRs are not affected.
+
+    COPS-2507 multi-repo: `repo` is the Bitbucket repo slug this PR belongs
+    to; `path_map` MUST be that repo's partition (path_map_for_repo). Loop
+    state is keyed by (repo, pr_id) — PR ids collide across repos.
+    """
+    repo   = repo or BB_REPO
     pr_id  = pr["id"]
     pr_sha = pr["source"]["commit"]["hash"]
+    _register_sha_repo(pr_sha, repo)
+    if base_sha:
+        _register_sha_repo(base_sha, repo)
+    sk     = (repo, pr_id)   # state key for _seen/_force_recompute/_pr_chart_targets
     dest   = pr["destination"]["branch"]["name"]
     _title = pr['title']
     _title_disp = _title if len(_title) <= 80 else _title[:80] + "..."
-    print(f"  PR #{pr_id}: {_title_disp!r} -> {dest} ({pr_sha[:8]})")
+    print(f"  PR {repo}#{pr_id}: {_title_disp!r} -> {dest} ({pr_sha[:8]})")
 
     if dest != "main":
         return
@@ -5376,19 +5541,19 @@ def process_pr(pr, path_map, base_sha=""):
     # bypassing both dedups below. Consume-once: if the recompute then fails,
     # the error-comment retry path takes over on the next iteration.
     with _seen_lock:
-        forced = pr_id in _force_recompute
+        forced = sk in _force_recompute
         if forced:
-            _force_recompute.discard(pr_id)
+            _force_recompute.discard(sk)
             print(f"    Forced recompute: a chart this PR renders with was republished")
 
     # In-memory dedup: skip same SHA already processed in this pod run
     with _seen_lock:
-        if not forced and _seen.get(pr_id) == (pr_sha, base_sha):
+        if not forced and _seen.get(sk) == (pr_sha, base_sha):
             print(f"    Skipping: SHA {pr_sha[:8]} (base {base_sha[:8] if base_sha else '?'}) already processed in this run")
             return
 
     # Cross-pod dedup: existing comment already covers this exact SHA
-    existing_id, comment_sha, comment_raw = find_existing_comment(pr_id)
+    existing_id, comment_sha, comment_raw = find_existing_comment(pr_id, repo=repo)
     if not forced and comment_sha == pr_sha[:8]:
         # Use the machine-readable [token] embedded in the comment footer (1.9.1+)
         # to decide if a re-run is needed. For legacy comments that lack the token
@@ -5427,14 +5592,42 @@ def process_pr(pr, path_map, base_sha=""):
             # existing_id is kept — the comment will be updated in place, not duplicated.
         else:
             with _seen_lock:
-                _seen[pr_id] = (pr_sha, base_sha)
+                _seen[sk] = (pr_sha, base_sha)
             print(f"    Skipping: comment up to date for SHA {pr_sha[:8]}")
             # Fix potential stuck INPROGRESS from a previously killed pod
-            fix_stuck_inprogress(pr_sha, pr_id, comment_raw)
+            fix_stuck_inprogress(pr_sha, pr_id, comment_raw, repo=repo)
             return
 
     try:
-        changed, renames = get_pr_changed_files(pr_id)
+        changed, renames = get_pr_changed_files(pr_id, repo=repo)
+        # COPS-2507: repo scope filter. Files outside the repo's configured
+        # scope prefixes (e.g. azure/ and aws/ trees in stage/prod, which
+        # belong to the legacy pipeline) are invisible to BOTH affected-app
+        # matching and new-env detection. A PR left with ZERO in-scope files
+        # is skipped in full silence (see below); mixed PRs proceed with only
+        # their in-scope files.
+        scopes = REPOS.get(repo, {}).get("scopes") or []
+        if scopes:
+            n_before = len(changed)
+            changed  = [f for f in changed
+                        if any(f.startswith(s) for s in scopes)]
+            renames  = {o: n for o, n in renames.items()
+                        if any(o.startswith(s) or n.startswith(s) for s in scopes)}
+            if n_before != len(changed):
+                print(f"    Scope filter [{'|'.join(scopes)}]: "
+                      f"{n_before} -> {len(changed)} files in scope")
+            if n_before > 0 and not changed and not renames:
+                # ENTIRELY out-of-scope PR (e.g. azure/-only in stage): full
+                # silence — no comment, no build status. These PRs belong to
+                # the legacy pipeline's team; a bot comment or a green
+                # "diff-preview" check there is noise at best and could be
+                # misread as ArgoCD validation. PRs with in-scope files (even
+                # if they match no app) keep the historical "No ArgoCD apps
+                # affected" comment+status behavior.
+                print(f"    Entirely out of scope for {repo} — skipping silently")
+                with _seen_lock:
+                    _seen[sk] = (pr_sha, base_sha)
+                return
         # Single O(files x paths) match for the whole PR (v2.4.8 perf fix) —
         # _app_to_files is reused below for the version-bump detection pass
         # instead of every app independently rescanning changed x path_map.
@@ -5503,9 +5696,9 @@ def process_pr(pr, path_map, base_sha=""):
                     status_line,
                     f"*{_ts()} \u2014 {COMMENT_MARKER} {clean_tag}" + (f" [base:{base_sha[:8]}]" if base_sha else "") + "*",
                 ]
-                upsert_comment(pr_id, "\n".join(lines), existing_id)
+                upsert_comment(pr_id, "\n".join(lines), existing_id, repo=repo)
                 with _seen_lock:
-                    _seen[pr_id] = (pr_sha, base_sha)
+                    _seen[sk] = (pr_sha, base_sha)
                 return
 
             # No apps affected and no new env pattern found.
@@ -5522,9 +5715,9 @@ def process_pr(pr, path_map, base_sha=""):
                 f"---\n**Status:** \u2705 No ArgoCD apps affected\n"
                 f"*{_ts()} \u2014 {COMMENT_MARKER} [clean]" + (f" [base:{base_sha[:8]}]" if base_sha else "") + "*"
             )
-            upsert_comment(pr_id, no_apps_body, existing_id)
+            upsert_comment(pr_id, no_apps_body, existing_id, repo=repo)
             with _seen_lock:
-                _seen[pr_id] = (pr_sha, base_sha)
+                _seen[sk] = (pr_sha, base_sha)
             return
 
         print(f"    Apps: {affected}")
@@ -5630,7 +5823,7 @@ def process_pr(pr, path_map, base_sha=""):
             if _bumped:
                 _targets.add((_cn, _bumped))
         with _seen_lock:
-            _pr_chart_targets[pr_id] = _targets
+            _pr_chart_targets[sk] = _targets
 
         _changed_paths_set = set(changed)   # for value-file skip optimization
 
@@ -5810,7 +6003,7 @@ def process_pr(pr, path_map, base_sha=""):
                                new_env_desc=new_env_desc,
                                decommission_lines=decommission_lines or None)
         comment_kb = round(len(body.encode()) / 1024, 1)
-        upsert_comment(pr_id, body, existing_id)
+        upsert_comment(pr_id, body, existing_id, repo=repo)
         action = "updated" if existing_id else "posted"
         print(f"    Comment {action} on PR #{pr_id} ({comment_kb}KB)")
 
@@ -5951,7 +6144,7 @@ def process_pr(pr, path_map, base_sha=""):
             # Mark seen for both clean runs AND permanent failures so we don't
             # spam the PR with repeated "not found" comments every 60s.
             with _seen_lock:
-                _seen[pr_id] = (pr_sha, base_sha)
+                _seen[sk] = (pr_sha, base_sha)
         return outcome_counts
 
     except Exception as e:
@@ -5968,7 +6161,7 @@ def process_pr(pr, path_map, base_sha=""):
             f"*{_ts()} \u2014 {COMMENT_MARKER} [permanent]" + (f" [base:{base_sha[:8]}]" if base_sha else "") + "*"
         )
         try:
-            upsert_comment(pr_id, err_body, existing_id)
+            upsert_comment(pr_id, err_body, existing_id, repo=repo)
         except Exception:
             pass
 
@@ -6012,61 +6205,90 @@ def main_iteration():
         f"{sum(len(v) for v in path_map.values())} app refs "
         f"({'cached' if cache_age >= 0 and cache_age < PATH_MAP_TTL else 'fresh'})")
 
-    try:
-        main_info = http("GET",
-            f"https://api.bitbucket.org/2.0/repositories/{BB_WORKSPACE}/{BB_REPO}"
-            "/refs/branches/main", auth=(BB_USER, BB_TOKEN))
-        base_sha = main_info["target"]["hash"]
-        log(f"Base SHA (main): {base_sha[:8]}")
-        # Invalidate the main-side render cache whenever main moves.
-        global _main_render_sha
-        if base_sha != _main_render_sha:
-            with _main_render_lock:
-                _main_render_cache.clear()
-            _main_render_sha = base_sha
-        prs = get_open_prs()
-    except Exception as e:
-        global _last_poll_ok, _consecutive_poll_fails
+    # ── COPS-2507 multi-repo scan: per-repo main sha, PR list and path-map
+    # partition. A Bitbucket failure on one repo must not starve the others,
+    # so each repo polls inside its own try. Global poll health only trips
+    # when EVERY configured repo failed this iteration.
+    global _last_poll_ok, _consecutive_poll_fails, _main_render_sha
+    per_repo = []          # (repo, prs, base_sha)
+    poll_failures = 0
+    for repo in REPOS:
+        try:
+            main_info = http("GET",
+                f"{_bb_api_base(repo)}/refs/branches/main",
+                auth=(BB_USER, BB_TOKEN))
+            base_sha = main_info["target"]["hash"]
+            _register_sha_repo(base_sha, repo)
+            log(f"[{repo}] Base SHA (main): {base_sha[:8]}")
+            # Invalidate the main-side render cache whenever THIS repo's main
+            # moves. _main_render_sha became a per-repo dict; the cache clear
+            # stays whole-cache (same correctness as before, slightly
+            # conservative on cross-repo hit rate — dev dominates traffic).
+            if not isinstance(_main_render_sha, dict):
+                _main_render_sha = {}
+            if base_sha != _main_render_sha.get(repo):
+                with _main_render_lock:
+                    _main_render_cache.clear()
+                _main_render_sha[repo] = base_sha
+            prs = get_open_prs(repo)
+            per_repo.append((repo, prs, base_sha))
+        except Exception as e:
+            poll_failures += 1
+            log(f"[{repo}] Bitbucket API error: {e}", "ERROR")
+    if poll_failures == len(REPOS):
         _last_poll_ok = False
         _consecutive_poll_fails += 1
-        log(f"Bitbucket API error (poll_fails={_consecutive_poll_fails}): {e}", "ERROR")
+        log(f"Bitbucket poll failed for ALL repos (poll_fails={_consecutive_poll_fails})",
+            "ERROR")
         return
-    # Mark poll as healthy after successful fetch (outside try so it only runs on success)
+    # Mark poll as healthy after at least one successful repo fetch.
     _last_poll_ok = True
     _consecutive_poll_fails = 0
     _touch_progress()  # C2 checkpoint: Bitbucket poll succeeded
-    log(f"Open PRs: {len(prs)}")
+    log("Open PRs: " + ", ".join(f"{repo}={len(prs)}" for repo, prs, _ in per_repo))
 
     # Evict _seen entries for PRs no longer open. Without this, a PR that
     # is declined and immediately reopened with the same SHA would be silently
     # skipped because the old SHA is still in _seen.
-    open_ids = {pr["id"] for pr in prs}
+    # Keys are (repo, pr_id); only repos successfully polled THIS iteration
+    # take part in eviction (a repo that failed to poll must not have its
+    # state wiped by absence).
+    polled_repos = {repo for repo, _, _ in per_repo}
+    open_keys = {(repo, pr["id"]) for repo, prs, _ in per_repo for pr in prs}
+    def _stale(k):
+        if not isinstance(k, tuple):   # legacy/foreign key shape: evict
+            return True
+        return k[0] in polled_repos and k not in open_keys
     with _seen_lock:
-        for stale_id in [k for k in _seen if k not in open_ids]:
-            del _seen[stale_id]
-        for stale_id in [k for k in _pr_chart_targets if k not in open_ids]:
-            del _pr_chart_targets[stale_id]
-        _force_recompute.intersection_update(open_ids)
+        for stale_k in [k for k in _seen if _stale(k)]:
+            del _seen[stale_k]
+        for stale_k in [k for k in _pr_chart_targets if _stale(k)]:
+            del _pr_chart_targets[stale_k]
+        _force_recompute.difference_update(
+            {k for k in _force_recompute if _stale(k)})
     with _comment_id_cache_lock:
-        for stale_id in [k for k in _comment_id_cache if k not in open_ids]:
-            del _comment_id_cache[stale_id]
+        for stale_k in [k for k in _comment_id_cache if _stale(k)]:
+            del _comment_id_cache[stale_k]
 
-    pending = [
-        pr for pr in prs
-        if pr["source"]["commit"]["hash"] != base_sha
-    ]
     totals = Counter()
-    if pending:
+    work = []
+    for repo, prs, base_sha in per_repo:
+        repo_map = path_map if len(REPOS) == 1 else path_map_for_repo(repo)
+        for pr in prs:
+            if pr["source"]["commit"]["hash"] != base_sha:
+                work.append((pr, repo_map, base_sha, repo))
+    if work:
         with ThreadPoolExecutor(max_workers=MAX_PR_WORKERS) as executor:
-            futs = {executor.submit(process_pr, pr, path_map, base_sha): pr for pr in pending}
+            futs = {executor.submit(process_pr, pr, rmap, bsha, repo): (pr, repo)
+                    for pr, rmap, bsha, repo in work}
             for fut in as_completed(futs):
                 try:
                     counts = fut.result()
                     if counts:
                         totals.update(counts)
                 except Exception as exc:
-                    pr = futs[fut]
-                    log(f"Unhandled error processing PR #{pr['id']}: {exc}", "ERROR")
+                    pr, repo = futs[fut]
+                    log(f"Unhandled error processing PR {repo}#{pr['id']}: {exc}", "ERROR")
                 _touch_progress()  # C2 checkpoint: one PR finished processing
 
     # Iteration-level rollup across all PRs: a single line that shows whether
@@ -6092,7 +6314,8 @@ def main():
     log("acme-diff-preview starting (Deployment mode, helm-template diff)",
         version=APP_VERSION,
         argocd_server=ARGOCD_SERVER, argocd_user=ARGOCD_USER,
-        bb_repo=BB_REPO, diff_workers=DIFF_WORKERS, pr_workers=MAX_PR_WORKERS,
+        bb_repos=";".join(f"{r}:{'|'.join(c['scopes']) or '*'}" for r, c in REPOS.items()),
+        diff_workers=DIFF_WORKERS, pr_workers=MAX_PR_WORKERS,
         max_apps_per_run=MAX_APPS_PER_RUN, diff_timeout=DIFF_TIMEOUT,
         diff_retries=DIFF_RETRIES, warm_workers=WARM_WORKERS,
         kube_version=KUBE_VERSION, log_level=LOG_LEVEL, vertex_model=VERTEX_MODEL)

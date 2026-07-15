@@ -155,7 +155,7 @@ def test_process_pr_legacy_text_without_token_triggers_rerun(world, monkeypatch)
     # rerun-decision block would be skipped rather than exercised.
     legacy_raw = "Old-style comment.\nDiff incomplete, could not evaluate.\n"
     monkeypatch.setattr(m, "find_existing_comment",
-                        lambda pr_id: (555, pr_sha[:8], legacy_raw))
+                        lambda pr_id, repo=None: (555, pr_sha[:8], legacy_raw))
     m.process_pr(pr, PATH_MAP, base_sha=BASE_SHA)
     assert sinks.diff_calls, "a legacy tokenless comment matching Diff incomplete must re-run"
 

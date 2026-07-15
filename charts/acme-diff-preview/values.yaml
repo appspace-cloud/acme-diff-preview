@@ -25,6 +25,11 @@ kubeVersion: "1.30.0"
 # are sized for a single PR that diffs hundreds of apps at once (a chart version
 # bump rolled out to many clusters). Override only to tune for a specific load.
 diff:
+  # COPS-2507 multi-repo: semicolon-separated "slug" or "slug:scope1|scope2"
+  # entries, e.g. "acme-config-dev;acme-config-stage:gcp/". Files outside a
+  # repo's scopes are invisible to the service (azure/aws trees stay with
+  # the legacy pipeline). Empty = historical dev-only behavior.
+  repos: ""
   # Hard cap on apps diffed per PR (covers 600+ apps/PR with headroom).
   maxAppsPerRun: 800
   # Parallel per-app helm-template diffs within one PR.
@@ -46,6 +51,10 @@ diff:
 argocd:
   server: argocd.appspace.com
   username: diff-preview
+  # Comma-separated ArgoCD projects for the JFrog-webhook hard-refresh.
+  # Unset = code default (appspace-dev,appspace-qa). Add appspace-stage
+  # when serving acme-config-stage (COPS-2507).
+  projects: ""
 
 # Bitbucket Cloud repository to watch for open PRs
 bitbucket:

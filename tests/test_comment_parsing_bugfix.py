@@ -138,11 +138,11 @@ def test_cross_pod_dedup_actually_works_after_pod_restart(monkeypatch):
     posted_comment = mod.format_comment(pr_sha, results, base_sha="b" * 40)
 
     monkeypatch.setattr(mod, "find_existing_comment",
-                        lambda pid: (55, mod._extract_comment_sha(posted_comment), posted_comment))
+                        lambda pid, repo=None: (55, mod._extract_comment_sha(posted_comment), posted_comment))
     monkeypatch.setattr(mod, "fix_stuck_inprogress", lambda *a, **k: None)
 
     diff_ran = []
-    monkeypatch.setattr(mod, "get_pr_changed_files", lambda pid: diff_ran.append(1) or [])
+    monkeypatch.setattr(mod, "get_pr_changed_files", lambda pid, repo=None: diff_ran.append(1) or [])
 
     # _seen is EMPTY, as it would be right after a pod restart.
     assert mod._seen.get(77) is None
@@ -175,7 +175,7 @@ def test_stuck_inprogress_recovery_marks_permanent_error_as_failed(monkeypatch):
         return {}
     monkeypatch.setattr(mod, "http", fake_http2)
     monkeypatch.setattr(mod, "post_build_status",
-                        lambda sha, state, desc, pr_id=None: posted.update(state=state, desc=desc))
+                        lambda sha, state, desc, pr_id=None, repo=None: posted.update(state=state, desc=desc))
 
     mod.fix_stuck_inprogress("a" * 40, 88, comment)
 
