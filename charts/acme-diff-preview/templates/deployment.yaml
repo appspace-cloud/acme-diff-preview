@@ -44,6 +44,12 @@ spec:
           env:
             - name: ARGOCD_USER
               value: {{ .Values.argocd.username | quote }}
+            {{- if .Values.argocd.projects }}
+            # Comma-separated ArgoCD projects the JFrog-webhook hard-refresh
+            # targets (COPS-2507: add appspace-stage when serving that repo).
+            - name: ARGOCD_PROJECTS
+              value: {{ .Values.argocd.projects | quote }}
+            {{- end }}
             # Vertex AI configuration — wires values.vertex.* to the code.
             # Before v2.4.2 these values existed in values.yaml but nothing
             # consumed them (the model name was hardcoded in the image).
@@ -63,6 +69,13 @@ spec:
               value: {{ .Values.kubeVersion | quote }}
             {{- end }}
             {{- with .Values.diff }}
+            {{- if .repos }}
+            # COPS-2507 multi-repo: "slug" or "slug:scope1|scope2" entries,
+            # semicolon-separated. Empty/unset = historical dev-only behavior.
+            # e.g. "acme-config-dev;acme-config-stage:gcp/"
+            - name: DIFF_REPOS
+              value: {{ .repos | quote }}
+            {{- end }}
             {{- if .maxAppsPerRun }}
             - name: MAX_APPS_PER_RUN
               value: {{ .maxAppsPerRun | quote }}

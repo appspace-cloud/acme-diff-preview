@@ -157,7 +157,7 @@ def test_process_pr_new_env_branch_renders_and_reports(world, monkeypatch):
     # The pure new-env path runs when NO existing app is affected: point the
     # changed files away from PATH_MAP so `affected` comes out empty.
     monkeypatch.setattr(m, "get_pr_changed_files",
-                        lambda pr_id: (["gcp/dev/private-cloud/ap1/custom/pv-new-x-a/customer.yaml"], {}))
+                        lambda pr_id, repo=None: (["gcp/dev/private-cloud/ap1/custom/pv-new-x-a/customer.yaml"], {}))
     monkeypatch.setattr(m, "_detect_new_env_candidates",
                         lambda changed, path_map, renames=None:
                         [{"name": "pv-new-x-a",
@@ -176,7 +176,7 @@ def test_process_pr_new_env_branch_renders_and_reports(world, monkeypatch):
 def test_process_pr_structural_new_env_blocks_the_pr(world, monkeypatch):
     sinks, plan = world
     monkeypatch.setattr(m, "get_pr_changed_files",
-                        lambda pr_id: (["gcp/dev/private-cloud/ap1/custom/pv-new-y-a/customer.yaml"], {}))
+                        lambda pr_id, repo=None: (["gcp/dev/private-cloud/ap1/custom/pv-new-y-a/customer.yaml"], {}))
     monkeypatch.setattr(m, "_detect_new_env_candidates",
                         lambda changed, path_map, renames=None:
                         [{"name": "pv-new-y-a",

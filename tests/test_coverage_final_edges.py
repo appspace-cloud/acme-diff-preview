@@ -132,9 +132,9 @@ def test_invalidate_for_republish_evicts_forces_and_wakes(monkeypatch):
         m._main_render_cache[("pv-repub-a-ms", "sha1")] = "cached-render"
         m._main_render_cache[("pv-unrelated-b-ms", "sha1")] = "keep-me"
     with m._seen_lock:
-        m._pr_chart_targets[777] = {(chart, ver)}
-        m._pr_chart_targets[888] = {(chart, "1.1.1")}
-        m._seen[777] = "aabbccdd"
+        m._pr_chart_targets[("acme-config-dev", 777)] = {(chart, ver)}
+        m._pr_chart_targets[("acme-config-dev", 888)] = {(chart, "1.1.1")}
+        m._seen[("acme-config-dev", 777)] = "aabbccdd"
     m._wake.clear()
     try:
         m._invalidate_for_republish(chart, ver)
@@ -142,8 +142,8 @@ def test_invalidate_for_republish_evicts_forces_and_wakes(monkeypatch):
         assert key_other in m._helm_chart_cache, "other versions stay cached"
         assert ("pv-repub-a-ms", "sha1") not in m._main_render_cache
         assert ("pv-unrelated-b-ms", "sha1") in m._main_render_cache
-        assert 777 in m._force_recompute and 888 not in m._force_recompute
-        assert 777 not in m._seen, "dedup must be bypassed for the forced PR"
+        assert ("acme-config-dev", 777) in m._force_recompute and ("acme-config-dev", 888) not in m._force_recompute
+        assert ("acme-config-dev", 777) not in m._seen, "dedup must be bypassed for the forced PR"
         assert m._wake.is_set(), "the polling loop must wake up immediately"
     finally:
         with m._helm_cache_lock:
@@ -171,13 +171,13 @@ def test_main_iteration_prunes_force_flags_of_closed_prs(monkeypatch):
     pr = {"id": 5, "title": "t",
           "source": {"commit": {"hash": "d" * 12}, "branch": {"name": "f"}},
           "destination": {"branch": {"name": "main"}}}
-    monkeypatch.setattr(m, "get_open_prs", lambda: [pr])
+    monkeypatch.setattr(m, "get_open_prs", lambda repo=None: [pr])
     monkeypatch.setattr(m, "process_pr", lambda *a, **kw: None)
-    m._force_recompute.update({5, 999})  # 999 = a PR that was closed meanwhile
+    m._force_recompute.update({("acme-config-dev", 5), ("acme-config-dev", 999)})  # 999 = a PR that was closed meanwhile
     try:
         m.main_iteration()
-        assert 5 in m._force_recompute or 5 not in m._force_recompute  # consumed or kept by process
-        assert 999 not in m._force_recompute, \
+        assert ("acme-config-dev", 5) in m._force_recompute or ("acme-config-dev", 5) not in m._force_recompute  # consumed or kept by process
+        assert ("acme-config-dev", 999) not in m._force_recompute, \
             "flags for no-longer-open PRs must be pruned, not accumulate forever"
     finally:
         m._force_recompute.clear()

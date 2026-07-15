@@ -126,7 +126,7 @@ def test_n3_module_survives_bad_env_at_import(monkeypatch):
 def test_n5_cached_lookup_makes_a_single_call(monkeypatch):
     mod = _import_module()
     mod._comment_id_cache.clear()
-    mod._comment_id_cache[555] = 42
+    mod._comment_id_cache[("acme-config-dev", 555)] = 42
 
     calls = []
 
@@ -147,7 +147,7 @@ def test_n5_stale_cached_id_falls_back_to_full_scan(monkeypatch):
     """A 404 on the cached id must evict it and fall back to pagination."""
     mod = _import_module()
     mod._comment_id_cache.clear()
-    mod._comment_id_cache[777] = 999   # stale: comment was deleted
+    mod._comment_id_cache[("acme-config-dev", 777)] = 999   # stale: comment was deleted
 
     calls = []
 
@@ -161,15 +161,15 @@ def test_n5_stale_cached_id_falls_back_to_full_scan(monkeypatch):
     monkeypatch.setattr(mod, "bb", fake_bb)
     cid, sha8, raw = mod.find_existing_comment(777)
     assert cid == 1001 and sha8 == "deadbeef"
-    assert mod._comment_id_cache[777] == 1001, "cache must be updated with the NEW id"
+    assert mod._comment_id_cache[("acme-config-dev", 777)] == 1001, "cache must be updated with the NEW id"
 
 
 def test_n5_cache_pruned_alongside_seen():
     """The eviction block that prunes _seen for closed PRs must also prune
     _comment_id_cache (same open_ids set), or it grows unbounded forever."""
     src = _source()
-    idx_seen_evict = src.find("for stale_id in [k for k in _seen if k not in open_ids]")
-    idx_cache_evict = src.find("for stale_id in [k for k in _comment_id_cache if k not in open_ids]")
+    idx_seen_evict = src.find("for stale_k in [k for k in _seen if _stale(k)]")
+    idx_cache_evict = src.find("for stale_k in [k for k in _comment_id_cache if _stale(k)]")
     assert idx_seen_evict > 0 and idx_cache_evict > 0, (
         "_comment_id_cache must be pruned using the same open_ids computation as _seen"
     )
