@@ -281,3 +281,42 @@ def test_no_version_anywhere_is_structural_failure(monkeypatch):
     assert diff_text is None
     assert "no appspace.version" in err, \
         "structural classification depends on this error prefix"
+
+
+# ── v2.6.1: build-status url deep-links to the review comment ────────────
+
+def test_build_status_anchors_to_comment_when_id_cached(monkeypatch):
+    calls = []
+    monkeypatch.setattr(m, "bb", lambda method, path, repo=None, body=None:
+                        calls.append(body) or {})
+    with m._comment_id_cache_lock:
+        m._comment_id_cache[(DEV, 321)] = 777888
+    m._register_sha_repo("9" * 12, DEV)
+    try:
+        m.post_build_status("9" * 12, "SUCCESSFUL", "d", pr_id=321)
+        assert calls and calls[0]["url"].endswith("/pull-requests/321#comment-777888")
+    finally:
+        with m._comment_id_cache_lock:
+            m._comment_id_cache.pop((DEV, 321), None)
+        m._sha_repo_map.clear()
+
+
+def test_build_status_plain_pr_link_without_cached_comment(monkeypatch):
+    calls = []
+    monkeypatch.setattr(m, "bb", lambda method, path, repo=None, body=None:
+                        calls.append(body) or {})
+    m.post_build_status("8" * 12, "INPROGRESS", "d", pr_id=999)
+    assert calls and calls[0]["url"].endswith("/pull-requests/999"), \
+        "no cached comment id -> plain PR link (never an empty/broken anchor)"
+
+
+def test_upsert_comment_caches_new_comment_id(monkeypatch):
+    monkeypatch.setattr(m, "bb", lambda method, path, repo=None, body=None:
+                        {"id": 424242})
+    with m._comment_id_cache_lock:
+        m._comment_id_cache.pop((DEV, 55), None)
+    m.upsert_comment(55, "body", existing_id=None, repo=DEV)
+    with m._comment_id_cache_lock:
+        assert m._comment_id_cache.get((DEV, 55)) == 424242, \
+            "POSTed comment id must be cached for the same-run final status"
+        m._comment_id_cache.pop((DEV, 55), None)

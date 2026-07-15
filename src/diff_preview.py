@@ -4148,14 +4148,26 @@ def post_build_status(pr_sha, state, description, pr_id=None, repo=None):
     build status is the acme-diff-preview service itself running as an
     ArgoCD Application - the link told a reviewer nothing about the actual
     diff and required separate ArgoCD access to even load). The full diff
-    and every detail is already in the PR comment, so the link now points
-    back at the PR itself when the caller has pr_id; only the handful of
-    call sites that fire before the PR id is known fall back to no
-    meaningful destination (ARGOCD_SERVER), which practically never happens
-    in the normal flow (pr_id is available everywhere process_pr runs).
+    and every detail is already in the PR comment, so the link deep-links
+    to that comment when its id is known (v2.6.1), or to the PR otherwise;
+    only the handful of call sites that fire before the PR id is known fall
+    back to no meaningful destination (ARGOCD_SERVER), which practically
+    never happens in the normal flow.
     """
     repo = repo or _repo_for_sha(pr_sha)
-    url = (f"https://bitbucket.org/{BB_WORKSPACE}/{repo or BB_REPO}/pull-requests/{pr_id}"
+    # v2.6.1: Bitbucket REQUIRES a url on build statuses (empirically verified:
+    # both a missing and an empty url are rejected). A bare PR link is
+    # confusing — it "redirects" to the page the reviewer is already on — so
+    # when the bot's comment id is known (cached by upsert_comment /
+    # find_existing_comment) the link anchors straight to the review comment,
+    # which is what the status text promises. First-run statuses posted
+    # before any comment exists fall back to the plain PR link.
+    _cid = None
+    if pr_id is not None:
+        with _comment_id_cache_lock:
+            _cid = _comment_id_cache.get((repo or BB_REPO, pr_id))
+    _anchor = f"#comment-{_cid}" if _cid else ""
+    url = (f"https://bitbucket.org/{BB_WORKSPACE}/{repo or BB_REPO}/pull-requests/{pr_id}{_anchor}"
            if pr_id else f"https://{ARGOCD_SERVER}")
     try:
         bb("POST", f"commit/{pr_sha}/statuses/build", repo=repo, body={
@@ -4340,11 +4352,18 @@ def upsert_comment(pr_id, body, existing_id=None, repo=None):
         log(f"[comment] truncated: {orig_bytes//1024}KB -> "
             f"{MAX_COMMENT_BYTES//1024}KB (footer/tokens preserved)", "WARNING")
     payload = {"content": {"raw": body}}
+    ck = (repo or BB_REPO, pr_id)
     try:
         if existing_id:
             bb("PUT",  f"pullrequests/{pr_id}/comments/{existing_id}", repo=repo, body=payload)
         else:
-            bb("POST", f"pullrequests/{pr_id}/comments", repo=repo, body=payload)
+            c = bb("POST", f"pullrequests/{pr_id}/comments", repo=repo, body=payload)
+            # v2.6.1: cache the fresh comment id so the FINAL build status of
+            # this same run can deep-link to the comment (#comment-<id>),
+            # instead of only from the second run on (via find_existing_comment).
+            if isinstance(c, dict) and c.get("id"):
+                with _comment_id_cache_lock:
+                    _comment_id_cache[ck] = c["id"]
     except Exception as e:
         # Only a 404 on PUT means the comment was deleted and a fresh POST is
         # correct. Any other failure (429/5xx/network) means the old comment
@@ -4360,9 +4379,12 @@ def upsert_comment(pr_id, body, existing_id=None, repo=None):
             return
         log(f"[comment] comment {existing_id} was deleted; re-creating", "WARNING")
         with _comment_id_cache_lock:
-            _comment_id_cache.pop((repo or BB_REPO, pr_id), None)
+            _comment_id_cache.pop(ck, None)
         try:
-            bb("POST", f"pullrequests/{pr_id}/comments", repo=repo, body=payload)
+            c = bb("POST", f"pullrequests/{pr_id}/comments", repo=repo, body=payload)
+            if isinstance(c, dict) and c.get("id"):
+                with _comment_id_cache_lock:
+                    _comment_id_cache[ck] = c["id"]
             log("[comment] fallback POST succeeded", "INFO")
         except Exception as e2:
             log(f"[comment] fallback POST also failed: {e2}", "ERROR")

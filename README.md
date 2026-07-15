@@ -8,10 +8,21 @@
 ACME Diff Preview service for Appspace. A long-running Kubernetes Deployment
 that does two distinct jobs:
 
-1. **PR diff comments** — watches `acme-config-dev` Bitbucket PRs and, for every
-   affected app, renders the chart with `helm template` for both the PR and the
-   `main` revision, diffs the two locally, and posts a formatted comment with a
-   Vertex AI Gemini summary.
+1. **PR diff comments** — watches Bitbucket PRs across the configured config
+   repos (today: `acme-config-dev` and `acme-config-stage`; `acme-config-prod`
+   once its ArgoCD onboarding lands) and, for every affected app, renders the
+   chart with `helm template` for both the PR and the `main` revision, diffs
+   the two locally, and posts a formatted comment with a Vertex AI Gemini
+   summary. Multi-repo (v2.6.0, COPS-2507): the path map is partitioned by
+   each Application's git source, so a PR can only ever match, fetch from,
+   and comment on its own repo. Repos are configured via `DIFF_REPOS`
+   (chart value `diff.repos`), e.g. `acme-config-dev;acme-config-stage:gcp/`.
+   The optional `:scopes` suffix limits which path prefixes the service sees
+   in that repo — stage/prod host `azure/` (and prod `aws/`) trees that stay
+   with the legacy pipeline, so PRs touching only those are skipped in full
+   silence (no comment, no build status). New-environment evaluation resolves
+   `appspace.version` through the config.yaml hierarchy at the PR sha, since
+   most stage/prod environments inherit it from a cohort-level config.yaml.
 
 2. **JFrog OCI webhook** — receives push events from JFrog when CI publishes
    a new Helm chart to `helm-oci-dev`, finds every dev/QA ArgoCD app tracking
@@ -344,7 +355,7 @@ argocd:
 
 bitbucket:
   workspace: appspace-cloud
-  repo: acme-config-dev
+  repo: acme-config-dev   # legacy value, superseded by diff.repos (multi-repo)
 
 vertex:
   project: appspace-devops
