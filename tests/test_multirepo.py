@@ -320,3 +320,109 @@ def test_upsert_comment_caches_new_comment_id(monkeypatch):
         assert m._comment_id_cache.get((DEV, 55)) == 424242, \
             "POSTed comment id must be cached for the same-run final status"
         m._comment_id_cache.pop((DEV, 55), None)
+
+
+# ── COPS-2507 contract: a single hierarchy-level version bump must reach ──
+# ── EVERY chart type (ms + ss + glb) that pins the platform revision ─────
+#
+# Live-verified 2026-07-15 on acme-config-stage PR #2728: bumping
+# cl-stage-b/config.yaml's appspace.version re-rendered 20 apps across
+# appspace-micro-services, appspace-supporting-services AND appspace-glb
+# (13 GLBs showed a real URLMap delta between chart builds). The mechanism
+# is chart-agnostic BY DESIGN — the ApplicationSet wires
+# sources[1].targetRevision = appspace.version for all three chart types,
+# and the service tracks revisions per APP, never per chart. These tests
+# pin that contract so a future "optimization" that special-cases ms/ss
+# (a plausible refactor, since GLB does not consume the ms chart) cannot
+# silently drop GLB apps from version-bump rendering.
+
+COHORT_CFG = "gcp/stage/public-cloud/na1/cl-x/config.yaml"
+OLD_REV, NEW_REV = "2603.1.0-A-dev", "2603.1.0-B-dev"
+TRIO = {
+    "cl-x-ms":       "appspace-micro-services",
+    "cl-x-ss":       "appspace-supporting-services",
+    "cl-x-app1-glb": "appspace-glb",
+}
+
+
+def _install_trio(monkeypatch):
+    monkeypatch.setattr(m, "_app_chart_map", dict(m._app_chart_map))
+    monkeypatch.setattr(m, "_app_chart_revision_map", dict(m._app_chart_revision_map))
+    m._app_chart_map.update(TRIO)
+    for app in TRIO:
+        m._app_chart_revision_map[app] = OLD_REV
+
+
+def test_cohort_bump_detected_for_every_chart_type(monkeypatch):
+    _install_trio(monkeypatch)
+    monkeypatch.setattr(m, "_bb_fetch_status",
+                        lambda path, sha, repo=None:
+                        (f"appspace:\n  version: {NEW_REV}\n", m.BB_OK)
+                        if path == COHORT_CFG else (None, m.BB_NOT_FOUND))
+    with m._vf_cache_lock:
+        m._vf_cache.clear()
+    for app in TRIO:
+        new_rev, invalid = m._pr_chart_revision_checked(
+            app, [COHORT_CFG], "c" * 12)
+        assert not invalid
+        assert new_rev == NEW_REV, (
+            f"{app} ({TRIO[app]}): the shared cohort config.yaml bump must "
+            f"apply to this chart type too, got {new_rev!r}")
+    with m._vf_cache_lock:
+        m._vf_cache.clear()
+
+
+def test_cohort_bump_renders_every_chart_type_with_new_revision(monkeypatch):
+    """Full process_pr pass: one cohort config.yaml bump -> argocd_diff must
+    receive chart_revision=NEW_REV for the ms, ss AND glb apps, and the
+    JFrog-webhook targets must register all three chart names at both the
+    main-side and the bumped revision."""
+    _install_trio(monkeypatch)
+    pr_sha, base_sha = "d" * 12, "e" * 12
+    path_map = {COHORT_CFG: list(TRIO)}
+
+    seen_revs = {}
+    def fake_diff(app, sha, main_sha, chart_revision=None,
+                  changed_paths=None, renames=None):
+        seen_revs[app] = chart_revision
+        return m.DiffResult("--- a\n+++ b",
+                            [("Deployment/x", "-i: A\n+i: B")],
+                            1, True, "", m.OUT_DIFF, "")
+    monkeypatch.setattr(m, "argocd_diff", fake_diff)
+    monkeypatch.setattr(m, "get_pr_changed_files",
+                        lambda pr_id, repo=None: ([COHORT_CFG], {}))
+    monkeypatch.setattr(m, "find_existing_comment",
+                        lambda pr_id, repo=None: (None, "", ""))
+    monkeypatch.setattr(m, "upsert_comment",
+                        lambda pr_id, body, existing_id=None, repo=None: None)
+    monkeypatch.setattr(m, "post_build_status", lambda *a, **k: None)
+    monkeypatch.setattr(m, "fix_stuck_inprogress", lambda *a, **k: None)
+    monkeypatch.setattr(m, "_touch_progress", lambda: None)
+    monkeypatch.setattr(m, "_bb_fetch_status",
+                        lambda path, sha, repo=None:
+                        (f"appspace:\n  version: {NEW_REV}\n", m.BB_OK)
+                        if path == COHORT_CFG else (None, m.BB_NOT_FOUND))
+    with m._vf_cache_lock:
+        m._vf_cache.clear()
+    m._seen.clear()
+
+    pr = {"id": 4242, "title": "cohort bump",
+          "source": {"commit": {"hash": pr_sha}, "branch": {"name": "b"}},
+          "destination": {"branch": {"name": "main"}}}
+    try:
+        m.process_pr(pr, path_map, base_sha=base_sha)
+        for app, chart in TRIO.items():
+            assert seen_revs.get(app) == NEW_REV, (
+                f"{app} ({chart}) rendered with {seen_revs.get(app)!r}, "
+                f"expected the bumped revision {NEW_REV!r}")
+        with m._seen_lock:
+            targets = m._pr_chart_targets.get((DEV, 4242), set())
+        for chart in TRIO.values():
+            assert (chart, OLD_REV) in targets and (chart, NEW_REV) in targets, (
+                f"webhook targets must track {chart} at both revisions; got {targets}")
+    finally:
+        m._seen.clear()
+        with m._seen_lock:
+            m._pr_chart_targets.pop((DEV, 4242), None)
+        with m._vf_cache_lock:
+            m._vf_cache.clear()
