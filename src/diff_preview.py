@@ -52,6 +52,7 @@ SHA dedup:
 - Cross-pod: compares comment SHA; skips and fixes stuck INPROGRESS if needed
 """
 import json, os, posixpath, random, re, shutil, signal, ssl, sys, subprocess, time, threading, urllib.error, urllib.parse, urllib.request
+import yaml  # PyYAML (requirements.txt) - input root-cause panel only, v2.6.2
 import io as _io
 import http.client as _http_client
 from collections import Counter, namedtuple
@@ -1557,6 +1558,7 @@ REASON_INVALID_VERSION = "invalid_version"
 # YAML (as opposed to a valid-but-incomplete chart render). Distinct hint so
 # the author knows to fix their YAML syntax rather than chart values (v2.4.9).
 REASON_INVALID_YAML  = "invalid_yaml"
+REASON_MISSING_REQUIRED = "missing_required"  # v2.6.2: helm `required`/nil-deref on absent value
 
 # Reasons worth retrying in-process with backoff (transient).
 # REASON_RENDER is retried once — a brief subprocess glitch (node IO, tmp
@@ -1572,6 +1574,7 @@ _REASON_HINTS = {
     REASON_OCI_PULL:      "could not pull the OCI chart (registry login or network)",
     REASON_METADATA:      "app not yet in the discovery cache (added since last refresh)",
     REASON_RENDER:        "helm template failed to render the chart with these values",
+    REASON_MISSING_REQUIRED: "a value the chart requires is missing from this environment's hierarchy",
     REASON_TIMEOUT:       f"a diff step exceeded {DIFF_TIMEOUT}s",
     REASON_UNEXPECTED:    "an unexpected error occurred while computing the diff",
     REASON_INVALID_VERSION: "appspace.version was rejected as unsafe/invalid — not a valid OCI tag",
@@ -3278,12 +3281,68 @@ def _render_reason(render_err: str) -> str:
     Everything else stays REASON_RENDER.
     """
     e = (render_err or "").lower()
+    # v2.6.2: a chart's `required "..."` guard tripping, or a nil-pointer
+    # dereference on a missing value block, means the ENVIRONMENT's values
+    # are incomplete for this chart version - the single most actionable
+    # render failure there is. Give it its own reason so the PR comment can
+    # spell out exactly what is missing instead of a generic render error
+    # (born from acme-config-dev PR #6848 confusion).
+    if ("is required" in e or "required value" in e
+            or "nil pointer evaluating" in e):
+        return REASON_MISSING_REQUIRED
     if ("error converting yaml" in e or "did not find expected" in e
             or "could not find expected" in e or "mapping values are not allowed" in e
             or "yaml: line" in e or "found character that cannot start" in e
             or "yaml:" in e and "unmarshal" in e):
         return REASON_INVALID_YAML
     return REASON_RENDER
+
+
+_HELM_EXEC_ERR_RE = re.compile(
+    r"execution error at \(([^)]+?):(\d+):\d+\):\s*(.+)", re.DOTALL)
+_HELM_TPL_ERR_RE = re.compile(
+    r"template:\s*([^\s:]+?):(\d+):\d+:\s*executing[^<]*at\s*<([^>]+)>:\s*(.+)",
+    re.DOTALL)
+
+
+def _explain_required_error(err: str) -> list:
+    """Markdown lines spelling out a REASON_MISSING_REQUIRED render failure.
+
+    v2.6.2 (born from acme-config-dev PR #6848): when a chart's `required`
+    guard trips - or a template nil-derefs a value block that is absent -
+    the developer must see, in the PR comment itself: WHAT value is missing,
+    WHERE in the chart it tripped, and WHERE to add it. Before this, the
+    comment showed 200 raw chars of helm stderr, and reviewers were blocked
+    guessing.
+
+    Handles the two shapes helm emits:
+    - `execution error at (chart/templates/x.yaml:25:15): <required msg>`
+      (the chart author's own message, usually naming the values path)
+    - `template: chart/templates/x.yaml:15:124: executing "..." at
+      <$thing.image.tag>: nil pointer evaluating interface {}.tag`
+      (no custom message - we name the dereferenced field instead)
+    """
+    err = err or ""
+    m1 = _HELM_EXEC_ERR_RE.search(err)
+    if m1:
+        tpl, line, msg = m1.group(1), m1.group(2), m1.group(3).strip()
+        # keep only the chart-relative template path (drop tmp dirs)
+        tpl = tpl[tpl.find("templates/"):] if "templates/" in tpl else tpl
+        return [
+            f"> **{msg.splitlines()[0][:300]}**",
+            f"> Chart template: `{tpl}:{line}`",
+        ]
+    m2 = _HELM_TPL_ERR_RE.search(err)
+    if m2:
+        tpl, line, expr, msg = (m2.group(1), m2.group(2),
+                                m2.group(3).strip(), m2.group(4).strip())
+        tpl = tpl[tpl.find("templates/"):] if "templates/" in tpl else tpl
+        return [
+            f"> **The chart reads `{expr}` but that value block is missing or"
+            f" empty** ({msg.splitlines()[0][:160]})",
+            f"> Chart template: `{tpl}:{line}`",
+        ]
+    return [f"> {err.splitlines()[0][:300] if err else 'no error output'}"]
 
 
 _IDENTITY_BASENAMES = ("customer.yaml", "config.yaml")
@@ -5236,6 +5295,90 @@ def _format_app_diff_block(app, sections, diff_text, show_diff=True, n_res=None)
     return out
 
 
+_SENSITIVE_KEY_RE = re.compile(r"password|secret|token|credential|apikey|api_key|privatekey", re.I)
+_INPUT_CHANGES_MAX_LINES = 24
+
+
+def _fmt_input_val(key: str, val) -> str:
+    """Render a value for the input panel: sensitive keys never echo values."""
+    if _SENSITIVE_KEY_RE.search(key):
+        return "***"
+    txt = val if isinstance(val, str) else repr(val)
+    return f"`{txt[:48]}{'...' if len(txt) > 48 else ''}`"
+
+
+def _flatten_yaml(node, prefix=""):
+    """Flatten nested mappings to {dotted.path: scalar/list} (PyYAML output)."""
+    out = {}
+    if isinstance(node, dict):
+        for k, v in node.items():
+            p = f"{prefix}.{k}" if prefix else str(k)
+            if isinstance(v, dict):
+                out.update(_flatten_yaml(v, p))
+            else:
+                out[p] = v
+    return out
+
+
+def _summarize_input_changes(changed_files, pr_sha, base_sha, repo=None) -> list:
+    """Markdown block: key-level changes this PR makes to its value files.
+
+    v2.6.2 (born from acme-config-dev PR #6848): the comment showed a chart
+    downgrade and 10 resource deletions - the SYMPTOMS - but never that the
+    PR had also deleted the `ashn:` line from customer.yaml, the kind of
+    silent input edit a reviewer cannot see without opening the file diff.
+    This section is the CAUSE panel: for every value file modified on both
+    sides, list removed keys (the #1 silent hazard, flagged loudest), value
+    changes (old -> new) and added keys. Files that exist on only one side
+    are new-env/decommission territory and already have their own dedicated
+    blocks - skipped here. Values under password/secret/token-ish keys are
+    never echoed. Output is capped; unparseable files are noted, never fatal.
+    """
+    out, budget = [], _INPUT_CHANGES_MAX_LINES
+    for path in (changed_files or [])[:8]:
+        if not path.endswith((".yaml", ".yml")):
+            continue
+        new_txt, st_new = _bb_fetch_status(path, pr_sha, repo=repo)
+        old_txt, st_old = _bb_fetch_status(path, base_sha, repo=repo)
+        if st_new != BB_OK or st_old != BB_OK:
+            continue  # added/deleted file: new-env / decommission territory
+        try:
+            new_flat = _flatten_yaml(yaml.safe_load(new_txt) or {})
+            old_flat = _flatten_yaml(yaml.safe_load(old_txt) or {})
+        except yaml.YAMLError:
+            out += [f"`{path}`: changed (not parseable as YAML)", ""]
+            continue
+        if not new_flat and not old_flat:
+            out += [f"`{path}`: changed (no scannable keys)", ""]
+            continue
+        removed = sorted(set(old_flat) - set(new_flat))
+        added   = sorted(set(new_flat) - set(old_flat))
+        changed = sorted(k for k in set(old_flat) & set(new_flat)
+                         if old_flat[k] != new_flat[k])
+        if not (removed or added or changed):
+            continue
+        file_lines = [f"`{path}`:"]
+        for k in removed:
+            file_lines.append(f"- \u26a0\ufe0f **removed** `{k}` "
+                              f"(was {_fmt_input_val(k, old_flat[k])})")
+        for k in changed:
+            file_lines.append(f"- `{k}`: {_fmt_input_val(k, old_flat[k])} "
+                              f"\u2192 {_fmt_input_val(k, new_flat[k])}")
+        for k in added:
+            file_lines.append(f"- **added** `{k}` = {_fmt_input_val(k, new_flat[k])}")
+        if len(file_lines) - 1 > budget:
+            keep = max(budget, 1)
+            file_lines = file_lines[:keep + 1] + [
+                f"- ... +{len(file_lines) - 1 - keep} more change(s) in this file"]
+        out += file_lines + [""]
+        budget -= len(file_lines) - 1
+        if budget <= 0:
+            break
+    if not out:
+        return []
+    return ["### \U0001f4dd Config changes in this PR", ""] + out
+
+
 def _comment_header(pr_sha: str) -> str:
     """The one true '**Commit**' header line for EVERY comment body.
 
@@ -5254,7 +5397,7 @@ def _comment_header(pr_sha: str) -> str:
 
 def format_comment(pr_sha, app_results, skipped_apps=None, base_sha="",
                     new_env_lines=None, new_env_structural=False, new_env_desc="",
-                    decommission_lines=None):
+                    decommission_lines=None, input_change_lines=None):
     """Format the full PR comment. Never uses <details>/<summary> — Bitbucket
     does not render them. Large changesets get a compact summary table at the
     top (all apps, one row each) and inline diffs for the top-N most-changed
@@ -5298,6 +5441,12 @@ def format_comment(pr_sha, app_results, skipped_apps=None, base_sha="",
         f"## \U0001f52d {STATUS_NAME}", "",
         f"{_comment_header(pr_sha)}{large_label}", "",
     ]
+
+    # ── Input root-cause panel (v2.6.2) ──────────────────────────────
+    # WHAT the PR edits at the values level, before any symptom below —
+    # a reviewer reads cause first (PR #6848).
+    if input_change_lines:
+        lines += input_change_lines
 
     # ── Environment decommission warning (v2.5.10) ───────────────────
     # Most critical/destructive possible finding — shown before even the
@@ -5432,7 +5581,23 @@ def format_comment(pr_sha, app_results, skipped_apps=None, base_sha="",
         elif r.outcome == OUT_INDETERMINATE:
             any_unknown = True
             unknown_apps.append(app)
-            if r.reason == REASON_OCI_NOT_FOUND and r.error:
+            if r.reason == REASON_MISSING_REQUIRED:
+                # v2.6.2: spell out the missing required value in full - the
+                # developer must know exactly what to add and where, without
+                # decoding raw helm stderr (acme-config-dev PR #6848).
+                lines += [
+                    f"\u274c **`{app}`** \u2014 \u2699\ufe0f **MISSING REQUIRED VALUE "
+                    f"\u2014 helm cannot render this environment**",
+                ]
+                lines += _explain_required_error(r.error)
+                lines += [
+                    "> **Fix:** define the missing value in this environment's "
+                    "`customer.yaml` (or a parent `config.yaml` of its hierarchy) "
+                    "and push to this branch. If the chart version changed in this "
+                    "PR, the new version may require values the old one did not.",
+                    "",
+                ]
+            elif r.reason == REASON_OCI_NOT_FOUND and r.error:
                 # Surface the exact missing chart:version prominently (bughunt):
                 # the generic hint below used to be the ONLY thing shown here,
                 # hiding which specific package was missing inside r.error -
@@ -6019,11 +6184,17 @@ def process_pr(pr, path_map, base_sha="", repo=None):
             f"config problem: {', '.join(structural_envs)}"
         ) if structural_envs else ""
 
+        try:
+            input_change_lines = _summarize_input_changes(changed, pr_sha, base_sha, repo=repo)
+        except Exception as e:  # cause panel must never break the comment
+            log(f"    [comment] input-changes panel failed: {e}", "WARNING")
+            input_change_lines = []
         body = format_comment(pr_sha, app_results, skipped_apps, base_sha=base_sha,
                                new_env_lines=new_env_lines or None,
                                new_env_structural=bool(structural_envs),
                                new_env_desc=new_env_desc,
-                               decommission_lines=decommission_lines or None)
+                               decommission_lines=decommission_lines or None,
+                               input_change_lines=input_change_lines or None)
         comment_kb = round(len(body.encode()) / 1024, 1)
         upsert_comment(pr_id, body, existing_id, repo=repo)
         action = "updated" if existing_id else "posted"

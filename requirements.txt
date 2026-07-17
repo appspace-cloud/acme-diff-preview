@@ -1,0 +1,16 @@
+# Runtime dependencies for the acme-diff-preview image.
+# Hash-pinned (--require-hashes) to match the Dockerfile's supply-chain
+# standard: digest-pinned base image, checksum-verified argocd/helm binaries.
+#
+# PyYAML (v2.6.2): real YAML parsing for the PR comment's input root-cause
+# panel - comparing both sides of every changed value file key-by-key needs
+# a correct parser (nested maps, lists, quoting, multiline), not the
+# indentation scanner _extract_chart_version_checked uses for its single
+# well-known key. That scanner stays untouched: its duplicate-key/last-wins
+# semantics are empirically calibrated against helm and it remains the
+# decision engine for chart revisions; PyYAML here is informational-panel
+# territory only.
+# Hashes: cp312 manylinux wheel (the python:3.12-slim image) + sdist fallback.
+PyYAML==6.0.3 \
+    --hash=sha256:ba1cc08a7ccde2d2ec775841541641e4548226580ab850948cbfda66a1befcdc \
+    --hash=sha256:d76623373421df22fb4cf8817020cbb7ef15c725b9d5e45f17e189bfc384190f
