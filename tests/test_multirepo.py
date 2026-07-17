@@ -426,3 +426,101 @@ def test_cohort_bump_renders_every_chart_type_with_new_revision(monkeypatch):
             m._pr_chart_targets.pop((DEV, 4242), None)
         with m._vf_cache_lock:
             m._vf_cache.clear()
+
+
+# ── v2.6.2: input-level root-cause section in the PR comment ─────────────
+# Born from acme-config-dev PR #6848: the comment screamed DOWNGRADE and
+# 10 DELETIONS (symptoms) but never showed WHAT the PR edited at the values
+# level - the version pin lowered AND the ashn line accidentally removed.
+# Reviewers were blocked staring at effects with no cause.
+
+def _mk_fetch(files_by_sha):
+    def fake(path, sha, repo=None):
+        v = files_by_sha.get((path, sha))
+        return (v, m.BB_OK) if v is not None else (None, m.BB_NOT_FOUND)
+    return fake
+
+
+def test_input_changes_removed_changed_added(monkeypatch):
+    f = "gcp/dev/x/customer.yaml"
+    monkeypatch.setattr(m, "_bb_fetch_status", _mk_fetch({
+        (f, "mainsha"): "appspace:\n  ashn: 7978xeebb\n  version: 2603.1.0-dev\n",
+        (f, "prsha"):   "appspace:\n  version: 2603.0.0-dev\n  zeroPods: true\n",
+    }))
+    out = "\n".join(m._summarize_input_changes([f], "prsha", "mainsha"))
+    assert "appspace.ashn" in out and "removed" in out and "7978xeebb" in out, \
+        "a deleted key is the #1 silent root cause and must be spelled out"
+    assert "appspace.version" in out and "2603.1.0-dev" in out and "2603.0.0-dev" in out
+    assert "appspace.zeroPods" in out and "added" in out
+
+
+def test_input_changes_redacts_sensitive_and_skips_added_files(monkeypatch):
+    f = "gcp/dev/x/customer.yaml"
+    g = "gcp/dev/x/new-file.yaml"   # absent on main side: new-env territory
+    monkeypatch.setattr(m, "_bb_fetch_status", _mk_fetch({
+        (f, "mainsha"): "appspace:\n  dbPassword: oldpw\n",
+        (f, "prsha"):   "appspace:\n  dbPassword: newpw\n",
+        (g, "prsha"):   "appspace:\n  foo: bar\n",
+    }))
+    out = "\n".join(m._summarize_input_changes([f, g], "prsha", "mainsha"))
+    assert "dbPassword" in out and "oldpw" not in out and "newpw" not in out, \
+        "values under password/secret/token-ish keys must never be echoed"
+    assert "new-file.yaml" not in out, \
+        "files existing on one side only are new-env/decommission territory"
+
+
+def test_comment_places_input_changes_before_warnings(monkeypatch):
+    res = m.DiffResult("--- a\n+++ b", [("Deployment/x", "-a\n+b")],
+                       1, True, "", m.OUT_DIFF, "")
+    res = res._replace(version_change=("2603.1.0-dev", "2603.0.0-dev")) \
+        if hasattr(res, "_replace") and hasattr(res, "version_change") else res
+    body = m.format_comment(
+        "c" * 12, {"appx": res},
+        input_change_lines=["### \U0001f4dd Config changes in this PR", "",
+                            "- `appspace.ashn` removed", ""])
+    assert "Config changes in this PR" in body
+    hdr  = body.index("ACME Diff Preview")
+    root = body.index("Config changes in this PR")
+    diff_block = body.index("appx")
+    assert hdr < root < diff_block, \
+        "cause must come right after the header, before per-app symptoms"
+
+
+# ── v2.6.2: missing helm `required` values must be SPELLED OUT in the ────
+# ── comment - the developer must see WHAT value is missing and WHERE ─────
+
+REQUIRED_ERR = ("Error: execution error at (appspace-supporting-services/"
+                "templates/bigquery/bigquerydataset.yaml:25:15): BigQuery "
+                "location is required (appspace.bigQuery.location)")
+NILPTR_ERR = ("Error: template: appspace-micro-services/templates/configmaps/"
+              "micro-versions-info.yaml:15:124: executing \"appspace-micro-"
+              "services/templates/configmaps/micro-versions-info.yaml\" at "
+              "<$microservice.image.tag>: nil pointer evaluating interface {}.tag")
+
+
+def test_render_reason_flags_missing_required():
+    assert m._render_reason(REQUIRED_ERR) == m.REASON_MISSING_REQUIRED
+    assert m._render_reason(NILPTR_ERR) == m.REASON_MISSING_REQUIRED
+    assert m._render_reason("something exploded") == m.REASON_RENDER
+
+
+def test_explain_required_error_extracts_message_and_template():
+    lines = "\n".join(m._explain_required_error(REQUIRED_ERR))
+    assert "BigQuery location is required (appspace.bigQuery.location)" in lines
+    assert "templates/bigquery/bigquerydataset.yaml:25" in lines
+    nil = "\n".join(m._explain_required_error(NILPTR_ERR))
+    assert ".tag" in nil and "micro-versions-info.yaml" in nil
+
+
+def test_comment_paints_missing_required_prominently():
+    res = m.DiffResult("", [], 0, False, REQUIRED_ERR,
+                       m.OUT_INDETERMINATE, m.REASON_MISSING_REQUIRED)
+    body = m.format_comment("c" * 12, {"pv-x-ss": res})
+    assert "MISSING REQUIRED VALUE" in body
+    assert "appspace.bigQuery.location" in body, \
+        "the exact missing value must be visible - that's the whole point"
+    assert "bigquerydataset.yaml:25" in body
+    assert "customer.yaml" in body and "config.yaml" in body, \
+        "the fix hint must tell the developer WHERE values live"
+    assert "diff unavailable" not in body, \
+        "must not fall through to the generic unhelpful hint"

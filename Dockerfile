@@ -41,6 +41,11 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 # Verify binaries
 RUN argocd version --client 2>&1 | head -1 && helm version --short
 
+# Runtime Python dependencies (hash-pinned, see requirements.txt).
+COPY requirements.txt /tmp/requirements.txt
+RUN pip install --no-cache-dir --require-hashes -r /tmp/requirements.txt \
+    && rm /tmp/requirements.txt
+
 COPY src/ /app/
 WORKDIR /app
 
