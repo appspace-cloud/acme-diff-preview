@@ -115,13 +115,18 @@ BB_WORKSPACE       = "appspace-cloud"
 # DIFF_REPOS: semicolon-separated repo entries, each "slug" or "slug:scopes"
 # where scopes is a |-separated list of path prefixes the service should
 # consider inside that repo (files outside every scope are invisible to
-# affected-app matching AND new-env detection). Scopes track what ArgoCD
-# actually manages in each repo. Since v2.6.3 the azure/ tree in stage is
-# IN scope: pv-stage-corporate-b (AKS az-prod-pv-na1-b) was onboarded as
-# the first Azure spoke, so its PRs get full diff output. The aws/ tree
-# still belongs to the legacy pipeline and stays out of scope.
-# An entry with no scopes means "whole repo" (dev's historical behavior).
-#   DIFF_REPOS="acme-config-dev;acme-config-stage:gcp/|azure/"
+# affected-app matching AND new-env detection). An entry with no scopes
+# means "whole repo" — every ArgoCD app in that repo is reachable, and any
+# tree the repo has that ArgoCD does NOT manage (e.g. a legacy-pipeline
+# path) is simply never matched by any app, so it stays silent on its own
+# without needing an explicit scope exclusion. Production runs both
+# acme-config-dev and acme-config-stage with no scope restriction (stage
+# gained azure/ coverage in v2.6.3, when pv-stage-corporate-b was onboarded
+# to ArgoCD as the first Azure spoke). Scopes remain available for a repo
+# that genuinely wants to exclude an in-repo tree the service should never
+# look at, regardless of whether ArgoCD apps exist there.
+#   DIFF_REPOS="acme-config-dev;acme-config-stage"
+#   DIFF_REPOS="acme-config-dev;acme-config-stage:gcp/|azure/"   (scoped form, still supported)
 # Default preserves the exact single-repo behavior this service always had.
 def _parse_diff_repos(raw: str) -> dict:
     repos: dict = {}
@@ -5790,12 +5795,16 @@ def process_pr(pr, path_map, base_sha="", repo=None):
 
     try:
         changed, renames = get_pr_changed_files(pr_id, repo=repo)
-        # COPS-2507: repo scope filter. Files outside the repo's configured
-        # scope prefixes (e.g. the aws/ tree in stage, still owned by the
-        # legacy pipeline) are invisible to BOTH affected-app matching and
-        # new-env detection. Since v2.6.3 the azure/ tree in stage is IN
-        # scope (pv-stage-corporate-b is ArgoCD-managed, COPS-2517). A PR
-        # left with ZERO in-scope files is skipped in full silence (see
+        # COPS-2507: repo scope filter. Only applies when the repo entry has
+        # a configured scope (see DIFF_REPOS above). Production runs stage
+        # with no scope, so a PR outside every ArgoCD app's paths (e.g. the
+        # aws/ legacy-pipeline tree) just matches zero apps below and gets
+        # the historical "No ArgoCD apps affected" comment+status, same as
+        # any other unmatched PR — it is not silenced. Scope filtering below
+        # is for a repo that wants a tree fully hidden regardless of app
+        # matching; when configured, files outside the scope prefixes are
+        # invisible to BOTH affected-app matching and new-env detection, and
+        # a PR left with ZERO in-scope files is skipped in full silence (see
         # below); mixed PRs proceed with only their in-scope files.
         scopes = REPOS.get(repo, {}).get("scopes") or []
         if scopes:

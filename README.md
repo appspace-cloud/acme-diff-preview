@@ -16,14 +16,20 @@ that does two distinct jobs:
    summary. Multi-repo (v2.6.0, COPS-2507): the path map is partitioned by
    each Application's git source, so a PR can only ever match, fetch from,
    and comment on its own repo. Repos are configured via `DIFF_REPOS`
-   (chart value `diff.repos`), e.g. `acme-config-dev;acme-config-stage:gcp/|azure/`.
-   The optional `:scopes` suffix limits which path prefixes the service sees
-   in that repo, tracking what ArgoCD actually manages there. Since v2.6.3
-   the `azure/` tree in stage is in scope: `pv-stage-corporate-b` (AKS
-   `az-prod-pv-na1-b`, COPS-2517) is ArgoCD-managed, so its PRs get the
-   same diff comments as any GCP environment. The `aws/` tree stays with
-   the legacy pipeline, so PRs touching only that are skipped in full
-   silence (no comment, no build status). New-environment evaluation resolves
+   (chart value `diff.repos`), e.g. `acme-config-dev;acme-config-stage`.
+   Production runs both repos with no scope restriction: every ArgoCD app
+   in the repo is reachable, and any tree the repo has that ArgoCD does not
+   manage (e.g. a legacy-pipeline path) is simply never matched by an app,
+   so it produces the historical "No ArgoCD apps affected" comment rather
+   than a diff. Since v2.6.3 this covers `azure/` in stage too:
+   `pv-stage-corporate-b` (AKS `az-prod-pv-na1-b`, COPS-2517) is
+   ArgoCD-managed, so its PRs get the same diff comments as any GCP
+   environment. The optional `:scopes` suffix on a repo entry (e.g.
+   `acme-config-stage:gcp/|azure/`) is still supported for a repo that
+   wants an in-repo tree fully hidden regardless of app matching — a PR
+   with zero in-scope files is then skipped in full silence (no comment,
+   no build status) instead of getting the "no apps affected" comment.
+   New-environment evaluation resolves
    `appspace.version` through the config.yaml hierarchy at the PR sha, since
    most stage/prod environments inherit it from a cohort-level config.yaml.
 
