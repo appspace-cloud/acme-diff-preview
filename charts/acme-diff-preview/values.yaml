@@ -26,9 +26,11 @@ kubeVersion: "1.30.0"
 # bump rolled out to many clusters). Override only to tune for a specific load.
 diff:
   # COPS-2507 multi-repo: semicolon-separated "slug" or "slug:scope1|scope2"
-  # entries, e.g. "acme-config-dev;acme-config-stage:gcp/". Files outside a
-  # repo's scopes are invisible to the service (azure/aws trees stay with
-  # the legacy pipeline). Empty = historical dev-only behavior.
+  # entries, e.g. "acme-config-dev;acme-config-stage:gcp/|azure/". Files
+  # outside a repo's scopes are invisible to the service. Scopes track what
+  # ArgoCD manages: stage serves gcp/ and azure/ (pv-stage-corporate-b is
+  # ArgoCD-managed since COPS-2517); the aws/ tree stays with the legacy
+  # pipeline. Empty = historical dev-only behavior.
   repos: ""
   # Hard cap on apps diffed per PR (covers 600+ apps/PR with headroom).
   maxAppsPerRun: 800
