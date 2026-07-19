@@ -947,7 +947,7 @@ def _parse_retry_after(value):
     try:
         from email.utils import parsedate_to_datetime
         when = parsedate_to_datetime(value)
-        if when is None:
+        if when is None:   # pragma: no cover - modern Python raises ValueError
             return None
         if when.tzinfo is None:
             when = when.replace(tzinfo=timezone.utc)
@@ -1078,7 +1078,11 @@ def _pooled_urlopen(req, timeout=60):
         conn = pool.get(key)
         reused = conn is not None and not fresh
         if conn is None or fresh:
-            if conn is not None:
+            if conn is not None:   # pragma: no cover - unreachable: any exit
+                # from a prior iteration that could leave conn non-None here
+                # always pool.pop()s the key first (see the except block
+                # below), so by the time a fresh=True pass re-checks
+                # pool.get(key) it is always None already.
                 try:
                     conn.close()
                 except Exception:
@@ -1179,7 +1183,9 @@ def http(method, url, body=None, headers=None, auth=None):
                 last_exc = e
                 continue
             raise
-    raise last_exc
+    raise last_exc   # pragma: no cover - unreachable: every loop iteration
+    # above either returns on success or raises before reaching a natural
+    # fall-through; this is a defensive guard against a future refactor.
 
 def bb(method, path, repo=None, **kw):
     url = f"https://api.bitbucket.org/2.0/repositories/{BB_WORKSPACE}/{repo or BB_REPO}/{path}"
@@ -1637,7 +1643,9 @@ def _bb_fetch_status(filepath, sha, repo=None):
                     time.sleep((attempt + 1) * 2)
                     continue
                 return None, BB_ERROR   # network/timeout after retries — transient
-    return None, BB_ERROR
+    return None, BB_ERROR   # pragma: no cover - unreachable: attempt 2 of
+    # range(3) always explicitly returns above (attempt < 2 is False there),
+    # so the loop never falls through naturally; defensive guard only.
 
 
 _appspace_key_re      = re.compile(r"^\s*appspace:\s*(#.*)?$")
@@ -3066,7 +3074,7 @@ def _parse_manifest_resources(yaml_text):
     resources = {}
     for doc in _split_yaml_docs(yaml_text):
         doc = doc.strip()
-        if not doc:
+        if not doc:   # pragma: no cover - _split_yaml_docs never yields blank
             continue
         kind = ns = name = api = ""
         in_meta = False
@@ -3264,7 +3272,7 @@ def _diff_resources(main_res: dict, pr_res: dict) -> str:
         a_lines = a_text.splitlines(keepends=True)
         b_lines = b_text.splitlines(keepends=True)
         delta = list(difflib.unified_diff(a_lines, b_lines, lineterm="\n"))
-        if not delta:
+        if not delta:   # pragma: no cover - differing text always diffs non-empty
             continue
         hdr = f"/{type_key} {ns}/{name}" if ns else f"/{type_key} {name}"
         parts.append(f"===== {hdr} ======\n" + "".join(delta))
