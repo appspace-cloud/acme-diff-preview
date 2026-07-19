@@ -115,10 +115,13 @@ BB_WORKSPACE       = "appspace-cloud"
 # DIFF_REPOS: semicolon-separated repo entries, each "slug" or "slug:scopes"
 # where scopes is a |-separated list of path prefixes the service should
 # consider inside that repo (files outside every scope are invisible to
-# affected-app matching AND new-env detection — e.g. stage/prod host azure/
-# and aws/ trees that belong to the legacy pipeline, not to ArgoCD).
+# affected-app matching AND new-env detection). Scopes track what ArgoCD
+# actually manages in each repo. Since v2.6.3 the azure/ tree in stage is
+# IN scope: pv-stage-corporate-b (AKS az-prod-pv-na1-b) was onboarded as
+# the first Azure spoke, so its PRs get full diff output. The aws/ tree
+# still belongs to the legacy pipeline and stays out of scope.
 # An entry with no scopes means "whole repo" (dev's historical behavior).
-#   DIFF_REPOS="acme-config-dev;acme-config-stage:gcp/"
+#   DIFF_REPOS="acme-config-dev;acme-config-stage:gcp/|azure/"
 # Default preserves the exact single-repo behavior this service always had.
 def _parse_diff_repos(raw: str) -> dict:
     repos: dict = {}
@@ -5788,11 +5791,12 @@ def process_pr(pr, path_map, base_sha="", repo=None):
     try:
         changed, renames = get_pr_changed_files(pr_id, repo=repo)
         # COPS-2507: repo scope filter. Files outside the repo's configured
-        # scope prefixes (e.g. azure/ and aws/ trees in stage/prod, which
-        # belong to the legacy pipeline) are invisible to BOTH affected-app
-        # matching and new-env detection. A PR left with ZERO in-scope files
-        # is skipped in full silence (see below); mixed PRs proceed with only
-        # their in-scope files.
+        # scope prefixes (e.g. the aws/ tree in stage, still owned by the
+        # legacy pipeline) are invisible to BOTH affected-app matching and
+        # new-env detection. Since v2.6.3 the azure/ tree in stage is IN
+        # scope (pv-stage-corporate-b is ArgoCD-managed, COPS-2517). A PR
+        # left with ZERO in-scope files is skipped in full silence (see
+        # below); mixed PRs proceed with only their in-scope files.
         scopes = REPOS.get(repo, {}).get("scopes") or []
         if scopes:
             n_before = len(changed)
@@ -5804,7 +5808,7 @@ def process_pr(pr, path_map, base_sha="", repo=None):
                 print(f"    Scope filter [{'|'.join(scopes)}]: "
                       f"{n_before} -> {len(changed)} files in scope")
             if n_before > 0 and not changed and not renames:
-                # ENTIRELY out-of-scope PR (e.g. azure/-only in stage): full
+                # ENTIRELY out-of-scope PR (e.g. aws/-only in stage): full
                 # silence — no comment, no build status. These PRs belong to
                 # the legacy pipeline's team; a bot comment or a green
                 # "diff-preview" check there is noise at best and could be

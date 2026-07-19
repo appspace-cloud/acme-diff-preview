@@ -16,10 +16,13 @@ that does two distinct jobs:
    summary. Multi-repo (v2.6.0, COPS-2507): the path map is partitioned by
    each Application's git source, so a PR can only ever match, fetch from,
    and comment on its own repo. Repos are configured via `DIFF_REPOS`
-   (chart value `diff.repos`), e.g. `acme-config-dev;acme-config-stage:gcp/`.
+   (chart value `diff.repos`), e.g. `acme-config-dev;acme-config-stage:gcp/|azure/`.
    The optional `:scopes` suffix limits which path prefixes the service sees
-   in that repo — stage/prod host `azure/` (and prod `aws/`) trees that stay
-   with the legacy pipeline, so PRs touching only those are skipped in full
+   in that repo, tracking what ArgoCD actually manages there. Since v2.6.3
+   the `azure/` tree in stage is in scope: `pv-stage-corporate-b` (AKS
+   `az-prod-pv-na1-b`, COPS-2517) is ArgoCD-managed, so its PRs get the
+   same diff comments as any GCP environment. The `aws/` tree stays with
+   the legacy pipeline, so PRs touching only that are skipped in full
    silence (no comment, no build status). New-environment evaluation resolves
    `appspace.version` through the config.yaml hierarchy at the PR sha, since
    most stage/prod environments inherit it from a cohort-level config.yaml.
