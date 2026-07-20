@@ -99,6 +99,16 @@ bitbucket:
   workspace: appspace-cloud
   repo: acme-config-dev
 
+# COPS-2520: optional GitHub support. Empty by default, so a deployment that
+# sets none of these behaves exactly as the Bitbucket-only service did.
+github:
+  # Comma-separated GitHub-hosted repo slugs to serve via GitHub instead of
+  # Bitbucket. Each slug MUST also appear in diff.repos. Empty = Bitbucket-only.
+  repos: ""
+  # GitHub org/owner for those slugs. Empty = code default (the Bitbucket
+  # workspace above, which is also the GitHub org for the acme-config-* move).
+  owner: ""
+
 # Vertex AI for diff summaries
 vertex:
   project: appspace-devops
@@ -117,6 +127,15 @@ secrets:
   # GCP SM secret name for Bitbucket webhook HMAC (X-Hub-Signature).
   # Leave empty to run in permissive mode (no verification) during rollout.
   bbWebhookSecretKey: ""
+  # COPS-2520: GCP SM secret name for the GitHub API token (sent as
+  # Authorization: Bearer). Empty = GitHub disabled. Required before any repo
+  # can be served from GitHub. Token scopes: contents read, pull requests read
+  # plus comment write, commit statuses read/write.
+  githubTokenKey: ""
+  # COPS-2520: GCP SM secret name for the GitHub webhook HMAC
+  # (X-Hub-Signature-256). Empty = permissive mode, matching the Bitbucket
+  # rollout default (no verification until the secret is configured on both ends).
+  ghWebhookSecretKey: ""
   # OCI registry credentials for the helm-template diff (both helm-oci-dev and
   # helm-oci-release use the same pair). REQUIRED: without OCI_PASS every diff
   # returns "diff unavailable" because the chart pull fails. The pod logs an

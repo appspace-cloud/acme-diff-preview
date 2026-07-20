@@ -8,7 +8,8 @@
 ACME Diff Preview service for Appspace. A long-running Kubernetes Deployment
 that does two distinct jobs:
 
-1. **PR diff comments** — watches Bitbucket PRs on the configured config repos
+1. **PR diff comments** — watches pull requests on the configured config repos
+   (Bitbucket or GitHub, chosen per repo — see [Git host](#git-host-bitbucket--github))
    and, for every affected app, renders the chart with `helm template` for
    both the PR and the `main` revision, diffs the two locally, and posts a
    formatted comment with a Vertex AI Gemini summary. Multi-repo (COPS-2507):
@@ -160,7 +161,7 @@ so several layers guard what reaches the Bitbucket comment:
 | `WARM_WORKERS` | `diff.warmWorkers` | `4` | Parallel chart warm-up pulls |
 | `WARM_THRESHOLD` | `diff.warmThreshold` | `8` | Min apps before warm-up kicks in |
 | `KUBE_VERSION` | `kubeVersion` | `1.30.0` | `--kube-version` passed to `helm template` |
-| `BB_API_CONCURRENCY` | — | `30` | Max concurrent Bitbucket API calls |
+| `BB_API_CONCURRENCY` | — | `30` | Max concurrent git-host raw-file API calls (Bitbucket or GitHub) |
 | `HELM_CACHE_MAX_CHARTS` | — | `60` | Max pulled chart versions kept on disk |
 | `AI_MAX_APPS` | — | `40` | Max changed apps included in the AI summary prompt |
 | `DIFF_OCI_SELFCHECK_INTERVAL` | — | `900` | Seconds between periodic OCI self-checks (`helm show chart` against a known-good ref). First check ~60s after start; `0` disables. Result in `/diff-preview/stats` as `oci_selfcheck` |
@@ -265,6 +266,72 @@ backend is separate follow-up work tracked in the ticket.
 
 ---
 
+## Git host (Bitbucket + GitHub)
+
+The service talks to each repo's git host through a small `VCSProvider`
+interface (`src/vcs_provider.py`), with two implementations:
+`BitbucketProvider` and `GitHubProvider`. Everything host-specific — listing
+open PRs, the diffstat, raw file reads, the PR comment, the commit build
+status, and the inbound webhook — goes through this interface, so the
+diff/render core never has to know which host a repo lives on. The marker
+matching, comment-id cache, dedup, truncation and the retry/pool/concurrency
+loop stay in the core; a provider only supplies transport and native shape.
+
+Selection is per repo and defaults to Bitbucket, so a deployment that sets
+none of the GitHub variables below behaves exactly as before. A repo listed
+in `GITHUB_REPOS` is served by GitHub; every other repo in `DIFF_REPOS` stays
+on Bitbucket. Both hosts can be served **at the same time** from one running
+instance (e.g. `acme-config-dev` on Bitbucket while a repo mid-migration is
+already on GitHub). The single `/diff-preview/webhook` endpoint serves both
+and picks the provider from the inbound event header (`X-GitHub-Event` for
+GitHub, `X-Event-Key` for Bitbucket).
+
+| Env | Helm value | Default | Purpose |
+|---|---|---|---|
+| `GITHUB_REPOS` | `github.repos` | *(empty)* | Comma-separated repo slugs served by GitHub instead of Bitbucket. Each must also be in `diff.repos`. Empty means Bitbucket-only, no behaviour change |
+| `GITHUB_OWNER` | `github.owner` | *(the Bitbucket workspace name)* | GitHub org/owner the repo slugs live under |
+| `GITHUB_TOKEN` | `secrets.githubTokenKey` | *(empty)* | GCP Secret Manager key for the GitHub REST API token, sent as `Authorization: Bearer`. Delivered to the pod via the `-creds` Secret, like the Bitbucket token |
+| `GH_WEBHOOK_SECRET` | `secrets.ghWebhookSecretKey` | *(empty)* | GCP Secret Manager key for the `X-Hub-Signature-256` HMAC secret. Empty runs the GitHub webhook in permissive mode (accepts unsigned requests), matching the Bitbucket rollout default |
+
+GitHub specifics handled inside `GitHubProvider`: page-number pagination,
+rename/copy detection from the files API, raw file reads via the Contents API
+(`Accept: application/vnd.github.raw`), issue-comment endpoints, and
+commit-status vocabulary translation (`INPROGRESS/SUCCESSFUL/FAILED` to and
+from `pending/success/failure/error`).
+
+These are wired into the Helm chart (`charts/acme-diff-preview`): `github.repos`
+and `github.owner` render as Deployment env, and `secrets.githubTokenKey` /
+`secrets.ghWebhookSecretKey` are pulled from GCP Secret Manager into the `-creds`
+Secret and injected via `envFrom`, exactly like the Bitbucket credentials. With
+all four left empty (the default) the chart renders identically to before, so a
+Bitbucket-only deployment is unaffected.
+
+### Enabling GitHub for a repo (migration runbook)
+
+The service code and the chart are ready; turning GitHub on for a repo still
+needs a few one-time, out-of-band steps that live outside this repo (GCP Secret
+Manager, ArgoCD, and the GitHub repo settings):
+
+1. Create the GitHub API token in GCP Secret Manager and point
+   `secrets.githubTokenKey` at it. Token scopes: contents read, pull requests
+   read plus comment write, commit statuses read/write. Optionally create a
+   webhook secret too and point `secrets.ghWebhookSecretKey` at it.
+2. Repoint the repo's ArgoCD Applications to their GitHub git source
+   (`github.com/<owner>/<slug>`) and give ArgoCD its own credentials for that
+   repo. This is what makes the service's app/path map resolve to the GitHub
+   slug; `_extract_app_git_repo` already handles GitHub SSH and HTTPS URLs.
+3. Add the slug to both `diff.repos` and `github.repos`.
+4. Optional but recommended: add a webhook on the GitHub repo pointing at
+   `/diff-preview/webhook` (content type JSON, the `pull_request` event, secret
+   matching `GH_WEBHOOK_SECRET`), and make sure GitHub can reach that endpoint.
+   Without it the service still works through the 60s poll loop, just slower.
+
+Order matters: do steps 1 and 2 before step 3, so a slug only lands in
+`github.repos` once its token and ArgoCD source are in place. Every other repo
+stays on Bitbucket throughout.
+
+---
+
 ## Repository layout
 
 ```
@@ -272,7 +339,10 @@ acme-diff-preview/
 ├── src/
 │   ├── diff_preview.py        Main service (Deployment)
 │   ├── diff_ui.py             Full-diff artifact store + web UI (stdlib only)
-│   └── dev_hard_refresh.py    Full hard-refresh of all dev/QA apps (CronJob)
+│   ├── dev_hard_refresh.py    Full hard-refresh of all dev/QA apps (CronJob)
+│   ├── vcs_provider.py        VCSProvider interface (COPS-2520: Bitbucket + GitHub support)
+│   ├── bitbucket_provider.py  BitbucketProvider — the Bitbucket implementation of VCSProvider
+│   └── github_provider.py     GitHubProvider — the GitHub implementation of VCSProvider
 ├── tests/                     Full pytest suite, 100% coverage of src/ — see "Tests" below
 ├── charts/
 │   └── acme-diff-preview/     Helm chart

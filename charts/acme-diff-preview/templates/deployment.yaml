@@ -126,6 +126,21 @@ spec:
             {{- end }}
             {{- end }}
             {{- end }}
+            {{- with .Values.github }}
+            {{- if .repos }}
+            # COPS-2520: repo slugs served by GitHub instead of Bitbucket
+            # (comma-separated). Each must also appear in diff.repos. Empty/unset
+            # = Bitbucket-only, no behavior change. GITHUB_TOKEN and
+            # GH_WEBHOOK_SECRET arrive via the -creds Secret (envFrom below),
+            # exactly like the Bitbucket credentials.
+            - name: GITHUB_REPOS
+              value: {{ .repos | quote }}
+            {{- end }}
+            {{- if .owner }}
+            - name: GITHUB_OWNER
+              value: {{ .owner | quote }}
+            {{- end }}
+            {{- end }}
           envFrom:
             - secretRef:
                 name: {{ include "acme-diff-preview.fullname" . }}-creds

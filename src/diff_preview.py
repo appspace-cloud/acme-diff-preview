@@ -62,6 +62,9 @@ import concurrent.futures
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone
 
+from bitbucket_provider import BitbucketProvider  # COPS-2520: extracted VCS layer
+from github_provider import GitHubProvider         # COPS-2520: GitHub VCS layer
+
 def _env_int(name: str, default: int) -> int:
     """Parse an integer env var, falling back to default on any bad value.
 
@@ -576,7 +579,7 @@ class _HealthHandler(BaseHTTPRequestHandler):
 # HTTP POST handler — receives Bitbucket webhook events
     def do_POST(self):
         if self.path == "/diff-preview/webhook":
-            # Bitbucket PR webhook — wake the diff loop immediately.
+            # PR webhook (Bitbucket or GitHub) — wake the diff loop immediately.
             # Cap body size so a large malformed request cannot exhaust pod memory.
             try:
                 length = int(self.headers.get("Content-Length", 0))
@@ -594,17 +597,32 @@ class _HealthHandler(BaseHTTPRequestHandler):
                 return
             body = self.rfile.read(length)
 
-            # HMAC-SHA256 verification (Bitbucket X-Hub-Signature header).
-            # Permissive when BB_WEBHOOK_SECRET is not set (backward compat).
-            if not _verify_bb_hmac(body, self.headers.get("X-Hub-Signature", "")):
-                log("Bitbucket webhook: HMAC verification failed — rejecting request", "WARNING")
+            # COPS-2520: one endpoint serves both hosts. Pick the provider by
+            # the event header the request carries — GitHub always sends
+            # X-GitHub-Event, Bitbucket sends X-Event-Key — and fall back to
+            # Bitbucket when no GitHub provider is configured, so a
+            # Bitbucket-only deployment behaves exactly as before.
+            if _github_provider is not None and self.headers.get(GitHubProvider.event_header):
+                _hook_provider, _hook_secret, _hook_label = (
+                    _github_provider, GH_WEBHOOK_SECRET, "GitHub")
+            else:
+                _hook_provider, _hook_secret, _hook_label = (
+                    _bitbucket_provider, BB_WEBHOOK_SECRET, "Bitbucket")
+
+            # HMAC-SHA256 verification of the raw body against the host's
+            # signature header. Permissive when that host's webhook secret is
+            # not set (backward compat during rollout).
+            _sig = self.headers.get(_hook_provider.signature_header, "")
+            if not _hook_provider.verify_webhook_signature(body, _sig, _hook_secret):
+                log(f"{_hook_label} webhook: HMAC verification failed — rejecting request",
+                    "WARNING")
                 self.send_response(401)
                 self.end_headers()
                 return
 
-            event_key = self.headers.get("X-Event-Key", "")
-            if event_key.startswith("pullrequest:"):
-                log(f"Webhook received: {event_key} — waking loop")
+            event_value = self.headers.get(_hook_provider.event_header, "")
+            if _hook_provider.is_pr_event(event_value):
+                log(f"Webhook received: {event_value} — waking loop")
                 _wake.set()
             self.send_response(200)
             self.end_headers()
@@ -726,26 +744,11 @@ def _verify_jfrog_hmac(body: bytes, header: str) -> bool:
 def _verify_bb_hmac(body: bytes, header: str) -> bool:
     """Verify Bitbucket X-Hub-Signature HMAC-SHA256 against BB_WEBHOOK_SECRET.
 
-    Bitbucket signs the payload as: X-Hub-Signature: sha256=<hex-digest>
-    If BB_WEBHOOK_SECRET is empty, the webhook is accepted without verification
-    (permissive mode for backward compatibility during rollout). Once the secret
-    is configured in both Bitbucket and GCP SM, all unsigned requests are rejected.
-
-    See _verify_jfrog_hmac for why the comparison is done in bytes, not str
-    (v2.5.3 CRIT-2): hmac.compare_digest on two str values raises TypeError
-    for any non-ASCII character, and that exception was uncaught in do_POST.
+    COPS-2520: delegates to BitbucketProvider.verify_webhook_signature. See
+    that method's docstring (bitbucket_provider.py) for the full behavior
+    contract (permissive mode, bytes-not-str comparison rationale).
     """
-    import hmac, hashlib
-    if not BB_WEBHOOK_SECRET:
-        # Secret not yet configured — accept all (permissive mode).
-        return True
-    if not header:
-        return False
-    # Strip "sha256=" prefix sent by Bitbucket.
-    sig = header.removeprefix("sha256=")
-    expected = hmac.new(BB_WEBHOOK_SECRET.encode(), body, hashlib.sha256).hexdigest()
-    return hmac.compare_digest(sig.encode("utf-8", errors="replace"),
-                                expected.encode("ascii"))
+    return _bitbucket_provider.verify_webhook_signature(body, header, BB_WEBHOOK_SECRET)
 
 
 def _invalidate_for_republish(chart_name: str, chart_version: str) -> None:
@@ -1228,8 +1231,13 @@ def http(method, url, body=None, headers=None, auth=None):
     # fall-through; this is a defensive guard against a future refactor.
 
 def bb(method, path, repo=None, **kw):
-    url = f"https://api.bitbucket.org/2.0/repositories/{BB_WORKSPACE}/{repo or BB_REPO}/{path}"
-    return http(method, url, auth=(BB_USER, BB_TOKEN), **kw)
+    # COPS-2520: delegates to BitbucketProvider (instantiated below, after
+    # _BB_MAX_PAGES is defined). Referencing _bitbucket_provider here is safe
+    # even though it's defined later in this file - Python resolves module
+    # globals at call time, and nothing calls bb() before import finishes.
+    # `http` is passed explicitly (not captured by the provider) so that
+    # tests monkeypatching the module-level `http` name still take effect.
+    return _bitbucket_provider.call(method, path, repo, http, **kw)
 
 # ── ArgoCD dynamic discovery ──────────────────────────────────────────
 def discover_path_app_map():
@@ -1341,9 +1349,15 @@ def _extract_app_git_repo(app):
     """Return the config repo slug for an app's git source, or None.
 
     The git source is the one WITHOUT a chart (multi-source apps: source-1 is
-    the git config repo providing value files via the $config alias). repoURL
-    formats seen live: git@bitbucket.org:appspace-cloud/acme-config-dev and
-    https://bitbucket.org/appspace-cloud/acme-config-dev(.git).
+    the git config repo providing value files via the $config alias).
+
+    COPS-2520: this is already host-agnostic. It only takes the last path
+    segment (minus a trailing .git), which is correct for both the SSH and
+    HTTPS forms of any git host - Bitbucket (git@bitbucket.org:workspace/slug,
+    https://bitbucket.org/workspace/slug(.git)) and GitHub
+    (git@github.com:owner/slug.git, https://github.com/owner/slug) alike.
+    Verified empirically against a real GitHub repo during the COPS-2520
+    analysis. No change needed here for GitHub support.
     """
     spec = app.get("spec", {})
     srcs = spec.get("sources") or ([spec["source"]] if spec.get("source") else [])
@@ -1661,9 +1675,13 @@ def _bb_fetch_status(filepath, sha, repo=None):
     mass PR (one call per value file), so it gains the most from
     connection reuse.
     """
-    url = (f"https://api.bitbucket.org/2.0/repositories/"
-           f"{BB_WORKSPACE}/{repo or _repo_for_sha(sha) or BB_REPO}/src/{sha}/{filepath}")
-    req = urllib.request.Request(url, headers={"Authorization": _BB_AUTH_HEADER})
+    # COPS-2520: the provider supplies the host-specific raw-file URL and auth
+    # headers; the retry / connection-pool / concurrency-limiter loop below is
+    # shared infrastructure and stays here (it is the single hottest path on a
+    # mass PR). Resolve the repo first so the right provider is chosen.
+    repo = repo or _repo_for_sha(sha) or BB_REPO
+    url, _raw_headers = _provider_for_repo(repo).raw_file_url_and_headers(filepath, sha, repo)
+    req = urllib.request.Request(url, headers=_raw_headers)
     for attempt in range(3):
         with _bb_api_sem:   # global rate limiter: caps concurrent BB API calls
             try:
@@ -4270,20 +4288,26 @@ def post_build_status(pr_sha, state, description, pr_id=None, repo=None):
     never happens in the normal flow.
     """
     repo = repo or _repo_for_sha(pr_sha)
-    # v2.6.1: Bitbucket REQUIRES a url on build statuses (empirically verified:
+    provider = _provider_for_repo(repo)
+    # v2.6.1: a build status REQUIRES a url (empirically verified on Bitbucket:
     # both a missing and an empty url are rejected). A bare PR link is
     # confusing — it "redirects" to the page the reviewer is already on — so
     # when the bot's comment id is known (cached by upsert_comment /
     # find_existing_comment) the link anchors straight to the review comment,
     # which is what the status text promises. First-run statuses posted
-    # before any comment exists fall back to the plain PR link.
+    # before any comment exists fall back to the plain PR link. The anchor
+    # syntax and the PR URL are host-specific, so both come from the provider.
     _cid = None
     if pr_id is not None:
         with _comment_id_cache_lock:
             _cid = _comment_id_cache.get((repo or BB_REPO, pr_id))
-    _anchor = f"#comment-{_cid}" if _cid else ""
-    url = (f"https://bitbucket.org/{BB_WORKSPACE}/{repo or BB_REPO}/pull-requests/{pr_id}{_anchor}"
-           if pr_id else f"https://{ARGOCD_SERVER}")
+    if pr_id:
+        _anchor = provider.comment_anchor(_cid) if _cid else ""
+        url = f"{provider.pr_web_url(pr_id, repo)}{_anchor}"
+    else:
+        # No PR id yet (rare pre-PR path): fall back to the ArgoCD server,
+        # which is a core-level destination and the same for either host.
+        url = f"https://{ARGOCD_SERVER}"
     # Full-diff UI: when the full-diff UI is enabled AND reachable (base url set)
     # AND this exact commit's artifact exists, the build icon deep-links to
     # the complete, untruncated diff (Atlantis-style). Any other case keeps
@@ -4292,68 +4316,95 @@ def post_build_status(pr_sha, state, description, pr_id=None, repo=None):
             and diff_ui.has_artifact(DIFF_UI_DIR, repo or BB_REPO, pr_id, pr_sha)):
         url = diff_ui.ui_url(DIFF_UI_BASE_URL, repo or BB_REPO, pr_id, pr_sha)
     try:
-        bb("POST", f"commit/{pr_sha}/statuses/build", repo=repo, body={
-            "state": state, "key": BUILD_KEY,
-            "name": STATUS_NAME,
-            "url": url,
-            "description": description[:255],
-        })
+        provider.post_build_status(
+            pr_sha, state, description, url, repo,
+            _provider_transport(provider),
+            key=BUILD_KEY, context=STATUS_NAME)
     except Exception as e:
         log(f"[build status] failed to set {state}: {e}", "WARNING")
 
 def _bb_api_base(repo=None):
-    """Per-repo Bitbucket API base URL (COPS-2507 multi-repo)."""
-    return f"https://api.bitbucket.org/2.0/repositories/{BB_WORKSPACE}/{repo or BB_REPO}"
+    """Per-repo Bitbucket API base URL (COPS-2507 multi-repo).
+
+    COPS-2520: delegates to BitbucketProvider.api_base.
+    """
+    return _bitbucket_provider.api_base(repo)
+
+# COPS-2520: single BitbucketProvider instance backing every bb()/get_open_prs()/
+# get_pr_changed_files()/_verify_bb_hmac() call in this module. Constructed here
+# (after all the BB_* config globals above it are defined) rather than at the
+# top of the file, so its dependencies are all already resolved.
+_BB_MAX_PAGES = 100   # safety guard: prevents infinite loops on malformed next-links
+_bitbucket_provider = BitbucketProvider(
+    workspace=BB_WORKSPACE, default_repo=BB_REPO,
+    user=BB_USER, token=BB_TOKEN,
+)
 
 # Kept as a module-level value for legacy call sites/tests; equals the default repo's base.
 _BB_API_BASE = _bb_api_base()
-_BB_MAX_PAGES = 100   # safety guard: prevents infinite loops on malformed next-links
+
+# ── COPS-2520: optional GitHub provider + per-repo provider selection ────────
+# A deployment that sets none of these behaves EXACTLY as before: everything
+# routes to Bitbucket, _github_provider is None, and _provider_for_repo always
+# returns the Bitbucket provider. A repo listed in GITHUB_REPOS routes to
+# GitHub; its owner is GITHUB_OWNER (defaults to the Bitbucket workspace name,
+# which is also the GitHub org for the acme-config-* migration).
+GITHUB_OWNER      = os.environ.get("GITHUB_OWNER", BB_WORKSPACE)
+GITHUB_TOKEN      = os.environ.get("GITHUB_TOKEN", "")
+GH_WEBHOOK_SECRET = os.environ.get("GH_WEBHOOK_SECRET", "")
+_GITHUB_REPOS = {s.strip() for s in os.environ.get("GITHUB_REPOS", "").split(",") if s.strip()}
+
+
+def _build_github_provider(repos, token, owner, default_repo):
+    """Build the optional GitHub provider, or None when GitHub is not
+    configured (no repos and no token). Factored out of the module-level
+    assignment so both the configured and the unconfigured branches are
+    unit-testable without re-importing the module under a fresh environment."""
+    if not (repos or token):
+        return None
+    return GitHubProvider(
+        owner=owner,
+        default_repo=(next(iter(repos)) if repos else default_repo),
+        token=token,
+    )
+
+
+_github_provider = _build_github_provider(
+    _GITHUB_REPOS, GITHUB_TOKEN, GITHUB_OWNER, BB_REPO)
+
+
+def _provider_for_repo(repo=None):
+    """Return the VCSProvider hosting `repo`. Bitbucket by default; a repo in
+    GITHUB_REPOS routes to GitHub. Falls back to Bitbucket when GitHub is not
+    configured, so unknown repos are never left without a provider."""
+    r = repo or BB_REPO
+    if _github_provider is not None and r in _GITHUB_REPOS:
+        return _github_provider
+    return _bitbucket_provider
+
+
+def _provider_transport(provider):
+    """The transport callable a provider's methods expect, resolved at CALL
+    time so a test monkeypatching the module-level `bb`/`http` names still
+    takes effect. Bitbucket comment/status methods were written against bb();
+    GitHub's against http()."""
+    return bb if provider is _bitbucket_provider else http
 
 
 def get_open_prs(repo=None):
-    base = _bb_api_base(repo)
-    url = f"{base}/pullrequests?state=OPEN&pagelen=50"
-    prs, nxt, pages = [], url, 0
-    while nxt and pages < _BB_MAX_PAGES:
-        data = http("GET", nxt, auth=(BB_USER, BB_TOKEN))
-        prs += data.get("values", [])
-        nxt  = data.get("next")
-        pages += 1
-    if pages >= _BB_MAX_PAGES:
+    provider = _provider_for_repo(repo)
+    prs, hit_page_limit = provider.list_open_prs(repo, http, _BB_MAX_PAGES)
+    if hit_page_limit:
         log(f"get_open_prs[{repo or BB_REPO}]: hit page limit ({_BB_MAX_PAGES}), "
             f"results may be incomplete", "WARNING")
     return prs
 
 
 def get_pr_changed_files(pr_id, repo=None):
-    files, renames, path, pages = [], {}, f"pullrequests/{pr_id}/diffstat?pagelen=100", 0
-    base = _bb_api_base(repo)
-    while path and pages < _BB_MAX_PAGES:
-        data = bb("GET", path, repo=repo)
-        for item in data.get("values", []):
-            # FIX C (v2.4.9): a rename has BOTH old and new paths. The OLD
-            # path is the one referenced by the live ArgoCD Application's
-            # valueFiles (and present in path_map), so it must be kept or the
-            # affected-app detector misses the change entirely and wrongly
-            # reports "no apps affected" for a rename that will break sync.
-            old_p = (item.get("old") or {}).get("path", "")
-            new_p = (item.get("new") or {}).get("path", "")
-            for p in (old_p, new_p):
-                if p and p not in files:
-                    files.append(p)
-            # v2.5.4 (Finding 6): remember the old->new pairing too. A rename
-            # means the OLD path's content is NOT gone, it moved — the value
-            # fetch layer needs this to follow it instead of treating the
-            # old path's 404-at-pr_sha as a deletion (confirmed live: a pure
-            # folder rename made helm template fail entirely for that
-            # customer, PRs #6647/#6648/#6649/#6654).
-            if old_p and new_p and old_p != new_p:
-                renames[posixpath.normpath(old_p.lstrip("/"))] = \
-                    posixpath.normpath(new_p.lstrip("/"))
-        nxt  = data.get("next", "")
-        path = nxt.replace(f"{base}/", "") if nxt else ""
-        pages += 1
-    if pages >= _BB_MAX_PAGES and path:
+    provider = _provider_for_repo(repo)
+    files, renames, hit_page_limit = provider.get_pr_diffstat(
+        pr_id, repo, _provider_transport(provider), _BB_MAX_PAGES)
+    if hit_page_limit:
         # Page limit hit and more pages exist — affected app list is INCOMPLETE.
         # Missing changed files → apps appear unaffected → potential false no_diff.
         log(f"PR #{pr_id}: diffstat page limit ({_BB_MAX_PAGES}) hit with more pages "
@@ -4375,12 +4426,14 @@ def find_existing_comment(pr_id, repo=None):
     Cache key is (repo, pr_id) — PR ids collide across repos (COPS-2507).
     """
     ck = (repo or BB_REPO, pr_id)
+    provider = _provider_for_repo(repo)
+    transport = _provider_transport(provider)
     with _comment_id_cache_lock:
         cached_id = _comment_id_cache.get(ck)
     if cached_id:
         try:
-            c = bb("GET", f"pullrequests/{pr_id}/comments/{cached_id}", repo=repo)
-            raw = c.get("content", {}).get("raw", "")
+            c = provider.get_comment(pr_id, cached_id, repo, transport)
+            raw = c.get("body", "")
             if any(mk in raw for mk in _COMMENT_MARKERS):
                 return cached_id, _extract_comment_sha(raw), raw
             # Marker gone (comment edited by a human) — fall through to a
@@ -4394,27 +4447,25 @@ def find_existing_comment(pr_id, repo=None):
         except Exception:
             raise
 
-    nxt, pages = f"pullrequests/{pr_id}/comments?pagelen=100", 0
-    base = _bb_api_base(repo)
-    while nxt and pages < _BB_MAX_PAGES:
-        try:
-            data = bb("GET", nxt, repo=repo)
-        except Exception as e:
-            # Transient Bitbucket error: raise so process_pr skips this PR
-            # rather than posting a duplicate comment (new ID, no update in place).
-            debug(f"find_existing_comment page {pages} error: {e}")
-            raise
-        for c in data.get("values", []):
-            raw = c.get("content", {}).get("raw", "")
+    # Full scan: the provider yields every comment as a normalized
+    # {"id","body"}; the marker matching, sha extraction and id caching are
+    # host-agnostic and stay here. iter_comments is a generator, so a
+    # transient transport error surfaces while iterating and is re-raised —
+    # process_pr then skips this PR instead of posting a duplicate comment
+    # (new id, no in-place update). That raise contract is pinned by
+    # test_coverage_last_mile.
+    try:
+        for c in provider.iter_comments(pr_id, repo, transport, _BB_MAX_PAGES):
+            raw = c.get("body", "")
             # Match the current marker AND the legacy one so comments written by
             # older pods are updated in place instead of duplicated during rollout.
             if any(mk in raw for mk in _COMMENT_MARKERS):
                 with _comment_id_cache_lock:
                     _comment_id_cache[ck] = c["id"]
                 return c["id"], _extract_comment_sha(raw), raw
-        next_url = data.get("next", "")
-        nxt = next_url.replace(f"{base}/", "") if next_url else ""
-        pages += 1
+    except Exception as e:
+        debug(f"find_existing_comment scan error: {e}")
+        raise
     return None, "", ""
 
 def _truncate_comment(body: str) -> str:
@@ -4498,15 +4549,17 @@ def upsert_comment(pr_id, body, existing_id=None, repo=None):
             _diff_stats["comments_truncated"] += 1
         log(f"[comment] truncated: {orig_bytes//1024}KB -> "
             f"{MAX_COMMENT_BYTES//1024}KB (footer/tokens preserved)", "WARNING")
-    payload = {"content": {"raw": body}}
+    payload_body = body
     ck = (repo or BB_REPO, pr_id)
+    provider = _provider_for_repo(repo)
+    transport = _provider_transport(provider)
     try:
         if existing_id:
-            bb("PUT",  f"pullrequests/{pr_id}/comments/{existing_id}", repo=repo, body=payload)
+            provider.update_comment(pr_id, existing_id, payload_body, repo, transport)
         else:
-            c = bb("POST", f"pullrequests/{pr_id}/comments", repo=repo, body=payload)
+            c = provider.create_comment(pr_id, payload_body, repo, transport)
             # v2.6.1: cache the fresh comment id so the FINAL build status of
-            # this same run can deep-link to the comment (#comment-<id>),
+            # this same run can deep-link to the comment (host-specific anchor),
             # instead of only from the second run on (via find_existing_comment).
             if isinstance(c, dict) and c.get("id"):
                 with _comment_id_cache_lock:
@@ -4528,7 +4581,7 @@ def upsert_comment(pr_id, body, existing_id=None, repo=None):
         with _comment_id_cache_lock:
             _comment_id_cache.pop(ck, None)
         try:
-            c = bb("POST", f"pullrequests/{pr_id}/comments", repo=repo, body=payload)
+            c = provider.create_comment(pr_id, payload_body, repo, transport)
             if isinstance(c, dict) and c.get("id"):
                 with _comment_id_cache_lock:
                     _comment_id_cache[ck] = c["id"]
@@ -4543,10 +4596,12 @@ def fix_stuck_inprogress(pr_sha, pr_id, comment_raw, repo=None):
     the comment but before posting the final SUCCESSFUL/FAILED status.
     """
     try:
-        st = http("GET",
-            f"{_bb_api_base(repo)}"
-            f"/commit/{pr_sha}/statuses/build/{BUILD_KEY}",
-            auth=(BB_USER, BB_TOKEN))
+        provider = _provider_for_repo(repo)
+        # get_build_status builds an absolute URL itself and uses http() on
+        # BOTH hosts (Bitbucket with auth, GitHub with bearer headers), so the
+        # transport is always http here, not _provider_transport.
+        st = provider.get_build_status(
+            pr_sha, repo, http, key=BUILD_KEY, context=STATUS_NAME)
         if st.get("state") != "INPROGRESS":
             return
         # Derive correct state from the machine-readable token first (1.9.1+,
@@ -5797,15 +5852,16 @@ def process_pr(pr, path_map, base_sha="", repo=None):
     to; `path_map` MUST be that repo's partition (path_map_for_repo). Loop
     state is keyed by (repo, pr_id) — PR ids collide across repos.
     """
-    repo   = repo or BB_REPO
-    pr_id  = pr["id"]
-    pr_sha = pr["source"]["commit"]["hash"]
+    repo     = repo or BB_REPO
+    provider = _provider_for_repo(repo)
+    pr_id    = provider.pr_id(pr)
+    pr_sha   = provider.pr_source_sha(pr)
     _register_sha_repo(pr_sha, repo)
     if base_sha:
         _register_sha_repo(base_sha, repo)
     sk     = (repo, pr_id)   # state key for _seen/_force_recompute/_pr_chart_targets
-    dest   = pr["destination"]["branch"]["name"]
-    _title = pr['title']
+    dest   = provider.pr_dest_branch(pr)
+    _title = provider.pr_title(pr)
     _title_disp = _title if len(_title) <= 80 else _title[:80] + "..."
     print(f"  PR {repo}#{pr_id}: {_title_disp!r} -> {dest} ({pr_sha[:8]})")
 
@@ -6507,10 +6563,8 @@ def main_iteration():
     poll_failures = 0
     for repo in REPOS:
         try:
-            main_info = http("GET",
-                f"{_bb_api_base(repo)}/refs/branches/main",
-                auth=(BB_USER, BB_TOKEN))
-            base_sha = main_info["target"]["hash"]
+            provider = _provider_for_repo(repo)
+            base_sha = provider.get_branch_head_sha("main", repo, http)
             _register_sha_repo(base_sha, repo)
             log(f"[{repo}] Base SHA (main): {base_sha[:8]}")
             # Invalidate the main-side render cache whenever THIS repo's main
@@ -6527,11 +6581,14 @@ def main_iteration():
             per_repo.append((repo, prs, base_sha))
         except Exception as e:
             poll_failures += 1
-            log(f"[{repo}] Bitbucket API error: {e}", "ERROR")
+            # COPS-2520: a repo may be hosted on Bitbucket or GitHub, so this
+            # operator-facing message is host-neutral (the repo slug is enough
+            # to tell which host from the config).
+            log(f"[{repo}] VCS API error: {e}", "ERROR")
     if poll_failures == len(REPOS):
         _last_poll_ok = False
         _consecutive_poll_fails += 1
-        log(f"Bitbucket poll failed for ALL repos (poll_fails={_consecutive_poll_fails})",
+        log(f"VCS poll failed for ALL repos (poll_fails={_consecutive_poll_fails})",
             "ERROR")
         return
     # Mark poll as healthy after at least one successful repo fetch.
@@ -6547,7 +6604,8 @@ def main_iteration():
     # take part in eviction (a repo that failed to poll must not have its
     # state wiped by absence).
     polled_repos = {repo for repo, _, _ in per_repo}
-    open_keys = {(repo, pr["id"]) for repo, prs, _ in per_repo for pr in prs}
+    open_keys = {(repo, _provider_for_repo(repo).pr_id(pr))
+                 for repo, prs, _ in per_repo for pr in prs}
     def _stale(k):
         if not isinstance(k, tuple):   # legacy/foreign key shape: evict
             return True
@@ -6567,8 +6625,9 @@ def main_iteration():
     work = []
     for repo, prs, base_sha in per_repo:
         repo_map = path_map if len(REPOS) == 1 else path_map_for_repo(repo)
+        provider = _provider_for_repo(repo)
         for pr in prs:
-            if pr["source"]["commit"]["hash"] != base_sha:
+            if provider.pr_source_sha(pr) != base_sha:
                 work.append((pr, repo_map, base_sha, repo))
     if work:
         with ThreadPoolExecutor(max_workers=MAX_PR_WORKERS) as executor:
@@ -6581,7 +6640,8 @@ def main_iteration():
                         totals.update(counts)
                 except Exception as exc:
                     pr, repo = futs[fut]
-                    log(f"Unhandled error processing PR {repo}#{pr['id']}: {exc}", "ERROR")
+                    log(f"Unhandled error processing PR "
+                        f"{repo}#{_provider_for_repo(repo).pr_id(pr)}: {exc}", "ERROR")
                 _touch_progress()  # C2 checkpoint: one PR finished processing
 
     # Iteration-level rollup across all PRs: a single line that shows whether

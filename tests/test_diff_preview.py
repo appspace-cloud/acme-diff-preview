@@ -99,9 +99,13 @@ def test_seen_eviction_uses_integer_ids():
         "REGRESSION: eviction key uses str(pr['id']) — integer IDs will "
         "never match the state keys, clearing state every iteration."
     )
-    # Ensure the correct multi-repo pattern is present
-    assert 'open_keys = {(repo, pr["id"]) for repo, prs, _ in per_repo for pr in prs}' in src, (
-        "state eviction must build (repo, integer-id) keys matching _seen/_pr_chart_targets keys."
+    # Ensure the correct multi-repo pattern is present. COPS-2520: the id
+    # component now comes from the provider accessor pr_id(), which returns the
+    # raw integer for Bitbucket, so the (repo, integer-id) key shape is intact
+    # and the str() regression stays pinned by the assertion above.
+    assert 'open_keys = {(repo, _provider_for_repo(repo).pr_id(pr))' in src, (
+        "state eviction must build (repo, provider.pr_id) keys matching "
+        "_seen/_pr_chart_targets keys."
     )
 
 
@@ -508,12 +512,30 @@ def test_status_name_is_acme():
     )
 
 
-def test_build_status_name_uses_status_name():
-    """post_build_status must send STATUS_NAME, not a hardcoded ArgoCD label."""
-    src = _source()
-    assert '"name": STATUS_NAME' in src, (
-        "Build status must use STATUS_NAME so the PR shows 'ACME Diff Preview'"
+def test_build_status_name_uses_status_name(monkeypatch):
+    """post_build_status must send STATUS_NAME as the host-visible status name,
+    not a hardcoded ArgoCD label. COPS-2520: the display name now flows from the
+    core (context=STATUS_NAME) into BitbucketProvider (which sends it as the
+    build-status "name" field), so this asserts the end result on the actual
+    request body rather than a source string in one file."""
+    mod = _import_module()
+    captured = {}
+
+    def fake_bb(method, path, **kw):
+        captured["method"] = method
+        captured["path"] = path
+        captured.update(kw.get("body", {}))
+        return {}
+
+    monkeypatch.setattr(mod, "bb", fake_bb)
+    mod.post_build_status("deadbeefcafe", "SUCCESSFUL",
+                          "1 resource(s) will change", pr_id=1, repo=None)
+    assert captured.get("method") == "POST"
+    assert captured.get("path") == "commit/deadbeefcafe/statuses/build"
+    assert captured.get("name") == mod.STATUS_NAME == "ACME Diff Preview", (
+        "Build status must send STATUS_NAME so the PR shows 'ACME Diff Preview'"
     )
+    assert captured.get("key") == mod.BUILD_KEY  # stable status key preserved
 
 
 def test_build_key_is_stable():
