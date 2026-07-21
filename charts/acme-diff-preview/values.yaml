@@ -51,6 +51,18 @@ diff:
   # warmThreshold was removed — it had no effect after the warm-diff pass was
   # replaced by the pre-pull phase. Keeping the key here is intentionally omitted.
 
+# Full-diff web UI (Atlantis-style). Off by default: the rendered manifests
+# are identical with enabled: false. When enabled, the complete untruncated
+# diff is persisted per (repo, pr, sha) and served at /diff/<repo>/<pr>/<sha>
+# on the health port; baseUrl is the externally reachable host (the planned
+# IAP-protected one) the Bitbucket build status deep-links to. While baseUrl
+# is empty, artifacts are saved but the status keeps linking to the comment.
+diffUi:
+  enabled: false
+  baseUrl: ""
+  dir: /tmp/acme-diff-ui
+  maxArtifacts: 500
+
 # ArgoCD server (hub cluster ingress)
 argocd:
   server: argocd.appspace.com

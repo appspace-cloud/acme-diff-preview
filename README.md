@@ -168,6 +168,32 @@ so several layers guard what reaches the Bitbucket comment:
 | `DIFF_OCI_FAIL_ERROR_THRESHOLD` | — | `3` | Consecutive systemic chart-pull failures after which failures log at ERROR instead of WARNING |
 | `DIFF_IGNORE_RESOURCES` | — | *(empty)* | Extra comma-separated resource-name substrings to hide from every diff, on top of the built-in `micro-versions-info` |
 | `DIFF_HTTP_POOLING` | — | `on` | HTTP keep-alive pooling: one persistent TLS connection per worker thread and host. `off` routes every request through plain `urlopen`. Auto-defers to `urlopen` when a proxy is configured. Visible in `/diff-preview/stats` (`http_pool_reuses`/`http_pool_fresh_conns`/`http_pool_fallbacks`) |
+| `DIFF_UI_ENABLED` | `diffUi.enabled` | `false` | Full-diff web UI (see below). Off = byte-identical legacy behavior |
+| `DIFF_UI_BASE_URL` | `diffUi.baseUrl` | *(empty)* | External base URL the build status deep-links to. Empty = status keeps linking to the comment |
+| `DIFF_UI_DIR` | `diffUi.dir` | `/tmp/acme-diff-ui` | Artifact directory (bounded, pruned oldest-first) |
+| `DIFF_UI_MAX_ARTIFACTS` | `diffUi.maxArtifacts` | `500` | Max stored artifacts before pruning |
+
+### Full-diff web UI (Atlantis-style)
+
+The PR comment has a hard Bitbucket size limit (`MAX_COMMENT_BYTES`, ~245KB):
+an oversized comment is cut in the middle and, until now, the complete output
+only existed in the pod logs. With `DIFF_UI_ENABLED`, the service persists the
+COMPLETE, untruncated comment body per `(repo, pr, sha)` (already redacted,
+the exact text the comment would carry) and serves it on the health port:
+
+| Method | Path | Description |
+|---|---|---|
+| `GET` | `/diff/<repo>/<pr>/<sha>` | Full diff rendered as HTML (everything escaped) |
+| `GET` | `/diff/<repo>/<pr>/<sha>/raw` | Exact plain-text body |
+
+When `DIFF_UI_BASE_URL` is also set, the Bitbucket build status URL becomes
+the permalink to that page for the exact commit, mirroring how the Atlantis
+commit-status "Details" link opens the full plan output. The comment stays
+as the summary. Storage v1 is a bounded local directory (atomic writes,
+oldest-pruned); a durable GCS backend and the IAP-protected external host are
+the follow-up infra work tracked in the ticket. Until that host exists, keep
+`DIFF_UI_BASE_URL` empty: artifacts are still served in-cluster (port-forward)
+and the status link is unchanged.
 
 ---
 
@@ -177,6 +203,7 @@ so several layers guard what reaches the Bitbucket comment:
 acme-diff-preview/
 ├── src/
 │   ├── diff_preview.py        Main service (Deployment)
+│   ├── diff_ui.py             Full-diff artifact store + web UI (stdlib only)
 │   └── dev_hard_refresh.py    Full hard-refresh of all dev/QA apps (CronJob)
 ├── tests/                     Full pytest suite, 100% coverage of src/ — see "Tests" below
 ├── charts/
@@ -259,6 +286,8 @@ All endpoints are served on port **8080** inside the pod.
 | `GET` | `/jfrog-webhook/stats` | Webhook counters (JSON) |
 | `GET` | `/healthz` | Liveness probe |
 | `GET` | `/readyz` | Readiness probe |
+| `GET` | `/diff/<repo>/<pr>/<sha>` | Full untruncated diff as HTML (404 unless `DIFF_UI_ENABLED`) |
+| `GET` | `/diff/<repo>/<pr>/<sha>/raw` | Full untruncated diff as plain text (404 unless `DIFF_UI_ENABLED`) |
 
 ### JFrog webhook security
 
