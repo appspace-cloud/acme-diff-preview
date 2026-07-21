@@ -168,32 +168,74 @@ so several layers guard what reaches the Bitbucket comment:
 | `DIFF_OCI_FAIL_ERROR_THRESHOLD` | — | `3` | Consecutive systemic chart-pull failures after which failures log at ERROR instead of WARNING |
 | `DIFF_IGNORE_RESOURCES` | — | *(empty)* | Extra comma-separated resource-name substrings to hide from every diff, on top of the built-in `micro-versions-info` |
 | `DIFF_HTTP_POOLING` | — | `on` | HTTP keep-alive pooling: one persistent TLS connection per worker thread and host. `off` routes every request through plain `urlopen`. Auto-defers to `urlopen` when a proxy is configured. Visible in `/diff-preview/stats` (`http_pool_reuses`/`http_pool_fresh_conns`/`http_pool_fallbacks`) |
-| `DIFF_UI_ENABLED` | `diffUi.enabled` | `false` | Full-diff web UI (see below). Off = byte-identical legacy behavior |
+| `DIFF_UI_ENABLED` | `diffUi.enabled` | `true` | Full-diff web UI (see below). Persists artifacts + serves `/diff/*` in-cluster; safe by default since no ingress path exposes it externally |
 | `DIFF_UI_BASE_URL` | `diffUi.baseUrl` | *(empty)* | External base URL the build status deep-links to. Empty = status keeps linking to the comment |
 | `DIFF_UI_DIR` | `diffUi.dir` | `/tmp/acme-diff-ui` | Artifact directory (bounded, pruned oldest-first) |
 | `DIFF_UI_MAX_ARTIFACTS` | `diffUi.maxArtifacts` | `500` | Max stored artifacts before pruning |
+| — | `diffUi.ingress.enabled` | `false` | Externally reachable, IAP-gated Service + BackendConfig for the UI (see below) |
 
 ### Full-diff web UI (Atlantis-style)
 
 The PR comment has a hard Bitbucket size limit (`MAX_COMMENT_BYTES`, ~245KB):
 an oversized comment is cut in the middle and, until now, the complete output
-only existed in the pod logs. With `DIFF_UI_ENABLED`, the service persists the
-COMPLETE, untruncated comment body per `(repo, pr, sha)` (already redacted,
-the exact text the comment would carry) and serves it on the health port:
+only existed in the pod logs. With `DIFF_UI_ENABLED` (**on by default**, see
+below), the service persists the COMPLETE, untruncated comment body per
+`(repo, pr, sha)` (already redacted, the exact text the comment would carry),
+together with the same at-a-glance context the comment header shows (base
+commit, apps evaluated, per-outcome breakdown), and serves it on the health
+port. Every page names the service explicitly ("ACME Diff Preview" in the
+title and on the page) so a reviewer landing here from a build status link
+never has to guess which tool posted it:
 
 | Method | Path | Description |
 |---|---|---|
 | `GET` | `/diff/<repo>/<pr>/<sha>` | Full diff rendered as HTML (everything escaped) |
 | `GET` | `/diff/<repo>/<pr>/<sha>/raw` | Exact plain-text body |
 
-When `DIFF_UI_BASE_URL` is also set, the Bitbucket build status URL becomes
-the permalink to that page for the exact commit, mirroring how the Atlantis
-commit-status "Details" link opens the full plan output. The comment stays
-as the summary. Storage v1 is a bounded local directory (atomic writes,
-oldest-pruned); a durable GCS backend and the IAP-protected external host are
-the follow-up infra work tracked in the ticket. Until that host exists, keep
-`DIFF_UI_BASE_URL` empty: artifacts are still served in-cluster (port-forward)
-and the status link is unchanged.
+**Why the default is on and why that is safe.** The ArgoCD hub Ingress
+`extraPaths` forward exactly two paths to this Service, `/jfrog-webhook` and
+`/diff-preview/webhook`, never a wildcard (defined in `acme-infrastructure`,
+not this chart). Turning `DIFF_UI_ENABLED` on does not add a new externally
+reachable path: `/diff/*` is only reachable in-cluster or via
+`kubectl port-forward`, exactly like `/diff-preview/stats` already is.
+`DIFF_UI_BASE_URL` stays empty by default, so the Bitbucket build status
+keeps linking to the comment, never to a host with no access control in
+front of it.
+
+**Reaching it from a browser, behind SSO.** This is a SEPARATE, explicit
+opt-in: `diffUi.ingress.enabled` (default `false`). When set, the chart
+renders a second Service, `<release>-acme-diff-preview-ui`, selecting the
+exact same pods on the exact same port, with a GKE `BackendConfig`
+(`cloud.google.com/backend-config` annotation) enabling Google
+Identity-Aware Proxy on that Service only. The primary Service (the
+webhooks) is never touched, since JFrog and Bitbucket authenticate with an
+HMAC signature and could never complete an interactive Google login. This
+mirrors how ArgoCD itself is protected here (`argocd-dex-server` + Google
+OAuth, COPS-2479): the same Google identity gates this page. Turning it on
+requires, in order:
+
+1. A real IAP OAuth client already provisioned in the GCP project (Cloud
+   Console → Security → Identity-Aware Proxy).
+2. Its `client_id`/`client_secret` synced into GCP Secret Manager under the
+   keys named by `secrets.iapOauthClientIdKey` / `secrets.iapOauthClientSecretKey`
+   (both empty by default; setting both is what makes the chart create the
+   `ExternalSecret` that fills the `BackendConfig`'s referenced Secret).
+3. Wiring the new `<release>-acme-diff-preview-ui` Service into the hub
+   Ingress' host/path rules and the TLS certificate for that host: both
+   live in `acme-infrastructure`, tracked as follow-up work in the ticket,
+   not in this chart.
+
+If step 2 or 3 is missing while `diffUi.ingress.enabled` is `true`, the GKE
+ingress controller simply fails to sync that one backend (visible on
+`kubectl describe backendconfig`/ingress events); nothing else in the
+cluster, and no other Application, is affected. Once the host is live, set
+`DIFF_UI_BASE_URL` to it (e.g. `https://acme-diff-preview.appspace.com`, the
+same `acme-diff-preview` slug this chart already uses for the Service name)
+so the Bitbucket build status becomes the permalink to that exact commit's
+page, mirroring how the Atlantis commit-status "Details" link opens the
+full plan output. The comment stays as the summary either way. Storage v1
+is a bounded local directory (atomic writes, oldest-pruned); a durable GCS
+backend is separate follow-up work tracked in the ticket.
 
 ---
 
@@ -213,6 +255,9 @@ acme-diff-preview/
 │       └── templates/
 │           ├── deployment.yaml
 │           ├── service.yaml
+│           ├── ui-service.yaml         IAP-fronted Service (diffUi.ingress.enabled)
+│           ├── ui-backendconfig.yaml   GKE BackendConfig enabling IAP on it
+│           ├── ui-iap-externalsecret.yaml  IAP OAuth client creds
 │           ├── serviceaccount.yaml
 │           ├── externalsecret.yaml
 │           └── cronjob.yaml

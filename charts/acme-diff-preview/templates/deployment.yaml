@@ -103,13 +103,15 @@ spec:
             {{- /* warmThreshold removed — no effect after warm-diff pass was replaced by pre-pull */ -}}
             {{- end }}
             {{- with .Values.diffUi }}
-            {{- if .enabled }}
             # Full-diff web UI (Atlantis-style): the complete, untruncated
             # diff is persisted per (repo, pr, sha) and served on /diff/...
-            # by the same health server. Default off; baseUrl is the future
-            # IAP-protected external host the build status will link to.
+            # by the same health server. Rendered unconditionally (never
+            # omitted) so an explicit enabled: false in values can never be
+            # silently shadowed by the container's own default, whatever
+            # that default happens to be.
             - name: DIFF_UI_ENABLED
-              value: "true"
+              value: {{ .enabled | quote }}
+            {{- if .enabled }}
             {{- if .baseUrl }}
             - name: DIFF_UI_BASE_URL
               value: {{ .baseUrl | quote }}

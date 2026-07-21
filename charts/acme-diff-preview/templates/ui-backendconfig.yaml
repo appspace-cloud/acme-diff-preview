@@ -1,0 +1,24 @@
+{{- if and .Values.diffUi.enabled .Values.diffUi.ingress.enabled }}
+# Enables Google Identity-Aware Proxy on the acme-diff-preview-ui Service
+# above (GKE reads this via the cloud.google.com/backend-config annotation
+# on that Service — see enabling-kubernetes-howto in Google's IAP docs).
+# Requires a real IAP OAuth client already provisioned in this GCP project
+# and its credentials synced into the Secret below via ExternalSecret (see
+# ui-iap-externalsecret.yaml, gated on secrets.iapOauthClientId/SecretKey).
+# If that Secret does not exist yet, the GKE ingress controller simply fails
+# to sync THIS backend (visible on `kubectl describe backendconfig`/ingress
+# events) without affecting the webhook Service, any other Application in
+# this cluster, or the pod itself.
+apiVersion: cloud.google.com/v1
+kind: BackendConfig
+metadata:
+  name: {{ include "acme-diff-preview.fullname" . }}-ui
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "acme-diff-preview.labels" . | nindent 4 }}
+spec:
+  iap:
+    enabled: true
+    oauthclientCredentials:
+      secretName: {{ include "acme-diff-preview.fullname" . }}-ui-iap-oauth
+{{- end }}

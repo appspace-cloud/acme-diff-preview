@@ -1,0 +1,29 @@
+{{- if and .Values.diffUi.enabled .Values.diffUi.ingress.enabled }}
+# ACME Diff Preview full-diff web UI: a SEPARATE Service from the primary
+# one in service.yaml, on purpose. The primary Service carries the JFrog
+# and Bitbucket webhooks, which authenticate via HMAC and can never sit
+# behind an interactive Google login (neither JFrog nor Bitbucket can
+# complete an IAP OAuth redirect). This Service selects the exact same
+# pods on the exact same port; it exists only so a GKE BackendConfig with
+# Identity-Aware Proxy can be attached to it without touching the webhook
+# path at all. Wiring this Service into the ArgoCD hub Ingress' host/path
+# rules (and the TLS certificate for that host) lives in acme-infrastructure,
+# not this chart.
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "acme-diff-preview.fullname" . }}-ui
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "acme-diff-preview.labels" . | nindent 4 }}
+  annotations:
+    cloud.google.com/backend-config: '{"default": "{{ include "acme-diff-preview.fullname" . }}-ui"}'
+spec:
+  type: {{ .Values.service.type }}
+  selector:
+    {{- include "acme-diff-preview.selectorLabels" . | nindent 4 }}
+  ports:
+    - port: {{ .Values.service.port }}
+      targetPort: {{ .Values.service.port }}
+      protocol: TCP
+{{- end }}

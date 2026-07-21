@@ -51,17 +51,34 @@ diff:
   # warmThreshold was removed — it had no effect after the warm-diff pass was
   # replaced by the pre-pull phase. Keeping the key here is intentionally omitted.
 
-# Full-diff web UI (Atlantis-style). Off by default: the rendered manifests
-# are identical with enabled: false. When enabled, the complete untruncated
-# diff is persisted per (repo, pr, sha) and served at /diff/<repo>/<pr>/<sha>
-# on the health port; baseUrl is the externally reachable host (the planned
-# IAP-protected one) the Bitbucket build status deep-links to. While baseUrl
-# is empty, artifacts are saved but the status keeps linking to the comment.
+# Full-diff web UI (Atlantis-style). Default ON (verified safe: the ArgoCD
+# hub Ingress extraPaths only forward /jfrog-webhook and /diff-preview/webhook
+# to this Service, never a wildcard, so this does not expose /diff/* anywhere
+# it was not already reachable: in-cluster traffic or kubectl port-forward).
+# baseUrl is the externally reachable host (e.g.
+# https://acme-diff-preview.appspace.com, same "acme-diff-preview" slug this
+# chart already uses for the Service/Ingress name above) the Bitbucket build
+# status deep-links to. Empty by default: reaching the page from outside the
+# cluster is the SEPARATE `ingress` opt-in below, so a build status is never
+# published pointing at a host with no real access control in front of it.
 diffUi:
-  enabled: false
+  enabled: true
   baseUrl: ""
   dir: /tmp/acme-diff-ui
   maxArtifacts: 500
+  # Externally reachable, Google IAP-gated exposure of the full-diff pages,
+  # via a SEPARATE Service + GKE BackendConfig (the webhook Service above is
+  # never touched: JFrog/Bitbucket authenticate by HMAC, not by browser
+  # login, and could never complete an IAP redirect). Off by default: a real
+  # IAP OAuth client must already exist in the GCP project (Cloud Console >
+  # Security > Identity-Aware Proxy) before this is safe to enable, and its
+  # client_id/client_secret must be synced via the secrets.iapOauthClientId/
+  # SecretKey values below (ExternalSecret, same pattern as secrets.* further
+  # down). Wiring the resulting Service into the hub Ingress' host/path rules
+  # and issuing the TLS cert both live in acme-infrastructure, not this
+  # chart; see the tracking ticket for the full rollout checklist.
+  ingress:
+    enabled: false
 
 # ArgoCD server (hub cluster ingress)
 argocd:
@@ -101,6 +118,11 @@ secrets:
   # ERROR at startup if OCI_PASS is empty.
   ociUserKey: acme-repo-username
   ociPassKey: acme-repo-password
+  # GCP Secret Manager keys for the full-diff UI's IAP OAuth client
+  # (diffUi.ingress.enabled). Both empty (default) skips creating that
+  # ExternalSecret entirely; set both once a real IAP OAuth client exists.
+  iapOauthClientIdKey: ""
+  iapOauthClientSecretKey: ""
 
 # Webhook endpoint exposed via the ArgoCD Ingress extraPaths
 webhook:

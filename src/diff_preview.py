@@ -259,12 +259,18 @@ JFROG_MAX_BODY_BYTES = _env_int("JFROG_MAX_BODY_BYTES", 65536)  # 64 KB — reje
 # The PR comment stays the summary (truncated over MAX_COMMENT_BYTES); with
 # this enabled the COMPLETE body is persisted per (repo, pr, sha) and served
 # at /diff/<repo>/<pr>/<sha> on the same health server, and the Bitbucket
-# build status deep-links there. Default OFF: with the flag off, behavior is
-# byte-for-byte identical to before (no writes, /diff/* is 404, status URL
-# unchanged). DIFF_UI_BASE_URL is the externally reachable base (the future
-# IAP-protected host); while empty, artifacts are still saved but the status
-# keeps linking to the comment.
-DIFF_UI_ENABLED       = os.environ.get("DIFF_UI_ENABLED", "false").strip().lower() in ("1", "true", "yes")
+# build status deep-links there. Default ON, and verified safe to default
+# on: the ArgoCD hub Ingress extraPaths only forward two specific paths to
+# this Service (/jfrog-webhook, /diff-preview/webhook), never a wildcard, so
+# turning this on does not expose /diff/* anywhere it was not already
+# reachable (in-cluster traffic or kubectl port-forward only). Reaching it
+# from outside the cluster over a real hostname, behind Google IAP, is a
+# SEPARATE opt-in: see the diffUi.ingress chart value (default off, it needs
+# a real IAP OAuth client provisioned in the GCP project first).
+# DIFF_UI_BASE_URL is that externally reachable base; while empty, artifacts
+# are still saved and served in-cluster but the build status keeps linking
+# to the comment, exactly as before this feature existed.
+DIFF_UI_ENABLED       = os.environ.get("DIFF_UI_ENABLED", "true").strip().lower() in ("1", "true", "yes")
 DIFF_UI_DIR           = os.environ.get("DIFF_UI_DIR", "/tmp/acme-diff-ui")
 DIFF_UI_BASE_URL      = os.environ.get("DIFF_UI_BASE_URL", "").rstrip("/")
 DIFF_UI_MAX_ARTIFACTS = _env_int("DIFF_UI_MAX_ARTIFACTS", 500)
@@ -4450,12 +4456,18 @@ def _truncate_comment(body: str) -> str:
     return out
 
 
-def _save_diff_ui_artifact(repo, pr_id, pr_sha, body):
+def _save_diff_ui_artifact(repo, pr_id, pr_sha, body, base_sha=None,
+                           outcome_counts=None, app_count=None):
     """Full-diff UI: persist the FULL comment body (pre-truncation) for the web
     UI. No-op unless DIFF_UI_ENABLED. Never raises: the artifact is a bonus
     on top of the comment, so a full disk or bad key must not break the run.
     The body passed here is the exact text upsert_comment posts, so the store
-    only ever holds already-redacted content."""
+    only ever holds already-redacted content.
+
+    base_sha/outcome_counts/app_count are the same per-PR context already
+    computed for the log line and the comment header, threaded through so
+    the page shows real PR context (base commit, per-outcome breakdown, app
+    count) instead of only the raw diff text."""
     if not DIFF_UI_ENABLED:
         return
     try:
@@ -4463,7 +4475,9 @@ def _save_diff_ui_artifact(repo, pr_id, pr_sha, body):
             DIFF_UI_DIR, repo or BB_REPO, pr_id, pr_sha, body,
             pr_url=(f"https://bitbucket.org/{BB_WORKSPACE}/"
                     f"{repo or BB_REPO}/pull-requests/{pr_id}"),
-            max_artifacts=DIFF_UI_MAX_ARTIFACTS)
+            max_artifacts=DIFF_UI_MAX_ARTIFACTS,
+            base_sha=base_sha, outcome_counts=outcome_counts,
+            app_count=app_count)
     except Exception as e:
         log(f"[diff-ui] artifact save failed (non-fatal): {e}", "WARNING")
 
@@ -6268,8 +6282,12 @@ def process_pr(pr, path_map, base_sha="", repo=None):
                                input_change_lines=input_change_lines or None)
         comment_kb = round(len(body.encode()) / 1024, 1)
         # Full-diff UI: persist the full body BEFORE upsert (which truncates over
-        # MAX_COMMENT_BYTES) so the web UI serves the complete diff.
-        _save_diff_ui_artifact(repo, pr_id, pr_sha, body)
+        # MAX_COMMENT_BYTES) so the web UI serves the complete diff, with the
+        # same per-PR context (base commit, outcome breakdown, app count)
+        # already computed above for the log line.
+        _save_diff_ui_artifact(repo, pr_id, pr_sha, body, base_sha=base_sha,
+                               outcome_counts=dict(outcome_counts),
+                               app_count=len(app_results))
         upsert_comment(pr_id, body, existing_id, repo=repo)
         action = "updated" if existing_id else "posted"
         print(f"    Comment {action} on PR #{pr_id} ({comment_kb}KB)")

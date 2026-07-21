@@ -29,6 +29,24 @@ import re
 import tempfile
 import time
 
+# Mirrors diff_preview.STATUS_NAME. Duplicated on purpose: this module stays
+# standalone stdlib-only (see module docstring) and never imports
+# diff_preview just to reuse one string. Every page this module renders
+# names the service explicitly, so a reviewer landing here from a build
+# status link never has to guess which tool they are looking at.
+SERVICE_NAME = "ACME Diff Preview"
+
+# Outcome keys mirror diff_preview.OUT_* (diff/no_diff/indeterminate/error/
+# decommissioned), passed in as plain strings so this module stays decoupled
+# from those constants. Unknown keys still render, just unlabeled.
+_OUTCOME_LABELS = {
+    "diff": "changed",
+    "no_diff": "no changes",
+    "indeterminate": "unavailable",
+    "error": "errors",
+    "decommissioned": "decommissioned",
+}
+
 # Bitbucket repo slugs are lowercase alphanumerics plus ._- ; PR ids are
 # positive integers; shas are abbreviated-to-full lowercase hex. Anything
 # else is rejected before it can touch the filesystem (no separators, no
@@ -56,8 +74,15 @@ def _artifact_path(base_dir, repo, pr_id, sha):
 
 
 def save_artifact(base_dir, repo, pr_id, sha, body, pr_url="",
-                  max_artifacts=500):
+                  max_artifacts=500, base_sha="", outcome_counts=None,
+                  app_count=None):
     """Persist the full (already redacted) diff body. Atomic; then prune.
+
+    base_sha/outcome_counts/app_count are optional PR-level context (the diff
+    base commit, the per-outcome breakdown, and how many apps were
+    evaluated) so the page shows more than the raw comment text: the same
+    at-a-glance summary a reviewer gets from the comment header, kept even
+    after the comment itself gets truncated.
 
     Atomic tmp+rename so a concurrent reader can never see a half-written
     file; pruning is best-effort (a locked/vanished file must never break
@@ -70,6 +95,9 @@ def save_artifact(base_dir, repo, pr_id, sha, body, pr_url="",
         "pr_id": int(pr_id),
         "sha": str(sha),
         "pr_url": pr_url,
+        "base_sha": str(base_sha) if base_sha else "",
+        "outcome_counts": dict(outcome_counts) if outcome_counts else {},
+        "app_count": int(app_count) if app_count is not None else None,
         "created_utc": time.strftime("%Y-%m-%d %H:%M:%S UTC", time.gmtime()),
         "body": body,
     }
@@ -144,6 +172,24 @@ def parse_request_path(path):
     return repo, int(pr_s), sha, raw
 
 
+def _format_outcome_summary(app_count, outcome_counts):
+    """Human line like '15 apps, 3 changed, 12 no changes'. Empty if there is
+    no metadata (e.g. an artifact saved before this field existed)."""
+    if app_count is None and not outcome_counts:
+        return ""
+    parts = []
+    if app_count is not None:
+        parts.append(f"{app_count} app{'s' if app_count != 1 else ''} evaluated")
+    for key, label in _OUTCOME_LABELS.items():
+        n = outcome_counts.get(key, 0)
+        if n:
+            parts.append(f"{n} {label}")
+    for key, n in outcome_counts.items():
+        if key not in _OUTCOME_LABELS and n:
+            parts.append(f"{n} {key}")
+    return " &middot; ".join(html.escape(str(p)) for p in parts)
+
+
 def render_html(artifact):
     """Minimal server-rendered page. EVERY dynamic value is escaped: the body
     is PR-controlled content, so the same comment-injection hardening the
@@ -151,6 +197,7 @@ def render_html(artifact):
     repo = html.escape(str(artifact.get("repo", "")))
     pr_id = html.escape(str(artifact.get("pr_id", "")))
     sha = html.escape(str(artifact.get("sha", "")))
+    base_sha = html.escape(str(artifact.get("base_sha", "") or ""))
     created = html.escape(str(artifact.get("created_utc", "")))
     body = html.escape(str(artifact.get("body", "")))
     pr_url = str(artifact.get("pr_url", ""))
@@ -159,22 +206,31 @@ def render_html(artifact):
     raw_href = html.escape(f"/diff/{artifact.get('repo','')}"
                            f"/{artifact.get('pr_id','')}"
                            f"/{artifact.get('sha','')}/raw", quote=True)
+    base_bit = f" vs base <code>{base_sha}</code>" if base_sha else ""
+    summary = _format_outcome_summary(artifact.get("app_count"),
+                                      artifact.get("outcome_counts") or {})
+    summary_html = f'<div class="summary">{summary}</div>' if summary else ""
     return f"""<!doctype html>
 <html lang="en">
 <head>
 <meta charset="utf-8">
-<title>diff {repo} #{pr_id} @ {sha}</title>
+<title>{SERVICE_NAME} - {repo} #{pr_id} @ {sha}</title>
 <style>
 body {{ font-family: -apple-system, Segoe UI, sans-serif; margin: 2rem; }}
 pre {{ background: #f6f8fa; border: 1px solid #d0d7de; border-radius: 6px;
       padding: 1rem; overflow-x: auto; font-size: 12px; line-height: 1.45; }}
-.meta {{ color: #57606a; margin-bottom: 1rem; }}
+.brand {{ color: #57606a; font-size: 12px; text-transform: uppercase;
+         letter-spacing: .04em; margin-bottom: 4px; }}
+.meta {{ color: #57606a; margin-bottom: 0.5rem; }}
+.summary {{ color: #57606a; font-size: 13px; margin-bottom: 1rem; }}
 </style>
 </head>
 <body>
+<div class="brand">{SERVICE_NAME}</div>
 <h2>acme-diff-preview: full diff</h2>
-<div class="meta">{repo} &middot; {pr_link} &middot; commit <code>{sha}</code>
+<div class="meta">{repo} &middot; {pr_link} &middot; commit <code>{sha}</code>{base_bit}
  &middot; generated {created} &middot; <a href="{raw_href}">raw</a></div>
+{summary_html}
 <pre>{body}</pre>
 </body>
 </html>
