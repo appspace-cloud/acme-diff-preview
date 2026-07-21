@@ -60,6 +60,33 @@ def test_save_and_load_with_pr_metadata(tmp_path):
     assert art["app_count"] == 15
 
 
+def test_new_commit_overwrites_same_pr_in_place(tmp_path):
+    # Like the PR comment: one live entry per (repo, pr). A second commit on
+    # the same PR must overwrite the previous diff, not pile up a new file,
+    # so the page always reflects the latest generated diff.
+    diff_ui.save_artifact(str(tmp_path), "acme-config-dev", 42, "aaaaaaa",
+                          "old body")
+    diff_ui.save_artifact(str(tmp_path), "acme-config-dev", 42, "bbbbbbb",
+                          "new body")
+    files = [f for f in os.listdir(str(tmp_path)) if f.endswith(".json")]
+    assert len(files) == 1  # overwritten in place, not accumulated
+    art = diff_ui.load_artifact(str(tmp_path), "acme-config-dev", 42, "bbbbbbb")
+    assert art["body"] == "new body"
+    assert art["sha"] == "bbbbbbb"
+
+
+def test_load_by_stale_sha_returns_latest(tmp_path):
+    # The build status link embeds a sha; after a new commit the old link
+    # must still resolve to the PR's current diff rather than 404, mirroring
+    # how the comment link always points at the newest comment.
+    diff_ui.save_artifact(str(tmp_path), "acme-config-dev", 42, "aaaaaaa",
+                          "old")
+    diff_ui.save_artifact(str(tmp_path), "acme-config-dev", 42, "bbbbbbb",
+                          "new")
+    art = diff_ui.load_artifact(str(tmp_path), "acme-config-dev", 42, "aaaaaaa")
+    assert art is not None and art["sha"] == "bbbbbbb"
+
+
 def test_load_missing_returns_none(tmp_path):
     assert diff_ui.load_artifact(str(tmp_path), "repo-x", 1, "abcdef1") is None
     assert not diff_ui.has_artifact(str(tmp_path), "repo-x", 1, "abcdef1")
@@ -96,8 +123,8 @@ def test_prune_keeps_newest(tmp_path):
                           BODY, max_artifacts=3)
     files = sorted(os.listdir(str(tmp_path)))
     assert len(files) == 3
-    assert any("__99__" in f for f in files)
-    assert not any("__1__" in f for f in files)
+    assert any("__99." in f for f in files)
+    assert not any("__1." in f for f in files)
 
 
 def test_prune_ignores_remove_errors(tmp_path, monkeypatch):
@@ -151,8 +178,10 @@ def test_respond_html_escapes_content(tmp_path):
                                            str(tmp_path), enabled=True)
     assert code == 200 and ctype.startswith("text/html")
     text = payload.decode()
-    assert "<script>" not in text            # injected script must be escaped
-    assert "&lt;script&gt;" in text
+    # the injected payload must never survive as live markup (the page has
+    # its own legitimate <script> for the theme switch, so check the payload)
+    assert "<script>alert" not in text
+    assert "&lt;script&gt;alert(1)&lt;/script&gt;" in text
     assert "repo-x" in text and "abcdef1" in text
     assert "https://bb/pr/1" in text         # link back to the PR
     assert "/raw" in text                    # link to the raw view
@@ -240,28 +269,30 @@ def test_render_html_colors_diff_lines():
             "+    replicas: 3\n"
             "```\n")
     out = diff_ui.render_html(_art(body))
-    assert '<span class="l del">-    replicas: 2</span>' in out
-    assert '<span class="l add">+    replicas: 3</span>' in out
-    assert '<span class="l hunk">@@ -1,2 +1,2 @@</span>' in out
-    assert '<span class="l ctx">     image: repo/x:1</span>' in out
+    assert '<tr class="row del">' in out
+    assert '<tr class="row add">' in out
+    assert '<tr class="row hunk">' in out
+    assert '<tr class="row ctx">' in out
+    # the code text itself still lands in the row, escaped as-is
+    assert "-    replicas: 2" in out
+    assert "+    replicas: 3" in out
 
 
 def test_render_html_escapes_inside_colored_lines():
     # PR-controlled content inside a colored diff line must stay escaped:
-    # the highlighting must never open an injection hole the plain <pre>
-    # did not have.
+    # the highlighting must never open an injection hole.
     body = "```diff\n- <script>alert(1)</script>\n+ <b>bold</b>\n```\n"
     out = diff_ui.render_html(_art(body))
-    assert "<script>" not in out and "<b>" not in out
-    assert '<span class="l del">- &lt;script&gt;alert(1)&lt;/script&gt;</span>' in out
-    assert '<span class="l add">+ &lt;b&gt;bold&lt;/b&gt;</span>' in out
+    assert "<script>alert" not in out and "<b>bold" not in out
+    assert "- &lt;script&gt;alert(1)&lt;/script&gt;" in out
+    assert "+ &lt;b&gt;bold&lt;/b&gt;" in out
 
 
 def test_render_html_markdown_headers_highlighted():
     out = diff_ui.render_html(_art("## Title\nplain text\n### `sub`\n"))
-    assert '<span class="l mdh">## Title</span>' in out
-    assert '<span class="l mdh">### `sub`</span>' in out
-    assert '<span class="l">plain text</span>' in out
+    assert '<tr class="row mdh">' in out
+    assert "## Title" in out and "### `sub`" in out
+    assert '<tr class="row">' in out and "plain text" in out
 
 
 def test_render_html_non_diff_fence_not_colored():
@@ -269,28 +300,66 @@ def test_render_html_non_diff_fence_not_colored():
     # NOT be painted as deletions; only ```diff fences get diff colors.
     body = "```yaml\n- item-one\n+ not-an-addition\n```\n"
     out = diff_ui.render_html(_art(body))
-    assert '<span class="l del">' not in out
-    assert '<span class="l add">' not in out
-    assert '<span class="l ctx">- item-one</span>' in out
+    assert '<tr class="row del">' not in out
+    assert '<tr class="row add">' not in out
+    assert '<tr class="row ctx">' in out and "- item-one" in out
 
 
 def test_render_html_fence_markers_present_and_dimmed():
     out = diff_ui.render_html(_art("```diff\n+ x\n```\n"))
-    assert '<span class="l fence">```diff</span>' in out
-    assert '<span class="l fence">```</span>' in out
+    assert out.count('<tr class="row fence">') == 2
+    assert "```diff" in out
 
 
 def test_render_html_empty_lines_survive():
-    # Blank lines must produce their own line span (CSS gives it height),
-    # so vertical rhythm matches the raw text.
+    # Blank lines must produce their own row (CSS gives it height), so
+    # vertical rhythm matches the raw text.
     out = diff_ui.render_html(_art("a\n\nb\n"))
-    assert '<span class="l"></span>' in out
+    assert out.count('<tr class="row">') >= 3
 
 
-def test_render_html_has_dark_mode_and_wraps_line_spans_in_pre():
+def test_render_html_has_dark_mode_and_theme_switch():
     out = diff_ui.render_html(_art("x\n"))
     assert "prefers-color-scheme: dark" in out
-    assert "<pre>" in out and "</pre>" in out
+    # Three-way appearance control (Light / Auto / Dark), macOS/iOS style.
+    assert 'data-theme' in out
+    assert out.count('data-set-theme="') == 3  # three appearance buttons
+    assert "localStorage" in out  # persists the choice across visits
+
+
+def test_render_html_diff_lines_get_line_numbers():
+    # ADO-style: added/removed/context lines inside a diff fence carry an
+    # old and a new line-number gutter so a reviewer can locate the change.
+    body = ("```diff\n"
+            "@@ -18,2 +18,3 @@\n"
+            " ctx line\n"
+            "-removed line\n"
+            "+added line\n"
+            "```\n")
+    out = diff_ui.render_html(_art(body))
+    assert 'class="ln-old"' in out
+    assert 'class="ln-new"' in out
+    # a removed line advances the OLD side only; an added line the NEW side
+    assert ">19<" in out  # new-side number reached on the added line
+
+
+def test_render_html_large_body_is_paginated_with_show_all(monkeypatch):
+    # Huge diffs must not dump thousands of lines unbounded. The body is
+    # capped to a scrollable window; the rest stays in the page (no second
+    # request) behind a "show full output" control.
+    monkeypatch.setattr(diff_ui, "MAX_VISIBLE_LINES", 50)
+    body = "```diff\n" + "".join(f"+line {i}\n" for i in range(400)) + "```\n"
+    out = diff_ui.render_html(_art(body))
+    assert "show full output" in out.lower()
+    assert 'class="rest"' in out  # the overflow block is present but hidden
+    assert "line 399" in out      # nothing is dropped, only hidden
+
+
+def test_render_html_small_body_has_no_show_all(monkeypatch):
+    monkeypatch.setattr(diff_ui, "MAX_VISIBLE_LINES", 50)
+    out = diff_ui.render_html(_art("```diff\n+one\n+two\n```\n"))
+    assert "show full output" not in out.lower()
+    assert 'class="rest"' not in out
 
 
 def test_ui_url():

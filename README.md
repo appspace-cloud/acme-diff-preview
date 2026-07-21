@@ -179,17 +179,26 @@ so several layers guard what reaches the Bitbucket comment:
 The PR comment has a hard Bitbucket size limit (`MAX_COMMENT_BYTES`, ~245KB):
 an oversized comment is cut in the middle and, until now, the complete output
 only existed in the pod logs. With `DIFF_UI_ENABLED` (**on by default**, see
-below), the service persists the COMPLETE, untruncated comment body per
-`(repo, pr, sha)` (already redacted, the exact text the comment would carry),
-together with the same at-a-glance context the comment header shows (base
-commit, apps evaluated, per-outcome breakdown), and serves it on the health
-port. Every page names the service explicitly ("ACME Diff Preview" in the
-title and on the page) so a reviewer landing here from a build status link
-never has to guess which tool posted it:
+below), the service persists the COMPLETE, untruncated comment body for the
+PR (already redacted, the exact text the comment would carry), together with
+the same at-a-glance context the comment header shows (base commit, apps
+evaluated, per-outcome breakdown), and serves it on the health port. Like the
+PR comment itself, there is exactly one live artifact per `(repo, pr)`: each
+new commit overwrites the previous diff in place (atomic write), so the page
+always reflects the latest generated output, and a build-status link that
+embeds an older commit sha still resolves to the PR's current diff rather than
+404. The page is rendered Azure DevOps-style (dense line-numbered diff table,
+GitHub diff palette, sticky header) with a Light / Auto / Dark appearance
+switch (persisted per browser; Auto follows the OS). Very large diffs render a
+capped, scrollable window first with a "show full output" control that reveals
+the rest in place (nothing is dropped; `/raw` is always byte-exact). Every
+page names the service explicitly ("acme-diff-preview" wordmark, "ACME Diff
+Preview" label) so a reviewer landing here from a build status link never has
+to guess which tool posted it:
 
 | Method | Path | Description |
 |---|---|---|
-| `GET` | `/diff/<repo>/<pr>/<sha>` | Full diff rendered as HTML (everything escaped) |
+| `GET` | `/diff/<repo>/<pr>/<sha>` | Full diff rendered as HTML (everything escaped); serves the PR's latest diff even if `<sha>` is stale |
 | `GET` | `/diff/<repo>/<pr>/<sha>/raw` | Exact plain-text body |
 
 **Why the default is on and why that is safe.** The ArgoCD hub Ingress

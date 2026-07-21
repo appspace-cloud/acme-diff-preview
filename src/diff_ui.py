@@ -69,8 +69,14 @@ def _validate(repo, pr_id, sha):
 
 
 def _artifact_path(base_dir, repo, pr_id, sha):
+    # Keyed by (repo, pr) only, NOT by sha: one live artifact per PR, exactly
+    # like the single PR comment that gets updated in place on every commit.
+    # A new commit's save_artifact overwrites the previous one (atomic
+    # os.replace), and load-by-sha resolves to whatever the PR's current diff
+    # is, so the build-status link never 404s just because the tip moved. The
+    # sha is still validated (below) and stored inside the artifact.
     repo, pr_s, sha = _validate(repo, pr_id, sha)
-    return os.path.join(base_dir, f"{repo}__{pr_s}__{sha}.json")
+    return os.path.join(base_dir, f"{repo}__{pr_s}.json")
 
 
 def save_artifact(base_dir, repo, pr_id, sha, body, pr_url="",
@@ -197,55 +203,90 @@ def _format_outcome_summary(app_count, outcome_counts):
 # painted as deletions.
 _FENCE_RE = re.compile(r"^```([A-Za-z0-9_-]*)\s*$")
 
+# Hunk headers look like "@@ -18,6 +18,8 @@": pull the old/new start lines so
+# the gutters can count from the right place.
+_HUNK_RE = re.compile(r"^@@ -(\d+)(?:,\d+)? \+(\d+)(?:,\d+)? @@")
 
-def _render_body_html(body):
-    """Line-oriented highlighting of the comment body. Same information as
-    the raw text (the /raw endpoint stays byte-exact), just readable:
-    +/-/@@ lines inside ```diff fences get GitHub-style colors, markdown
-    headers get weight, fence markers are dimmed. Every line goes through
-    html.escape BEFORE being wrapped in a span, so the highlighting can
-    never open an injection hole the plain <pre> did not have."""
-    out = []
-    fence = None  # None | "diff" | "code"
+# Default cap on rows rendered outright. A huge multi-app diff can be many
+# thousands of lines; past this the overflow is still emitted (nothing is
+# dropped, /raw stays byte-exact) but hidden behind a "show full output"
+# button so first paint and scrolling stay snappy. Module-level so tests and
+# operators can tune it.
+MAX_VISIBLE_LINES = 1500
+
+
+def _diff_row(cls, old_no, new_no, marker, esc_text):
+    """One table row: two line-number gutters, a +/- marker cell, and the
+    escaped code cell. esc_text is ALREADY html-escaped by the caller."""
+    o = str(old_no) if old_no is not None else ""
+    n = str(new_no) if new_no is not None else ""
+    row_cls = f"row {cls}" if cls else "row"
+    return (f'<tr class="{row_cls}">'
+            f'<td class="ln-old">{o}</td>'
+            f'<td class="ln-new">{n}</td>'
+            f'<td class="mk">{marker}</td>'
+            f'<td class="code">{esc_text}</td></tr>')
+
+
+def _render_body_rows(body):
+    """Render the comment body as diff table rows. Same information as the
+    raw text (the /raw endpoint stays byte-exact), just readable: inside
+    ```diff fences, +/-/@@ lines get GitHub-palette colors and old/new line
+    numbers in the gutters; non-diff fences render as neutral code (so a yaml
+    "- item" is never painted as a deletion); markdown headers outside fences
+    get weight; fence markers are dimmed. Every line goes through html.escape
+    BEFORE being placed in a cell, so highlighting can never open an
+    injection hole. Returns a list of row strings (one per source line)."""
+    rows = []
+    fence = None      # None | "diff" | "code"
+    old_no = new_no = 0
     for line in str(body).split("\n"):
         esc = html.escape(line)
         m = _FENCE_RE.match(line)
         if m:
             fence = (None if fence is not None
                      else ("diff" if m.group(1) == "diff" else "code"))
-            out.append(f'<span class="l fence">{esc}</span>')
-        elif fence == "diff":
-            if line.startswith("+"):
-                cls = "l add"
+            rows.append(_diff_row("fence", None, None, "", esc))
+            continue
+        if fence == "diff":
+            hm = _HUNK_RE.match(line)
+            if hm:
+                old_no = int(hm.group(1))
+                new_no = int(hm.group(2))
+                rows.append(_diff_row("hunk", None, None, "", esc))
+            elif line.startswith("+"):
+                rows.append(_diff_row("add", None, new_no, "+", esc))
+                new_no += 1
             elif line.startswith("-"):
-                cls = "l del"
-            elif line.startswith("@@"):
-                cls = "l hunk"
+                rows.append(_diff_row("del", old_no, None, "-", esc))
+                old_no += 1
             else:
-                cls = "l ctx"
-            out.append(f'<span class="{cls}">{esc}</span>')
+                rows.append(_diff_row("ctx", old_no, new_no, "", esc))
+                old_no += 1
+                new_no += 1
         elif fence == "code":
-            out.append(f'<span class="l ctx">{esc}</span>')
+            rows.append(_diff_row("ctx", None, None, "", esc))
         elif line.startswith("# ") or line.startswith("## ") \
                 or line.startswith("### "):
-            out.append(f'<span class="l mdh">{esc}</span>')
+            rows.append(_diff_row("mdh", None, None, "", esc))
         else:
-            out.append(f'<span class="l">{esc}</span>')
-    return "".join(out)
+            rows.append(_diff_row("", None, None, "", esc))
+    return rows
 
 
 def render_html(artifact):
-    """Server-rendered page, no JS, no external assets. EVERY dynamic value
-    is escaped: the body is PR-controlled content, so the same
-    comment-injection hardening the Bitbucket comment gets applies here (no
-    raw HTML can survive). Colors follow the GitHub diff palette in both
-    schemes; dark mode is automatic via prefers-color-scheme."""
+    """Server-rendered Azure DevOps-style diff page. No external assets; the
+    only script is a tiny theme switcher and a show-all toggle. EVERY dynamic
+    value is escaped: the body is PR-controlled content, so the same
+    comment-injection hardening the Bitbucket comment gets applies here.
+    Colors follow the GitHub diff palette (more legible than Monaco's own),
+    with Azure DevOps blue chrome. Light / Auto / Dark via a segmented
+    control, persisted in localStorage; Auto follows prefers-color-scheme."""
     repo = html.escape(str(artifact.get("repo", "")))
     pr_id = html.escape(str(artifact.get("pr_id", "")))
     sha = html.escape(str(artifact.get("sha", "")))
     base_sha = html.escape(str(artifact.get("base_sha", "") or ""))
     created = html.escape(str(artifact.get("created_utc", "")))
-    body_html = _render_body_html(artifact.get("body", ""))
     pr_url = str(artifact.get("pr_url", ""))
     pr_link = (f'<a href="{html.escape(pr_url, quote=True)}">PR #{pr_id}</a>'
                if pr_url else f"PR #{pr_id}")
@@ -256,6 +297,24 @@ def render_html(artifact):
     summary = _format_outcome_summary(artifact.get("app_count"),
                                       artifact.get("outcome_counts") or {})
     summary_html = f'<div class="summary">{summary}</div>' if summary else ""
+
+    rows = _render_body_rows(artifact.get("body", ""))
+    visible = "".join(rows[:MAX_VISIBLE_LINES])
+    overflow = rows[MAX_VISIBLE_LINES:]
+    if overflow:
+        rest = "".join(overflow)
+        n_more = len(overflow)
+        rest_html = (
+            f'<tbody class="rest" hidden>{rest}</tbody>'
+            f'<tbody class="show-all-row"><tr><td colspan="4">'
+            f'<button type="button" class="show-all" onclick="'
+            f"this.closest('table').querySelector('.rest').hidden=false;"
+            f"this.closest('tbody').remove();"
+            f'">show full output ({n_more} more lines)</button>'
+            f'</td></tr></tbody>')
+    else:
+        rest_html = ""
+
     return f"""<!doctype html>
 <html lang="en">
 <head>
@@ -264,65 +323,135 @@ def render_html(artifact):
 <title>{SERVICE_NAME} - {repo} #{pr_id} @ {sha}</title>
 <style>
 :root {{
-  --bg: #ffffff; --fg: #1f2328; --muted: #57606a;
-  --border: #d0d7de; --code-bg: #f6f8fa; --link: #0969da;
-  --add-bg: #e6ffec; --add-fg: #116329;
-  --del-bg: #ffebe9; --del-fg: #82071e;
-  --hunk-bg: #ddf4ff; --hunk-fg: #0550ae;
+  --bg: #ffffff; --fg: #1f2328; --muted: #57606a; --border: #d0d7de;
+  --panel: #f6f8fa; --link: #0969da; --accent: #0078d4;
+  --gutter-bg: #fafbfc; --gutter-fg: #8b949e;
+  --add-bg: #e6ffec; --add-mk: #1a7f37;
+  --del-bg: #ffebe9; --del-mk: #cf222e;
+  --hunk-bg: #f6f8fa; --hunk-fg: #57606a;
+  --seg-bg: #eceef1; --seg-thumb: #ffffff; --seg-active: #0078d4;
+}}
+:root[data-theme="dark"] {{
+  --bg: #0d1117; --fg: #e6edf3; --muted: #8d96a0; --border: #30363d;
+  --panel: #161b22; --link: #4493f8; --accent: #4493f8;
+  --gutter-bg: #0d1117; --gutter-fg: #6e7681;
+  --add-bg: #2ea04326; --add-mk: #3fb950;
+  --del-bg: #f8514926; --del-mk: #f85149;
+  --hunk-bg: #161b22; --hunk-fg: #8d96a0;
+  --seg-bg: #161b22; --seg-thumb: #30363d; --seg-active: #4493f8;
 }}
 @media (prefers-color-scheme: dark) {{
-  :root {{
-    --bg: #0d1117; --fg: #e6edf3; --muted: #8d96a0;
-    --border: #30363d; --code-bg: #161b22; --link: #58a6ff;
-    --add-bg: #16281f; --add-fg: #3fb950;
-    --del-bg: #2b1a1f; --del-fg: #f85149;
-    --hunk-bg: #16233a; --hunk-fg: #58a6ff;
+  :root:not([data-theme="light"]) {{
+    --bg: #0d1117; --fg: #e6edf3; --muted: #8d96a0; --border: #30363d;
+    --panel: #161b22; --link: #4493f8; --accent: #4493f8;
+    --gutter-bg: #0d1117; --gutter-fg: #6e7681;
+    --add-bg: #2ea04326; --add-mk: #3fb950;
+    --del-bg: #f8514926; --del-mk: #f85149;
+    --hunk-bg: #161b22; --hunk-fg: #8d96a0;
+    --seg-bg: #161b22; --seg-thumb: #30363d; --seg-active: #4493f8;
   }}
 }}
 * {{ box-sizing: border-box; }}
 body {{ background: var(--bg); color: var(--fg); margin: 0;
-       font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; }}
-main {{ max-width: 980px; margin: 0 auto; padding: 2rem 1.25rem 3rem; }}
+       font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif; }}
+.topbar {{ position: sticky; top: 0; z-index: 5; display: flex;
+          align-items: center; justify-content: space-between;
+          padding: 9px 18px; background: var(--bg);
+          border-bottom: 1px solid var(--border); }}
+.wordmark {{ font-family: ui-monospace, SFMono-Regular, Consolas, monospace;
+            font-size: 13px; font-weight: 700; letter-spacing: .02em; }}
+.seg {{ display: inline-flex; gap: 2px; padding: 2px; border-radius: 7px;
+       background: var(--seg-bg); }}
+.seg button {{ border: none; background: transparent; width: 30px; height: 24px;
+              border-radius: 5px; cursor: pointer; color: var(--muted);
+              font-size: 13px; line-height: 1; }}
+.seg button[aria-pressed="true"] {{ background: var(--seg-thumb);
+              color: var(--seg-active); }}
+main {{ max-width: 980px; margin: 0 auto; padding: 1.5rem 1.25rem 3rem; }}
 .brand {{ color: var(--muted); font-size: 12px; font-weight: 600;
          text-transform: uppercase; letter-spacing: .08em; }}
-h1 {{ margin: .25rem 0 .35rem; font-size: 22px; font-weight: 600; }}
+h1 {{ margin: .25rem 0 .35rem; font-size: 21px; font-weight: 600; }}
 h1 .pr {{ color: var(--muted); font-weight: 400; }}
-.meta {{ color: var(--muted); font-size: 13px; margin-bottom: .5rem; }}
+.meta {{ color: var(--muted); font-size: 13px; margin-bottom: .6rem; }}
 .meta a {{ color: var(--link); text-decoration: none; }}
 .meta a:hover {{ text-decoration: underline; }}
-code {{ font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
-       font-size: 12px; background: var(--code-bg);
+code {{ font-family: ui-monospace, SFMono-Regular, Consolas, monospace;
+       font-size: 12px; background: var(--panel);
        border: 1px solid var(--border); border-radius: 4px; padding: 0 4px; }}
 .summary {{ margin: 0 0 1rem; }}
-.summary span {{ display: inline-block; background: var(--code-bg);
+.summary span {{ display: inline-block; background: var(--panel);
                 border: 1px solid var(--border); border-radius: 999px;
                 color: var(--muted); font-size: 12px;
                 padding: 2px 10px; margin: 0 6px 6px 0; }}
-pre {{ background: var(--code-bg); border: 1px solid var(--border);
-      border-radius: 8px; padding: 12px 0; overflow-x: auto; margin: 0;
-      font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
-      font-size: 12px; line-height: 1.5; }}
-pre code {{ background: none; border: 0; padding: 0; font-size: inherit; }}
-.l {{ display: block; padding: 0 16px; min-height: 1.5em;
-     white-space: pre; }}
-.l.add {{ background: var(--add-bg); color: var(--add-fg); }}
-.l.del {{ background: var(--del-bg); color: var(--del-fg); }}
-.l.hunk {{ background: var(--hunk-bg); color: var(--hunk-fg); }}
-.l.fence {{ color: var(--muted); opacity: .55; }}
-.l.mdh {{ font-weight: 700; padding-top: .35em; }}
+.diffwrap {{ border: 1px solid var(--border); border-radius: 8px;
+            overflow: auto; max-height: 78vh; }}
+table.diff {{ width: 100%; border-collapse: collapse;
+             font-family: ui-monospace, SFMono-Regular, Consolas, monospace;
+             font-size: 12px; line-height: 20px; }}
+table.diff td {{ padding: 0 8px; vertical-align: top; }}
+table.diff td.code {{ white-space: pre; width: 100%; }}
+td.ln-old, td.ln-new {{ width: 1%; text-align: right; padding: 0 8px;
+             color: var(--gutter-fg); background: var(--gutter-bg);
+             user-select: none; border-right: 1px solid var(--border); }}
+td.mk {{ width: 14px; text-align: center; user-select: none; }}
+tr.add td.code {{ background: var(--add-bg); }}
+tr.add td.mk {{ color: var(--add-mk); }}
+tr.del td.code {{ background: var(--del-bg); }}
+tr.del td.mk {{ color: var(--del-mk); }}
+tr.hunk td {{ background: var(--hunk-bg); color: var(--hunk-fg); }}
+tr.fence td.code {{ color: var(--muted); opacity: .55; }}
+tr.mdh td.code {{ font-weight: 700; }}
+.show-all {{ width: 100%; border: none; background: var(--panel);
+            color: var(--link); font: inherit; font-size: 12px;
+            padding: 8px; cursor: pointer; }}
+.show-all:hover {{ text-decoration: underline; }}
 footer {{ color: var(--muted); font-size: 12px; margin-top: 1rem; }}
 </style>
 </head>
 <body>
+<div class="topbar">
+  <span class="wordmark">acme-diff-preview</span>
+  <div class="seg" role="group" aria-label="Appearance">
+    <button type="button" data-set-theme="light" aria-label="Light" title="Light">&#9728;</button>
+    <button type="button" data-set-theme="auto" aria-label="Auto" title="Auto">&#9673;</button>
+    <button type="button" data-set-theme="dark" aria-label="Dark" title="Dark">&#9789;</button>
+  </div>
+</div>
 <main>
 <div class="brand">{SERVICE_NAME}</div>
 <h1>{repo} <span class="pr">{pr_link}</span></h1>
 <div class="meta">commit <code>{sha}</code>{base_bit}
  &middot; generated {created} &middot; <a href="{raw_href}">raw</a></div>
 {summary_html}
-<pre>{body_html}</pre>
+<div class="diffwrap">
+<table class="diff"><tbody>{visible}</tbody>{rest_html}</table>
+</div>
 <footer>served by acme-diff-preview &middot; full, untruncated output for this exact commit</footer>
 </main>
+<script>
+(function(){{
+  var root=document.documentElement;
+  function apply(t){{
+    if(t==="auto"){{root.removeAttribute("data-theme");}}
+    else{{root.setAttribute("data-theme",t);}}
+    var b=document.querySelectorAll("[data-set-theme]");
+    for(var i=0;i<b.length;i++){{
+      b[i].setAttribute("aria-pressed", b[i].getAttribute("data-set-theme")===t ? "true":"false");
+    }}
+  }}
+  var saved="auto";
+  try{{ saved=localStorage.getItem("adp-theme")||"auto"; }}catch(e){{}}
+  apply(saved);
+  var btns=document.querySelectorAll("[data-set-theme]");
+  for(var i=0;i<btns.length;i++){{
+    btns[i].addEventListener("click",function(){{
+      var t=this.getAttribute("data-set-theme");
+      try{{ localStorage.setItem("adp-theme",t); }}catch(e){{}}
+      apply(t);
+    }});
+  }}
+}})();
+</script>
 </body>
 </html>
 """
