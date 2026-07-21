@@ -69,14 +69,19 @@ diffUi:
   # Externally reachable, Google IAP-gated exposure of the full-diff pages,
   # via a SEPARATE Service + GKE BackendConfig (the webhook Service above is
   # never touched: JFrog/Bitbucket authenticate by HMAC, not by browser
-  # login, and could never complete an IAP redirect). Off by default: a real
-  # IAP OAuth client must already exist in the GCP project (Cloud Console >
-  # Security > Identity-Aware Proxy) before this is safe to enable, and its
-  # client_id/client_secret must be synced via the secrets.iapOauthClientId/
-  # SecretKey values below (ExternalSecret, same pattern as secrets.* further
-  # down). Wiring the resulting Service into the hub Ingress' host/path rules
-  # and issuing the TLS cert both live in acme-infrastructure, not this
-  # chart; see the tracking ticket for the full rollout checklist.
+  # login, and could never complete an IAP redirect). Off by default.
+  # Simplest path (this cluster runs GKE 1.35.x, well past the 1.29.4-
+  # gke.1043000 minimum): enable this alone and GKE uses its own
+  # Google-managed IAP OAuth client, no custom client to provision, no
+  # secret to sync. secrets.iapOauthClientId/SecretKey below are ONLY for
+  # orgs that specifically need their own custom OAuth client instead
+  # (ExternalSecret, same pattern as secrets.* further down; leave both
+  # empty for the managed-client path). Either way, granting real people
+  # or groups access is a separate, unavoidable step: Cloud Console >
+  # Security > Identity-Aware Proxy > select this backend > Add principal.
+  # Wiring the resulting Service into the hub Ingress' host/path rules and
+  # issuing the TLS cert both live in acme-infrastructure, not this chart;
+  # see the tracking ticket for the full rollout checklist.
   ingress:
     enabled: false
 

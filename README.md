@@ -211,23 +211,40 @@ Identity-Aware Proxy on that Service only. The primary Service (the
 webhooks) is never touched, since JFrog and Bitbucket authenticate with an
 HMAC signature and could never complete an interactive Google login. This
 mirrors how ArgoCD itself is protected here (`argocd-dex-server` + Google
-OAuth, COPS-2479): the same Google identity gates this page. Turning it on
-requires, in order:
+OAuth, COPS-2479): the same Google identity gates this page.
 
-1. A real IAP OAuth client already provisioned in the GCP project (Cloud
-   Console → Security → Identity-Aware Proxy).
-2. Its `client_id`/`client_secret` synced into GCP Secret Manager under the
-   keys named by `secrets.iapOauthClientIdKey` / `secrets.iapOauthClientSecretKey`
-   (both empty by default; setting both is what makes the chart create the
-   `ExternalSecret` that fills the `BackendConfig`'s referenced Secret).
-3. Wiring the new `<release>-acme-diff-preview-ui` Service into the hub
+Turning it on is simpler than it sounds. GKE 1.29.4-gke.1043000+ supports
+IAP with a Google-managed OAuth client, and this cluster runs 1.35.x
+(verified live). The default path needs just:
+
+1. Set `diffUi.ingress.enabled: true`. No custom OAuth client, no secret
+   to provision, GKE manages the client itself.
+2. Grant access to real people/groups: Cloud Console → Security →
+   Identity-Aware Proxy → select this backend → Add principal →
+   "IAP-secured Web App User". This step is unavoidable either way, it is
+   the actual access-control layer, independent of the OAuth client.
+3. Wire the new `<release>-acme-diff-preview-ui` Service into the hub
    Ingress' host/path rules and the TLS certificate for that host: both
    live in `acme-infrastructure`, tracked as follow-up work in the ticket,
    not in this chart.
 
-If step 2 or 3 is missing while `diffUi.ingress.enabled` is `true`, the GKE
-ingress controller simply fails to sync that one backend (visible on
-`kubectl describe backendconfig`/ingress events); nothing else in the
+A custom OAuth client is also supported, for orgs that specifically need
+one instead of the Google-managed client: set both
+`secrets.iapOauthClientIdKey` and `secrets.iapOauthClientSecretKey` (both
+empty by default) to GCP Secret Manager key names, which makes the chart
+create the `ExternalSecret` that fills the `BackendConfig`'s
+`oauthclientCredentials`. Leaving either one empty keeps the
+Google-managed path.
+
+One project-level prerequisite either path shares, per Google's own docs:
+the GKE service agent needs the `compute.backendServices.update` IAM
+permission. This is granted automatically on almost every GCP project
+(it is part of the default `Kubernetes Engine Service Agent` role) and is
+project-level IAM, not something this chart can set or verify; if IAP
+enablement silently does not take effect, check this first.
+
+If step 3 is not done yet while `diffUi.ingress.enabled` is `true`, the
+BackendConfig and Service simply exist unused; nothing else in the
 cluster, and no other Application, is affected. Once the host is live, set
 `DIFF_UI_BASE_URL` to it (e.g. `https://acme-diff-preview.appspace.com`, the
 same `acme-diff-preview` slug this chart already uses for the Service name)

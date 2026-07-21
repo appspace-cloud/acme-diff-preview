@@ -559,6 +559,14 @@ class _HealthHandler(BaseHTTPRequestHandler):
                 self.path, DIFF_UI_DIR, DIFF_UI_ENABLED)
             self.send_response(code)
             self.send_header("Content-Type", ctype)
+            # Explicit Content-Length, matching every other route on this
+            # handler (/healthz, /diff-preview/stats, ...). Harmless under
+            # the current HTTP/1.0 (connection close marks the body end
+            # either way), but this route serves the largest bodies of
+            # anything here (a full multi-app diff can be several MB), so
+            # it is exactly the one that would silently hang a client if
+            # this handler ever moves to HTTP/1.1 keep-alive.
+            self.send_header("Content-Length", str(len(payload)))
             self.end_headers()
             self.wfile.write(payload)
         else:

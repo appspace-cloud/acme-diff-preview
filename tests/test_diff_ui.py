@@ -328,6 +328,24 @@ def _req(url):
         return e.code, e.read()
 
 
+def _req_with_headers(url):
+    with urllib.request.urlopen(url, timeout=10) as r:
+        return r.status, r.read(), dict(r.headers)
+
+
+def test_http_diff_route_sets_content_length(health, tmp_path, monkeypatch):
+    # Every other route on this handler sets Content-Length explicitly;
+    # this one serves the largest bodies of anything here (a full
+    # multi-app diff), so it is exactly the one that must not be the odd
+    # route out relying on connection-close to mark the body end.
+    monkeypatch.setattr(m, "DIFF_UI_ENABLED", True)
+    monkeypatch.setattr(m, "DIFF_UI_DIR", str(tmp_path))
+    diff_ui.save_artifact(str(tmp_path), "repo-x", 3, "abcdef1", BODY)
+    code, payload, headers = _req_with_headers(f"{health}/diff/repo-x/3/abcdef1")
+    assert code == 200
+    assert int(headers["Content-Length"]) == len(payload)
+
+
 def test_http_diff_route_serves_artifact(health, tmp_path, monkeypatch):
     monkeypatch.setattr(m, "DIFF_UI_ENABLED", True)
     monkeypatch.setattr(m, "DIFF_UI_DIR", str(tmp_path))

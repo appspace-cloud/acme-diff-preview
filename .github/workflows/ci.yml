@@ -29,6 +29,7 @@ jobs:
       - name: Syntax check Python
         run: |
           python3 -m py_compile src/diff_preview.py && echo "diff_preview.py OK"
+          python3 -m py_compile src/diff_ui.py && echo "diff_ui.py OK"
           python3 -m py_compile src/dev_hard_refresh.py && echo "dev_hard_refresh.py OK"
 
       - name: Regenerate badges
@@ -74,6 +75,38 @@ jobs:
           helm template test-release charts/acme-diff-preview/ \
             --set image.tag=ci \
             --namespace argocd \
+            --debug
+
+      - name: Helm lint + template - full-diff UI IAP exposure (Google-managed OAuth client path)
+        # The simplest, most likely-to-be-used path: ingress enabled alone,
+        # no custom OAuth client. BackendConfig must render without an
+        # oauthclientCredentials block and the ExternalSecret must NOT be
+        # created (only ci-test-id/secret above exercises that one).
+        run: |
+          helm lint charts/acme-diff-preview/ \
+            --set diffUi.ingress.enabled=true
+          helm template test-release charts/acme-diff-preview/ \
+            --set image.tag=ci \
+            --namespace argocd \
+            --set diffUi.ingress.enabled=true \
+            --debug
+
+      - name: Helm lint + template - full-diff UI IAP exposure (custom OAuth client path)
+        # Only default values are exercised above. diffUi.ingress.enabled
+        # renders 3 additional templates (ui-service, ui-backendconfig,
+        # ui-iap-externalsecret) that would otherwise never be checked by
+        # CI at all, since they render nothing at the defaults.
+        run: |
+          helm lint charts/acme-diff-preview/ \
+            --set diffUi.ingress.enabled=true \
+            --set secrets.iapOauthClientIdKey=ci-test-id \
+            --set secrets.iapOauthClientSecretKey=ci-test-secret
+          helm template test-release charts/acme-diff-preview/ \
+            --set image.tag=ci \
+            --namespace argocd \
+            --set diffUi.ingress.enabled=true \
+            --set secrets.iapOauthClientIdKey=ci-test-id \
+            --set secrets.iapOauthClientSecretKey=ci-test-secret \
             --debug
 
   docker-build:
