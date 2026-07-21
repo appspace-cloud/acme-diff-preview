@@ -224,6 +224,75 @@ def test_render_html_summary_includes_unknown_outcome_key():
     assert "2 something_new" in out
 
 
+# ── diff highlighting (server-side, per line, everything still escaped) ───
+
+def _art(body):
+    return {"repo": "repo-x", "pr_id": 1, "sha": "abcdef1",
+            "created_utc": "2026-01-01 00:00:00 UTC", "body": body}
+
+
+def test_render_html_colors_diff_lines():
+    body = ("### `app-one`\n"
+            "```diff\n"
+            "@@ -1,2 +1,2 @@\n"
+            "     image: repo/x:1\n"
+            "-    replicas: 2\n"
+            "+    replicas: 3\n"
+            "```\n")
+    out = diff_ui.render_html(_art(body))
+    assert '<span class="l del">-    replicas: 2</span>' in out
+    assert '<span class="l add">+    replicas: 3</span>' in out
+    assert '<span class="l hunk">@@ -1,2 +1,2 @@</span>' in out
+    assert '<span class="l ctx">     image: repo/x:1</span>' in out
+
+
+def test_render_html_escapes_inside_colored_lines():
+    # PR-controlled content inside a colored diff line must stay escaped:
+    # the highlighting must never open an injection hole the plain <pre>
+    # did not have.
+    body = "```diff\n- <script>alert(1)</script>\n+ <b>bold</b>\n```\n"
+    out = diff_ui.render_html(_art(body))
+    assert "<script>" not in out and "<b>" not in out
+    assert '<span class="l del">- &lt;script&gt;alert(1)&lt;/script&gt;</span>' in out
+    assert '<span class="l add">+ &lt;b&gt;bold&lt;/b&gt;</span>' in out
+
+
+def test_render_html_markdown_headers_highlighted():
+    out = diff_ui.render_html(_art("## Title\nplain text\n### `sub`\n"))
+    assert '<span class="l mdh">## Title</span>' in out
+    assert '<span class="l mdh">### `sub`</span>' in out
+    assert '<span class="l">plain text</span>' in out
+
+
+def test_render_html_non_diff_fence_not_colored():
+    # A yaml fence contains lines starting with "-" (list items) that must
+    # NOT be painted as deletions; only ```diff fences get diff colors.
+    body = "```yaml\n- item-one\n+ not-an-addition\n```\n"
+    out = diff_ui.render_html(_art(body))
+    assert '<span class="l del">' not in out
+    assert '<span class="l add">' not in out
+    assert '<span class="l ctx">- item-one</span>' in out
+
+
+def test_render_html_fence_markers_present_and_dimmed():
+    out = diff_ui.render_html(_art("```diff\n+ x\n```\n"))
+    assert '<span class="l fence">```diff</span>' in out
+    assert '<span class="l fence">```</span>' in out
+
+
+def test_render_html_empty_lines_survive():
+    # Blank lines must produce their own line span (CSS gives it height),
+    # so vertical rhythm matches the raw text.
+    out = diff_ui.render_html(_art("a\n\nb\n"))
+    assert '<span class="l"></span>' in out
+
+
+def test_render_html_has_dark_mode_and_wraps_line_spans_in_pre():
+    out = diff_ui.render_html(_art("x\n"))
+    assert "prefers-color-scheme: dark" in out
+    assert "<pre>" in out and "</pre>" in out
+
+
 def test_ui_url():
     assert (diff_ui.ui_url("https://d.example.com", "repo-x", 7, "abcdef1")
             == "https://d.example.com/diff/repo-x/7/abcdef1")

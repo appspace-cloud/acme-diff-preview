@@ -173,8 +173,9 @@ def parse_request_path(path):
 
 
 def _format_outcome_summary(app_count, outcome_counts):
-    """Human line like '15 apps, 3 changed, 12 no changes'. Empty if there is
-    no metadata (e.g. an artifact saved before this field existed)."""
+    """Chip per fact: '15 apps evaluated', '3 changed', '12 no changes'.
+    Empty string if there is no metadata (e.g. an artifact saved before
+    these fields existed), so the page renders no summary row at all."""
     if app_count is None and not outcome_counts:
         return ""
     parts = []
@@ -187,19 +188,64 @@ def _format_outcome_summary(app_count, outcome_counts):
     for key, n in outcome_counts.items():
         if key not in _OUTCOME_LABELS and n:
             parts.append(f"{n} {key}")
-    return " &middot; ".join(html.escape(str(p)) for p in parts)
+    return "".join(f"<span>{html.escape(str(p))}</span>" for p in parts)
+
+
+# Fence markers as the comment renderer emits them: ``` optionally followed
+# by a language tag. Only ```diff fences get diff coloring; any other fence
+# is rendered as neutral code so yaml list items ("- item") are never
+# painted as deletions.
+_FENCE_RE = re.compile(r"^```([A-Za-z0-9_-]*)\s*$")
+
+
+def _render_body_html(body):
+    """Line-oriented highlighting of the comment body. Same information as
+    the raw text (the /raw endpoint stays byte-exact), just readable:
+    +/-/@@ lines inside ```diff fences get GitHub-style colors, markdown
+    headers get weight, fence markers are dimmed. Every line goes through
+    html.escape BEFORE being wrapped in a span, so the highlighting can
+    never open an injection hole the plain <pre> did not have."""
+    out = []
+    fence = None  # None | "diff" | "code"
+    for line in str(body).split("\n"):
+        esc = html.escape(line)
+        m = _FENCE_RE.match(line)
+        if m:
+            fence = (None if fence is not None
+                     else ("diff" if m.group(1) == "diff" else "code"))
+            out.append(f'<span class="l fence">{esc}</span>')
+        elif fence == "diff":
+            if line.startswith("+"):
+                cls = "l add"
+            elif line.startswith("-"):
+                cls = "l del"
+            elif line.startswith("@@"):
+                cls = "l hunk"
+            else:
+                cls = "l ctx"
+            out.append(f'<span class="{cls}">{esc}</span>')
+        elif fence == "code":
+            out.append(f'<span class="l ctx">{esc}</span>')
+        elif line.startswith("# ") or line.startswith("## ") \
+                or line.startswith("### "):
+            out.append(f'<span class="l mdh">{esc}</span>')
+        else:
+            out.append(f'<span class="l">{esc}</span>')
+    return "".join(out)
 
 
 def render_html(artifact):
-    """Minimal server-rendered page. EVERY dynamic value is escaped: the body
-    is PR-controlled content, so the same comment-injection hardening the
-    Bitbucket comment gets applies here (no raw HTML can survive)."""
+    """Server-rendered page, no JS, no external assets. EVERY dynamic value
+    is escaped: the body is PR-controlled content, so the same
+    comment-injection hardening the Bitbucket comment gets applies here (no
+    raw HTML can survive). Colors follow the GitHub diff palette in both
+    schemes; dark mode is automatic via prefers-color-scheme."""
     repo = html.escape(str(artifact.get("repo", "")))
     pr_id = html.escape(str(artifact.get("pr_id", "")))
     sha = html.escape(str(artifact.get("sha", "")))
     base_sha = html.escape(str(artifact.get("base_sha", "") or ""))
     created = html.escape(str(artifact.get("created_utc", "")))
-    body = html.escape(str(artifact.get("body", "")))
+    body_html = _render_body_html(artifact.get("body", ""))
     pr_url = str(artifact.get("pr_url", ""))
     pr_link = (f'<a href="{html.escape(pr_url, quote=True)}">PR #{pr_id}</a>'
                if pr_url else f"PR #{pr_id}")
@@ -214,24 +260,69 @@ def render_html(artifact):
 <html lang="en">
 <head>
 <meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
 <title>{SERVICE_NAME} - {repo} #{pr_id} @ {sha}</title>
 <style>
-body {{ font-family: -apple-system, Segoe UI, sans-serif; margin: 2rem; }}
-pre {{ background: #f6f8fa; border: 1px solid #d0d7de; border-radius: 6px;
-      padding: 1rem; overflow-x: auto; font-size: 12px; line-height: 1.45; }}
-.brand {{ color: #57606a; font-size: 12px; text-transform: uppercase;
-         letter-spacing: .04em; margin-bottom: 4px; }}
-.meta {{ color: #57606a; margin-bottom: 0.5rem; }}
-.summary {{ color: #57606a; font-size: 13px; margin-bottom: 1rem; }}
+:root {{
+  --bg: #ffffff; --fg: #1f2328; --muted: #57606a;
+  --border: #d0d7de; --code-bg: #f6f8fa; --link: #0969da;
+  --add-bg: #e6ffec; --add-fg: #116329;
+  --del-bg: #ffebe9; --del-fg: #82071e;
+  --hunk-bg: #ddf4ff; --hunk-fg: #0550ae;
+}}
+@media (prefers-color-scheme: dark) {{
+  :root {{
+    --bg: #0d1117; --fg: #e6edf3; --muted: #8d96a0;
+    --border: #30363d; --code-bg: #161b22; --link: #58a6ff;
+    --add-bg: #16281f; --add-fg: #3fb950;
+    --del-bg: #2b1a1f; --del-fg: #f85149;
+    --hunk-bg: #16233a; --hunk-fg: #58a6ff;
+  }}
+}}
+* {{ box-sizing: border-box; }}
+body {{ background: var(--bg); color: var(--fg); margin: 0;
+       font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; }}
+main {{ max-width: 980px; margin: 0 auto; padding: 2rem 1.25rem 3rem; }}
+.brand {{ color: var(--muted); font-size: 12px; font-weight: 600;
+         text-transform: uppercase; letter-spacing: .08em; }}
+h1 {{ margin: .25rem 0 .35rem; font-size: 22px; font-weight: 600; }}
+h1 .pr {{ color: var(--muted); font-weight: 400; }}
+.meta {{ color: var(--muted); font-size: 13px; margin-bottom: .5rem; }}
+.meta a {{ color: var(--link); text-decoration: none; }}
+.meta a:hover {{ text-decoration: underline; }}
+code {{ font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+       font-size: 12px; background: var(--code-bg);
+       border: 1px solid var(--border); border-radius: 4px; padding: 0 4px; }}
+.summary {{ margin: 0 0 1rem; }}
+.summary span {{ display: inline-block; background: var(--code-bg);
+                border: 1px solid var(--border); border-radius: 999px;
+                color: var(--muted); font-size: 12px;
+                padding: 2px 10px; margin: 0 6px 6px 0; }}
+pre {{ background: var(--code-bg); border: 1px solid var(--border);
+      border-radius: 8px; padding: 12px 0; overflow-x: auto; margin: 0;
+      font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+      font-size: 12px; line-height: 1.5; }}
+pre code {{ background: none; border: 0; padding: 0; font-size: inherit; }}
+.l {{ display: block; padding: 0 16px; min-height: 1.5em;
+     white-space: pre; }}
+.l.add {{ background: var(--add-bg); color: var(--add-fg); }}
+.l.del {{ background: var(--del-bg); color: var(--del-fg); }}
+.l.hunk {{ background: var(--hunk-bg); color: var(--hunk-fg); }}
+.l.fence {{ color: var(--muted); opacity: .55; }}
+.l.mdh {{ font-weight: 700; padding-top: .35em; }}
+footer {{ color: var(--muted); font-size: 12px; margin-top: 1rem; }}
 </style>
 </head>
 <body>
+<main>
 <div class="brand">{SERVICE_NAME}</div>
-<h2>acme-diff-preview: full diff</h2>
-<div class="meta">{repo} &middot; {pr_link} &middot; commit <code>{sha}</code>{base_bit}
+<h1>{repo} <span class="pr">{pr_link}</span></h1>
+<div class="meta">commit <code>{sha}</code>{base_bit}
  &middot; generated {created} &middot; <a href="{raw_href}">raw</a></div>
 {summary_html}
-<pre>{body}</pre>
+<pre>{body_html}</pre>
+<footer>served by acme-diff-preview &middot; full, untruncated output for this exact commit</footer>
+</main>
 </body>
 </html>
 """
