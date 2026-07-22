@@ -66,6 +66,12 @@ diffUi:
   baseUrl: ""
   dir: /tmp/acme-diff-ui
   maxArtifacts: 500
+  # Durable artifact store: a GCS bucket name. Empty = local dir only (an
+  # emptyDir in this chart, so artifacts die with the pod). When set, every
+  # save is mirrored to the bucket and local read misses fall back to it:
+  # permalinks survive restarts and any replica can serve any artifact. The
+  # pod's Workload Identity service account needs objectAdmin on the bucket.
+  gcsBucket: ""
   # Externally reachable, Google IAP-gated exposure of the full-diff pages,
   # via a SEPARATE Service + GKE BackendConfig (the webhook Service above is
   # never touched: JFrog/Bitbucket authenticate by HMAC, not by browser
