@@ -529,3 +529,36 @@ def test_default_is_enabled_with_no_override():
 
 def test_explicit_false_env_var_disables_it():
     assert _diff_ui_enabled_in_fresh_process({"DIFF_UI_ENABLED": "false"}) is False
+
+
+# --- v2.7.1 visual polish ------------------------------------------------
+
+def test_render_html_topbar_has_diff_mark_logo():
+    # The brand mark is a diff in miniature: an app-icon-style rounded
+    # square holding a longer "add" bar over a shorter "remove" bar. It
+    # sits in the sticky topbar next to the wordmark, and is pure
+    # decoration for assistive tech.
+    out = diff_ui.render_html(_art("x\n"))
+    assert '<span class="mark" aria-hidden="true">' in out
+    assert '<span class="ln ln-a"></span>' in out
+    assert '<span class="ln ln-d"></span>' in out
+    # mark colors are theme-driven, so a CSS variable must exist
+    assert "--mark-bg" in out
+
+
+def test_render_html_uses_full_viewport_width():
+    # Wide screens must show more diff, not more empty margin: the layout
+    # is fluid (no fixed max-width cap on main).
+    out = diff_ui.render_html(_art("x\n"))
+    assert "max-width: 980px" not in out
+    assert "max-width: none" in out
+
+
+def test_render_html_soft_backgrounds_with_surface_separation():
+    # The page canvas is a soft tint (not pure white / not pure black) and
+    # content sits on a distinct surface so it stands out. Both themes.
+    out = diff_ui.render_html(_art("x\n"))
+    assert "--bg: #ffffff" not in out   # light canvas is no longer stark white
+    assert "--bg: #0d1117" not in out   # dark canvas is no longer near-black
+    assert out.count("--surface:") >= 3  # light + dark + auto media block
+    assert "var(--surface)" in out
