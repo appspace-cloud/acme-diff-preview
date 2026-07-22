@@ -323,32 +323,38 @@ def render_html(artifact):
 <title>{SERVICE_NAME} - {repo} #{pr_id} @ {sha}</title>
 <style>
 :root {{
-  --bg: #ffffff; --fg: #1f2328; --muted: #57606a; --border: #d0d7de;
+  --bg: #eef1f6; --surface: #ffffff; --fg: #1f2328; --muted: #57606a;
+  --border: #d5dae2;
   --panel: #f6f8fa; --link: #0969da; --accent: #0078d4;
   --gutter-bg: #fafbfc; --gutter-fg: #8b949e;
   --add-bg: #e6ffec; --add-mk: #1a7f37;
   --del-bg: #ffebe9; --del-mk: #cf222e;
   --hunk-bg: #f6f8fa; --hunk-fg: #57606a;
-  --seg-bg: #eceef1; --seg-thumb: #ffffff; --seg-active: #0078d4;
+  --seg-bg: #e6e9ef; --seg-thumb: #ffffff; --seg-active: #0078d4;
+  --mark-bg: #111418; --mark-add: #3fb950; --mark-del: #f85149;
 }}
 :root[data-theme="dark"] {{
-  --bg: #0d1117; --fg: #e6edf3; --muted: #8d96a0; --border: #30363d;
-  --panel: #161b22; --link: #4493f8; --accent: #4493f8;
-  --gutter-bg: #0d1117; --gutter-fg: #6e7681;
+  --bg: #14181f; --surface: #1a2029; --fg: #e6edf3; --muted: #8d96a0;
+  --border: #363e4a;
+  --panel: #20262f; --link: #4493f8; --accent: #4493f8;
+  --gutter-bg: #1a2029; --gutter-fg: #6e7681;
   --add-bg: #2ea04326; --add-mk: #3fb950;
   --del-bg: #f8514926; --del-mk: #f85149;
-  --hunk-bg: #161b22; --hunk-fg: #8d96a0;
-  --seg-bg: #161b22; --seg-thumb: #30363d; --seg-active: #4493f8;
+  --hunk-bg: #20262f; --hunk-fg: #8d96a0;
+  --seg-bg: #20262f; --seg-thumb: #363e4a; --seg-active: #4493f8;
+  --mark-bg: #1f6feb; --mark-add: #3fb950; --mark-del: #f85149;
 }}
 @media (prefers-color-scheme: dark) {{
   :root:not([data-theme="light"]) {{
-    --bg: #0d1117; --fg: #e6edf3; --muted: #8d96a0; --border: #30363d;
-    --panel: #161b22; --link: #4493f8; --accent: #4493f8;
-    --gutter-bg: #0d1117; --gutter-fg: #6e7681;
+    --bg: #14181f; --surface: #1a2029; --fg: #e6edf3; --muted: #8d96a0;
+    --border: #363e4a;
+    --panel: #20262f; --link: #4493f8; --accent: #4493f8;
+    --gutter-bg: #1a2029; --gutter-fg: #6e7681;
     --add-bg: #2ea04326; --add-mk: #3fb950;
     --del-bg: #f8514926; --del-mk: #f85149;
-    --hunk-bg: #161b22; --hunk-fg: #8d96a0;
-    --seg-bg: #161b22; --seg-thumb: #30363d; --seg-active: #4493f8;
+    --hunk-bg: #20262f; --hunk-fg: #8d96a0;
+    --seg-bg: #20262f; --seg-thumb: #363e4a; --seg-active: #4493f8;
+    --mark-bg: #1f6feb; --mark-add: #3fb950; --mark-del: #f85149;
   }}
 }}
 * {{ box-sizing: border-box; }}
@@ -356,8 +362,15 @@ body {{ background: var(--bg); color: var(--fg); margin: 0;
        font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif; }}
 .topbar {{ position: sticky; top: 0; z-index: 5; display: flex;
           align-items: center; justify-content: space-between;
-          padding: 9px 18px; background: var(--bg);
+          padding: 9px 18px; background: var(--surface);
           border-bottom: 1px solid var(--border); }}
+.brandbox {{ display: flex; align-items: center; gap: 9px; }}
+.mark {{ width: 26px; height: 26px; border-radius: 7px; background: var(--mark-bg);
+        display: inline-flex; flex-direction: column; justify-content: center;
+        gap: 3px; padding: 0 5px; flex: none; }}
+.mark .ln {{ height: 3px; border-radius: 1.5px; display: block; }}
+.mark .ln-a {{ background: var(--mark-add); width: 12px; }}
+.mark .ln-d {{ background: var(--mark-del); width: 8px; }}
 .wordmark {{ font-family: ui-monospace, SFMono-Regular, Consolas, monospace;
             font-size: 13px; font-weight: 700; letter-spacing: .02em; }}
 .seg {{ display: inline-flex; gap: 2px; padding: 2px; border-radius: 7px;
@@ -367,7 +380,7 @@ body {{ background: var(--bg); color: var(--fg); margin: 0;
               font-size: 13px; line-height: 1; }}
 .seg button[aria-pressed="true"] {{ background: var(--seg-thumb);
               color: var(--seg-active); }}
-main {{ max-width: 980px; margin: 0 auto; padding: 1.5rem 1.25rem 3rem; }}
+main {{ max-width: none; margin: 0 auto; padding: 1.5rem 24px 3rem; }}
 .brand {{ color: var(--muted); font-size: 12px; font-weight: 600;
          text-transform: uppercase; letter-spacing: .08em; }}
 h1 {{ margin: .25rem 0 .35rem; font-size: 21px; font-weight: 600; }}
@@ -384,6 +397,7 @@ code {{ font-family: ui-monospace, SFMono-Regular, Consolas, monospace;
                 color: var(--muted); font-size: 12px;
                 padding: 2px 10px; margin: 0 6px 6px 0; }}
 .diffwrap {{ border: 1px solid var(--border); border-radius: 8px;
+            background: var(--surface);
             overflow: auto; max-height: 78vh; }}
 table.diff {{ width: 100%; border-collapse: collapse;
              font-family: ui-monospace, SFMono-Regular, Consolas, monospace;
@@ -410,7 +424,7 @@ footer {{ color: var(--muted); font-size: 12px; margin-top: 1rem; }}
 </head>
 <body>
 <div class="topbar">
-  <span class="wordmark">acme-diff-preview</span>
+  <span class="brandbox"><span class="mark" aria-hidden="true"><span class="ln ln-a"></span><span class="ln ln-d"></span></span><span class="wordmark">acme-diff-preview</span></span>
   <div class="seg" role="group" aria-label="Appearance">
     <button type="button" data-set-theme="light" aria-label="Light" title="Light">&#9728;</button>
     <button type="button" data-set-theme="auto" aria-label="Auto" title="Auto">&#9673;</button>
