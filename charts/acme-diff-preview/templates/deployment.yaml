@@ -124,6 +124,12 @@ spec:
             - name: DIFF_UI_MAX_ARTIFACTS
               value: {{ .maxArtifacts | quote }}
             {{- end }}
+            {{- if .gcsBucket }}
+            # Durable artifact store: saves are mirrored to this bucket and
+            # local read misses fall back to it (see values.yaml).
+            - name: DIFF_UI_GCS_BUCKET
+              value: {{ .gcsBucket | quote }}
+            {{- end }}
             {{- end }}
             {{- end }}
           envFrom:

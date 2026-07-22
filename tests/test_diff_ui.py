@@ -562,3 +562,211 @@ def test_render_html_soft_backgrounds_with_surface_separation():
     assert "--bg: #0d1117" not in out   # dark canvas is no longer near-black
     assert out.count("--surface:") >= 3  # light + dark + auto media block
     assert "var(--surface)" in out
+
+
+# ── GCS persistence (durable store behind the local cache) ─────────────────
+
+class _FakeResp:
+    def __init__(self, payload=b"{}"):
+        self._payload = payload
+
+    def read(self):
+        return self._payload
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        return False
+
+
+def _gcs_env(monkeypatch, objects, calls):
+    """Fake urlopen wired as: metadata token + GCS upload/download API."""
+    def fake_urlopen(req, timeout=None):
+        url = req.full_url
+        calls.append(url)
+        if "metadata.google.internal" in url:
+            # urllib stores header keys str.capitalize()d and get_header
+            # does NOT normalize on lookup, hence the lowercase f.
+            assert req.get_header("Metadata-flavor") == "Google"
+            return _FakeResp(json.dumps(
+                {"access_token": "tok-123", "expires_in": 3600}).encode())
+        assert req.get_header("Authorization") == "Bearer tok-123"
+        if "/upload/storage/v1/b/" in url:
+            name = urllib.parse.unquote(url.split("name=")[1])
+            objects[name] = req.data
+            return _FakeResp(b"{}")
+        if "/storage/v1/b/" in url:
+            name = urllib.parse.unquote(url.split("/o/")[1].split("?")[0])
+            if name not in objects:
+                raise urllib.error.HTTPError(url, 404, "not found", {}, None)
+            return _FakeResp(objects[name])
+        raise AssertionError(f"unexpected url {url}")  # pragma: no cover
+    monkeypatch.setattr(urllib.request, "urlopen", fake_urlopen)
+    monkeypatch.setattr(diff_ui, "_token_cache", {"token": "", "exp": 0.0})
+    monkeypatch.setattr(diff_ui, "on_warning", None)
+
+
+def test_save_artifact_uploads_to_gcs_when_bucket_set(tmp_path, monkeypatch):
+    objects, calls = {}, []
+    _gcs_env(monkeypatch, objects, calls)
+    p = diff_ui.save_artifact(str(tmp_path), "acme-config-stage", 2679,
+                              "d7dfd92fd43b", BODY, bucket="my-bucket")
+    assert os.path.isfile(p)
+    uploaded = json.loads(objects["acme-config-stage__2679.json"].decode())
+    assert uploaded["body"] == BODY
+    assert any("/upload/storage/v1/b/my-bucket/o" in u for u in calls)
+
+
+def test_save_artifact_without_bucket_never_touches_network(tmp_path,
+                                                            monkeypatch):
+    def boom(*a, **kw):  # pragma: no cover - must never run
+        raise AssertionError("network touched with no bucket configured")
+    monkeypatch.setattr(urllib.request, "urlopen", boom)
+    p = diff_ui.save_artifact(str(tmp_path), "acme-config-dev", 7, "ab12cd3",
+                              BODY)
+    assert os.path.isfile(p)
+    assert diff_ui.load_artifact(str(tmp_path), "acme-config-dev", 7,
+                                 "ab12cd3")["body"] == BODY
+
+
+def test_save_artifact_gcs_failure_is_non_fatal_and_reported(tmp_path,
+                                                             monkeypatch):
+    def fail(req, timeout=None):
+        raise urllib.error.URLError("metadata server unreachable")
+    monkeypatch.setattr(urllib.request, "urlopen", fail)
+    monkeypatch.setattr(diff_ui, "_token_cache", {"token": "", "exp": 0.0})
+    warnings = []
+    monkeypatch.setattr(diff_ui, "on_warning", warnings.append)
+    p = diff_ui.save_artifact(str(tmp_path), "acme-config-dev", 8, "ab12cd3",
+                              BODY, bucket="b")
+    assert os.path.isfile(p)  # local persistence is never held hostage
+    assert warnings and "non-fatal" in warnings[0]
+
+
+def test_gcs_failures_with_no_hook_are_silent(tmp_path, monkeypatch):
+    def fail(req, timeout=None):
+        raise urllib.error.URLError("down")
+    monkeypatch.setattr(urllib.request, "urlopen", fail)
+    monkeypatch.setattr(diff_ui, "_token_cache", {"token": "", "exp": 0.0})
+    monkeypatch.setattr(diff_ui, "on_warning", None)
+    p = diff_ui.save_artifact(str(tmp_path), "acme-config-dev", 3, "ab12cd3",
+                              BODY, bucket="b")
+    assert os.path.isfile(p)
+
+
+def test_warning_hook_errors_never_propagate(tmp_path, monkeypatch):
+    def fail(req, timeout=None):
+        raise urllib.error.URLError("down")
+    monkeypatch.setattr(urllib.request, "urlopen", fail)
+    monkeypatch.setattr(diff_ui, "_token_cache", {"token": "", "exp": 0.0})
+    monkeypatch.setattr(diff_ui, "on_warning", lambda m: 1 / 0)
+    p = diff_ui.save_artifact(str(tmp_path), "acme-config-dev", 5, "ab12cd3",
+                              BODY, bucket="b")
+    assert os.path.isfile(p)
+
+
+def test_load_artifact_falls_back_to_gcs_and_caches_locally(tmp_path,
+                                                            monkeypatch):
+    objects, calls = {}, []
+    _gcs_env(monkeypatch, objects, calls)
+    src, dst = str(tmp_path / "src"), str(tmp_path / "dst")
+    diff_ui.save_artifact(src, "acme-config-stage", 2679, "d7dfd92fd43b",
+                          BODY, bucket="b")
+    art = diff_ui.load_artifact(dst, "acme-config-stage", 2679,
+                                "d7dfd92fd43b", bucket="b")
+    assert art and art["body"] == BODY
+    assert os.path.isfile(os.path.join(dst, "acme-config-stage__2679.json"))
+    n = len(calls)
+    art2 = diff_ui.load_artifact(dst, "acme-config-stage", 2679,
+                                 "d7dfd92fd43b", bucket="b")
+    assert art2 and len(calls) == n  # second read: warmed local cache only
+
+
+def test_load_artifact_gcs_404_returns_none_without_warning(tmp_path,
+                                                            monkeypatch):
+    objects, calls = {}, []
+    _gcs_env(monkeypatch, objects, calls)
+    warnings = []
+    monkeypatch.setattr(diff_ui, "on_warning", warnings.append)
+    art = diff_ui.load_artifact(str(tmp_path), "acme-config-dev", 9,
+                                "ab12cd3", bucket="b")
+    assert art is None
+    assert warnings == []  # a plain miss is not an operational problem
+
+
+def test_load_artifact_gcs_non_404_http_error_warns(tmp_path, monkeypatch):
+    def fail(req, timeout=None):
+        if "metadata.google.internal" in req.full_url:
+            return _FakeResp(json.dumps(
+                {"access_token": "tok-123", "expires_in": 3600}).encode())
+        raise urllib.error.HTTPError(req.full_url, 500, "boom", {}, None)
+    monkeypatch.setattr(urllib.request, "urlopen", fail)
+    monkeypatch.setattr(diff_ui, "_token_cache", {"token": "", "exp": 0.0})
+    warnings = []
+    monkeypatch.setattr(diff_ui, "on_warning", warnings.append)
+    assert diff_ui.load_artifact(str(tmp_path), "acme-config-dev", 4,
+                                 "ab12cd3", bucket="b") is None
+    assert warnings and "HTTP 500" in warnings[0]
+
+
+def test_load_artifact_gcs_network_error_warns_and_returns_none(tmp_path,
+                                                                monkeypatch):
+    def fail(req, timeout=None):
+        if "metadata.google.internal" in req.full_url:
+            return _FakeResp(json.dumps(
+                {"access_token": "tok-123", "expires_in": 3600}).encode())
+        raise urllib.error.URLError("connection reset")
+    monkeypatch.setattr(urllib.request, "urlopen", fail)
+    monkeypatch.setattr(diff_ui, "_token_cache", {"token": "", "exp": 0.0})
+    warnings = []
+    monkeypatch.setattr(diff_ui, "on_warning", warnings.append)
+    assert diff_ui.load_artifact(str(tmp_path), "acme-config-dev", 6,
+                                 "ab12cd3", bucket="b") is None
+    assert warnings and "non-fatal" in warnings[0]
+
+
+def test_load_artifact_corrupt_gcs_object_returns_none(tmp_path, monkeypatch):
+    objects, calls = {}, []
+    _gcs_env(monkeypatch, objects, calls)
+    objects["acme-config-dev__9.json"] = b"{not json"
+    assert diff_ui.load_artifact(str(tmp_path), "acme-config-dev", 9,
+                                 "ab12cd3", bucket="b") is None
+
+
+def test_gcs_token_is_cached_between_calls(tmp_path, monkeypatch):
+    objects, calls = {}, []
+    _gcs_env(monkeypatch, objects, calls)
+    diff_ui.save_artifact(str(tmp_path), "acme-config-dev", 1, "ab12cd3",
+                          BODY, bucket="b")
+    diff_ui.save_artifact(str(tmp_path), "acme-config-dev", 2, "ab12cd3",
+                          BODY, bucket="b")
+    assert len([u for u in calls
+                if "metadata.google.internal" in u]) == 1
+
+
+def test_respond_serves_from_gcs_on_local_miss(tmp_path, monkeypatch):
+    objects, calls = {}, []
+    _gcs_env(monkeypatch, objects, calls)
+    src, dst = str(tmp_path / "src"), str(tmp_path / "dst")
+    diff_ui.save_artifact(src, "acme-config-stage", 2679, "d7dfd92fd43b",
+                          BODY, bucket="b")
+    code, ctype, payload = diff_ui.respond(
+        "/diff/acme-config-stage/2679/d7dfd92fd43b", dst, True, bucket="b")
+    assert code == 200
+    assert "text/html" in ctype
+    assert b"acme-config-stage" in payload
+
+
+def test_diff_preview_wires_gcs_bucket_and_warning_hook():
+    assert m.DIFF_UI_GCS_BUCKET == ""    # off unless the chart sets it
+    assert callable(diff_ui.on_warning)  # soft failures reach the JSON log
+
+
+def test_load_artifact_bad_key_returns_none_without_touching_gcs(tmp_path,
+                                                                 monkeypatch):
+    def boom(*a, **kw):  # pragma: no cover - must never run
+        raise AssertionError("network touched for an invalid key")
+    monkeypatch.setattr(urllib.request, "urlopen", boom)
+    assert diff_ui.load_artifact(str(tmp_path), "../evil", 1, "ab12cd3",
+                                 bucket="b") is None

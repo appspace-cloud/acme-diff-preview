@@ -274,6 +274,16 @@ DIFF_UI_ENABLED       = os.environ.get("DIFF_UI_ENABLED", "true").strip().lower(
 DIFF_UI_DIR           = os.environ.get("DIFF_UI_DIR", "/tmp/acme-diff-ui")
 DIFF_UI_BASE_URL      = os.environ.get("DIFF_UI_BASE_URL", "").rstrip("/")
 DIFF_UI_MAX_ARTIFACTS = _env_int("DIFF_UI_MAX_ARTIFACTS", 500)
+# Durable artifact store: name of a GCS bucket. Empty keeps the old
+# behavior (local dir only, artifacts die with the pod). When set, saves
+# are mirrored to the bucket and local read misses fall back to it, so
+# permalinks survive restarts and any replica can serve any artifact.
+DIFF_UI_GCS_BUCKET    = os.environ.get("DIFF_UI_GCS_BUCKET", "").strip()
+
+# Soft GCS failures from the store surface in this process's JSON log.
+# Late-bound on purpose: log() is defined further down and resolves at
+# call time, not at assignment time.
+diff_ui.on_warning = lambda msg: log(msg, "WARNING")
 
 # JFrog webhook dedup state: {chart:version -> last_processed_timestamp}
 _jfrog_recent:     dict          = {}
@@ -556,7 +566,8 @@ class _HealthHandler(BaseHTTPRequestHandler):
             # payload): strict path validation, 404 unless DIFF_UI_ENABLED,
             # fully escaped HTML. This shim only speaks HTTP.
             code, ctype, payload = diff_ui.respond(
-                self.path, DIFF_UI_DIR, DIFF_UI_ENABLED)
+                self.path, DIFF_UI_DIR, DIFF_UI_ENABLED,
+                bucket=DIFF_UI_GCS_BUCKET)
             self.send_response(code)
             self.send_header("Content-Type", ctype)
             # Explicit Content-Length, matching every other route on this
@@ -4289,7 +4300,8 @@ def post_build_status(pr_sha, state, description, pr_id=None, repo=None):
     # the complete, untruncated diff (Atlantis-style). Any other case keeps
     # the existing comment/PR link so the status never points at a 404.
     if (pr_id and DIFF_UI_ENABLED and DIFF_UI_BASE_URL
-            and diff_ui.has_artifact(DIFF_UI_DIR, repo or BB_REPO, pr_id, pr_sha)):
+            and diff_ui.has_artifact(DIFF_UI_DIR, repo or BB_REPO, pr_id,
+                                     pr_sha, bucket=DIFF_UI_GCS_BUCKET)):
         url = diff_ui.ui_url(DIFF_UI_BASE_URL, repo or BB_REPO, pr_id, pr_sha)
     try:
         bb("POST", f"commit/{pr_sha}/statuses/build", repo=repo, body={
@@ -4485,7 +4497,7 @@ def _save_diff_ui_artifact(repo, pr_id, pr_sha, body, base_sha=None,
                     f"{repo or BB_REPO}/pull-requests/{pr_id}"),
             max_artifacts=DIFF_UI_MAX_ARTIFACTS,
             base_sha=base_sha, outcome_counts=outcome_counts,
-            app_count=app_count)
+            app_count=app_count, bucket=DIFF_UI_GCS_BUCKET)
     except Exception as e:
         log(f"[diff-ui] artifact save failed (non-fatal): {e}", "WARNING")
 

@@ -17,8 +17,19 @@ diff_preview passes configuration as arguments.
 Storage v1 is a bounded flat directory (one JSON file per artifact, atomic
 write, oldest-by-mtime pruned past max_artifacts). The caller passes the SAME
 body it posts to Bitbucket, so the store only ever holds already-redacted
-content. A durable GCS backend is a planned follow-up in the tracking ticket;
-the function surface here is the seam where it plugs in.
+content.
+
+Storage v2 adds an optional durable GCS layer behind that directory: when a
+bucket is configured every save is also uploaded, and a local read miss
+falls back to the bucket and warms the cache. The local dir usually lives
+on an emptyDir, so this is what keeps permalinks alive across pod restarts,
+and it is replica-ready: any pod can serve any artifact, and because the
+content for a (repo, pr) is deterministic per sha, concurrent writers
+converge on the same bytes (last-writer-wins is safe). Plain GCS JSON API
+over urllib keeps the module stdlib-only; auth is the pod's Workload
+Identity token from the GKE metadata server. Every GCS failure is soft: the
+worst outcome is a 404 after a restart (exactly the old behavior), never a
+broken diff run or a broken page.
 """
 from __future__ import annotations
 
@@ -28,6 +39,9 @@ import os
 import re
 import tempfile
 import time
+import urllib.error
+import urllib.parse
+import urllib.request
 
 # Mirrors diff_preview.STATUS_NAME. Duplicated on purpose: this module stays
 # standalone stdlib-only (see module docstring) and never imports
@@ -79,9 +93,85 @@ def _artifact_path(base_dir, repo, pr_id, sha):
     return os.path.join(base_dir, f"{repo}__{pr_s}.json")
 
 
+# ── durable GCS layer ───────────────────────────────────────────────────────
+
+_GCS_TIMEOUT = 10
+_METADATA_TOKEN_URL = ("http://metadata.google.internal/computeMetadata/v1/"
+                       "instance/service-accounts/default/token")
+_token_cache = {"token": "", "exp": 0.0}
+
+# Optional callable(str) the host process may set so soft GCS failures show
+# up in its own logs. This module stays logging-agnostic (stdlib only, no
+# assumptions about the host's log format).
+on_warning = None
+
+
+def _warn(msg):
+    cb = on_warning
+    if cb is None:
+        return
+    try:
+        cb(msg)
+    except Exception:
+        pass  # a broken log hook must never break the store
+
+
+def _gcs_token():
+    """Workload Identity access token, cached until shortly before expiry."""
+    now = time.time()
+    if _token_cache["token"] and now < _token_cache["exp"] - 60:
+        return _token_cache["token"]
+    req = urllib.request.Request(
+        _METADATA_TOKEN_URL, headers={"Metadata-Flavor": "Google"})
+    with urllib.request.urlopen(req, timeout=_GCS_TIMEOUT) as r:
+        data = json.load(r)
+    _token_cache["token"] = data["access_token"]
+    _token_cache["exp"] = now + float(data.get("expires_in", 0))
+    return _token_cache["token"]
+
+
+def _gcs_upload(bucket, name, data):
+    """Best-effort upload of one object. Returns True on success."""
+    try:
+        url = ("https://storage.googleapis.com/upload/storage/v1/b/"
+               f"{urllib.parse.quote(bucket, safe='')}/o?uploadType=media"
+               f"&name={urllib.parse.quote(name, safe='')}")
+        req = urllib.request.Request(
+            url, data=data, method="POST",
+            headers={"Authorization": f"Bearer {_gcs_token()}",
+                     "Content-Type": "application/json"})
+        with urllib.request.urlopen(req, timeout=_GCS_TIMEOUT):
+            pass
+        return True
+    except Exception as e:
+        _warn(f"[diff-ui] GCS upload of {name} failed (non-fatal): {e}")
+        return False
+
+
+def _gcs_download(bucket, name):
+    """Return an object's bytes, or None. A 404 is a plain miss, not an
+    operational problem; anything else gets surfaced through the hook."""
+    try:
+        url = ("https://storage.googleapis.com/storage/v1/b/"
+               f"{urllib.parse.quote(bucket, safe='')}/o/"
+               f"{urllib.parse.quote(name, safe='')}?alt=media")
+        req = urllib.request.Request(
+            url, headers={"Authorization": f"Bearer {_gcs_token()}"})
+        with urllib.request.urlopen(req, timeout=_GCS_TIMEOUT) as r:
+            return r.read()
+    except urllib.error.HTTPError as e:
+        if e.code != 404:
+            _warn(f"[diff-ui] GCS download of {name} failed (non-fatal): "
+                  f"HTTP {e.code}")
+        return None
+    except Exception as e:
+        _warn(f"[diff-ui] GCS download of {name} failed (non-fatal): {e}")
+        return None
+
+
 def save_artifact(base_dir, repo, pr_id, sha, body, pr_url="",
                   max_artifacts=500, base_sha="", outcome_counts=None,
-                  app_count=None):
+                  app_count=None, bucket=""):
     """Persist the full (already redacted) diff body. Atomic; then prune.
 
     base_sha/outcome_counts/app_count are optional PR-level context (the diff
@@ -93,6 +183,10 @@ def save_artifact(base_dir, repo, pr_id, sha, body, pr_url="",
     Atomic tmp+rename so a concurrent reader can never see a half-written
     file; pruning is best-effort (a locked/vanished file must never break
     the diff run that triggered the save).
+
+    When bucket is set the exact same bytes are also uploaded to GCS
+    (best-effort, soft failure) so the artifact survives pod restarts and
+    is reachable from any replica.
     """
     path = _artifact_path(base_dir, repo, pr_id, sha)
     os.makedirs(base_dir, exist_ok=True)
@@ -107,15 +201,19 @@ def save_artifact(base_dir, repo, pr_id, sha, body, pr_url="",
         "created_utc": time.strftime("%Y-%m-%d %H:%M:%S UTC", time.gmtime()),
         "body": body,
     }
+    payload = json.dumps(artifact, ensure_ascii=False)
     fd, tmp = tempfile.mkstemp(dir=base_dir, suffix=".tmp")
     try:
         with os.fdopen(fd, "w", encoding="utf-8") as f:
-            json.dump(artifact, f, ensure_ascii=False)
+            f.write(payload)
         os.replace(tmp, path)
     finally:
         if os.path.exists(tmp):  # pragma: no cover - only on a failed replace
             os.remove(tmp)
     _prune(base_dir, max_artifacts)
+    if bucket:
+        _gcs_upload(bucket, os.path.basename(path),
+                    payload.encode("utf-8"))
     return path
 
 
@@ -134,18 +232,44 @@ def _prune(base_dir, max_artifacts):
             pass  # locked or already gone: never fail the save over pruning
 
 
-def load_artifact(base_dir, repo, pr_id, sha):
-    """Return the artifact dict, or None if missing/corrupt/bad key."""
+def load_artifact(base_dir, repo, pr_id, sha, bucket=""):
+    """Return the artifact dict, or None if missing/corrupt/bad key.
+
+    Local cache first. On a miss (fresh pod after a restart, or a sibling
+    replica wrote it) fall back to the GCS bucket when configured, and warm
+    the local cache with the downloaded bytes so the next read is local.
+    """
     try:
         path = _artifact_path(base_dir, repo, pr_id, sha)
+    except ValueError:
+        return None
+    try:
         with open(path, encoding="utf-8") as f:
             return json.load(f)
     except (OSError, ValueError):
+        pass
+    if not bucket:
         return None
+    data = _gcs_download(bucket, os.path.basename(path))
+    if data is None:
+        return None
+    try:
+        artifact = json.loads(data.decode("utf-8"))
+    except ValueError:
+        return None
+    try:
+        os.makedirs(base_dir, exist_ok=True)
+        fd, tmp = tempfile.mkstemp(dir=base_dir, suffix=".tmp")
+        with os.fdopen(fd, "wb") as f:
+            f.write(data)
+        os.replace(tmp, path)
+    except OSError:  # pragma: no cover - cache warm is best-effort only
+        pass
+    return artifact
 
 
-def has_artifact(base_dir, repo, pr_id, sha):
-    return load_artifact(base_dir, repo, pr_id, sha) is not None
+def has_artifact(base_dir, repo, pr_id, sha, bucket=""):
+    return load_artifact(base_dir, repo, pr_id, sha, bucket=bucket) is not None
 
 
 def ui_url(base_url, repo, pr_id, sha):
@@ -471,7 +595,7 @@ footer {{ color: var(--muted); font-size: 12px; margin-top: 1rem; }}
 """
 
 
-def respond(path, base_dir, enabled):
+def respond(path, base_dir, enabled, bucket=""):
     """Pure request handler: (status, content_type, payload bytes).
 
     Pure on purpose so the HTTP layer in diff_preview stays a 5-line shim
@@ -484,7 +608,7 @@ def respond(path, base_dir, enabled):
     if parsed is None:
         return 400, text, b"bad request"
     repo, pr_id, sha, raw = parsed
-    artifact = load_artifact(base_dir, repo, pr_id, sha)
+    artifact = load_artifact(base_dir, repo, pr_id, sha, bucket=bucket)
     if artifact is None:
         return 404, text, b"not found"
     if raw:
