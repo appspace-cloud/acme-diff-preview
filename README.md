@@ -168,6 +168,100 @@ so several layers guard what reaches the Bitbucket comment:
 | `DIFF_OCI_FAIL_ERROR_THRESHOLD` | — | `3` | Consecutive systemic chart-pull failures after which failures log at ERROR instead of WARNING |
 | `DIFF_IGNORE_RESOURCES` | — | *(empty)* | Extra comma-separated resource-name substrings to hide from every diff, on top of the built-in `micro-versions-info` |
 | `DIFF_HTTP_POOLING` | — | `on` | HTTP keep-alive pooling: one persistent TLS connection per worker thread and host. `off` routes every request through plain `urlopen`. Auto-defers to `urlopen` when a proxy is configured. Visible in `/diff-preview/stats` (`http_pool_reuses`/`http_pool_fresh_conns`/`http_pool_fallbacks`) |
+| `DIFF_UI_ENABLED` | `diffUi.enabled` | `true` | Full-diff web UI (see below). Persists artifacts + serves `/diff/*` in-cluster; safe by default since no ingress path exposes it externally |
+| `DIFF_UI_BASE_URL` | `diffUi.baseUrl` | *(empty)* | External base URL the build status deep-links to. Empty = status keeps linking to the comment |
+| `DIFF_UI_DIR` | `diffUi.dir` | `/tmp/acme-diff-ui` | Artifact directory (bounded, pruned oldest-first) |
+| `DIFF_UI_MAX_ARTIFACTS` | `diffUi.maxArtifacts` | `500` | Max stored artifacts before pruning |
+| — | `diffUi.ingress.enabled` | `false` | Externally reachable, IAP-gated Service + BackendConfig for the UI (see below) |
+
+### Full-diff web UI (Atlantis-style)
+
+The PR comment has a hard Bitbucket size limit (`MAX_COMMENT_BYTES`, ~245KB):
+an oversized comment is cut in the middle and, until now, the complete output
+only existed in the pod logs. With `DIFF_UI_ENABLED` (**on by default**, see
+below), the service persists the COMPLETE, untruncated comment body for the
+PR (already redacted, the exact text the comment would carry), together with
+the same at-a-glance context the comment header shows (base commit, apps
+evaluated, per-outcome breakdown), and serves it on the health port. Like the
+PR comment itself, there is exactly one live artifact per `(repo, pr)`: each
+new commit overwrites the previous diff in place (atomic write), so the page
+always reflects the latest generated output, and a build-status link that
+embeds an older commit sha still resolves to the PR's current diff rather than
+404. The page is rendered Azure DevOps-style (dense line-numbered diff table,
+GitHub diff palette, sticky header) with a Light / Auto / Dark appearance
+switch (persisted per browser; Auto follows the OS). Very large diffs render a
+capped, scrollable window first with a "show full output" control that reveals
+the rest in place (nothing is dropped; `/raw` is always byte-exact). Every
+page names the service explicitly ("acme-diff-preview" wordmark, "ACME Diff
+Preview" label) so a reviewer landing here from a build status link never has
+to guess which tool posted it:
+
+| Method | Path | Description |
+|---|---|---|
+| `GET` | `/diff/<repo>/<pr>/<sha>` | Full diff rendered as HTML (everything escaped); serves the PR's latest diff even if `<sha>` is stale |
+| `GET` | `/diff/<repo>/<pr>/<sha>/raw` | Exact plain-text body |
+
+**Why the default is on and why that is safe.** The ArgoCD hub Ingress
+`extraPaths` forward exactly two paths to this Service, `/jfrog-webhook` and
+`/diff-preview/webhook`, never a wildcard (defined in `acme-infrastructure`,
+not this chart). Turning `DIFF_UI_ENABLED` on does not add a new externally
+reachable path: `/diff/*` is only reachable in-cluster or via
+`kubectl port-forward`, exactly like `/diff-preview/stats` already is.
+`DIFF_UI_BASE_URL` stays empty by default, so the Bitbucket build status
+keeps linking to the comment, never to a host with no access control in
+front of it.
+
+**Reaching it from a browser, behind SSO.** This is a SEPARATE, explicit
+opt-in: `diffUi.ingress.enabled` (default `false`). When set, the chart
+renders a second Service, `<release>-acme-diff-preview-ui`, selecting the
+exact same pods on the exact same port, with a GKE `BackendConfig`
+(`cloud.google.com/backend-config` annotation) enabling Google
+Identity-Aware Proxy on that Service only. The primary Service (the
+webhooks) is never touched, since JFrog and Bitbucket authenticate with an
+HMAC signature and could never complete an interactive Google login. This
+mirrors how ArgoCD itself is protected here (`argocd-dex-server` + Google
+OAuth, COPS-2479): the same Google identity gates this page.
+
+Turning it on is simpler than it sounds. GKE 1.29.4-gke.1043000+ supports
+IAP with a Google-managed OAuth client, and this cluster runs 1.35.x
+(verified live). The default path needs just:
+
+1. Set `diffUi.ingress.enabled: true`. No custom OAuth client, no secret
+   to provision, GKE manages the client itself.
+2. Grant access to real people/groups: Cloud Console → Security →
+   Identity-Aware Proxy → select this backend → Add principal →
+   "IAP-secured Web App User". This step is unavoidable either way, it is
+   the actual access-control layer, independent of the OAuth client.
+3. Wire the new `<release>-acme-diff-preview-ui` Service into the hub
+   Ingress' host/path rules and the TLS certificate for that host: both
+   live in `acme-infrastructure`, tracked as follow-up work in the ticket,
+   not in this chart.
+
+A custom OAuth client is also supported, for orgs that specifically need
+one instead of the Google-managed client: set both
+`secrets.iapOauthClientIdKey` and `secrets.iapOauthClientSecretKey` (both
+empty by default) to GCP Secret Manager key names, which makes the chart
+create the `ExternalSecret` that fills the `BackendConfig`'s
+`oauthclientCredentials`. Leaving either one empty keeps the
+Google-managed path.
+
+One project-level prerequisite either path shares, per Google's own docs:
+the GKE service agent needs the `compute.backendServices.update` IAM
+permission. This is granted automatically on almost every GCP project
+(it is part of the default `Kubernetes Engine Service Agent` role) and is
+project-level IAM, not something this chart can set or verify; if IAP
+enablement silently does not take effect, check this first.
+
+If step 3 is not done yet while `diffUi.ingress.enabled` is `true`, the
+BackendConfig and Service simply exist unused; nothing else in the
+cluster, and no other Application, is affected. Once the host is live, set
+`DIFF_UI_BASE_URL` to it (e.g. `https://acme-diff-preview.appspace.com`, the
+same `acme-diff-preview` slug this chart already uses for the Service name)
+so the Bitbucket build status becomes the permalink to that exact commit's
+page, mirroring how the Atlantis commit-status "Details" link opens the
+full plan output. The comment stays as the summary either way. Storage v1
+is a bounded local directory (atomic writes, oldest-pruned); a durable GCS
+backend is separate follow-up work tracked in the ticket.
 
 ---
 
@@ -177,6 +271,7 @@ so several layers guard what reaches the Bitbucket comment:
 acme-diff-preview/
 ├── src/
 │   ├── diff_preview.py        Main service (Deployment)
+│   ├── diff_ui.py             Full-diff artifact store + web UI (stdlib only)
 │   └── dev_hard_refresh.py    Full hard-refresh of all dev/QA apps (CronJob)
 ├── tests/                     Full pytest suite, 100% coverage of src/ — see "Tests" below
 ├── charts/
@@ -186,6 +281,9 @@ acme-diff-preview/
 │       └── templates/
 │           ├── deployment.yaml
 │           ├── service.yaml
+│           ├── ui-service.yaml         IAP-fronted Service (diffUi.ingress.enabled)
+│           ├── ui-backendconfig.yaml   GKE BackendConfig enabling IAP on it
+│           ├── ui-iap-externalsecret.yaml  IAP OAuth client creds
 │           ├── serviceaccount.yaml
 │           ├── externalsecret.yaml
 │           └── cronjob.yaml
@@ -259,6 +357,8 @@ All endpoints are served on port **8080** inside the pod.
 | `GET` | `/jfrog-webhook/stats` | Webhook counters (JSON) |
 | `GET` | `/healthz` | Liveness probe |
 | `GET` | `/readyz` | Readiness probe |
+| `GET` | `/diff/<repo>/<pr>/<sha>` | Full untruncated diff as HTML (404 unless `DIFF_UI_ENABLED`) |
+| `GET` | `/diff/<repo>/<pr>/<sha>/raw` | Full untruncated diff as plain text (404 unless `DIFF_UI_ENABLED`) |
 
 ### JFrog webhook security
 

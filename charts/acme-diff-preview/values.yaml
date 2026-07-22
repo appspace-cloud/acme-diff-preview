@@ -7,7 +7,7 @@ fullnameOverride: "acme-diff-preview"
 
 image:
   repository: us-central1-docker.pkg.dev/appspace-devops/artifact/acme-diff-preview
-  tag: "2.5.19"
+  tag: "2.7.0"
   pullPolicy: IfNotPresent
 
 # Log verbosity for the diff-preview service. Set to DEBUG to emit the full
@@ -51,6 +51,40 @@ diff:
   # warmThreshold was removed — it had no effect after the warm-diff pass was
   # replaced by the pre-pull phase. Keeping the key here is intentionally omitted.
 
+# Full-diff web UI (Atlantis-style). Default ON (verified safe: the ArgoCD
+# hub Ingress extraPaths only forward /jfrog-webhook and /diff-preview/webhook
+# to this Service, never a wildcard, so this does not expose /diff/* anywhere
+# it was not already reachable: in-cluster traffic or kubectl port-forward).
+# baseUrl is the externally reachable host (e.g.
+# https://acme-diff-preview.appspace.com, same "acme-diff-preview" slug this
+# chart already uses for the Service/Ingress name above) the Bitbucket build
+# status deep-links to. Empty by default: reaching the page from outside the
+# cluster is the SEPARATE `ingress` opt-in below, so a build status is never
+# published pointing at a host with no real access control in front of it.
+diffUi:
+  enabled: true
+  baseUrl: ""
+  dir: /tmp/acme-diff-ui
+  maxArtifacts: 500
+  # Externally reachable, Google IAP-gated exposure of the full-diff pages,
+  # via a SEPARATE Service + GKE BackendConfig (the webhook Service above is
+  # never touched: JFrog/Bitbucket authenticate by HMAC, not by browser
+  # login, and could never complete an IAP redirect). Off by default.
+  # Simplest path (this cluster runs GKE 1.35.x, well past the 1.29.4-
+  # gke.1043000 minimum): enable this alone and GKE uses its own
+  # Google-managed IAP OAuth client, no custom client to provision, no
+  # secret to sync. secrets.iapOauthClientId/SecretKey below are ONLY for
+  # orgs that specifically need their own custom OAuth client instead
+  # (ExternalSecret, same pattern as secrets.* further down; leave both
+  # empty for the managed-client path). Either way, granting real people
+  # or groups access is a separate, unavoidable step: Cloud Console >
+  # Security > Identity-Aware Proxy > select this backend > Add principal.
+  # Wiring the resulting Service into the hub Ingress' host/path rules and
+  # issuing the TLS cert both live in acme-infrastructure, not this chart;
+  # see the tracking ticket for the full rollout checklist.
+  ingress:
+    enabled: false
+
 # ArgoCD server (hub cluster ingress)
 argocd:
   server: argocd.appspace.com
@@ -89,6 +123,11 @@ secrets:
   # ERROR at startup if OCI_PASS is empty.
   ociUserKey: acme-repo-username
   ociPassKey: acme-repo-password
+  # GCP Secret Manager keys for the full-diff UI's IAP OAuth client
+  # (diffUi.ingress.enabled). Both empty (default) skips creating that
+  # ExternalSecret entirely; set both once a real IAP OAuth client exists.
+  iapOauthClientIdKey: ""
+  iapOauthClientSecretKey: ""
 
 # Webhook endpoint exposed via the ArgoCD Ingress extraPaths
 webhook:

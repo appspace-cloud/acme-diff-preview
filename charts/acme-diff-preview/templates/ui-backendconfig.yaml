@@ -1,0 +1,31 @@
+{{- if and .Values.diffUi.enabled .Values.diffUi.ingress.enabled }}
+# Enables Google Identity-Aware Proxy on the acme-diff-preview-ui Service
+# above (GKE reads this via the cloud.google.com/backend-config annotation
+# on that Service, see enabling-kubernetes-howto in Google's IAP docs).
+#
+# oauthclientCredentials below is OPTIONAL. GKE 1.29.4-gke.1043000+ supports
+# IAP with a Google-managed OAuth client: omit oauthclientCredentials
+# entirely (this cluster runs 1.35.x, verified live, so this is the
+# supported default path here) and GKE handles the OAuth client itself, no
+# custom client to provision or secret to sync. The custom-client path
+# below only renders once BOTH secrets.iapOauthClientIdKey/SecretKey are
+# set in values, for orgs that specifically need their own OAuth client
+# (see ui-iap-externalsecret.yaml). Either way, granting real people or
+# groups access is a SEPARATE, unavoidable step regardless of client type:
+# Cloud Console > Security > Identity-Aware Proxy > select this backend >
+# Add principal > IAP-secured Web App User.
+apiVersion: cloud.google.com/v1
+kind: BackendConfig
+metadata:
+  name: {{ include "acme-diff-preview.fullname" . }}-ui
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "acme-diff-preview.labels" . | nindent 4 }}
+spec:
+  iap:
+    enabled: true
+    {{- if and .Values.secrets.iapOauthClientIdKey .Values.secrets.iapOauthClientSecretKey }}
+    oauthclientCredentials:
+      secretName: {{ include "acme-diff-preview.fullname" . }}-ui-iap-oauth
+    {{- end }}
+{{- end }}

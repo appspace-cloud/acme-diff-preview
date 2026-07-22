@@ -53,6 +53,7 @@ SHA dedup:
 """
 import json, os, posixpath, random, re, shutil, signal, ssl, sys, subprocess, time, threading, urllib.error, urllib.parse, urllib.request
 import yaml  # PyYAML (requirements.txt) - input root-cause panel only, v2.6.2
+import diff_ui  # full-diff web UI (same-dir module, stdlib only)
 import io as _io
 import http.client as _http_client
 from collections import Counter, namedtuple
@@ -253,6 +254,26 @@ WARM_WORKERS       = _env_int("WARM_WORKERS", 4)         # parallel chart-cache 
 WARM_THRESHOLD     = _env_int("WARM_THRESHOLD", 8)       # only warm when a PR fans out to more apps than this
 MAX_COMMENT_BYTES  = 245_000 # Bitbucket ~256KB limit; leave headroom
 JFROG_MAX_BODY_BYTES = _env_int("JFROG_MAX_BODY_BYTES", 65536)  # 64 KB — reject oversized bodies before HMAC
+
+# ── Full-diff web UI (Atlantis-style) ────────────────────────────
+# The PR comment stays the summary (truncated over MAX_COMMENT_BYTES); with
+# this enabled the COMPLETE body is persisted per (repo, pr, sha) and served
+# at /diff/<repo>/<pr>/<sha> on the same health server, and the Bitbucket
+# build status deep-links there. Default ON, and verified safe to default
+# on: the ArgoCD hub Ingress extraPaths only forward two specific paths to
+# this Service (/jfrog-webhook, /diff-preview/webhook), never a wildcard, so
+# turning this on does not expose /diff/* anywhere it was not already
+# reachable (in-cluster traffic or kubectl port-forward only). Reaching it
+# from outside the cluster over a real hostname, behind Google IAP, is a
+# SEPARATE opt-in: see the diffUi.ingress chart value (default off, it needs
+# a real IAP OAuth client provisioned in the GCP project first).
+# DIFF_UI_BASE_URL is that externally reachable base; while empty, artifacts
+# are still saved and served in-cluster but the build status keeps linking
+# to the comment, exactly as before this feature existed.
+DIFF_UI_ENABLED       = os.environ.get("DIFF_UI_ENABLED", "true").strip().lower() in ("1", "true", "yes")
+DIFF_UI_DIR           = os.environ.get("DIFF_UI_DIR", "/tmp/acme-diff-ui")
+DIFF_UI_BASE_URL      = os.environ.get("DIFF_UI_BASE_URL", "").rstrip("/")
+DIFF_UI_MAX_ARTIFACTS = _env_int("DIFF_UI_MAX_ARTIFACTS", 500)
 
 # JFrog webhook dedup state: {chart:version -> last_processed_timestamp}
 _jfrog_recent:     dict          = {}
@@ -529,6 +550,25 @@ class _HealthHandler(BaseHTTPRequestHandler):
             self.send_response(200 if ok else 503)
             self.end_headers()
             self.wfile.write(b"ready" if ok else reason)
+
+        elif self.path.startswith("/diff/"):
+            # Full-diff UI. diff_ui.respond is pure (status, ctype,
+            # payload): strict path validation, 404 unless DIFF_UI_ENABLED,
+            # fully escaped HTML. This shim only speaks HTTP.
+            code, ctype, payload = diff_ui.respond(
+                self.path, DIFF_UI_DIR, DIFF_UI_ENABLED)
+            self.send_response(code)
+            self.send_header("Content-Type", ctype)
+            # Explicit Content-Length, matching every other route on this
+            # handler (/healthz, /diff-preview/stats, ...). Harmless under
+            # the current HTTP/1.0 (connection close marks the body end
+            # either way), but this route serves the largest bodies of
+            # anything here (a full multi-app diff can be several MB), so
+            # it is exactly the one that would silently hang a client if
+            # this handler ever moves to HTTP/1.1 keep-alive.
+            self.send_header("Content-Length", str(len(payload)))
+            self.end_headers()
+            self.wfile.write(payload)
         else:
             self.send_response(404)
             self.end_headers()
@@ -4244,6 +4284,13 @@ def post_build_status(pr_sha, state, description, pr_id=None, repo=None):
     _anchor = f"#comment-{_cid}" if _cid else ""
     url = (f"https://bitbucket.org/{BB_WORKSPACE}/{repo or BB_REPO}/pull-requests/{pr_id}{_anchor}"
            if pr_id else f"https://{ARGOCD_SERVER}")
+    # Full-diff UI: when the full-diff UI is enabled AND reachable (base url set)
+    # AND this exact commit's artifact exists, the build icon deep-links to
+    # the complete, untruncated diff (Atlantis-style). Any other case keeps
+    # the existing comment/PR link so the status never points at a 404.
+    if (pr_id and DIFF_UI_ENABLED and DIFF_UI_BASE_URL
+            and diff_ui.has_artifact(DIFF_UI_DIR, repo or BB_REPO, pr_id, pr_sha)):
+        url = diff_ui.ui_url(DIFF_UI_BASE_URL, repo or BB_REPO, pr_id, pr_sha)
     try:
         bb("POST", f"commit/{pr_sha}/statuses/build", repo=repo, body={
             "state": state, "key": BUILD_KEY,
@@ -4416,6 +4463,31 @@ def _truncate_comment(body: str) -> str:
             f" - see ArgoCD UI for full diff - {COMMENT_MARKER}*")
     return out
 
+
+def _save_diff_ui_artifact(repo, pr_id, pr_sha, body, base_sha=None,
+                           outcome_counts=None, app_count=None):
+    """Full-diff UI: persist the FULL comment body (pre-truncation) for the web
+    UI. No-op unless DIFF_UI_ENABLED. Never raises: the artifact is a bonus
+    on top of the comment, so a full disk or bad key must not break the run.
+    The body passed here is the exact text upsert_comment posts, so the store
+    only ever holds already-redacted content.
+
+    base_sha/outcome_counts/app_count are the same per-PR context already
+    computed for the log line and the comment header, threaded through so
+    the page shows real PR context (base commit, per-outcome breakdown, app
+    count) instead of only the raw diff text."""
+    if not DIFF_UI_ENABLED:
+        return
+    try:
+        diff_ui.save_artifact(
+            DIFF_UI_DIR, repo or BB_REPO, pr_id, pr_sha, body,
+            pr_url=(f"https://bitbucket.org/{BB_WORKSPACE}/"
+                    f"{repo or BB_REPO}/pull-requests/{pr_id}"),
+            max_artifacts=DIFF_UI_MAX_ARTIFACTS,
+            base_sha=base_sha, outcome_counts=outcome_counts,
+            app_count=app_count)
+    except Exception as e:
+        log(f"[diff-ui] artifact save failed (non-fatal): {e}", "WARNING")
 
 def upsert_comment(pr_id, body, existing_id=None, repo=None):
     """Post or update PR comment. Truncates if over limit; posts fallback on error."""
@@ -6217,6 +6289,13 @@ def process_pr(pr, path_map, base_sha="", repo=None):
                                decommission_lines=decommission_lines or None,
                                input_change_lines=input_change_lines or None)
         comment_kb = round(len(body.encode()) / 1024, 1)
+        # Full-diff UI: persist the full body BEFORE upsert (which truncates over
+        # MAX_COMMENT_BYTES) so the web UI serves the complete diff, with the
+        # same per-PR context (base commit, outcome breakdown, app count)
+        # already computed above for the log line.
+        _save_diff_ui_artifact(repo, pr_id, pr_sha, body, base_sha=base_sha,
+                               outcome_counts=dict(outcome_counts),
+                               app_count=len(app_results))
         upsert_comment(pr_id, body, existing_id, repo=repo)
         action = "updated" if existing_id else "posted"
         print(f"    Comment {action} on PR #{pr_id} ({comment_kb}KB)")

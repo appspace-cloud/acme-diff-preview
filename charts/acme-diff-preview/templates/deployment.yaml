@@ -102,6 +102,30 @@ spec:
             {{- end }}
             {{- /* warmThreshold removed — no effect after warm-diff pass was replaced by pre-pull */ -}}
             {{- end }}
+            {{- with .Values.diffUi }}
+            # Full-diff web UI (Atlantis-style): the complete, untruncated
+            # diff is persisted per (repo, pr, sha) and served on /diff/...
+            # by the same health server. Rendered unconditionally (never
+            # omitted) so an explicit enabled: false in values can never be
+            # silently shadowed by the container's own default, whatever
+            # that default happens to be.
+            - name: DIFF_UI_ENABLED
+              value: {{ .enabled | quote }}
+            {{- if .enabled }}
+            {{- if .baseUrl }}
+            - name: DIFF_UI_BASE_URL
+              value: {{ .baseUrl | quote }}
+            {{- end }}
+            {{- if .dir }}
+            - name: DIFF_UI_DIR
+              value: {{ .dir | quote }}
+            {{- end }}
+            {{- if .maxArtifacts }}
+            - name: DIFF_UI_MAX_ARTIFACTS
+              value: {{ .maxArtifacts | quote }}
+            {{- end }}
+            {{- end }}
+            {{- end }}
           envFrom:
             - secretRef:
                 name: {{ include "acme-diff-preview.fullname" . }}-creds
