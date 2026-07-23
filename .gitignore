@@ -7,3 +7,6 @@ dist/
 .coverage
 htmlcov/
 coverage.json
+# mutation testing (mutmut) working tree and hypothesis' example database
+mutants/
+.hypothesis/

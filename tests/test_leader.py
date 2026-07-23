@@ -796,3 +796,172 @@ def test_release_from_within_the_election_thread_does_not_self_join(
     el.release()                              # must not raise
     assert el.is_leader() is False
     assert api.spec["holderIdentity"] == ""
+
+
+def test_start_health_server_does_not_pay_the_getfqdn_dns_tax():
+    """_start_health_server binds to ("", port), all interfaces, required
+    in production so kubelet/Service probes can reach it over the pod
+    network. The stdlib HTTPServer.server_bind() ALSO calls
+    socket.getfqdn(host) to populate server.server_name, an attribute
+    nothing in this codebase reads. On a host where that lookup is slow
+    (a wildcard bind forces a reverse lookup of the machine's own
+    hostname; on this class of machine that can take several real
+    seconds), every test and every real pod start pays that tax for
+    metadata nobody uses. Bounded well under the observed ~5s tax so this
+    fails loudly again if the fix regresses, without being a hard sleep
+    dependency in either direction.
+    """
+    t0 = time.monotonic()
+    srv = m._start_health_server(0)
+    try:
+        assert time.monotonic() - t0 < 1.0
+    finally:
+        srv.shutdown()
+
+
+# ── mutation-testing follow-up: gaps a 100%-line-coverage suite missed ──────
+#
+# A mutmut pass against this module (419 mutants, 69% killed) found real
+# gaps line coverage alone could never surface. Most of the 130 survivors
+# were either equivalent mutants (e.g. reassigning resourceVersion to
+# itself — _get_lease always returns rv already read from that same
+# field, so the "assignment" is a no-op by construction) or mutations in
+# the verify_tls=True / real-Lease-body-construction paths, which ARE
+# exercised — by tests/test_leader_kind_integration.py against a real
+# cluster, just not by this fake-mock suite. The tests below close the
+# handful of genuine gaps: silent local-time-vs-UTC drift, unverified
+# constructor defaults that diff_preview.py's factory actually relies on,
+# unchecked boundary conditions, a guard whose "or" could have been
+# "and" without any test noticing, and false leadership-transition
+# events that would have been a real, confusing operational signal.
+
+def test_microtime_uses_real_utc_not_local_time():
+    # The regex-only check elsewhere confirms the SHAPE; a local-time bug
+    # (e.g. dropping tzinfo) would still match that shape while being
+    # silently wrong for any host not in UTC. Anchor on a known instant.
+    assert leader._microtime(0) == "1970-01-01T00:00:00.000000Z"
+    assert leader._microtime(1700000000) == "2023-11-14T22:13:20.000000Z"
+
+
+def test_default_construction_uses_the_documented_timers(tmp_path):
+    # Every other test passes these explicitly; diff_preview.py's
+    # _make_leader_elector() relies on the class defaults whenever the
+    # matching env var is unset, so the defaults themselves are
+    # production-relevant, not just documentation.
+    el = leader.LeaderElector("adp-leader", "pod-a", sa_dir=_sa_dir(tmp_path))
+    assert el._duration == 15
+    assert el._deadline == 10
+    assert el._retry == 2.0
+    assert el._verify_tls is True
+
+
+def test_is_leader_boundary_is_strictly_less_than_deadline(tmp_path,
+                                                           monkeypatch):
+    el, api, clock = _elector(tmp_path, monkeypatch)
+    el.tick()
+    clock.advance(10)                # exactly renew_deadline: must be False
+    assert el.is_leader() is False
+
+
+def test_tick_expiry_boundary_is_strictly_greater_than_duration(tmp_path,
+                                                                monkeypatch):
+    el, api, clock = _elector(tmp_path, monkeypatch)
+    el2, _, _ = _elector(tmp_path, monkeypatch, api=api, clock=clock,
+                         identity="pod-b")
+    el2.tick()
+    el.tick()
+    clock.advance(15)                 # exactly leaseDurationSeconds: not expired yet
+    el.tick()
+    assert el.is_leader() is False
+    assert api.spec["holderIdentity"] == "pod-b"
+
+
+def test_release_guard_is_or_not_and_disabled_alone_skips_network(
+        tmp_path, monkeypatch):
+    # Regression pin for a guard that reads "if not enabled or not
+    # bootstrap(): return". With a real sa_dir present (bootstrap() would
+    # be True) but the elector disabled, only "or" guarantees the early
+    # return; "and" would let a disabled elector fall through into the
+    # network path below.
+    def boom(*a, **kw):  # pragma: no cover - must never run
+        raise AssertionError("disabled elector touched the network")
+    monkeypatch.setattr(urllib.request, "urlopen", boom)
+    el = leader.LeaderElector("adp-leader", "pod-a",
+                              sa_dir=_sa_dir(tmp_path), enabled=False)
+    el.release()   # must return immediately, no GET/PUT attempted
+
+
+def test_release_when_lease_vanished_meanwhile_is_graceful(tmp_path,
+                                                            monkeypatch):
+    # Chaos scenario exercised manually in production this session
+    # (kubectl delete lease mid-flight); pinned here as a fast unit test.
+    # If the lease is deleted between the leadership check and release()'s
+    # own GET, there must be no PUT attempt and no exception escaping.
+    el, api, clock = _elector(tmp_path, monkeypatch)
+    el.tick()
+    assert el.is_leader() is True
+    api.lease = None                 # simulates an external delete
+    api.rv = 0
+    el.release()                     # must not raise
+    assert el.is_leader() is False
+    assert [c for c in api.calls if c[0] == "PUT"] == []
+
+
+def test_set_leading_never_fires_acquired_while_staying_standby(tmp_path,
+                                                                 monkeypatch):
+    # Regression pin: "if leading and not was" must be AND. With OR, a
+    # standby tick (leading=False, was=False) would satisfy
+    # "leading or not was" (True or True) and wrongly log/emit
+    # "acquired leadership" on every single standby tick.
+    standby_events = []
+    el, api, clock = _elector(tmp_path, monkeypatch, events=standby_events)
+    el2, _, _ = _elector(tmp_path, monkeypatch, api=api, clock=clock,
+                         identity="pod-b")
+    el2.tick()   # pod-b leads
+    el.tick()    # pod-a: standby, staying standby
+    el.tick()    # pod-a: standby again, staying standby
+    assert standby_events == []      # pod-a never announces acquiring anything
+    assert el.is_leader() is False
+
+
+def test_set_leading_only_fires_lost_on_a_real_leader_to_standby_edge(
+        tmp_path, monkeypatch):
+    # Regression pin: "elif was and not leading" must be AND, not OR.
+    # With OR, "was or not leading" is satisfied even while STAYING
+    # leader (was=True, leading=True -> True or False -> True), which
+    # would wrongly emit "lost leadership" on every successful renewal.
+    events = []
+    el, api, clock = _elector(tmp_path, monkeypatch, events=events)
+    el.tick()                        # acquires
+    events.clear()
+    clock.advance(2)
+    el.tick()                        # a normal, successful renewal
+    assert events == []              # no spurious "lost leadership"
+    assert el.is_leader() is True
+
+
+def test_election_thread_is_created_as_a_daemon(tmp_path, monkeypatch):
+    # A non-daemon thread would block process exit on SIGTERM even after
+    # release(); nothing else in this suite asserts the daemon flag.
+    el, api, clock = _elector(tmp_path, monkeypatch, retry_period=0.01)
+    el.start()
+    try:
+        assert el._thread.daemon is True
+    finally:
+        el.release()
+
+
+def test_takeover_on_expiry_sets_a_usable_lease_duration(tmp_path,
+                                                         monkeypatch):
+    # Pins that the NEW holder's takeover write carries a real, usable
+    # leaseDurationSeconds for whichever replica reads the lease next
+    # (not None / a typo'd key), independent of the identity/renewTime
+    # fields already checked elsewhere.
+    el, api, clock = _elector(tmp_path, monkeypatch)
+    el2, _, _ = _elector(tmp_path, monkeypatch, api=api, clock=clock,
+                         identity="pod-b")
+    el2.tick()
+    el.tick()
+    clock.advance(16)
+    el.tick()
+    assert api.spec["leaseDurationSeconds"] == el._duration

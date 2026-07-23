@@ -1,0 +1,8 @@
+[tool.mutmut]
+source_paths = ["src/leader.py"]
+pytest_add_cli_args_test_selection = ["tests/test_leader.py"]
+# test_leader.py's HA-wiring tests import diff_preview (which in turn
+# imports diff_ui) to exercise diff_preview.py's own leader-election glue.
+# mutmut's sandbox only copies source_paths by default, so these sibling
+# modules must be listed explicitly or the import fails at collection.
+also_copy = ["src/diff_preview.py", "src/diff_ui.py"]
