@@ -10,6 +10,8 @@ AlreadyExists).
 import json
 import os
 import re
+import threading
+import time
 import urllib.error
 import urllib.request
 
@@ -723,3 +725,74 @@ def test_forwarder_declines_unknown_or_own_holder(monkeypatch):
                         _ForwardingElector(False, holder="pod-self"),
                         raising=False)
     assert m._forward_webhook_to_leader(b"{}", {}) is False
+
+
+# ── final review: release() must not race a concurrent tick() ──────────────
+
+def test_release_joins_the_background_thread_before_touching_the_network(
+        tmp_path, monkeypatch):
+    """release() must synchronize with the background election thread
+    BEFORE doing its own lease write. Without this, a tick() already in
+    flight (e.g. a renewal) can win the resourceVersion race against
+    release()'s write, leaving the lease renewed instead of released and
+    forcing the standby to wait out the full lease duration instead of
+    the instant handoff release() exists to provide.
+    """
+    el, api, clock = _elector(tmp_path, monkeypatch)
+    el.tick()
+    assert el.is_leader() is True
+
+    class _FakeThread:
+        def __init__(self):
+            self.join_called = False
+
+        def join(self, timeout=None):
+            self.join_called = True
+
+        def is_alive(self):
+            return False
+
+    fake_thread = _FakeThread()
+    el._thread = fake_thread
+
+    order = []
+    real_get_lease = el._get_lease
+
+    def spying_get_lease():
+        order.append(("network", fake_thread.join_called))
+        return real_get_lease()
+    monkeypatch.setattr(el, "_get_lease", spying_get_lease)
+
+    el.release()
+    assert fake_thread.join_called is True
+    assert order == [("network", True)]   # join happened BEFORE the GET
+
+
+def test_release_stops_a_real_background_thread_before_returning(
+        tmp_path, monkeypatch):
+    """End-to-end companion to the ordering test above, with a real
+    thread: once release() returns, the election thread must actually be
+    gone, not just asked to stop."""
+    el, api, clock = _elector(tmp_path, monkeypatch, retry_period=0.01)
+    el.start()
+    for _ in range(300):
+        if el.is_leader():
+            break
+        time.sleep(0.01)
+    assert el.is_leader() is True
+    el.release()
+    assert not el._thread.is_alive()
+    assert api.spec["holderIdentity"] == ""
+
+
+def test_release_from_within_the_election_thread_does_not_self_join(
+        tmp_path, monkeypatch):
+    """Guard against the failure mode the join fix could introduce: if
+    release() is ever reached from inside the election thread itself, a
+    self-join would raise RuntimeError. It must be skipped instead."""
+    el, api, clock = _elector(tmp_path, monkeypatch)
+    el.tick()
+    el._thread = threading.current_thread()   # pretend we ARE that thread
+    el.release()                              # must not raise
+    assert el.is_leader() is False
+    assert api.spec["holderIdentity"] == ""

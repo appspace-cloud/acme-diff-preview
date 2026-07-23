@@ -6787,11 +6787,11 @@ def main():
         if not _shutdown:
             # Webhook wakes the loop instantly (<1s). The 60s timeout is
             # just a safety net in case webhook delivery is ever unavailable.
-            # Known HA tradeoff: the load balancer delivers each webhook to
-            # ONE replica, so a wake landing on the standby only wakes the
-            # standby; the leader picks the work up on its next safety-net
-            # tick (60s worst case), the same bound as a lost webhook
-            # pre-HA. Accepted for now instead of pod-to-pod forwarding.
+            # HA note: the load balancer delivers each webhook to ONE
+            # replica; when it lands on the standby, the standby relays it
+            # to the leader (see _forward_webhook_to_leader), so the leader
+            # still wakes in <1s. If the relay ever fails, the leader's own
+            # safety-net tick below (60s worst case) is the backstop.
             # A standby uses a short 5s wait instead, so a leadership
             # handoff is picked up quickly. Both are known-safe, bounded
             # waits (never hangs), so the heartbeat keeps vouching for
