@@ -405,6 +405,27 @@ Published to GitHub Pages on every merge to `main`:
 https://appspace-cloud.github.io/acme-diff-preview
 ```
 
+### High availability (2+ replicas)
+
+Set `replicaCount: 2` and the service survives pod loss, node drains and
+rolling deploys with no availability gap:
+
+- The diff web UI and the webhooks are active-active: every replica serves
+  them at all times. Artifacts live in the GCS bucket (`diffUi.gcsBucket`),
+  so any replica can serve any diff page.
+- The PR poll loop stays a singleton: only the replica holding a Kubernetes
+  Lease runs it (`leaderElection.enabled`, on by default). The standby takes
+  over in seconds when the leader dies, and instantly on a clean shutdown
+  (the leader releases the lease on SIGTERM). `GET /diff-preview/stats`
+  exposes `is_leader` per replica.
+- The chart ships the rest of the disruption armor: `RollingUpdate` with
+  `maxUnavailable: 0`, a PodDisruptionBudget (rendered only above one
+  replica), node and zone topology spread, a `preStop` sleep for clean
+  endpoint drain, and the Lease RBAC for the pod's ServiceAccount.
+
+With one replica everything above is inert and behavior is exactly the
+single-instance one: the pod trivially elects itself.
+
 ---
 
 ## CI/CD
