@@ -212,11 +212,15 @@ def test_c2_per_app_diff_touches_progress():
 def test_c2_main_loop_marks_idle_around_wake_wait():
     """Structural guard: the outer poll loop must mark the loop as idle
     right before blocking on _wake.wait, and clear it right after — this is
-    the known-safe state _liveness_should_refresh relies on."""
+    the known-safe state _liveness_should_refresh relies on. The wait
+    timeout became variable with HA (leader: 60s safety net, standby: 5s
+    reactive poll for a handoff), so the guard matches the call shape
+    rather than a literal 60.
+    """
     src = open(os.path.join(SRC, "diff_preview.py")).read()
     start = src.index("def main()")
     body = src[start:]
-    idx = body.index("_wake.wait(timeout=60)")
+    idx = body.index("_wake.wait(timeout=_idle_timeout)")
     before = body[max(0, idx - 300):idx]
     after = body[idx:idx + 300]
     assert "_loop_idle = True" in before, "must mark idle before waiting"

@@ -9,19 +9,45 @@ metadata:
     # Restart pod when acme-diff-preview-creds Secret changes (ESO rotation).
     reloader.stakater.com/auto: "true"
 spec:
-  replicas: 1
+  replicas: {{ .Values.replicaCount }}
   selector:
     matchLabels:
       {{- include "acme-diff-preview.selectorLabels" . | nindent 6 }}
   strategy:
-    # Recreate prevents two instances running concurrently and racing on _seen.
-    type: Recreate
+    # RollingUpdate with maxUnavailable 0: a new pod must be Ready before
+    # an old one is removed, so at least one replica always serves. Safe to
+    # run two instances concurrently since the poll loop (the only
+    # singleton work, the old "_seen race" behind the previous Recreate
+    # strategy) is gated by Lease-based leader election in the app.
+    type: RollingUpdate
+    rollingUpdate:
+      maxSurge: 1
+      maxUnavailable: 0
   template:
     metadata:
       labels:
         {{- include "acme-diff-preview.selectorLabels" . | nindent 8 }}
     spec:
       serviceAccountName: {{ include "acme-diff-preview.fullname" . }}
+      {{- with .Values.priorityClassName }}
+      priorityClassName: {{ . }}
+      {{- end }}
+      # Spread replicas across nodes and zones (soft: a constrained cluster
+      # can still schedule) so one node or zone loss cannot take out every
+      # replica at once. With a single replica these are inert.
+      topologySpreadConstraints:
+        - maxSkew: 1
+          topologyKey: kubernetes.io/hostname
+          whenUnsatisfiable: ScheduleAnyway
+          labelSelector:
+            matchLabels:
+              {{- include "acme-diff-preview.selectorLabels" . | nindent 14 }}
+        - maxSkew: 1
+          topologyKey: topology.kubernetes.io/zone
+          whenUnsatisfiable: ScheduleAnyway
+          labelSelector:
+            matchLabels:
+              {{- include "acme-diff-preview.selectorLabels" . | nindent 14 }}
       # Grace period must exceed worst-case single-PR duration:
       # DIFF_TIMEOUT(120s) x DIFF_RETRIES(5) x batch_serialization ≈ 10 min max.
       # 600s = 10 min; gives SIGTERM handler time to finish in-flight diffs cleanly.
@@ -132,6 +158,15 @@ spec:
             {{- end }}
             {{- end }}
             {{- end }}
+            {{- with .Values.leaderElection }}
+            # HA: only the Lease holder runs the poll loop; every replica
+            # serves HTTP. The lease name must match the RBAC resourceName
+            # in role.yaml, so both derive from the same value.
+            - name: LEADER_ELECTION_ENABLED
+              value: {{ .enabled | quote }}
+            - name: LEADER_LEASE_NAME
+              value: {{ include "acme-diff-preview.fullname" $ }}-leader
+            {{- end }}
           envFrom:
             - secretRef:
                 name: {{ include "acme-diff-preview.fullname" . }}-creds
@@ -139,6 +174,15 @@ spec:
             - containerPort: {{ .Values.service.port }}
               name: health
               protocol: TCP
+          lifecycle:
+            # Endpoint deregistration propagates asynchronously: for a short
+            # window after a pod turns Terminating, new requests still route
+            # to it. Sleeping before SIGTERM lets that window close so a
+            # rollout or drain never drops in-flight or just-routed requests.
+            # The sleep counts against terminationGracePeriodSeconds (600s).
+            preStop:
+              exec:
+                command: ["sleep", "15"]
           livenessProbe:
             httpGet:
               path: /healthz

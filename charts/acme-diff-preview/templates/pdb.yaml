@@ -1,0 +1,19 @@
+{{- if gt (int .Values.replicaCount) 1 }}
+# Voluntary disruptions (node drains, GKE node-pool upgrades, autoscaler
+# consolidation) must never evict every replica at once: minAvailable 1
+# lets exactly one pod be evicted at a time. Rendered ONLY above one
+# replica: a PDB with minAvailable 1 over a single replica would allow
+# zero disruptions and permanently block node drains and GKE upgrades.
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: {{ include "acme-diff-preview.fullname" . }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "acme-diff-preview.labels" . | nindent 4 }}
+spec:
+  minAvailable: 1
+  selector:
+    matchLabels:
+      {{- include "acme-diff-preview.selectorLabels" . | nindent 6 }}
+{{- end }}

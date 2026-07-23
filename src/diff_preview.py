@@ -51,9 +51,10 @@ SHA dedup:
 - In-memory: skips same PR SHA within this pod's loop iterations
 - Cross-pod: compares comment SHA; skips and fixes stuck INPROGRESS if needed
 """
-import json, os, posixpath, random, re, shutil, signal, ssl, sys, subprocess, time, threading, urllib.error, urllib.parse, urllib.request
+import json, os, posixpath, random, re, shutil, signal, socket, ssl, sys, subprocess, time, threading, urllib.error, urllib.parse, urllib.request
 import yaml  # PyYAML (requirements.txt) - input root-cause panel only, v2.6.2
 import diff_ui  # full-diff web UI (same-dir module, stdlib only)
+import leader  # Lease-based leader election (same-dir module, stdlib only)
 import io as _io
 import http.client as _http_client
 from collections import Counter, namedtuple
@@ -285,6 +286,41 @@ DIFF_UI_GCS_BUCKET    = os.environ.get("DIFF_UI_GCS_BUCKET", "").strip()
 # call time, not at assignment time.
 diff_ui.on_warning = lambda msg: log(msg, "WARNING")
 
+# Leader election (HA): with 2+ replicas, only the lease holder runs the
+# poll loop; every replica keeps serving HTTP (diff UI, webhooks, probes).
+# Env knobs (read by _make_leader_elector at startup, client-go defaults):
+# LEADER_ELECTION_ENABLED, LEADER_LEASE_NAME, LEADER_LEASE_DURATION,
+# LEADER_RENEW_DEADLINE, LEADER_RETRY_PERIOD. At replicas=1 the single pod
+# trivially always wins, so this ships as a behavioral no-op.
+#
+# The election runs in its own daemon thread; main() wires this up. None
+# means "no elector" (tests, direct function calls): act as a single
+# instance, exactly the pre-HA behavior.
+_leader = None
+
+
+def _make_leader_elector():
+    """Build the elector from env, read at call time so startup always sees
+    the pod's real environment (and tests can vary it per case)."""
+    enabled = os.environ.get(
+        "LEADER_ELECTION_ENABLED", "true").strip().lower() in ("1", "true", "yes")
+    return leader.LeaderElector(
+        os.environ.get("LEADER_LEASE_NAME", "acme-diff-preview-leader").strip(),
+        os.environ.get("HOSTNAME") or socket.gethostname(),
+        lease_duration=_env_int("LEADER_LEASE_DURATION", 15),
+        renew_deadline=_env_int("LEADER_RENEW_DEADLINE", 10),
+        retry_period=float(_env_int("LEADER_RETRY_PERIOD", 2)),
+        enabled=enabled,
+        on_event=lambda msg: log(
+            f"[leader] {msg}",
+            "WARNING" if ("non-fatal" in msg or "failed" in msg) else "INFO"))
+
+
+def _should_run_iteration(elector) -> bool:
+    """Pure gate: the poll loop belongs to the leader (or to a process with
+    no elector wired, which is the single-instance mode)."""
+    return elector is None or elector.is_leader()
+
 # JFrog webhook dedup state: {chart:version -> last_processed_timestamp}
 _jfrog_recent:     dict          = {}
 _jfrog_dedup_lock: threading.Lock = threading.Lock()
@@ -486,6 +522,14 @@ def _handle_sigterm(signum, frame) -> None:
     global _shutdown
     _shutdown = True
     log("SIGTERM received — draining current iteration then exiting", "WARNING")
+    # Hand leadership over NOW (best-effort): the standby replica takes the
+    # poll loop in ~1 renewal instead of waiting out a full lease duration.
+    # If an iteration is still draining here, the new leader's first
+    # iteration may briefly overlap it. That is accepted by design: diff
+    # output is deterministic per sha, comments are upserted in place, and
+    # the cross-pod SHA dedup skips already-commented commits.
+    if _leader is not None:
+        _leader.release()
 
 signal.signal(signal.SIGTERM, _handle_sigterm)
 
@@ -513,6 +557,9 @@ class _HealthHandler(BaseHTTPRequestHandler):
             payload["version"] = APP_VERSION   # v2.5.19 (F1): running version
             # COPS-2507: which repos (and scopes) this instance is serving.
             payload["repos"] = {r: (c["scopes"] or ["*"]) for r, c in REPOS.items()}
+            # HA: which replica owns the poll loop right now. No elector
+            # wired (tests, single-process runs) counts as leading.
+            payload["is_leader"] = _should_run_iteration(_leader)
             data = json.dumps(payload, indent=2).encode()
             self.send_response(200)
             self.send_header("Content-Type", "application/json")
@@ -6615,7 +6662,7 @@ def main_iteration():
 # ── Main entry point (long-running Deployment mode) ───────────────────
 def main():
     """Start health server, login to ArgoCD, then run poll loop until SIGTERM."""
-    global _last_ok, _loop_idle
+    global _last_ok, _loop_idle, _leader
     log("acme-diff-preview starting (Deployment mode, helm-template diff)",
         version=APP_VERSION,
         argocd_server=ARGOCD_SERVER, argocd_user=ARGOCD_USER,
@@ -6664,25 +6711,49 @@ def main():
     argocd_login()
     log("ArgoCD login OK")
 
+    # HA (leader election): the poll loop below runs only on the replica
+    # holding the lease; everything already started above (health server,
+    # webhooks, diff UI) keeps serving on every replica. With one replica
+    # or off-cluster this trivially always elects itself.
+    _leader = _make_leader_elector()
+    _leader.start()
+
+    _standby_logged = False
     while not _shutdown:
-        try:
-            main_iteration()
-            _last_ok = time.monotonic()  # only bumped on a clean iteration
-        except Exception as e:
-            log(f"Unhandled error in main loop: {e}", "ERROR")
-            # Do NOT bump _last_ok here — /healthz must reflect real staleness.
+        if _should_run_iteration(_leader):
+            if _standby_logged:
+                log("[leader] this replica now owns the poll loop")
+                _standby_logged = False
+            try:
+                main_iteration()
+                _last_ok = time.monotonic()  # only bumped on a clean iteration
+            except Exception as e:
+                log(f"Unhandled error in main loop: {e}", "ERROR")
+                # Do NOT bump _last_ok here — /healthz must reflect real staleness.
+        elif not _standby_logged:
+            log("[leader] standby: another replica owns the poll loop; "
+                "serving HTTP only")
+            _standby_logged = True
         if not _shutdown:
             # Webhook wakes the loop instantly (<1s). The 60s timeout is
             # just a safety net in case webhook delivery is ever unavailable.
-            # _loop_idle marks this as a known-safe, bounded wait — NOT a
-            # hang — so the heartbeat can keep vouching for liveness while
-            # the loop is legitimately doing nothing (v2.5.2 C2). Guarded by
-            # the same lock _beat() reads it under, for a clean, unambiguous
-            # happens-before relationship (belt-and-braces on top of the
-            # GIL's own atomicity for a single bool assignment).
+            # Known HA tradeoff: the load balancer delivers each webhook to
+            # ONE replica, so a wake landing on the standby only wakes the
+            # standby; the leader picks the work up on its next safety-net
+            # tick (60s worst case), the same bound as a lost webhook
+            # pre-HA. Accepted for now instead of pod-to-pod forwarding.
+            # A standby uses a short 5s wait instead, so a leadership
+            # handoff is picked up quickly. Both are known-safe, bounded
+            # waits (never hangs), so the heartbeat keeps vouching for
+            # liveness while the loop is legitimately doing nothing
+            # (v2.5.2 C2). Guarded by the same lock _beat() reads it under,
+            # for a clean, unambiguous happens-before relationship
+            # (belt-and-braces on top of the GIL's own atomicity for a
+            # single bool assignment).
+            _idle_timeout = 60 if not _standby_logged else 5
             with _progress_lock:
                 _loop_idle = True
-            _wake.wait(timeout=60)
+            _wake.wait(timeout=_idle_timeout)
             with _progress_lock:
                 _loop_idle = False
             _wake.clear()

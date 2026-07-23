@@ -5,6 +5,26 @@
 # The ArgoCD Ingress extraPaths hardcodes "acme-diff-preview" as the Service name.
 fullnameOverride: "acme-diff-preview"
 
+# HA: run more than one replica and the poll loop stays a singleton via
+# Lease-based leader election (leaderElection below), while the diff UI
+# and webhooks serve from every replica. The PodDisruptionBudget template
+# renders only above one replica. Default stays 1: production opts in to
+# 2 from the acme-infrastructure values.
+replicaCount: 1
+
+# Only the Lease holder runs the PR poll loop; the standby replica keeps
+# serving HTTP and takes over in seconds when the leader goes away. The
+# switch exists as an escape hatch; leave it on. Turning it off with two
+# replicas would make both of them post PR comments, and even at one
+# replica a RollingUpdate briefly runs old and new pods together, so
+# without the election every deploy would overlap two poll loops.
+leaderElection:
+  enabled: true
+
+# Optional PriorityClass so the pods are not the first candidates for
+# preemption under node pressure. Empty = cluster default.
+priorityClassName: ""
+
 image:
   repository: us-central1-docker.pkg.dev/appspace-devops/artifact/acme-diff-preview
   tag: "2.7.0"
