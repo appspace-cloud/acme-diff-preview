@@ -57,6 +57,7 @@ import diff_ui  # full-diff web UI (same-dir module, stdlib only)
 import leader  # Lease-based leader election (same-dir module, stdlib only)
 import io as _io
 import http.client as _http_client
+import socketserver
 from collections import Counter, namedtuple
 from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
 import concurrent.futures
@@ -1038,13 +1039,33 @@ def _start_heartbeat() -> None:
     log("Heartbeat thread started (tick every 30s, liveness threshold 10 min)")
 
 
+class _FastBindHTTPServer(ThreadingHTTPServer):
+    """ThreadingHTTPServer, minus the slow, unused FQDN lookup on bind.
+
+    Stock HTTPServer.server_bind() calls socket.getfqdn(host) to populate
+    server_name, an attribute nothing in this codebase reads. Binding to
+    ("", port) (required in production so kubelet/Service probes reach the
+    pod on any interface) makes getfqdn() reverse-resolve the machine's OWN
+    hostname; on hosts where that path is slow (observed: several real
+    seconds on this class of machine) every process start, and every test
+    that boots the health server, pays it for metadata nobody uses. This
+    calls TCPServer.server_bind directly (skipping HTTPServer's override)
+    so the actual bind/listen behavior, what matters for real traffic,
+    is unchanged; only the unused, slow metadata computation is skipped.
+    """
+    def server_bind(self):
+        socketserver.TCPServer.server_bind(self)
+        self.server_name = self.server_address[0] or "0.0.0.0"
+        self.server_port = self.server_address[1]
+
+
 def _start_health_server(port: int = 8080) -> ThreadingHTTPServer:
     """Start the health server in a daemon thread and handle webhook POSTs.
 
     Uses ThreadingHTTPServer so health probes (GET /healthz) are never blocked
     by a concurrent JFrog or Bitbucket webhook request.
     """
-    server = ThreadingHTTPServer(("", port), _HealthHandler)
+    server = _FastBindHTTPServer(("", port), _HealthHandler)
     t = threading.Thread(target=server.serve_forever, daemon=True, name="health-server")
     t.start()
     log(f"Health server listening on :{port}")
@@ -1811,7 +1832,11 @@ _suffix_key_re        = re.compile(r"^\s*suffix:\s*([^\s#]+)")
 # A safe OCI tag: alphanumeric start, then alphanumerics and . _ - + (build
 # metadata like 1.0.0+abc is legal in OCI tags and semver, v2.5.0 H5). Still
 # forbids path separators, whitespace, leading dash, and shell metacharacters.
-_SAFE_CHART_VERSION_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._+-]{0,127}$")
+# \Z, not $: in Python re, `$` also matches just BEFORE a trailing
+# newline, so "1.2.3\n" slipped through while the contract below promises
+# no whitespace at all. \Z anchors to the true end of the string.
+# (Caught by tests/test_property_based.py's spec-equivalence property.)
+_SAFE_CHART_VERSION_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._+-]{0,127}\Z")
 
 
 def _is_valid_chart_version(version: str) -> bool:

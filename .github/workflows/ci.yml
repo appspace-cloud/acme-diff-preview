@@ -120,3 +120,45 @@ jobs:
           context: .
           push: false
           tags: ghcr.io/appspace-cloud/acme-diff-preview:ci
+
+  kind-integration:
+    # Contract test: leader.py's Lease-based election against a REAL
+    # Kubernetes API (an ephemeral kind cluster), not the hand-written
+    # _FakeLeaseApi mock every other leader test drives. Separate job on
+    # purpose: it needs Docker-in-Docker and takes noticeably longer to
+    # provision than the fast unit suite in `test`, so it must never slow
+    # down that job's feedback loop. tests/test_leader_kind_integration.py
+    # is opt-in (RUN_KIND_TESTS=1) and self-contained: it creates and
+    # destroys its own cluster, this job only needs the CLI tools present.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5.0.0
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install kind and verify required CLIs
+        run: |
+          # Download to a path we own, make it executable there, then move it
+          # into place with sudo. The runner user can write into /usr/local/bin
+          # but cannot chmod a file it does not own there, so the direct
+          # "curl -o /usr/local/bin/kind + chmod" approach failed with
+          # "Operation not permitted". This is the flow kind documents.
+          curl -Lo ./kind https://kind.sigs.k8s.io/dl/v0.31.0/kind-linux-amd64
+          chmod +x ./kind
+          sudo mv ./kind /usr/local/bin/kind
+          # The contract test skips (does not fail) when kind, kubectl or docker
+          # are missing, so assert they are all present here. This keeps the job
+          # honest: without it a missing tool would produce a silent green while
+          # the real-cluster test never actually ran.
+          for t in kind kubectl docker; do command -v "$t" >/dev/null || { echo "::error::required CLI '$t' not found on the runner"; exit 1; }; done
+          kind version
+
+      - name: Run the real-cluster leader election contract tests
+        env:
+          RUN_KIND_TESTS: "1"
+        run: |
+          pip install -r requirements-dev.txt --quiet
+          pytest tests/test_leader_kind_integration.py -v
