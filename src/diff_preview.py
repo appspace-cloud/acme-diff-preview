@@ -321,6 +321,45 @@ def _should_run_iteration(elector) -> bool:
     no elector wired, which is the single-instance mode)."""
     return elector is None or elector.is_leader()
 
+
+def _forward_webhook_to_leader(body: bytes, headers) -> bool:
+    """Relay a verified Bitbucket webhook from a standby to the leader pod.
+
+    The load balancer delivers each webhook to ONE replica; when that
+    replica is the standby, waking only itself would defer processing to
+    the leader's 60s safety net. Instead the standby relays the EXACT
+    original request (body and HMAC signature untouched, so the leader
+    re-verifies it like any other webhook) straight to the leader pod's
+    IP, with a marker header so a relay is never relayed again even if
+    leadership flips mid-flight. Best-effort by design: any failure here
+    just means falling back to the safety net, never a failed webhook.
+    """
+    holder = ""
+    try:
+        if _leader is None:
+            return False
+        holder = _leader.current_holder()
+        if not holder or holder == (
+                os.environ.get("HOSTNAME") or socket.gethostname()):
+            return False
+        ip = _leader.pod_ip(holder)
+        req = urllib.request.Request(
+            f"http://{ip}:8080/diff-preview/webhook", data=body,
+            method="POST",
+            headers={
+                "X-Hub-Signature": headers.get("X-Hub-Signature", ""),
+                "X-Event-Key": headers.get("X-Event-Key", ""),
+                "X-ADP-Forwarded": "1",
+                "Content-Type": "application/json",
+            })
+        with urllib.request.urlopen(req, timeout=3):
+            pass
+        return True
+    except Exception as e:
+        log(f"[leader] webhook relay to {holder or 'unknown leader'} failed "
+            f"(non-fatal, safety net covers it): {e}", "WARNING")
+        return False
+
 # JFrog webhook dedup state: {chart:version -> last_processed_timestamp}
 _jfrog_recent:     dict          = {}
 _jfrog_dedup_lock: threading.Lock = threading.Lock()
@@ -662,8 +701,19 @@ class _HealthHandler(BaseHTTPRequestHandler):
 
             event_key = self.headers.get("X-Event-Key", "")
             if event_key.startswith("pullrequest:"):
-                log(f"Webhook received: {event_key} — waking loop")
+                # Always wake the local loop (harmless on a standby). If we
+                # are the standby and this is not already a relay, relay it
+                # to the leader so processing starts in <1s instead of on
+                # the leader's 60s safety-net tick.
                 _wake.set()
+                relayed_in = self.headers.get("X-ADP-Forwarded", "") == "1"
+                if relayed_in or _should_run_iteration(_leader):
+                    log(f"Webhook received: {event_key} — waking loop")
+                else:
+                    ok = _forward_webhook_to_leader(body, self.headers)
+                    log(f"Webhook received: {event_key} (standby): "
+                        + ("relayed to the leader" if ok
+                           else "relay unavailable, safety net covers it"))
             self.send_response(200)
             self.end_headers()
 

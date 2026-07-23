@@ -41,6 +41,7 @@ import ssl
 import threading
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 
 DEFAULT_SA_DIR = "/var/run/secrets/kubernetes.io/serviceaccount"
@@ -145,6 +146,31 @@ class LeaderElector:
         except Exception as e:
             self._event(f"lease release failed (non-fatal): {e}")
 
+    def current_holder(self) -> str:
+        """Best-known current leader identity, for pod-to-pod relays.
+
+        Ourselves while leading; otherwise the holder from the last
+        observed lease, or "" before any observation. Thread-safe: HTTP
+        handler threads call this while the election thread updates state.
+        """
+        if self.is_leader():
+            return self._id
+        with self._lock:
+            return self._observed[0][0] if self._observed else ""
+
+    def pod_ip(self, pod_name: str) -> str:
+        """Resolve a pod's IP through the Kubernetes API (needs pods get).
+
+        Used by a standby to relay a verified webhook to the leader pod.
+        Raises on any failure; the caller treats the relay as best-effort.
+        """
+        if not pod_name:
+            raise ValueError("pod_name must not be empty")
+        url = (f"{self._api}/api/v1/namespaces/{self._namespace()}/pods/"
+               f"{urllib.parse.quote(pod_name, safe='')}")
+        with self._request("GET", url) as r:
+            return json.load(r)["status"]["podIP"]
+
     def tick(self) -> None:
         """One election round. Never raises: a broken tick must never take
         down the poll loop thread, and leadership decays on its own anyway.
@@ -176,12 +202,15 @@ class LeaderElector:
             return
 
         # Someone else's lease (or a released one): take over only when it
-        # is released, or expired by our LOCAL observation window.
+        # is released, or expired by our LOCAL observation window. Guarded
+        # by the lock: current_holder() reads _observed from other threads.
         key = (holder, spec.get("renewTime", ""))
-        if self._observed is None or self._observed[0] != key:
-            self._observed = (key, now)
+        with self._lock:
+            if self._observed is None or self._observed[0] != key:
+                self._observed = (key, now)
+            observed_since = self._observed[1]
         expired = (holder == ""
-                   or (now - self._observed[1]) > self._duration)
+                   or (now - observed_since) > self._duration)
         if not expired:
             self._set_leading(False, now)
             return

@@ -32,13 +32,17 @@ spec:
       {{- with .Values.priorityClassName }}
       priorityClassName: {{ . }}
       {{- end }}
-      # Spread replicas across nodes and zones (soft: a constrained cluster
-      # can still schedule) so one node or zone loss cannot take out every
-      # replica at once. With a single replica these are inert.
+      # Spread replicas across failure domains. The hostname constraint is
+      # HARD (DoNotSchedule): two replicas on one node protect nothing
+      # against a sudden node loss, so we prefer a Pending pod under
+      # capacity pressure (the cluster autoscaler resolves it) over a
+      # co-located one. The zone constraint stays soft: this pool may not
+      # always have capacity in every zone. With a single replica both are
+      # inert.
       topologySpreadConstraints:
         - maxSkew: 1
           topologyKey: kubernetes.io/hostname
-          whenUnsatisfiable: ScheduleAnyway
+          whenUnsatisfiable: DoNotSchedule
           labelSelector:
             matchLabels:
               {{- include "acme-diff-preview.selectorLabels" . | nindent 14 }}

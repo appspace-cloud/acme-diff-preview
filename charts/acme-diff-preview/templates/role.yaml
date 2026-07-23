@@ -20,4 +20,11 @@ rules:
   - apiGroups: ["coordination.k8s.io"]
     resources: ["leases"]
     verbs: ["create"]
+  # Read-only pod lookup so a standby can resolve the leader pod's IP and
+  # relay a verified Bitbucket webhook to it (see _forward_webhook_to_leader
+  # in diff_preview.py). Pod names change on every restart, so this rule
+  # cannot be resourceName-scoped; get-only, this namespace only.
+  - apiGroups: [""]
+    resources: ["pods"]
+    verbs: ["get"]
 {{- end }}
