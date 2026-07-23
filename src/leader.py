@@ -130,6 +130,16 @@ class LeaderElector:
         if not self._enabled or not self._bootstrap():
             return
         self._stop_event.set()  # no further ticks, leader or standby
+        # Quiesce the background election thread BEFORE our own lease write.
+        # Otherwise a tick() already in flight (e.g. a renewal) can win the
+        # resourceVersion race against the release write, leaving the lease
+        # renewed instead of blanked and defeating the instant handoff. Skip
+        # the join if release() is somehow called from within that very
+        # thread (a self-join raises RuntimeError); bound it so a tick
+        # blocked on the network cannot hold shutdown open forever.
+        t = self._thread
+        if t is not None and t is not threading.current_thread():
+            t.join(timeout=self._retry + _HTTP_TIMEOUT)
         was_leader = self.is_leader()
         with self._lock:
             self._leading = False  # local demotion first, unconditionally

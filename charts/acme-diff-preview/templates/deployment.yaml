@@ -1,3 +1,6 @@
+{{- if and (gt (int .Values.replicaCount) 1) (not .Values.leaderElection.enabled) }}
+{{- fail "replicaCount > 1 requires leaderElection.enabled: true, otherwise every replica runs the poll loop and posts duplicate PR comments and racing build statuses" }}
+{{- end }}
 apiVersion: apps/v1
 kind: Deployment
 metadata:
