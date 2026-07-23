@@ -543,3 +543,183 @@ def test_release_on_a_standby_also_stops_the_election(tmp_path, monkeypatch):
     el.tick()                        # stray tick on the dying standby
     assert el.is_leader() is False
     assert api.spec["holderIdentity"] == ""   # nobody stole it back
+
+
+# ── leader identity lookup and webhook forwarding (HA hardening) ────────────
+
+def test_current_holder_is_self_when_leading(tmp_path, monkeypatch):
+    el, api, clock = _elector(tmp_path, monkeypatch)
+    el.tick()
+    assert el.current_holder() == "pod-a"
+
+
+def test_current_holder_is_the_observed_leader_when_standby(tmp_path,
+                                                            monkeypatch):
+    el, api, clock = _elector(tmp_path, monkeypatch)
+    el2, _, _ = _elector(tmp_path, monkeypatch, api=api, clock=clock,
+                         identity="pod-b")
+    el2.tick()                       # pod-b leads
+    el.tick()                        # pod-a observes pod-b
+    assert el.current_holder() == "pod-b"
+
+
+def test_current_holder_is_empty_before_any_observation(tmp_path,
+                                                        monkeypatch):
+    el, api, clock = _elector(tmp_path, monkeypatch)
+    assert el.current_holder() == ""
+
+
+def test_pod_ip_fetches_the_pod_status(tmp_path, monkeypatch):
+    calls = []
+
+    def fake(req, timeout=None):
+        calls.append(req.full_url)
+        assert req.get_header("Authorization") == "Bearer tok-1"
+        return _FakeResp(json.dumps(
+            {"status": {"podIP": "10.32.6.99"}}).encode())
+    monkeypatch.setattr(urllib.request, "urlopen", fake)
+    el = leader.LeaderElector("adp-leader", "pod-a",
+                              sa_dir=_sa_dir(tmp_path), verify_tls=False)
+    assert el.pod_ip("pod-b") == "10.32.6.99"
+    assert calls == [
+        "https://kubernetes.default.svc/api/v1/namespaces/argocd/pods/pod-b"]
+
+
+def test_pod_ip_rejects_empty_name(tmp_path, monkeypatch):
+    el = leader.LeaderElector("adp-leader", "pod-a",
+                              sa_dir=_sa_dir(tmp_path), verify_tls=False)
+    with pytest.raises(ValueError):
+        el.pod_ip("")
+
+
+# ── standby forwards verified Bitbucket webhooks to the leader ──────────────
+
+class _ForwardingElector(_FakeElector):
+    def __init__(self, leading, holder="pod-l", ip="10.0.0.9"):
+        super().__init__(leading)
+        self.holder = holder
+        self.ip = ip
+        self.ip_lookups = []
+
+    def current_holder(self):
+        return self.holder
+
+    def pod_ip(self, name):
+        self.ip_lookups.append(name)
+        if self.ip is None:
+            raise urllib.error.URLError("pods get denied")
+        return self.ip
+
+
+def _post_webhook(url, marker=None):
+    body = json.dumps({"pullrequest": {"id": 42}}).encode()
+    headers = {"Content-Length": str(len(body)),
+               "X-Event-Key": "pullrequest:updated",
+               "X-Hub-Signature": "sha256=stub"}
+    if marker:
+        headers["X-ADP-Forwarded"] = marker
+    req = urllib.request.Request(f"{url}/diff-preview/webhook", data=body,
+                                 headers=headers, method="POST")
+    with urllib.request.urlopen(req, timeout=10) as r:
+        return r.status, body
+
+
+def _capture_forwards(monkeypatch):
+    real = urllib.request.urlopen
+    captured = []
+
+    def dispatch(req, timeout=None, **kw):
+        url = req.full_url if hasattr(req, "full_url") else req
+        if "10.0.0.9" in str(url):
+            captured.append(req)
+            return _FakeResp(b"")
+        return real(req, timeout=timeout, **kw)
+    monkeypatch.setattr(urllib.request, "urlopen", dispatch)
+    return captured
+
+
+def test_standby_forwards_webhook_to_leader_once(health, monkeypatch):
+    url, _ = health
+    monkeypatch.setattr(m, "BB_WEBHOOK_SECRET", "")
+    monkeypatch.setattr(m, "_leader", _ForwardingElector(False),
+                        raising=False)
+    captured = _capture_forwards(monkeypatch)
+    m._wake.clear()
+    code, body = _post_webhook(url)
+    assert code == 200
+    assert m._wake.is_set()          # local wake still happens (harmless)
+    assert len(captured) == 1
+    fwd = captured[0]
+    assert fwd.full_url == "http://10.0.0.9:8080/diff-preview/webhook"
+    assert fwd.data == body          # exact original body, signature intact
+    assert fwd.get_header("X-hub-signature") == "sha256=stub"
+    assert fwd.get_header("X-adp-forwarded") == "1"
+    m._wake.clear()
+
+
+def test_leader_does_not_forward_its_own_webhooks(health, monkeypatch):
+    url, _ = health
+    monkeypatch.setattr(m, "BB_WEBHOOK_SECRET", "")
+    monkeypatch.setattr(m, "_leader", _ForwardingElector(True),
+                        raising=False)
+    captured = _capture_forwards(monkeypatch)
+    m._wake.clear()
+    code, _ = _post_webhook(url)
+    assert code == 200 and m._wake.is_set()
+    assert captured == []
+    m._wake.clear()
+
+
+def test_forwarded_webhook_is_never_reforwarded(health, monkeypatch):
+    url, _ = health
+    monkeypatch.setattr(m, "BB_WEBHOOK_SECRET", "")
+    monkeypatch.setattr(m, "_leader", _ForwardingElector(False),
+                        raising=False)
+    captured = _capture_forwards(monkeypatch)
+    m._wake.clear()
+    code, _ = _post_webhook(url, marker="1")
+    assert code == 200 and m._wake.is_set()
+    assert captured == []            # the marker breaks the relay chain
+    m._wake.clear()
+
+
+def test_forward_failure_falls_back_to_the_safety_net(health, monkeypatch):
+    url, _ = health
+    monkeypatch.setattr(m, "BB_WEBHOOK_SECRET", "")
+    fake = _ForwardingElector(False, ip=None)   # pods get denied
+    monkeypatch.setattr(m, "_leader", fake, raising=False)
+    m._wake.clear()
+    code, _ = _post_webhook(url)
+    assert code == 200               # Bitbucket always gets its 200
+    assert m._wake.is_set()          # local wake still set: net catches it
+    assert fake.ip_lookups == ["pod-l"]
+    m._wake.clear()
+
+
+def test_no_elector_means_no_forwarding(health, monkeypatch):
+    url, _ = health
+    monkeypatch.setattr(m, "BB_WEBHOOK_SECRET", "")
+    monkeypatch.setattr(m, "_leader", None, raising=False)
+    m._wake.clear()
+    code, _ = _post_webhook(url)
+    assert code == 200 and m._wake.is_set()
+    m._wake.clear()
+
+
+def test_forwarder_declines_without_an_elector(monkeypatch):
+    # Defensive guard: the handler never calls the forwarder with no
+    # elector (the leadership gate short-circuits first), but the helper
+    # must still be safe if called directly.
+    monkeypatch.setattr(m, "_leader", None, raising=False)
+    assert m._forward_webhook_to_leader(b"{}", {}) is False
+
+
+def test_forwarder_declines_unknown_or_own_holder(monkeypatch):
+    monkeypatch.setattr(m, "_leader", _ForwardingElector(False, holder=""),
+                        raising=False)
+    assert m._forward_webhook_to_leader(b"{}", {}) is False
+    monkeypatch.setenv("HOSTNAME", "pod-self")
+    monkeypatch.setattr(m, "_leader",
+                        _ForwardingElector(False, holder="pod-self"),
+                        raising=False)
+    assert m._forward_webhook_to_leader(b"{}", {}) is False
