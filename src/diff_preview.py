@@ -2643,6 +2643,66 @@ def _helm_template(chart_path: str, release: str, namespace: str,
         return r.stdout, None
 
 
+# --- Wiped microservices.definitions guard (COPR-31637) ---------------------
+# A config value file (typically cicd-versions.yaml, which ArgoCD merges LAST
+# over the chart's own values) that carries
+#
+#     appspace:
+#       microservices:
+#         definitions:      # <- key present, NO children => YAML null
+#
+# collapses the ENTIRE microservices.definitions map to null in the helm
+# `merge`. That wipes every per-service image.name override the chart ships
+# (appspace-platformservice, appspace-webhookservice, appspace-screenshot,
+# ...). Each affected service then falls back to the helper's derived
+# `appspace-<key>` name, which for those services points at a registry path
+# that has never held an image -> ImagePullBackOff across the whole
+# environment. Root cause: acme-config-dev commit 1015bc622 "remove CICD"
+# deleted the children but left the key. This guard blocks any PR that
+# reintroduces the pattern before it can be merged.
+_VALUE_FILE_SUFFIXES = (".yaml", ".yml")
+
+
+def _values_wipes_definitions(body: str) -> bool:
+    """True iff this value-file body sets appspace.microservices.definitions to
+    an empty/null map (the dangerous pattern). A missing key, a populated map,
+    or unparseable YAML all return False: only an explicitly present-but-empty
+    definitions map is a wipe, and we never block on a mere parse error."""
+    if not body or not body.strip():
+        return False
+    try:
+        doc = yaml.safe_load(body)
+    except Exception:
+        return False  # malformed YAML fails elsewhere; never block on it here
+    if not isinstance(doc, dict):
+        return False
+    ms = (doc.get("appspace") or {})
+    ms = ms.get("microservices") if isinstance(ms, dict) else None
+    if not isinstance(ms, dict):
+        return False
+    if "definitions" not in ms:
+        return False  # absent key: merge leaves the chart's map intact — safe
+    defs = ms["definitions"]
+    # Present key with null (None) or an empty mapping is the wipe.
+    return defs is None or defs == {}
+
+
+def _detect_wiped_definitions(changed_files: list, sha: str, repo=None) -> list:
+    """Return the changed value files whose content at `sha` wipes the
+    microservices.definitions map. Only *.yaml/*.yml files are fetched; a
+    transient fetch error is skipped (never block a merge on a flaky read)."""
+    hits = []
+    for f in changed_files:
+        if not f.endswith(_VALUE_FILE_SUFFIXES):
+            continue
+        body, status = _bb_fetch_status(f, sha, repo=repo)
+        if status != BB_OK or body is None:
+            continue
+        if _values_wipes_definitions(body):
+            hits.append(f)
+    return hits
+
+
 def _detect_new_env_candidates(changed_files: list, path_map: dict, renames: dict = None) -> list:
     """Scan changed files for patterns that indicate a brand-new environment.
 
@@ -6047,6 +6107,50 @@ def process_pr(pr, path_map, base_sha="", repo=None):
         # instead of every app independently rescanning changed x path_map.
         affected, _app_to_files = _match_files_to_apps(changed, path_map)
         print(f"    Changed files: {len(changed)} | Affected apps: {len(affected)}")
+
+        # v2.12.0 (COPR-31637): hard guard. A value file that sets
+        # appspace.microservices.definitions to null/empty wipes every
+        # per-service image.name override on merge (helm `merge` collapses the
+        # map), silently breaking image names -> ImagePullBackOff across the
+        # whole environment. This is checked BEFORE any diff/app logic and, if
+        # found, blocks the merge outright with a red status: no rendered diff
+        # would make the danger obvious, so we refuse instead of commenting a
+        # green diff. Runs on every PR regardless of affected apps.
+        wiped = _detect_wiped_definitions(changed, pr_sha, repo=repo)
+        if wiped:
+            _files_md = "\n".join(f"- `{w}`" for w in wiped)
+            desc = (f"BLOCKED: {len(wiped)} file(s) empty out "
+                    f"microservices.definitions (wipes image overrides)")
+            post_build_status(pr_sha, "FAILED", desc, pr_id=pr_id)
+            body = (
+                f"## \U0001f52d {STATUS_NAME}\n\n"
+                f"{_comment_header(pr_sha)}\n\n"
+                f"\u26d4 **This PR is blocked from merging — dangerous change "
+                f"detected.**\n\n"
+                f"The following value file(s) set "
+                f"`appspace.microservices.definitions` to an **empty/null "
+                f"map**:\n\n{_files_md}\n\n"
+                f"On merge, Helm merges this map **last**, so a null/empty "
+                f"`definitions` **wipes every per-service `image.name` "
+                f"override** the chart ships (e.g. `appspace-platformservice`, "
+                f"`appspace-webhookservice`, `appspace-screenshot`). Each "
+                f"affected microservice then falls back to the derived "
+                f"`appspace-<key>` name, which for these services points at a "
+                f"registry path that has never held an image \u2014 causing "
+                f"**ImagePullBackOff across the whole environment** (this is "
+                f"exactly what happened in COPR-31637).\n\n"
+                f"**How to fix:** either remove the `definitions:` key entirely "
+                f"(so the chart's own map is kept), or give it real children. "
+                f"Never leave `definitions:` present but empty.\n\n"
+                f"---\n**Status:** \u26d4 Blocked \u2014 empty "
+                f"`microservices.definitions` would break image names on merge\n"
+                f"*{_ts()} \u2014 {COMMENT_MARKER} [blocked]"
+                + (f" [base:{base_sha[:8]}]" if base_sha else "") + "*"
+            )
+            upsert_comment(pr_id, body, existing_id, repo=repo)
+            with _seen_lock:
+                _seen[sk] = (pr_sha, base_sha)
+            return
 
         # v2.5.4 (Finding 4): always check for new-env candidates, not just
         # when `affected` is empty. _detect_new_env_candidates already

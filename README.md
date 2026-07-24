@@ -91,6 +91,44 @@ kubectl -n argocd logs deploy/acme-diff-preview | grep '"outcome"'
 # or, for full per-step detail, set logLevel: DEBUG in the Helm values
 ```
 
+## Merge-blocking guards
+
+Beyond rendering diffs, the service also **blocks** a PR from merging (red
+`FAILED` build status + an explanatory comment) when it detects a change that
+is known to break an environment on merge. These are structural checks, run
+before any diff, that no rendered diff would make obvious to a reviewer.
+
+| Guard | What it catches | Why it is dangerous |
+|---|---|---|
+| Structural new-env failure | a new environment missing a required value (e.g. `appspace.version`) | the environment cannot render at all on merge |
+| **Empty `microservices.definitions`** | a value file (typically `cicd-versions.yaml`) with `appspace.microservices.definitions` present but **null/empty** | see below |
+
+### Why an empty `microservices.definitions` is blocked
+
+ArgoCD merges an environment's Helm value files in order, with the per-env
+`cicd-versions.yaml` **last**. A file shaped like
+
+```yaml
+appspace:
+  microservices:
+    definitions:        # <- key present, no children => YAML null
+```
+
+collapses the **entire** `microservices.definitions` map to null in Helm's
+`merge`, wiping every per-service `image.name` override the chart ships
+(`appspace-platformservice`, `appspace-webhookservice`, `appspace-screenshot`,
+…). Each affected service then falls back to the chart helper's derived
+`appspace-<key>` name — a registry path that for these services has never
+held an image — so the whole environment goes `ImagePullBackOff` on the next
+sync. This is the COPR-31637 incident.
+
+The guard flags a `definitions` key that is present but null/empty. A
+**missing** `definitions` key is safe (the chart's own map is kept intact) and
+is deliberately **not** blocked. To remove per-env overrides, delete the
+`definitions:` key entirely — never leave it present but empty. See
+[`docs/microservices-definitions-guard.md`](docs/microservices-definitions-guard.md)
+for the full incident write-up and the exact detection rule.
+
 ### Handling mass version bumps (hundreds of apps in one PR)
 
 Bumping a chart `version:` across many clusters in a single PR is a normal
