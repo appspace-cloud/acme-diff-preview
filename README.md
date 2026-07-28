@@ -147,6 +147,18 @@ API used to fetch value files. What keeps it fast and reliable:
   (`BB_API_CONCURRENCY`) caps concurrent calls; value files are cached by
   immutable `(commit_sha, path)`, and a transient error is never cached as
   "missing" so one app's rate-limit blip can't poison the others.
+  A 429 is a property of the *token*, not of the one request that received it,
+  so the pause is **shared**: the first caller to be rate limited publishes a
+  deadline (`Retry-After` when Bitbucket sends it, `BB_RATELIMIT_FALLBACK`
+  when it does not, capped at `BB_RATELIMIT_MAX_PAUSE`) and every other
+  Bitbucket call brakes with it, waiting *outside* the semaphore so a sleeping
+  thread does not hold a concurrency slot. This covers both the value-file
+  path and the poll loop; non-Bitbucket hosts (Vertex AI, the GCP metadata
+  server) keep their own per-request backoff and never trip the shared gate.
+  429s log at `WARNING` **with the endpoint**, and a value file that could not
+  be read is reported separately from one that is genuinely absent — the two
+  used to share a single `debug()` line, which made rate limiting
+  indistinguishable from a real gap in the values hierarchy.
 - **Retry with backoff + jitter** — transient reasons (`oci_pull_failed`,
   `metadata_pending`, `timeout`) retry in-process up to `DIFF_RETRIES` times.
 - **AI summary at scale** — only the `AI_MAX_APPS` apps with the most changed
@@ -204,6 +216,8 @@ so several layers guard what reaches the Bitbucket comment:
 | `WARM_THRESHOLD` | `diff.warmThreshold` | `8` | Min apps before warm-up kicks in |
 | `KUBE_VERSION` | `kubeVersion` | `1.30.0` | `--kube-version` passed to `helm template` |
 | `BB_API_CONCURRENCY` | — | `30` | Max concurrent Bitbucket API calls |
+| `BB_RATELIMIT_FALLBACK` | — | `15` | Shared pause after a 429 that carries no `Retry-After`. Sized to Bitbucket's ~60s window, not to a single retry |
+| `BB_RATELIMIT_MAX_PAUSE` | — | `60` | Cap on the shared pause, so a broken `Retry-After` cannot stall a PR |
 | `HELM_CACHE_MAX_CHARTS` | — | `60` | Max pulled chart versions kept on disk |
 | `AI_MAX_APPS` | — | `40` | Max changed apps included in the AI summary prompt |
 | `DIFF_OCI_SELFCHECK_INTERVAL` | — | `900` | Seconds between periodic OCI self-checks (`helm show chart` against a known-good ref). First check ~60s after start; `0` disables. Result in `/diff-preview/stats` as `oci_selfcheck` |
