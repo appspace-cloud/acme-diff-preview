@@ -1,3 +1,4 @@
+{{- if .Values.hardRefresh.enabled }}
 apiVersion: batch/v1
 kind: CronJob
 metadata:
@@ -34,6 +35,16 @@ spec:
                   value: {{ .Values.argocd.username | quote }}
                 - name: HOME
                   value: /tmp
+                # Deliberately NOT argocd.projects: that list includes
+                # appspace-prod for the JFrog webhook, which only refreshes the
+                # apps actually tracking the published chart. This job refreshes
+                # EVERY app in the list, so it gets its own narrower one.
+                - name: HARD_REFRESH_PROJECTS
+                  value: {{ .Values.hardRefresh.projects | quote }}
+                - name: HARD_REFRESH_WORKERS
+                  value: {{ .Values.hardRefresh.workers | quote }}
+                - name: HARD_REFRESH_PACE
+                  value: {{ .Values.hardRefresh.pace | quote }}
               envFrom:
                 - secretRef:
                     name: {{ include "acme-diff-preview.fullname" . }}-creds
@@ -45,3 +56,4 @@ spec:
           volumes:
             - name: tmp
               emptyDir: {}
+{{- end }}

@@ -32,8 +32,13 @@ that does two distinct jobs:
    a new Helm chart to `helm-oci-dev`, finds every dev/QA ArgoCD app tracking
    that chart version, and hard-refreshes them to bypass the OCI cache.
 
-A CronJob runs a full hard-refresh of all dev/QA apps every 30 minutes as a
-fallback safety net.
+An optional CronJob can sweep every app in the configured projects as a
+fallback safety net. It ships **disabled** (`hardRefresh.enabled: false`): the
+webhook above already refreshes exactly the apps that track the chart that was
+just published, while a full sweep pushed enough traffic through the
+argocd-agent principal that spoke-hosted apps started getting cut off by the
+30s load-balancer timeout. Enable it only if webhook delivery proves
+unreliable.
 
 ---
 
@@ -310,7 +315,7 @@ acme-diff-preview/
 ├── src/
 │   ├── diff_preview.py        Main service (Deployment)
 │   ├── diff_ui.py             Full-diff artifact store + web UI (stdlib only)
-│   └── dev_hard_refresh.py    Full hard-refresh of all dev/QA apps (CronJob)
+│   └── dev_hard_refresh.py    Full sweep of the mutable-tag projects (opt-in CronJob)
 ├── tests/                     Full pytest suite, 100% coverage of src/ — see "Tests" below
 ├── charts/
 │   └── acme-diff-preview/     Helm chart
@@ -522,7 +527,10 @@ vertex:
   model: gemini-2.5-flash
 
 hardRefresh:
-  schedule: "*/30 * * * *"
+  enabled: false                # webhook-only by default; see above
+  schedule: "0 6 * * *"
+  projects: "appspace-dev,appspace-qa,appspace-stage"
+  workers: 3
 
 secrets:
   externalSecretStore: argocd-gcp-sm

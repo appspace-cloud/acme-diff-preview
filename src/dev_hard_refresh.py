@@ -1,15 +1,26 @@
 #!/usr/bin/env python3
-"""Periodic hard-refresh for dev/qa ArgoCD apps.
+"""Periodic hard-refresh for the ArgoCD projects that track mutable tags.
 
-Runs every 2 hours from the argocd-dev-hard-refresh CronJob.
-Triggers a hard refresh on all apps in appspace-dev and appspace-qa
-projects so ArgoCD re-pulls the OCI Helm chart even when the tag has
-not changed (mutable -dev tags overwritten on each CI build).
+Runs from the acme-diff-preview-hard-refresh CronJob as a safety net; the
+JFrog webhook is the primary trigger. Triggers a hard refresh on every app
+in the configured projects so ArgoCD re-pulls the OCI Helm chart even when
+the tag has not changed (mutable -dev tags are overwritten on each CI build).
 
 Hard refresh bypasses the Redis manifest cache and forces the
 repo-server to re-download the .tgz from the OCI registry.
-This is targeted only at dev/qa environments - staging and
-production apps are not touched.
+
+Which projects (COPS-2543): any project whose apps track MUTABLE chart tags.
+That is dev, qa AND stage - 35 of the 38 stage apps point at `-dev` tags, so
+leaving stage out (as this script did until v2.13.0) meant stage had no cron
+safety net behind the webhook at all. Prod is deliberately excluded: it pins
+immutable `-rev1` tags, so a refresh can never find anything new, and walking
+its 761 apps daily would hammer the hub for nothing.
+
+Deliberately NOT reusing ARGOCD_PROJECTS (the webhook path's list): that one
+includes appspace-prod on purpose, because the webhook only refreshes the
+apps actually tracking the chart that was just published - a targeted set.
+This CronJob refreshes EVERY app in the listed projects, so it needs its own,
+narrower list.
 """
 import concurrent.futures
 import json
@@ -22,11 +33,48 @@ import urllib.request
 
 SERVER    = os.environ.get("ARGOCD_SERVER", "argocd.appspace.com")
 ARGOCD    = os.environ.get("ARGOCD_BIN", "/usr/local/bin/argocd")
-PROJECTS  = ["appspace-dev", "appspace-qa"]
-WORKERS   = 8
+PROJECTS  = [p.strip() for p in os.environ.get(
+    "HARD_REFRESH_PROJECTS", "appspace-dev,appspace-qa,appspace-stage").split(",")
+    if p.strip()]
+def _env_int(name, default):
+    """Read a positive int from env, falling back on anything unusable."""
+    try:
+        value = int(os.environ.get(name, "").strip())
+        return value if value > 0 else default
+    except (TypeError, ValueError):
+        return default
+
+
+# Concurrency (v2.13.0, COPS-2543): lowered 8 -> 3.
+#
+# `argocd app get --hard-refresh` is SYNCHRONOUS: the server holds the request
+# open while the repo-server re-pulls the chart and re-renders, which measures
+# ~19s per app even when the hub is idle. That is already close to the 30s
+# timeout on the GCP load balancer backend in front of argocd.appspace.com, so
+# there is very little headroom to spend on queueing. Under the old 8-way fan
+# out, sustained for the whole run, 20 of 120 apps got cut off by the LB at
+# exactly 30.1s. Every one of them was a `pv-*` app, i.e. hosted on a SPOKE and
+# reached through the argocd-agent principal - the component with the known
+# ~9.5 events/s per spoke ceiling from COPS-2540. Refreshing 8 at a time drives
+# the principal past that and the slowest ones fall off the LB.
+#
+# This is a daily safety net (the JFrog webhook is the primary trigger), so
+# wall-clock time is worth nothing here and being gentle is worth a lot:
+# 3 workers over ~158 apps is ~17min instead of ~5min, and stays inside the
+# per-request budget instead of racing it.
+WORKERS   = _env_int("HARD_REFRESH_WORKERS", 3)
+# Stagger between submissions so a pool slot freeing up does not immediately
+# fire the next request in the same instant as its two siblings.
+PACE      = float(os.environ.get("HARD_REFRESH_PACE", "0.5") or 0.5)
 # 60s per app — TimeoutExpired is caught inside hard_refresh() so a
 # single slow app never crashes the entire ThreadPoolExecutor pool.
-TIMEOUT   = 60
+# Note this is the CLIENT budget; the LB cuts at 30s well before this, which
+# is why a cut shows up as a plain failure rather than a TimeoutExpired.
+TIMEOUT   = _env_int("HARD_REFRESH_TIMEOUT", 60)
+# One retry per app (v2.13.0): a 30s LB cut is transient by nature, and losing
+# an app's refresh for a whole day because it queued behind a slow spoke is
+# exactly what this job exists to prevent.
+ATTEMPTS  = _env_int("HARD_REFRESH_ATTEMPTS", 2)
 
 # --insecure removed: argocd.appspace.com has a valid CA-signed certificate.
 BASE_FLAGS = [
@@ -79,22 +127,40 @@ def list_apps():
     return apps
 
 def hard_refresh(app):
-    """Hard-refresh one app. Returns (app, success, elapsed_secs)."""
-    t0 = time.monotonic()
-    try:
-        r = subprocess.run(
-            [ARGOCD, "app", "get", app, "--hard-refresh"] + BASE_FLAGS,
-            capture_output=True, text=True, timeout=TIMEOUT,
-        )
-        elapsed = round(time.monotonic() - t0, 1)
-        ok = r.returncode == 0
-        if not ok:
-            print(f"  WARN: {app}: failed ({elapsed}s) {r.stderr[:80]}", flush=True)
-        return app, ok, elapsed
-    except subprocess.TimeoutExpired:
-        elapsed = round(time.monotonic() - t0, 1)
-        print(f"  WARN: {app}: timed out after {elapsed}s", flush=True)
-        return app, False, elapsed
+    """Hard-refresh one app, retrying once. Returns (app, success, elapsed_secs).
+
+    elapsed is the LAST attempt's duration, not the sum, so main() can still
+    tell a client-side TimeoutExpired (>= TIMEOUT) apart from a load-balancer
+    cut at ~30s just by looking at it.
+    """
+    last_err = ""
+    elapsed = 0.0
+    for attempt in range(ATTEMPTS):
+        # Stagger: keeps the workers from firing in the same instant, and
+        # spaces a retry out from the failure that caused it instead of
+        # slamming a hub that is evidently already busy.
+        if PACE:
+            time.sleep(PACE)
+        t0 = time.monotonic()
+        try:
+            r = subprocess.run(
+                [ARGOCD, "app", "get", app, "--hard-refresh"] + BASE_FLAGS,
+                capture_output=True, text=True, timeout=TIMEOUT,
+            )
+            elapsed = round(time.monotonic() - t0, 1)
+            if r.returncode == 0:
+                return app, True, elapsed
+            # 200 chars, not 80: the old truncation cut the argocd CLI's JSON
+            # error in half ("...POST https://argocd.app") and hid whether it
+            # was a timeout, a 502 or a permission problem.
+            last_err = " ".join(r.stderr[:200].split())
+        except subprocess.TimeoutExpired:
+            elapsed = round(time.monotonic() - t0, 1)
+            print(f"  WARN: {app}: timed out after {elapsed}s", flush=True)
+            return app, False, elapsed
+    print(f"  WARN: {app}: failed after {ATTEMPTS} attempts ({elapsed}s) {last_err}",
+          flush=True)
+    return app, False, elapsed
 
 def main():
     # Authenticate once via REST: sets ARGOCD_AUTH_TOKEN in the process env
@@ -111,7 +177,8 @@ def main():
 
     apps = list_apps()
     t_start = time.monotonic()
-    print(f"Hard-refreshing {len(apps)} dev/qa apps ...", flush=True)
+    print(f"Hard-refreshing {len(apps)} apps in {', '.join(PROJECTS)} ...",
+          flush=True)
     ok = 0
     timeouts = 0
     with concurrent.futures.ThreadPoolExecutor(max_workers=WORKERS) as pool:

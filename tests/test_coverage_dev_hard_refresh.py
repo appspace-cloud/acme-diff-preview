@@ -133,7 +133,9 @@ esac''')
         dhr.main()
         out = capsys.readouterr().out
         assert "ArgoCD authentication OK." in out
-        assert "Hard-refreshing 2 dev/qa apps" in out
+        # v2.13.0: the log names the configured projects instead of saying
+        # "dev/qa", which stopped being true when stage was added.
+        assert "Hard-refreshing 2 apps in appspace-dev" in out
         assert "OK: app-good" in out
         assert "Done: 1/2 refreshed" in out
         # The REST token must be exported for the CLI subprocesses.
