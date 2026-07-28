@@ -1794,24 +1794,43 @@ def _bb_fetch_status(filepath, sha, repo=None):
            f"{BB_WORKSPACE}/{repo or _repo_for_sha(sha) or BB_REPO}/src/{sha}/{filepath}")
     req = urllib.request.Request(url, headers={"Authorization": _BB_AUTH_HEADER})
     for attempt in range(3):
-        with _bb_api_sem:   # global rate limiter: caps concurrent BB API calls
-            try:
+        # v2.13.0 (COPS-2543): brake with the whole pool before spending an
+        # attempt, so a 429 another thread already hit does not cost this one
+        # a retry. Outside the semaphore: a thread that is only waiting must
+        # not sit on one of the BB_API_CONCURRENCY slots.
+        _bb_ratelimit_wait()
+        try:
+            with _bb_api_sem:   # global rate limiter: caps concurrent BB API calls
                 with _pooled_urlopen(req, timeout=20) as r:
                     return r.read().decode("utf-8", errors="replace"), BB_OK
-            except urllib.error.HTTPError as e:
-                if e.code == 404:
-                    return None, BB_NOT_FOUND   # genuinely absent at this sha
-                if e.code in (429, 500, 502, 503, 504) and attempt < 2:
-                    wait = (attempt + 1) * 2  # 2s, 4s
-                    debug(f"Bitbucket API {e.code} for {filepath}, retry {attempt+1}/2 in {wait}s")
-                    time.sleep(wait)
-                    continue
-                return None, BB_ERROR   # other / exhausted HTTP error — transient
-            except Exception:
-                if attempt < 2:
-                    time.sleep((attempt + 1) * 2)
-                    continue
-                return None, BB_ERROR   # network/timeout after retries — transient
+        except urllib.error.HTTPError as e:
+            if e.code == 404:
+                return None, BB_NOT_FOUND   # genuinely absent at this sha
+            if e.code in (429, 500, 502, 503, 504) and attempt < 2:
+                if e.code == 429:
+                    # Honor the server-mandated pause, same as http() has done
+                    # since v2.5.19 (M5) — this path was the one that never
+                    # learned it, and 2s against a ~60s window meant both
+                    # retries died inside the same rejected window.
+                    ra = _parse_retry_after((e.headers or {}).get("Retry-After"))
+                    wait = min(ra, BB_RATELIMIT_MAX_PAUSE) if ra is not None \
+                        else BB_RATELIMIT_FALLBACK
+                    # WARNING, not debug(): rate limiting is an operational
+                    # signal. Production only ever showed the aggregate error.
+                    log(f"[bb] 429 rate limited on {filepath} — pausing all "
+                        f"Bitbucket calls {wait}s (retry {attempt+1}/2)", "WARNING")
+                    _bb_ratelimit_hold(wait)
+                    continue   # the gate above does the sleeping, for everyone
+                wait = (attempt + 1) * 2  # 2s, 4s — one sick request, not a budget
+                debug(f"Bitbucket API {e.code} for {filepath}, retry {attempt+1}/2 in {wait}s")
+                time.sleep(wait)
+                continue
+            return None, BB_ERROR   # other / exhausted HTTP error — transient
+        except Exception:
+            if attempt < 2:
+                time.sleep((attempt + 1) * 2)
+                continue
+            return None, BB_ERROR   # network/timeout after retries — transient
     return None, BB_ERROR   # pragma: no cover - unreachable: attempt 2 of
     # range(3) always explicitly returns above (attempt < 2 is False there),
     # so the loop never falls through naturally; defensive guard only.
@@ -2547,6 +2566,63 @@ def _bound_vf_cache():
 # Cap at 30 to stay well within BB API limits while keeping good throughput.
 BB_API_CONCURRENCY = _env_int("BB_API_CONCURRENCY", 30)
 _bb_api_sem = threading.Semaphore(BB_API_CONCURRENCY)
+
+# Shared rate-limit gate (v2.13.0, COPS-2543).
+#
+# A 429 is a property of the TOKEN, not of the one request that happened to
+# receive it: the budget is already spent for everyone. The old per-thread
+# backoff meant each of the BB_API_CONCURRENCY threads had to discover the
+# same 429 on its own and burn its own two retries doing it, all inside the
+# same rejected window. The first thread to see a 429 now publishes the pause
+# here and the rest brake with it.
+#
+# Cap: a hostile or broken Retry-After must not be able to stall a PR, so the
+# pause is clamped. Fallback: Bitbucket does not always send Retry-After on
+# /src, and 2s was useless against a ~60s window, so the no-header case still
+# waits long enough to leave it.
+BB_RATELIMIT_MAX_PAUSE = _env_int("BB_RATELIMIT_MAX_PAUSE", 60)
+BB_RATELIMIT_FALLBACK  = _env_int("BB_RATELIMIT_FALLBACK", 15)
+# Bounded slices instead of `while remaining > 0`: the loop must terminate
+# even if the clock never advances (a stubbed sleep, a frozen monotonic),
+# because hanging here would wedge every value-file fetch in the process.
+BB_RATELIMIT_SLICES = 4
+
+_bb_ratelimit_until = 0.0
+_bb_ratelimit_lock  = threading.Lock()
+
+
+def _bb_ratelimit_hold(seconds):
+    """Publish a shared pause of `seconds`, extending any pause already set.
+
+    max(), never min(): if another thread already learned a longer window,
+    shortening it would send the whole pool straight back into the window
+    that just rejected it.
+    """
+    global _bb_ratelimit_until
+    with _bb_ratelimit_lock:
+        _bb_ratelimit_until = max(_bb_ratelimit_until, time.monotonic() + seconds)
+
+
+def _bb_ratelimit_remaining():
+    """Seconds left on the shared pause, 0.0 when none is active."""
+    with _bb_ratelimit_lock:
+        return max(0.0, _bb_ratelimit_until - time.monotonic())
+
+
+def _bb_ratelimit_clear():
+    """Drop any active pause. Test seam only."""
+    global _bb_ratelimit_until
+    with _bb_ratelimit_lock:
+        _bb_ratelimit_until = 0.0
+
+
+def _bb_ratelimit_wait():
+    """Block until the shared Bitbucket pause has elapsed."""
+    for _ in range(BB_RATELIMIT_SLICES):
+        remaining = _bb_ratelimit_remaining()
+        if remaining <= 0:
+            return
+        time.sleep(min(remaining, BB_RATELIMIT_MAX_PAUSE))
 
 
 def _fetch_value_files(value_files: list, sha: str) -> dict:

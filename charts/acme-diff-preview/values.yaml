@@ -27,7 +27,10 @@ priorityClassName: ""
 
 image:
   repository: us-central1-docker.pkg.dev/appspace-devops/artifact/acme-diff-preview
-  tag: "2.7.0"
+  # Kept in sync with Chart.yaml appVersion (RELEASING.md). This default had
+  # drifted since v2.7.0; it never bit us because acme-infrastructure pins the
+  # tag explicitly, but anyone installing the chart as-is got a stale image.
+  tag: "2.13.0"
   pullPolicy: IfNotPresent
 
 # Log verbosity for the diff-preview service. Set to DEBUG to emit the full
@@ -177,19 +180,51 @@ resources:
     # CPU: sized for DIFF_WORKERS(16) × PR_WORKERS(3) concurrent helm subprocesses
     # plus Bitbucket API fan-out. Each helm template call uses <0.1 CPU serially.
     cpu: 500m
-    memory: 512Mi
+    memory: 2Gi
   limits:
     # CPU limit prevents noisy-neighbor starvation on shared GKE nodes during
     # 800-app PR bursts. Aligned with 48 concurrent subprocesses × node capacity.
     cpu: "4"
-    memory: 2Gi
+    # 8Gi, not 2Gi: a JFrog webhook burst landing on an active PR diff runs up
+    # to JFROG_DISPATCH_WORKERS(4) × `argocd app list -o json` (~100Mi of JSON
+    # each on a 919-app hub, several hundred Mi parsed) alongside 16 helm
+    # renders, which OOM-killed the pod at 2Gi. COPS-2543.
+    memory: 8Gi
 
-# Hard-refresh CronJob — hard-refreshes all dev/QA apps every 2 hours
+# Hard-refresh CronJob — re-pulls charts for the projects that track MUTABLE
+# tags, so ArgoCD notices a `-dev` tag that was overwritten in place.
 hardRefresh:
-  schedule: "*/30 * * * *"  # JFrog webhook is primary trigger; cron is a fallback
+  # OFF by default (COPS-2543). The JFrog webhook already fires on every chart
+  # publish and refreshes exactly the apps tracking it, which is both faster and
+  # far cheaper than walking every app in every project. The cron only ever
+  # added value for a webhook that was missed, and it paid for that with real
+  # load: a full sweep drove enough traffic through the argocd-agent principal
+  # that spoke-hosted apps started getting cut off by the 30s LB timeout.
+  # Turn it back on only if webhook delivery proves unreliable.
+  enabled: false
+  # Used only when enabled. Once a day, not the old */30 (which walked every
+  # app 48 times a day for almost nothing).
+  schedule: "0 6 * * *"
+  # dev + qa + stage: every project whose apps track mutable `-dev` tags (35 of
+  # the 38 stage apps do). Prod is excluded on purpose, it pins immutable
+  # `-rev1` tags so a refresh can never find anything new.
+  projects: "appspace-dev,appspace-qa,appspace-stage"
+  # 3, not 8: `app get --hard-refresh` is synchronous and takes ~19s per app,
+  # against a 30s timeout on the LB backend in front of argocd.appspace.com.
+  # 8-way fan out spent that headroom on queueing and lost 20 of 120 apps to LB
+  # cuts, all of them spoke-hosted `pv-*` apps going through the argocd-agent
+  # principal (COPS-2540: ~9.5 events/s per spoke ceiling). This job has all
+  # night, so it trades ~5min for ~17min and stops fighting the hub.
+  workers: 3
+  # Seconds of stagger before each attempt, so the workers do not fire in the
+  # same instant and a retry is spaced out from the failure that caused it.
+  pace: "0.5"
   resources:
     requests:
       cpu: 50m
-      memory: 128Mi
-    limits:
       memory: 256Mi
+    limits:
+      # 1Gi, not 256Mi: `argocd app list` over the ~919 apps on the hub does
+      # not fit in 256Mi, which silently OOM-killed every run from 2026-07-27
+      # (the job died right after auth with no output). COPS-2543.
+      memory: 1Gi
