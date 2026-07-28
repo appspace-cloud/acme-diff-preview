@@ -1306,12 +1306,47 @@ def _pooled_urlopen(req, timeout=60):
         return _PooledResponse(status, headers, body)
     # Unreachable: the fresh=True iteration always returns or raises.
 
+def _is_bb_url(url):
+    """True when this URL targets the Bitbucket API.
+
+    http() is not Bitbucket-only: it also serves the GCP metadata server and
+    Vertex AI. A 429 from those says nothing about our Bitbucket budget, so
+    only Bitbucket calls may join (or trip) the shared rate-limit gate.
+    Exact netloc match, so `api.bitbucket.org.evil.test` does not qualify.
+    """
+    try:
+        return urllib.parse.urlsplit(url).netloc == "api.bitbucket.org"
+    except ValueError:
+        return False
+
+
+def _log_endpoint(url):
+    """The path of a URL, for logs. Bitbucket URLs are mostly boilerplate.
+
+    v2.13.1 (COPS-2543): production only ever said "429 on GET", so working
+    out which call was being rejected meant correlating timestamps against the
+    iteration log. The path alone is enough to name it.
+    """
+    try:
+        path = urllib.parse.urlsplit(url).path or url
+    except ValueError:
+        return url
+    return path.replace(f"/2.0/repositories/{BB_WORKSPACE}/", "") or url
+
+
 def http(method, url, body=None, headers=None, auth=None):
     """HTTP call with exponential backoff on 429/503/network errors.
 
     v2.5.20 (E1): routed through _pooled_urlopen — one persistent TLS
     connection per (thread, host) instead of a fresh handshake per call.
     Error semantics are unchanged: non-2xx still raises HTTPError.
+
+    v2.13.1 (COPS-2543): Bitbucket calls share the rate-limit gate with the
+    value-file path. Every 429 seen in production came through here, and the
+    old backoff could not clear a rate-limit window: Bitbucket does not send
+    Retry-After on these endpoints, so `2 ** attempt` gave 1s then 2s against
+    a window that runs ~60s, and both retries died inside it. Non-Bitbucket
+    hosts keep the original per-request backoff untouched.
     """
     hdrs = dict(headers or {})
     if auth:
@@ -1321,25 +1356,44 @@ def http(method, url, body=None, headers=None, auth=None):
     if data:
         hdrs["Content-Type"] = "application/json"
     req = urllib.request.Request(url, data=data, headers=hdrs, method=method)
+    is_bb = _is_bb_url(url)
+    endpoint = _log_endpoint(url)
     last_exc = None
     for attempt in range(3):
+        # Brake with the pool before spending an attempt, so a 429 that another
+        # caller (or the value-file path) already hit does not cost this call a
+        # retry against a window we know is closed.
+        if is_bb:
+            _bb_ratelimit_wait()
         try:
             with _pooled_urlopen(req, timeout=60) as r:
                 return json.loads(r.read())
         except urllib.error.HTTPError as e:
             if e.code in (429, 500, 502, 503, 504) and attempt < 2:
+                # v2.5.19 (M5): _parse_retry_after handles both the
+                # delta-seconds and the HTTP-date form of the header.
+                ra = _parse_retry_after((e.headers or {}).get("Retry-After")) \
+                    if e.code == 429 else None
+                if e.code == 429 and is_bb:
+                    # A 429 is a property of the TOKEN, so publish the pause for
+                    # everyone rather than backing off alone. Bitbucket often
+                    # omits Retry-After here, hence the window-sized fallback;
+                    # the cap keeps a broken header from stalling the loop.
+                    wait = min(ra, BB_RATELIMIT_MAX_PAUSE) if ra is not None \
+                        else BB_RATELIMIT_FALLBACK
+                    log(f"[http] 429 on {method} {endpoint} — pausing all "
+                        f"Bitbucket calls {wait}s (retry {attempt+1}/2)", "WARNING")
+                    _bb_ratelimit_hold(wait)
+                    last_exc = e
+                    continue   # the gate above does the sleeping, for everyone
+                # Non-Bitbucket host, or a 5xx: one sick request is not a spent
+                # budget, so keep the per-request backoff and leave the pool
+                # alone.
                 wait = 2 ** attempt
-                if e.code == 429:
-                    # Honor the server-mandated pause: Bitbucket rate-limit
-                    # windows run ~60s while our old total backoff was ~3s,
-                    # so a storm failed straight through (bughunt F4).
-                    # Capped so a broken header cannot stall the loop.
-                    # v2.5.19 (M5): also parse the HTTP-date form of
-                    # Retry-After, not just delta-seconds.
-                    ra = _parse_retry_after((e.headers or {}).get("Retry-After"))
-                    if ra is not None:
-                        wait = max(wait, min(ra, 60))
-                log(f"[http] {e.code} on {method} — retry {attempt+1}/2 in {wait}s", "WARNING")
+                if ra is not None:
+                    wait = max(wait, min(ra, 60))
+                log(f"[http] {e.code} on {method} {endpoint} — retry {attempt+1}/2 in {wait}s",
+                    "WARNING")
                 time.sleep(wait)
                 last_exc = e
                 continue
@@ -1347,7 +1401,8 @@ def http(method, url, body=None, headers=None, auth=None):
         except (OSError, urllib.error.URLError) as e:
             if attempt < 2:
                 wait = 2 ** attempt
-                log(f"[http] network error on {method} — retry {attempt+1}/2 in {wait}s", "WARNING")
+                log(f"[http] network error on {method} {endpoint} — retry {attempt+1}/2 in {wait}s",
+                    "WARNING")
                 time.sleep(wait)
                 last_exc = e
                 continue
@@ -2639,6 +2694,11 @@ def _fetch_value_files(value_files: list, sha: str) -> dict:
     instead of ~2.1s sequential). Results are cached by (sha, path) so the main
     sha value files are fetched only once across all apps in a PR iteration.
     """
+    # Paths whose fetch failed transiently (429/5xx after retries), as opposed
+    # to genuinely absent ones. Appended from the fetcher threads.
+    unreadable = []
+    unreadable_lock = threading.Lock()
+
     def _fetch_one(vf):
         clean     = posixpath.normpath(vf.replace("$config/", "").lstrip("/"))
         cache_key = (sha, clean)
@@ -2674,6 +2734,9 @@ def _fetch_value_files(value_files: list, sha: str) -> dict:
             if status in (BB_OK, BB_NOT_FOUND):
                 with _vf_cache_lock:
                     _vf_cache[cache_key] = content
+            elif status == BB_ERROR:
+                with unreadable_lock:
+                    unreadable.append(vf)
             return vf, content
         finally:
             with _vf_inflight_lock:
@@ -2688,8 +2751,24 @@ def _fetch_value_files(value_files: list, sha: str) -> dict:
                 result[vf] = content
             else:
                 missing.append(vf.replace("$config/", ""))
-    if missing:
-        debug(f"value files not found at sha {sha[:8]}: {missing}")
+    # v2.13.1 (COPS-2543): report UNREADABLE separately from ABSENT, and at
+    # WARNING. These are different events and the old single debug() line
+    # ("value files not found") called both of them absence. A 404 is normal
+    # (new cluster not yet merged to main); a 429/5xx that outlived its retries
+    # means the render is about to fail for a reason that has nothing to do with
+    # the PR, and it reaches the reviewer as a bare "missing required value".
+    # Because the old line was debug() and production runs at INFO, we could not
+    # tell those two apart in the logs at all.
+    if unreadable:
+        shown = [v.replace("$config/", "") for v in unreadable[:5]]
+        more = f" (+{len(unreadable) - 5} more)" if len(unreadable) > 5 else ""
+        log(f"[bb] {len(unreadable)} value file(s) UNREADABLE at sha {sha[:8]} "
+            f"— 429/5xx after retries, NOT absent; the render will look like a "
+            f"missing required value: {shown}{more}", "WARNING")
+    absent = [v for v in missing if v not in
+              {u.replace("$config/", "") for u in unreadable}]
+    if absent:
+        debug(f"value files absent at sha {sha[:8]}: {absent}")
     return result
 
 
