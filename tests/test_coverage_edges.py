@@ -159,7 +159,7 @@ def test_process_pr_new_env_branch_renders_and_reports(world, monkeypatch):
     monkeypatch.setattr(m, "get_pr_changed_files",
                         lambda pr_id, repo=None: (["gcp/dev/private-cloud/ap1/custom/pv-new-x-a/customer.yaml"], {}))
     monkeypatch.setattr(m, "_detect_new_env_candidates",
-                        lambda changed, path_map, renames=None:
+                        lambda changed, path_map, renames=None, pr_sha=None, repo=None:
                         [{"name": "pv-new-x-a",
                           "config_file": "gcp/dev/private-cloud/ap1/custom/pv-new-x-a/customer.yaml",
                           "env_dir": "gcp/dev/private-cloud/ap1/custom/pv-new-x-a",
@@ -178,7 +178,7 @@ def test_process_pr_structural_new_env_blocks_the_pr(world, monkeypatch):
     monkeypatch.setattr(m, "get_pr_changed_files",
                         lambda pr_id, repo=None: (["gcp/dev/private-cloud/ap1/custom/pv-new-y-a/customer.yaml"], {}))
     monkeypatch.setattr(m, "_detect_new_env_candidates",
-                        lambda changed, path_map, renames=None:
+                        lambda changed, path_map, renames=None, pr_sha=None, repo=None:
                         [{"name": "pv-new-y-a",
                           "config_file": "gcp/dev/private-cloud/ap1/custom/pv-new-y-a/customer.yaml",
                           "env_dir": "gcp/dev/private-cloud/ap1/custom/pv-new-y-a",
