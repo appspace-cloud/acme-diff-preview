@@ -2858,7 +2858,7 @@ def _detect_wiped_definitions(changed_files: list, sha: str, repo=None) -> list:
     return hits
 
 
-def _detect_new_env_candidates(changed_files: list, path_map: dict, renames: dict = None) -> list:
+def _detect_new_env_candidates(changed_files: list, path_map: dict, renames: dict = None, pr_sha: str = None, repo: str = None) -> list:
     """Scan changed files for patterns that indicate a brand-new environment.
 
     A 'new env' is a customer.yaml or config.yaml at env-directory depth that is
@@ -2929,6 +2929,40 @@ def _detect_new_env_candidates(changed_files: list, path_map: dict, renames: dic
     # The (never observed) new-sub-app-in-existing-env case keeps its
     # pre-v2.5.6 behavior: a red structural finding — a conservative false
     # alarm a human will look at, never a silent skip.
+    # v2.13.2 (COPS-2544, live PRs acme-config-prod #3796/#3797): a
+    # config.yaml at env-directory depth that declares NO customerName is a
+    # cohort/defaults values level -- the file the ApplicationSet generator
+    # loads from `{{env}}/../config.yaml` next to every environment folder
+    # (hardcoded/migration cohorts, ring folders) -- not an environment.
+    # Rendering it as one always fails ("no appspace.version" or missing
+    # identity values) and, since the v2.5.4 allow-list, that failure class
+    # is FAILED by design: a structurally correct migration PR went red.
+    # Declared identity is the same signal the rename verification trusts
+    # since v2.5.15 (_extract_appspace_identity): an environment identity
+    # file declares customerName; a defaults level does not. Only
+    # config.yaml candidates are filtered -- customer.yaml keeps its exact
+    # behavior -- and the cl-* parent of v2.5.6 Finding A survives because
+    # it DOES declare customerName (verified live on cl-prod-b). A fetch
+    # failure keeps the candidate: a conservative red finding a human looks
+    # at beats a silent skip.
+    if pr_sha:
+        for env_dir in list(candidates.keys()):
+            info = candidates[env_dir]
+            cf = info["config_file"]
+            if not cf.endswith("config.yaml"):
+                continue
+            try:
+                content, _st = _bb_fetch_status(cf, pr_sha, repo=repo)
+            except Exception as e:
+                debug(f"new-env identity fetch failed for {cf}: {e}; "
+                      f"keeping candidate")
+                continue
+            cname, _suffix = _extract_appspace_identity(content or "")
+            if cname is None:
+                log(f"new-env candidate '{info['name']}' skipped: {cf} "
+                    f"declares no customerName (cohort/defaults values "
+                    f"level, not an environment)")
+                del candidates[env_dir]
     nested_children = {
         d for d in candidates
         if any(d.startswith(parent + "/") for parent in candidates if parent != d)
@@ -3059,6 +3093,44 @@ def _evaluate_new_envs(new_env_candidates: list, pr_sha: str) -> tuple:
     """
     new_env_sections = []
     for env_info in new_env_candidates:
+        # v2.13.2 (COPS-2544, explicit request): every ApplicationSet with a
+        # customer.yaml git generator also loads `{{env}}/../config.yaml` as
+        # a matrix generator (verified live on the hub 2026-07-28: all of
+        # them except the six gcp/aec/ ones). If that cohort file does not
+        # exist at the PR head, the matrix yields ZERO results: no
+        # Application is ever generated for this path, and a moved
+        # environment gets decommissioned instead of followed. A green
+        # "will be created on merge" here would be false, and the render
+        # error it produces instead is misleading. Block with the reason.
+        # A transient fetch error must NOT block (only a genuine 404 is a
+        # stable fact); gcp/aec/ paths have no cohort generator and are
+        # exempt. The wording below must never contain the phrase
+        # "missing required value": that exact phrase is the one allowed
+        # green shape in _new_env_status.
+        env_dir = env_info.get("env_dir", "")
+        if not env_dir.startswith("gcp/aec/") and "/" in env_dir:
+            cohort_path = env_dir.rsplit("/", 1)[0] + "/config.yaml"
+            _c, _cohort_st = _bb_fetch_status(cohort_path, pr_sha)
+            if _cohort_st == BB_NOT_FOUND:
+                reason = (
+                    f"the ApplicationSet generator loads `{cohort_path}` "
+                    f"next to every environment folder, and that file does "
+                    f"not exist at this commit. Without it the generator "
+                    f"produces zero Applications for this environment, so "
+                    f"nothing deploys on merge, and a moved environment "
+                    f"would be decommissioned instead of followed. Add that "
+                    f"config.yaml (a 4 line placeholder is enough, see "
+                    f"gcp/prod/private-cloud/eu1-b/hardcoded/migration/"
+                    f"monthly/config.yaml) and push again to unblock.")
+                log(f"  new env {env_info['name']}: blocked - {reason}",
+                    "WARNING")
+                new_env_sections.append({
+                    "name": env_info["name"], "version": "unknown",
+                    "files": env_info["all_yaml_files"], "n_res": 0,
+                    "kind_counts": None, "workloads": None,
+                    "error": reason, "blocked": True,
+                })
+                continue
         render_result = _render_new_env_diff(env_info, pr_sha)
         # Returns (rendered_manifest, error [, n_res [, version]])
         rendered   = render_result[0]
@@ -3100,7 +3172,13 @@ def _evaluate_new_envs(new_env_candidates: list, pr_sha: str) -> tuple:
             if len(sec["files"]) > 15:
                 lines.append(f"- *... {len(sec['files'])-15} more files*")
             lines.append("")
-        if sec["kind_counts"] is not None:
+        if sec.get("blocked"):
+            lines.append(
+                "\u26d4 **Blocked: a required cohort `config.yaml` is "
+                "missing.**")
+            lines.append("")
+            lines.append(f"This PR cannot work as written: {sec['error']}")
+        elif sec["kind_counts"] is not None:
             # v2.5.6 (Finding B): a completely new environment has nothing to
             # compare against — the full manifest is a wall of "+" lines with
             # no review value. Show what a reviewer actually needs instead.
@@ -6315,7 +6393,7 @@ def process_pr(pr, path_map, base_sha="", repo=None):
         # dropping a bundled new environment from evaluation entirely —
         # confirmed live with both a broken (#6646) and a fully valid
         # (#6652) new environment.
-        new_env_candidates = _detect_new_env_candidates(changed, path_map, renames)
+        new_env_candidates = _detect_new_env_candidates(changed, path_map, renames, pr_sha=pr_sha, repo=repo)
         if new_env_candidates:
             log(f"PR #{pr_id}: {len(new_env_candidates)} new env candidate(s): "
                 f"{[e['name'] for e in new_env_candidates]}", pr=pr_id)
