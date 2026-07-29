@@ -4243,7 +4243,18 @@ def _augment_renames_with_identity_moves(changed_files: list, renames: dict,
             elif f not in path_map and f not in new_sides:
                 _c, st = _bb_fetch_cached(f, pr_sha, repo=repo)
                 if st == BB_OK and _c:
-                    added.append((f, _extract_appspace_identity(_c)))
+                    # Only files that DECLARE an identity may compete for the
+                    # pairing. A cohort/defaults config.yaml declares none, and
+                    # _same_env_identity treats (None, None) as compatible with
+                    # anything, so including it made every real move ambiguous
+                    # and the pairing was dropped in silence. Live PR 3811 still
+                    # reported a decommission for a pure move because of this,
+                    # and the original tests missed it by never having the
+                    # cohort file present at pr_sha -- which is exactly the
+                    # shape COPS-2544 now requires in production.
+                    _nid = _extract_appspace_identity(_c)
+                    if _nid[0] is not None:
+                        added.append((f, _nid))
         if not deleted or not added:
             return out
         for old in deleted:
