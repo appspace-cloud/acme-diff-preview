@@ -4267,6 +4267,63 @@ def _detect_env_move(value_files: list, renames: dict, main_sha: str = None, pr_
     return None
 
 
+def _moves_missing_cohort(renames: dict, pr_sha: str, repo: str = None) -> list:
+    """Moved environments whose DESTINATION has no cohort config.yaml.
+
+    COPS-2552, regression found on live PR 3816. The v2.13.5 identity-move
+    pairing correctly kills the false decommission, but pairing also removes
+    the new path from the new-environment candidate list, and the cohort guard
+    added in v2.13.2 only ever ran over that list. So the exact case the guard
+    exists for stopped being checked: a move into a folder with no cohort file
+    posted SUCCESSFUL, and merging it would have made the ApplicationSet matrix
+    yield zero Applications for a live production customer.
+
+    A moved environment needs its destination cohort file exactly as much as a
+    brand-new one. Same rules as the new-env guard: only a genuine 404 blocks
+    (a transient error is not a fact), and gcp/aec paths are exempt because
+    those six ApplicationSets have no cohort generator.
+    """
+    out = []
+    for old, new in (renames or {}).items():
+        parts = new.split("/")
+        if len(parts) < 5 or parts[-1] not in _IDENTITY_BASENAMES:
+            continue
+        env_dir = new.rsplit("/", 1)[0]
+        if env_dir.startswith("gcp/aec/") or "/" not in env_dir:
+            continue
+        cohort = env_dir.rsplit("/", 1)[0] + "/config.yaml"
+        _c, st = _bb_fetch_cached(cohort, pr_sha, repo=repo)
+        if st == BB_NOT_FOUND:
+            out.append({"env": env_dir.rsplit("/", 1)[-1], "old": old,
+                        "new": new, "cohort": cohort})
+    return out
+
+
+def _moves_missing_cohort_lines(blocked: list) -> list:
+    """Render the blocking section for moves missing their cohort file."""
+    lines = []
+    for b in blocked:
+        lines += [
+            f"\u26d4 **`{b['env']}` is being moved, but its new folder has no "
+            f"cohort `config.yaml`.**",
+            "",
+            f"Moved: `{b['old'].rsplit('/', 1)[0]}` \u2192 "
+            f"`{b['new'].rsplit('/', 1)[0]}`",
+            "",
+            f"The ApplicationSet generator loads `{b['cohort']}` next to every "
+            f"environment folder, and that file does not exist at this commit. "
+            f"Without it the generator produces zero Applications for this "
+            f"environment, so merging this PR removes it from ArgoCD instead of "
+            f"moving it.",
+            "",
+            f"**Fix:** add `{b['cohort']}` to this PR. A 4 line placeholder is "
+            f"enough, see "
+            f"`gcp/prod/private-cloud/eu1-b/hardcoded/migration/monthly/config.yaml`.",
+            "",
+        ]
+    return lines
+
+
 def _augment_renames_with_identity_moves(changed_files: list, renames: dict,
                                           path_map: dict, main_sha: str,
                                           pr_sha: str, repo: str = None) -> dict:
@@ -7065,6 +7122,19 @@ def process_pr(pr, path_map, base_sha="", repo=None):
             f"config problem: {', '.join(structural_envs)}"
         ) if structural_envs else ""
 
+        # COPS-2552: a paired move is excluded from the new-env candidates, so
+        # the cohort guard above never sees it. Check the destinations here.
+        moves_missing_cohort = _moves_missing_cohort(renames, pr_sha, repo=repo)
+        if moves_missing_cohort:
+            envs = ", ".join(b["env"] for b in moves_missing_cohort)
+            log(f"PR #{pr_id}: move(s) with no cohort config.yaml at the "
+                f"destination: {envs}", "WARNING")
+            new_env_lines = _moves_missing_cohort_lines(moves_missing_cohort) + \
+                (new_env_lines or [])
+            new_env_desc = (f"{len(moves_missing_cohort)} moved environment(s) "
+                            f"have no cohort config.yaml at the destination: "
+                            f"{envs}")
+
         try:
             input_change_lines = _summarize_input_changes(changed, pr_sha, base_sha, repo=repo)
         except Exception as e:  # cause panel must never break the comment
@@ -7072,7 +7142,8 @@ def process_pr(pr, path_map, base_sha="", repo=None):
             input_change_lines = []
         body = format_comment(pr_sha, app_results, skipped_apps, base_sha=base_sha,
                                new_env_lines=new_env_lines or None,
-                               new_env_structural=bool(structural_envs),
+                               new_env_structural=bool(structural_envs
+                                                        or moves_missing_cohort),
                                new_env_desc=new_env_desc,
                                decommission_lines=decommission_lines or None,
                                input_change_lines=input_change_lines or None)
@@ -7147,8 +7218,19 @@ def process_pr(pr, path_map, base_sha="", repo=None):
         # transient error still gets retried automatically on the next
         # iteration (see is_transient_failure below) — only the COLOR changes,
         # never the retry behavior.
-        if any_hard_error or has_blocking_indet or structural_envs:
-            if structural_envs:
+        if (any_hard_error or has_blocking_indet or structural_envs
+                or moves_missing_cohort):
+            # COPS-2552: a move whose destination has no cohort config.yaml
+            # must never post green. Merging it removes the environment from
+            # ArgoCD instead of moving it, and the apps themselves diff clean,
+            # so nothing else in this chain would catch it.
+            if moves_missing_cohort:
+                envs = ", ".join(b["env"] for b in moves_missing_cohort)
+                _mmc_desc = (f"{len(moves_missing_cohort)} moved environment(s) "
+                             f"have no cohort config.yaml at the destination "
+                             f"({envs}) - merging would remove them from ArgoCD")
+                post_build_status(pr_sha, "FAILED", _mmc_desc, pr_id=pr_id)
+            elif structural_envs:
                 base_desc = (f"{len(structural_envs)} new environment(s) have a "
                              f"structural config problem: {', '.join(structural_envs)}")
                 if oci_not_found_count:
@@ -7219,7 +7301,9 @@ def process_pr(pr, path_map, base_sha="", repo=None):
         #   oci_not_found stopped the retry loop, so an invalid_yaml PR was
         #   silently re-diffed every ~60s forever even though it can never
         #   resolve itself.
-        is_permanent_failure = any_hard_error or has_blocking_indet or bool(structural_envs)
+        is_permanent_failure = (any_hard_error or has_blocking_indet
+                                or bool(structural_envs)
+                                or bool(moves_missing_cohort))
         is_transient_failure = any_unknown and not is_permanent_failure
         if not is_transient_failure:
             # Mark seen for both clean runs AND permanent failures so we don't
