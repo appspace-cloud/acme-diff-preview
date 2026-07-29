@@ -1829,13 +1829,24 @@ REASON_INVALID_VERSION = "invalid_version"
 # the author knows to fix their YAML syntax rather than chart values (v2.4.9).
 REASON_INVALID_YAML  = "invalid_yaml"
 REASON_MISSING_REQUIRED = "missing_required"  # v2.6.2: helm `required`/nil-deref on absent value
+REASON_SCHEMA_INVALID   = "schema_invalid"     # COPS-2554: values.schema.json validation failed
 
 # Reasons worth retrying in-process with backoff (transient).
 # REASON_RENDER is retried once — a brief subprocess glitch (node IO, tmp
 # exhaustion) should not produce a permanent "diff unavailable" result.
 RETRYABLE_REASONS = {REASON_OCI_PULL, REASON_METADATA, REASON_TIMEOUT, REASON_RENDER}
 # Reasons that permanently block the PR (the deployer would fail the same way).
-PERMANENT_REASONS = {REASON_OCI_NOT_FOUND, REASON_INVALID_VERSION, REASON_INVALID_YAML}
+PERMANENT_REASONS = {REASON_OCI_NOT_FOUND, REASON_INVALID_VERSION,
+                     REASON_INVALID_YAML, REASON_MISSING_REQUIRED,
+                     REASON_SCHEMA_INVALID}
+# COPS-2554: MISSING_REQUIRED and SCHEMA_INVALID joined the permanent set
+# alongside invalid_yaml/invalid_version. All four are deterministic given
+# the same pr_sha -- an environment missing a required value, or violating
+# the chart schema, will never resolve on retry, only on a new commit. Before
+# this they fell through as ordinary soft-indeterminate: retried up to
+# DIFF_RETRIES times per pass (wasted time on a certain failure) and then
+# backed off forever across iterations instead of blocking cleanly with a
+# FAILED status that tells the author what to fix.
 
 # Operator-friendly one-liners shown in the PR comment for each reason.
 # The full stderr is in the pod logs at LOG_LEVEL=DEBUG.
@@ -1845,6 +1856,7 @@ _REASON_HINTS = {
     REASON_METADATA:      "app not yet in the discovery cache (added since last refresh)",
     REASON_RENDER:        "helm template failed to render the chart with these values",
     REASON_MISSING_REQUIRED: "a value the chart requires is missing from this environment's hierarchy",
+    REASON_SCHEMA_INVALID: "this environment's values fail the chart's values.schema.json validation",
     REASON_TIMEOUT:       f"a diff step exceeded {DIFF_TIMEOUT}s",
     REASON_UNEXPECTED:    "an unexpected error occurred while computing the diff",
     REASON_INVALID_VERSION: "appspace.version was rejected as unsafe/invalid — not a valid OCI tag",
@@ -3962,15 +3974,27 @@ def _render_reason(render_err: str) -> str:
     Everything else stays REASON_RENDER.
     """
     e = (render_err or "").lower()
-    # v2.6.2: a chart's `required "..."` guard tripping, or a nil-pointer
-    # dereference on a missing value block, means the ENVIRONMENT's values
-    # are incomplete for this chart version - the single most actionable
-    # render failure there is. Give it its own reason so the PR comment can
-    # spell out exactly what is missing instead of a generic render error
-    # (born from acme-config-dev PR #6848 confusion).
-    if ("is required" in e or "required value" in e
-            or "nil pointer evaluating" in e):
+    # COPS-2554: match Helm's own message-independent SIGNATURE for a
+    # template `required()` failure ("execution error at (<template>:<line>):
+    # <message>") instead of guessing keywords from <message>, which chart
+    # authors write however they like. Live PR 3823 broke on a chart's own
+    # custom message ("Missing Image Tag on => platform") that contained none
+    # of the previously-matched phrases and fell through to generic
+    # REASON_RENDER: retried 5 times for a failure that can never resolve on
+    # retry, then showed only "diff unavailable" with the real cause hidden.
+    # Auditing this chart's own templates turned up more messages the old
+    # keyword list silently missed the same way ("Cloud instance not found
+    # for this deployment", "A valid appspace.prefix entry required!"). The
+    # nil-pointer shape (accessing a field with no required() guard at all)
+    # keeps its own separate check since it has a different Go-level phrase.
+    if "execution error at (" in e or "nil pointer evaluating" in e:
         return REASON_MISSING_REQUIRED
+    # COPS-2554: values.schema.json validation. Same class of bug -- this
+    # chart ships a schema, and a violation is exactly as deterministic and
+    # actionable as a missing required() value, but was not classified at
+    # all before, so it too fell into the generic bucket.
+    if "values don't meet the specifications of the schema" in e:
+        return REASON_SCHEMA_INVALID
     if ("error converting yaml" in e or "did not find expected" in e
             or "could not find expected" in e or "mapping values are not allowed" in e
             or "yaml: line" in e or "found character that cannot start" in e
@@ -4037,6 +4061,23 @@ def _explain_required_error(err: str) -> list:
             f"> Chart template: `{tpl}:{line}` ({msg.splitlines()[0][:120]})",
         ]
     return [f"> {err.splitlines()[0][:300] if err else 'no error output'}"]
+
+
+def _explain_schema_error(err: str) -> list:
+    """Break a Helm values.schema.json failure into one violation per line.
+
+    COPS-2554: Helm reports every schema violation in one multi-line stderr
+    block. Left as raw text (or worse, collapsed to the generic "diff
+    unavailable" message) an operator has to find and parse it themselves.
+    Each "- ..." line IS already the specific, actionable violation, so this
+    only needs to extract and re-list them, same "one thing per line"
+    principle as the required-value remedies.
+    """
+    lines = [l.strip() for l in (err or "").splitlines()]
+    violations = [l[1:].strip() for l in lines if l.startswith("-")]
+    if not violations:
+        return [f"> {(err or 'no error output').splitlines()[0][:300]}"]
+    return [f"> {v}" for v in violations]
 
 
 def _missing_value_remedies() -> list:
@@ -6473,6 +6514,20 @@ def format_comment(pr_sha, app_results, skipped_apps=None, base_sha="",
                 lines += _explain_required_error(r.error)
                 lines += _missing_value_remedies()
                 lines += [""]
+            elif r.reason == REASON_SCHEMA_INVALID:
+                # COPS-2554: same clarity principle, adapted to Helm's own
+                # multi-violation format instead of a single line/location.
+                lines += [
+                    f"❌ **`{app}`** — ⚙️ **SCHEMA VALIDATION FAILED "
+                    f"— this environment's values violate the chart's schema**",
+                ]
+                lines += _explain_schema_error(r.error)
+                lines += [
+                    "> **Fix:** correct each value listed above in this "
+                    "environment's `customer.yaml` (or the `config.yaml` of "
+                    "its cohort or ring if every environment needs the fix).",
+                    "",
+                ]
             elif r.reason == REASON_OCI_NOT_FOUND and r.error:
                 # Surface the exact missing chart:version prominently (bughunt):
                 # the generic hint below used to be the ONLY thing shown here,

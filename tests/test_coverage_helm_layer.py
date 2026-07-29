@@ -71,7 +71,7 @@ case "$1" in
     vf=""; prev=""
     for a in "$@"; do [ "$prev" = "-f" ] && vf="$a"; prev="$a"; done
     if grep -q "MARKER_BOOM" "$vf" 2>/dev/null; then
-      echo "helm template failed: execution error at (templates/deploy.yaml)" >&2; exit 1
+      echo "helm template failed: execution error, chart malformed" >&2; exit 1
     fi
     R=$(grep "replicas_marker:" "$vf" 2>/dev/null | awk '{{print $2}}')
     [ -z "$R" ] && R=1
