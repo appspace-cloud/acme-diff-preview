@@ -1334,6 +1334,37 @@ def _log_endpoint(url):
     return path.replace(f"/2.0/repositories/{BB_WORKSPACE}/", "") or url
 
 
+# COPS-2549: the OCI registry a chart lives in is decided by the version
+# string alone, exactly as every ApplicationSet does it:
+#   {{if hasSuffix "-dev" .appspace.version}}helm-oci-dev{{else}}helm-oci-release{{end}}
+# Any environment in any config repo may point at either kind of package, so
+# this must never be inferred from the tier or from the live app's registry.
+# _run_one_diff used to read the registry from the LIVE app spec while taking
+# the version from the PR, so a PR moving an environment onto a -dev chart
+# asked the release registry for a tag that only exists in the dev one (live
+# on acme-config-prod PRs 3808 and 3809). The main side is not safe either:
+# the live app can lag behind main, and then it fails the same way. Both sides
+# derive their own registry from their own version.
+OCI_DEV_REGISTRY     = "helm-oci-dev.repo.appspace.com"
+OCI_RELEASE_REGISTRY = "helm-oci-release.repo.appspace.com"
+
+
+def _registry_for_version(version) -> str:
+    """Return the OCI registry that hosts this chart version."""
+    return OCI_DEV_REGISTRY if version and str(version).endswith("-dev") \
+        else OCI_RELEASE_REGISTRY
+
+
+# COPS-2549: identify our traffic. Everything went out as Python-urllib/3.x,
+# indistinguishable from any other script in the logs, and on Bitbucket it
+# also posts as a shared service account. Built from APP_VERSION so the logs
+# also show which build made the call, which matters while a rollout is in
+# flight. Note this cannot cover helm and argocd: they run as subprocesses and
+# helm has no --user-agent flag, so registry pulls keep helm's own UA.
+def _user_agent() -> str:
+    return f"AppspaceAcmeDiffPreview/{APP_VERSION}"
+
+
 def http(method, url, body=None, headers=None, auth=None):
     """HTTP call with exponential backoff on 429/503/network errors.
 
@@ -1349,6 +1380,7 @@ def http(method, url, body=None, headers=None, auth=None):
     hosts keep the original per-request backoff untouched.
     """
     hdrs = dict(headers or {})
+    hdrs.setdefault("User-Agent", _user_agent())
     if auth:
         hdrs["Authorization"] = "Basic " + _base64.b64encode(
             f"{auth[0]}:{auth[1]}".encode()).decode()
@@ -3986,12 +4018,45 @@ def _explain_required_error(err: str) -> list:
         tpl, line, expr, msg = (m2.group(1), m2.group(2),
                                 m2.group(3).strip(), m2.group(4).strip())
         tpl = tpl[tpl.find("templates/"):] if "templates/" in tpl else tpl
+        # COPS-2548 (live feedback on PR 3813): leading with the chart's own
+        # loop variable told the operator nothing about their config. When the
+        # chart is iterating microservice definitions, the cause is concrete
+        # and worth naming: an entry exists under microservices.definitions
+        # with no image mapping behind it. Everything else keeps the generic
+        # wording, since we cannot know which values block a foreign chart
+        # meant to read.
+        field = expr.split(".", 1)[1] if "." in expr else expr
+        if "microservice" in expr.lower():
+            head = (f"> **A `microservices.definitions` entry has no `image` "
+                    f"mapping**, so the chart could not read its `{field}`.")
+        else:
+            head = (f"> **The chart reads `{expr}` but that value block is "
+                    f"missing or empty.**")
         return [
-            f"> **The chart reads `{expr}` but that value block is missing or"
-            f" empty** ({msg.splitlines()[0][:160]})",
-            f"> Chart template: `{tpl}:{line}`",
+            head,
+            f"> Chart template: `{tpl}:{line}` ({msg.splitlines()[0][:120]})",
         ]
     return [f"> {err.splitlines()[0][:300] if err else 'no error output'}"]
+
+
+def _missing_value_remedies() -> list:
+    """The remedies for a MISSING REQUIRED VALUE block, one per line.
+
+    COPS-2548: these used to be a single long sentence that crammed two
+    unrelated pieces of advice together ("define it in customer.yaml or a
+    parent config.yaml" and "if the chart version changed..."), which the
+    renderer showed as one wall of text. An operator had to untangle it to
+    work out what to actually do. Separate lines, most likely cause first.
+    """
+    return [
+        "> **Fix:** add the missing value to this environment's "
+        "`customer.yaml`, or to the `config.yaml` of its cohort or ring if "
+        "every environment at that level needs it.",
+        "> If this PR moved the environment to a new folder, check that the "
+        "new parent `config.yaml` carries what the old one did.",
+        "> If this PR changed the chart version, the new chart may require "
+        "values the old one did not.",
+    ]
 
 
 _IDENTITY_BASENAMES = ("customer.yaml", "config.yaml")
@@ -4615,8 +4680,11 @@ def _run_one_diff(app, pr_sha, main_sha, chart_revision=None, changed_paths=None
     # success path both futures are already done, so it is a no-op.
     _pull_ex = ThreadPoolExecutor(max_workers=2)
     try:
-        pr_fut   = _pull_ex.submit(_ensure_chart, registry, chart_name, pr_rev)
-        main_fut = _pull_ex.submit(_ensure_chart, registry, chart_name, main_rev)
+        # COPS-2549: each side from the registry its own version lives in.
+        pr_registry   = _registry_for_version(pr_rev)
+        main_registry = _registry_for_version(main_rev)
+        pr_fut   = _pull_ex.submit(_ensure_chart, pr_registry, chart_name, pr_rev)
+        main_fut = _pull_ex.submit(_ensure_chart, main_registry, chart_name, main_rev)
         pr_chart   = pr_fut.result(timeout=DIFF_TIMEOUT)
         main_chart = main_fut.result(timeout=DIFF_TIMEOUT)
     except OciChartNotFound as e:
@@ -6346,13 +6414,8 @@ def format_comment(pr_sha, app_results, skipped_apps=None, base_sha="",
                     f"\u2014 helm cannot render this environment**",
                 ]
                 lines += _explain_required_error(r.error)
-                lines += [
-                    "> **Fix:** define the missing value in this environment's "
-                    "`customer.yaml` (or a parent `config.yaml` of its hierarchy) "
-                    "and push to this branch. If the chart version changed in this "
-                    "PR, the new version may require values the old one did not.",
-                    "",
-                ]
+                lines += _missing_value_remedies()
+                lines += [""]
             elif r.reason == REASON_OCI_NOT_FOUND and r.error:
                 # Surface the exact missing chart:version prominently (bughunt):
                 # the generic hint below used to be the ONLY thing shown here,
