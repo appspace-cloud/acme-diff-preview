@@ -22,3 +22,35 @@ http.client.HTTPSConnection with fakes — still zero-network.
 import os
 
 os.environ["DIFF_HTTP_POOLING"] = "off"
+
+
+# ── COPS-2546: hermetic fetch cache between tests ───────────────────────────
+#
+# _vf_cache is keyed by (commit sha, path) and lives for the whole process,
+# which is correct in production: content at a git sha is immutable, so a hit
+# is always valid and the cache is what keeps Bitbucket API usage down.
+#
+# In tests it is a trap. Test modules share short fake shas ("prsha",
+# "cafe0001", ...) and the same fixture paths, so a value cached by one test
+# silently answers the next one and its monkeypatched fetcher is never called.
+# That produces failures that only appear in a full-suite run and vanish when
+# the test is run alone, which is the worst possible signal for a suite that
+# gates releases.
+#
+# Clearing before and after every test makes each one hermetic regardless of
+# ordering. Tests that populate the cache on purpose do so inside their own
+# body, after this fixture has run.
+import pytest
+
+
+@pytest.fixture(autouse=True)
+def _clear_sha_fetch_cache():
+    import diff_preview as _m
+    # _retry_backoff is module-level too: a transient failure registered by one
+    # test would otherwise make the next test's PR be skipped before it does
+    # any work, which surfaces as an empty result list far from the cause.
+    for d in (_m._vf_cache, _m._vf_inflight, _m._retry_backoff):
+        d.clear()
+    yield
+    for d in (_m._vf_cache, _m._vf_inflight, _m._retry_backoff):
+        d.clear()

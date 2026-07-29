@@ -2600,6 +2600,117 @@ def _prune_helm_cache():
 # entries never go stale; shared across all apps and all PRs in a pod lifetime.
 _vf_cache: dict = {}
 _vf_cache_lock  = threading.Lock()
+
+# COPS-2546: exponential retry backoff for transient PR failures. A PR whose
+# pass ends transient (indeterminate diffs, unreadable fetches) is retried, but
+# not on every single iteration: 1, 2, 4 then capped at 8 iterations between
+# attempts. Under a Bitbucket quota exhaustion the old retry-every-cycle
+# behavior was self-sustaining: 429s caused indeterminates, indeterminates
+# caused retries, retries consumed the recovering budget and caused the next
+# 429s (live on 2026-07-29, acme-config-dev PR 6938 with 120 apps).
+# A new push (sha change) is processed immediately and resets the escalation;
+# a clean or permanent completion clears the entry.
+#
+# In-memory and therefore per-pod: a restart drops the backoff state and the
+# next iteration retries everything once. That is the conservative direction
+# (a restart must never hide a PR), and the cross-pod comment dedup still
+# prevents duplicate comments.
+_retry_backoff = {}   # seen-key -> [skips_remaining, next_delay, pr_sha]
+
+
+def _backoff_should_skip(sk, pr_sha) -> bool:
+    """True if this PR should be skipped this iteration (consumes one skip)."""
+    with _seen_lock:
+        bo = _retry_backoff.get(sk)
+        if not bo:
+            return False
+        if bo[2] != pr_sha:            # new push: retry now, reset escalation
+            del _retry_backoff[sk]
+            return False
+        if bo[0] > 0:
+            bo[0] -= 1
+            return True
+        return False
+
+
+def _backoff_register_transient(sk, pr_sha) -> int:
+    """Record a transient failure; returns the delay (iterations) applied."""
+    with _seen_lock:
+        bo = _retry_backoff.get(sk)
+        delay = bo[1] if (bo and bo[2] == pr_sha) else 1
+        _retry_backoff[sk] = [delay, min(delay * 2, 8), pr_sha]
+        return delay
+
+
+def _backoff_clear(sk):
+    with _seen_lock:
+        _retry_backoff.pop(sk, None)
+
+
+# COPS-2546: read-at-sha caching for every fetch that is not a helm value file.
+# The v2.13.2/v2.13.3 additions (identity checks, cohort guard, identity-move
+# augmenter) called _bb_fetch_status directly, so every poll cycle re-fetched
+# files that cannot change (content at a git sha is immutable), multiplied by
+# every open PR and every retry. Combined with the retry-until-determinate loop
+# this exhausted the Bitbucket API budget live on 2026-07-29: 1449s iterations
+# and acme-config-dev PR 6938 stuck INPROGRESS for hours.
+#
+# This deliberately REUSES _vf_cache instead of adding a second dict:
+#   - _vf_cache is already bounded by _bound_vf_cache() once per iteration, so a
+#     long-lived pod cannot grow it without limit. A private cache here would
+#     have shipped an unbounded leak in a pod that runs for weeks.
+#   - the paths overlap heavily (the new-env ancestor chain reads the very same
+#     config.yaml files _fetch_value_files reads), so sharing turns those into
+#     cross-hits rather than duplicate calls.
+#   - one singleflight map means concurrent duplicates dedupe across both paths.
+#
+# Storage contract is _fetch_value_files': content for BB_OK, None for
+# BB_NOT_FOUND, and nothing at all for BB_ERROR, because a transient failure
+# must never be cached as a fact. Status is therefore derivable on read.
+def _bb_fetch_cached(filepath, sha, repo=None):
+    """_bb_fetch_status with (sha, path) caching and singleflight.
+
+    Returns the same (content, status) tuple, so callers keep the
+    BB_OK / BB_NOT_FOUND / BB_ERROR distinction they already branch on.
+
+    `repo` is forwarded only when set. Passing repo=None is identical to
+    omitting it (that is the wrapped function's own default), and omitting it
+    keeps this a true drop-in at every existing call shape rather than
+    silently changing the arity every caller and test double sees.
+    """
+    _kw = {"repo": repo} if repo else {}
+    clean = posixpath.normpath(str(filepath).replace("$config/", "").lstrip("/"))
+    key = (sha, clean)
+    with _vf_cache_lock:
+        if key in _vf_cache:
+            c = _vf_cache[key]
+            return c, (BB_NOT_FOUND if c is None else BB_OK)
+        if key in _vf_inflight:
+            evt, fetcher = _vf_inflight[key], False
+        else:
+            evt = threading.Event()
+            _vf_inflight[key] = evt
+            fetcher = True
+    if not fetcher:
+        evt.wait(timeout=30)
+        with _vf_cache_lock:
+            if key in _vf_cache:
+                c = _vf_cache[key]
+                return c, (BB_NOT_FOUND if c is None else BB_OK)
+        # The fetcher timed out or hit a transient error (never cached). Do the
+        # call ourselves rather than inventing an answer from an empty cache.
+        return _bb_fetch_status(filepath, sha, **_kw)
+    try:
+        content, status = _bb_fetch_status(filepath, sha, **_kw)
+        if status in (BB_OK, BB_NOT_FOUND):
+            with _vf_cache_lock:
+                _vf_cache[key] = content
+        return content, status
+    finally:
+        with _vf_inflight_lock:
+            _vf_inflight.pop(key, None)
+        evt.set()
+
 # Upper bound on cached value files so a long-lived pod cannot grow without limit
 # (each open PR adds ~7 base-sha + ~7 head-sha entries). When exceeded we drop the
 # oldest-inserted half. dict preserves insertion order, so the first keys are oldest.
@@ -2850,7 +2961,7 @@ def _detect_wiped_definitions(changed_files: list, sha: str, repo=None) -> list:
     for f in changed_files:
         if not f.endswith(_VALUE_FILE_SUFFIXES):
             continue
-        body, status = _bb_fetch_status(f, sha, repo=repo)
+        body, status = _bb_fetch_cached(f, sha, repo=repo)
         if status != BB_OK or body is None:
             continue
         if _values_wipes_definitions(body):
@@ -2952,7 +3063,7 @@ def _detect_new_env_candidates(changed_files: list, path_map: dict, renames: dic
             if not cf.endswith("config.yaml"):
                 continue
             try:
-                content, _st = _bb_fetch_status(cf, pr_sha, repo=repo)
+                content, _st = _bb_fetch_cached(cf, pr_sha, repo=repo)
             except Exception as e:
                 debug(f"new-env identity fetch failed for {cf}: {e}; "
                       f"keeping candidate")
@@ -3110,7 +3221,7 @@ def _evaluate_new_envs(new_env_candidates: list, pr_sha: str) -> tuple:
         env_dir = env_info.get("env_dir", "")
         if not env_dir.startswith("gcp/aec/") and "/" in env_dir:
             cohort_path = env_dir.rsplit("/", 1)[0] + "/config.yaml"
-            _c, _cohort_st = _bb_fetch_status(cohort_path, pr_sha)
+            _c, _cohort_st = _bb_fetch_cached(cohort_path, pr_sha)
             # COPS-2545 (F4, live scenario 5): a cohort file that EXISTS but
             # cannot be parsed is the same contract violation as a missing
             # one: the ApplicationSet git generator cannot load it, the
@@ -3281,7 +3392,7 @@ def _render_new_env_diff(env_info: dict, pr_sha: str) -> tuple:
     env_name    = env_info["name"]
 
     # 1. Fetch config to get appspace.version
-    raw_config, status = _bb_fetch_status(config_file, pr_sha)
+    raw_config, status = _bb_fetch_cached(config_file, pr_sha)
     if status != BB_OK or not raw_config:
         return None, f"could not fetch {config_file} from Bitbucket", 0, None
     version = _extract_chart_version(raw_config)
@@ -3304,7 +3415,7 @@ def _render_new_env_diff(env_info: dict, pr_sha: str) -> tuple:
             probe = probe.rsplit("/", 1)[0]
             ancestors.append(f"{probe}/config.yaml")
         for anc in ancestors:
-            raw_anc, st_anc = _bb_fetch_status(anc, pr_sha)
+            raw_anc, st_anc = _bb_fetch_cached(anc, pr_sha)
             if st_anc == BB_OK and raw_anc:
                 v = _extract_chart_version(raw_anc)
                 if v:
@@ -3962,8 +4073,8 @@ def _rename_identity_confirmed(old_clean: str, new_clean: str,
     if cached is not None:
         return cached
     try:
-        old_content, _old_status = _bb_fetch_status(old_clean, main_sha)
-        new_content, _new_status = _bb_fetch_status(new_clean, pr_sha)
+        old_content, _old_status = _bb_fetch_cached(old_clean, main_sha)
+        new_content, _new_status = _bb_fetch_cached(new_clean, pr_sha)
     except Exception as e:
         debug(f"identity check fetch failed for {old_clean} -> {new_clean}: {e}")
         old_content = new_content = None
@@ -4126,17 +4237,17 @@ def _augment_renames_with_identity_moves(changed_files: list, renames: dict,
             if len(parts) < 5 or parts[-1] not in ("customer.yaml", "config.yaml"):
                 continue
             if f in path_map and f not in old_sides:
-                _c, st = _bb_fetch_status(f, pr_sha, repo=repo)
+                _c, st = _bb_fetch_cached(f, pr_sha, repo=repo)
                 if st == BB_NOT_FOUND:
                     deleted.append(f)
             elif f not in path_map and f not in new_sides:
-                _c, st = _bb_fetch_status(f, pr_sha, repo=repo)
+                _c, st = _bb_fetch_cached(f, pr_sha, repo=repo)
                 if st == BB_OK and _c:
                     added.append((f, _extract_appspace_identity(_c)))
         if not deleted or not added:
             return out
         for old in deleted:
-            old_content, st_old = _bb_fetch_status(old, main_sha, repo=repo)
+            old_content, st_old = _bb_fetch_cached(old, main_sha, repo=repo)
             if st_old != BB_OK or not old_content:
                 continue
             old_id = _extract_appspace_identity(old_content)
@@ -4281,7 +4392,7 @@ def _evaluate_env_decommissions(candidates: list, pr_sha: str, main_sha: str) ->
     """
     lines, envs_reported = [], []
     for c in candidates:
-        _content, status = _bb_fetch_status(c["identity_file"], pr_sha)
+        _content, status = _bb_fetch_cached(c["identity_file"], pr_sha)
         if status != BB_NOT_FOUND:
             continue  # not actually deleted — do not warn on a false positive
         versions = sorted({
@@ -5972,8 +6083,8 @@ def _summarize_input_changes(changed_files, pr_sha, base_sha, repo=None) -> list
     for path in (changed_files or [])[:8]:
         if not path.endswith((".yaml", ".yml")):
             continue
-        new_txt, st_new = _bb_fetch_status(path, pr_sha, repo=repo)
-        old_txt, st_old = _bb_fetch_status(path, base_sha, repo=repo)
+        new_txt, st_new = _bb_fetch_cached(path, pr_sha, repo=repo)
+        old_txt, st_old = _bb_fetch_cached(path, base_sha, repo=repo)
         if st_new != BB_OK or st_old != BB_OK:
             continue  # added/deleted file: new-env / decommission territory
         try:
@@ -6372,6 +6483,14 @@ def process_pr(pr, path_map, base_sha="", repo=None):
         if not forced and _seen.get(sk) == (pr_sha, base_sha):
             print(f"    Skipping: SHA {pr_sha[:8]} (base {base_sha[:8] if base_sha else '?'}) already processed in this run")
             return
+
+    # COPS-2546: transient-failure backoff. Skips a growing number of
+    # iterations between retries of a PR whose last pass failed transiently,
+    # so a quota exhaustion cannot turn into a retry storm. A new push
+    # bypasses and resets it (handled inside the helper).
+    if not forced and _backoff_should_skip(sk, pr_sha):
+        print(f"    Skipping: transient-failure backoff active for SHA {pr_sha[:8]} (will retry)")
+        return
 
     # Cross-pod dedup: existing comment already covers this exact SHA
     existing_id, comment_sha, comment_raw = find_existing_comment(pr_id, repo=repo)
@@ -7033,6 +7152,13 @@ def process_pr(pr, path_map, base_sha="", repo=None):
             # spam the PR with repeated "not found" comments every 60s.
             with _seen_lock:
                 _seen[sk] = (pr_sha, base_sha)
+            _backoff_clear(sk)
+        else:
+            # COPS-2546: still unseen (so it retries), but with escalating
+            # spacing instead of every iteration.
+            delay = _backoff_register_transient(sk, pr_sha)
+            log(f"PR #{pr_id}: transient failure, backing off {delay} "
+                f"iteration(s) before the next retry")
         return outcome_counts
 
     except Exception as e:
