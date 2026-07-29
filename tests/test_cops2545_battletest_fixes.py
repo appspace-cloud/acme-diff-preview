@@ -202,3 +202,40 @@ def test_nil_pointer_error_gets_hint(monkeypatch):
     joined = "\n".join(lines)
     assert "microservices.definitions" in joined
     assert "image/version mapping" in joined
+
+
+# ── F2 regression from live PR 3811 (COPS-2546 verification) ────────────────
+#
+# The original F2 tests always had the cohort config.yaml absent at pr_sha, so
+# `added` only ever held the real environment and the one-to-one match was
+# trivially satisfied. In production the cohort file MUST exist (that is the
+# COPS-2544 contract), so it is also an added identity file. It declares no
+# customerName, _same_env_identity treats (None, None) as compatible with
+# anything, the match became ambiguous, and the pairing was silently dropped:
+# live PR 3811 still reported a decommission for a pure move.
+
+def test_move_still_pairs_when_the_cohort_file_is_present(monkeypatch):
+    """The real shape: cohort config.yaml exists at pr_sha alongside the moved
+    identity file. Only files that declare an identity may compete for the
+    pairing."""
+    _fetch_factory(monkeypatch,
+                   files_main={OLD_ENV: OLD_CONTENT},
+                   files_pr={NEW_ENV: NEW_CONTENT,
+                             COHORT: "---\n# placeholder, declares no identity\n"})
+    renames = m._augment_renames_with_identity_moves(
+        [OLD_ENV, NEW_ENV, COHORT], {}, PATH_MAP, MAIN_SHA, PR_SHA,
+        repo="acme-config-prod")
+    assert renames == {OLD_ENV: NEW_ENV}
+
+
+def test_identityless_files_never_compete_for_a_pairing(monkeypatch):
+    """Several identity-less files present must not make the match ambiguous."""
+    other_cohort = "gcp/prod/private-cloud/gb1-b/hardcoded/migration/config.yaml"
+    _fetch_factory(monkeypatch,
+                   files_main={OLD_ENV: OLD_CONTENT},
+                   files_pr={NEW_ENV: NEW_CONTENT,
+                             COHORT: "---\n# no identity\n",
+                             other_cohort: "---\n# no identity either\n"})
+    renames = m._augment_renames_with_identity_moves(
+        [OLD_ENV, NEW_ENV, COHORT, other_cohort], {}, PATH_MAP, MAIN_SHA, PR_SHA)
+    assert renames == {OLD_ENV: NEW_ENV}
