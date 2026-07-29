@@ -569,7 +569,12 @@ def test_render_new_env_value_files_fetch_failure_and_fallback_list(monkeypatch)
     info = dict(ENV_INFO, all_yaml_files=[])  # forces the config-file fallback
     text, err, *_ = m._render_new_env_diff(info, "prsha")
     assert "could not fetch value files" in err
-    assert captured["files"] == [f"$config/{ENV_INFO['config_file']}"]
+    # COPS-2545 (F1): the value list now carries the full root-to-leaf
+    # ancestor chain before the env's own file; the leaf stays last so
+    # helm override order is preserved.
+    assert captured["files"][-1] == f"$config/{ENV_INFO['config_file']}"
+    assert captured["files"][0] == "$config/gcp/config.yaml"
+    assert all(f.endswith("/config.yaml") for f in captured["files"][:-1])
 
 
 def test_render_new_env_happy_path_counts_resources(helm_world, monkeypatch):

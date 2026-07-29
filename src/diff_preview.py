@@ -3111,6 +3111,33 @@ def _evaluate_new_envs(new_env_candidates: list, pr_sha: str) -> tuple:
         if not env_dir.startswith("gcp/aec/") and "/" in env_dir:
             cohort_path = env_dir.rsplit("/", 1)[0] + "/config.yaml"
             _c, _cohort_st = _bb_fetch_status(cohort_path, pr_sha)
+            # COPS-2545 (F4, live scenario 5): a cohort file that EXISTS but
+            # cannot be parsed is the same contract violation as a missing
+            # one: the ApplicationSet git generator cannot load it, the
+            # matrix yields zero results, and nothing deploys on merge. The
+            # old behavior tolerated it silently because the new-env render
+            # never fed the cohort to helm (F1). Block with the reason.
+            if _cohort_st == BB_OK and _c:
+                try:
+                    yaml.safe_load(_c)
+                except Exception as ye:
+                    reason = (
+                        f"the ApplicationSet generator loads `{cohort_path}` "
+                        f"next to every environment folder, and that file "
+                        f"cannot be parsed as YAML ({str(ye).splitlines()[0][:120]}). "
+                        f"The generator produces zero Applications for this "
+                        f"environment until the file is valid, so nothing "
+                        f"deploys on merge. Fix the YAML and push again to "
+                        f"unblock.")
+                    log(f"  new env {env_info['name']}: blocked - {reason}",
+                        "WARNING")
+                    new_env_sections.append({
+                        "name": env_info["name"], "version": "unknown",
+                        "files": env_info["all_yaml_files"], "n_res": 0,
+                        "kind_counts": None, "workloads": None,
+                        "error": reason, "blocked": True,
+                    })
+                    continue
             if _cohort_st == BB_NOT_FOUND:
                 reason = (
                     f"the ApplicationSet generator loads `{cohort_path}` "
@@ -3214,6 +3241,17 @@ def _evaluate_new_envs(new_env_candidates: list, pr_sha: str) -> tuple:
                         f"  \n\u26a0\ufe0f **This is a structural problem, not the "
                         f"usual first-deploy case — it must be fixed before merge:** "
                         f"{sec['error'][:160]}")
+                    # COPS-2545 (F3): the raw helm nil-pointer on
+                    # $microservice.image.* means a microservices.definitions
+                    # entry exists with no image mapping behind it. The raw
+                    # error names a template line, not the actual mistake.
+                    if ("nil pointer" in sec["error"]
+                            and "microservice" in sec["error"]):
+                        lines.append(
+                            "  \n\U0001f4a1 *Hint: a `microservices.definitions` "
+                            "entry in this PR has no image/version mapping at "
+                            "any level (ring config or cicd-versions.yaml). "
+                            "Every definitions key needs one.*")
                 elif "helm template failed" not in sec["error"]:
                     lines.append(f"  \n*Technical detail: {sec['error'][:120]}*")
         lines.append("")
@@ -3312,13 +3350,31 @@ def _render_new_env_diff(env_info: dict, pr_sha: str) -> tuple:
     if not chart_path:
         return None, "chart pull returned None (registry login may have failed)", 0, version
 
-    # 4. Gather value files from the new env dir (files found in changed_files)
-    value_files_prefixed = sorted(set(
+    # 4. Gather value files: the FULL root-to-leaf ancestor chain plus the
+    # env's own files, mirroring the exact cascade a live Application uses
+    # (verified against pv-dkv-a-ms.spec.sources[0].helm.valueFiles).
+    # COPS-2545 (F1): before this fix only the env's own changed files were
+    # passed to helm, so every new environment failed on values defined at
+    # upper levels (cloudShortName lives in gcp/config.yaml), the failure
+    # matched the allowed first-deploy shape, and the preview silently
+    # degraded to boilerplate. It also meant a broken ancestor added in the
+    # same PR was never even parsed. Missing levels skip themselves inside
+    # _fetch_value_files, mirroring ignoreMissingValueFiles.
+    ancestor_levels = []
+    probe = env_info["env_dir"]
+    while "/" in probe:
+        probe = probe.rsplit("/", 1)[0]
+        ancestor_levels.append(f"$config/{probe}/config.yaml")
+    ancestor_levels.reverse()  # root first, most specific last
+    env_own = sorted(set(
         f"$config/{f}" for f in env_info["all_yaml_files"]
         if f.endswith((".yaml", ".yml"))
     ))
-    if not value_files_prefixed:
-        value_files_prefixed = [f"$config/{config_file}"]
+    if not env_own:
+        env_own = [f"$config/{config_file}"]
+    # dict.fromkeys keeps first occurrence: ancestors first, env files last
+    # (helm: later files win, so the env overrides its ancestors).
+    value_files_prefixed = list(dict.fromkeys(ancestor_levels + env_own))
 
     # 5. Fetch value file contents
     vals = _fetch_value_files(value_files_prefixed, pr_sha)
@@ -4033,6 +4089,69 @@ def _detect_env_move(value_files: list, renames: dict, main_sha: str = None, pr_
             continue
         return old_dir, new_dir
     return None
+
+
+def _augment_renames_with_identity_moves(changed_files: list, renames: dict,
+                                          path_map: dict, main_sha: str,
+                                          pr_sha: str, repo: str = None) -> dict:
+    """Synthesize rename pairings from declared identity (COPS-2545, F2).
+
+    Bitbucket pairs renames by content similarity. A real folder move whose
+    identity file is rewritten on the way (the hardcoded/migration flatten:
+    12 -> 497 lines on live PR #3796) falls below the similarity threshold,
+    arrives as a bare delete + add, and everything downstream misfires: the
+    decommission detector shouts, the new-env path evaluates a duplicate,
+    and the reviewer reads that the same environment is both going away and
+    brand new. The identity the files DECLARE is the signal similarity
+    cannot see, and it is the same signal v2.5.15 already trusts to verify
+    the pairings Bitbucket does produce.
+
+    For every identity file (customer.yaml/config.yaml) that belongs to an
+    existing app (path_map), is not already a rename old-side, and is
+    genuinely deleted at pr_sha (BB_NOT_FOUND), extract its identity at
+    main_sha and compare against every added identity file at env depth
+    that is not already a rename new-side. Exactly one match on both sides
+    -> synthesize the pairing (the v2.5.15 verification downstream will
+    re-confirm it from the same cached fetches). Ambiguity, a mismatch, or
+    any fetch error leaves the pairing alone: the conservative outcome is
+    the existing loud decommission warning, never a silent guess.
+    """
+    out = dict(renames or {})
+    try:
+        old_sides = set(out.keys())
+        new_sides = set(out.values())
+        deleted, added = [], []
+        for f in changed_files:
+            parts = f.split("/")
+            if len(parts) < 5 or parts[-1] not in ("customer.yaml", "config.yaml"):
+                continue
+            if f in path_map and f not in old_sides:
+                _c, st = _bb_fetch_status(f, pr_sha, repo=repo)
+                if st == BB_NOT_FOUND:
+                    deleted.append(f)
+            elif f not in path_map and f not in new_sides:
+                _c, st = _bb_fetch_status(f, pr_sha, repo=repo)
+                if st == BB_OK and _c:
+                    added.append((f, _extract_appspace_identity(_c)))
+        if not deleted or not added:
+            return out
+        for old in deleted:
+            old_content, st_old = _bb_fetch_status(old, main_sha, repo=repo)
+            if st_old != BB_OK or not old_content:
+                continue
+            old_id = _extract_appspace_identity(old_content)
+            if old_id[0] is None:
+                continue
+            matches = [nf for nf, nid in added if _same_env_identity(old_id, nid)]
+            if len(matches) == 1:
+                out[old] = matches[0]
+                log(f"identity move detected: {old} -> {matches[0]} "
+                    f"(Bitbucket did not pair the rename; matched by "
+                    f"declared identity {old_id})")
+    except Exception as e:
+        debug(f"identity move augmentation skipped: {e}")
+        return dict(renames or {})
+    return out
 
 
 def _detect_env_decommission_candidates(changed_files: list, path_map: dict, renames: dict,
@@ -6393,6 +6512,11 @@ def process_pr(pr, path_map, base_sha="", repo=None):
         # dropping a bundled new environment from evaluation entirely —
         # confirmed live with both a broken (#6646) and a fully valid
         # (#6652) new environment.
+        # COPS-2545 (F2): synthesize rename pairings from declared identity
+        # BEFORE any consumer runs, so the folder-move machinery, the
+        # new-env exclusion and the decommission detector all see the move.
+        renames = _augment_renames_with_identity_moves(
+            changed, renames, path_map, base_sha, pr_sha, repo=repo)
         new_env_candidates = _detect_new_env_candidates(changed, path_map, renames, pr_sha=pr_sha, repo=repo)
         if new_env_candidates:
             log(f"PR #{pr_id}: {len(new_env_candidates)} new env candidate(s): "
