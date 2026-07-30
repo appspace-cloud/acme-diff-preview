@@ -1883,6 +1883,224 @@ BB_NOT_FOUND = "not_found"   # 404 — file genuinely absent at this sha (cachea
 BB_ERROR     = "error"       # transient (429/5xx/network) after retries (NOT cacheable)
 
 
+# ── Local git mirrors (COPS-2564) ──────────────────────────────────────────
+#
+# Reading config files over the Bitbucket REST API costs one HTTPS call per
+# file per sha. acme-config-prod alone has 391 value files, so a PR that
+# touches a root file needs ~780 calls, and the (sha, path) cache goes cold
+# every time either side moves -- which is constantly, since any merge to main
+# moves the base sha for every open PR. Add three repos polled in parallel and
+# 429-driven retries, and the shared token (COPS-2543) runs out.
+#
+# git already solves this: one fetch brings every file at every commit.
+# Measured on the real prod repo: fetch 1.8s, then reading all 391 files at a
+# commit with cat-file takes 0.13s.
+#
+# This sits BEHIND _bb_fetch_status, the seam every reader already uses, and
+# returns the same (content, status) contract. Three outcomes, and the
+# difference between the last two is the whole correctness argument:
+#   (content, BB_OK)        file read from the mirror
+#   (None, BB_NOT_FOUND)    sha IS in the mirror and the path is not in that
+#                           tree -- a fact, exactly like the API's 404, safe
+#                           to cache
+#   None                    MISS: we cannot answer (sha unknown, git missing,
+#                           mirror broken). The caller falls back to the API.
+#                           Never report this as NOT_FOUND: caching that lie
+#                           would render an environment as empty.
+GIT_BIN            = os.environ.get("GIT_BIN", "git")
+GIT_MIRROR_ENABLED = os.environ.get("GIT_MIRROR_ENABLED", "1") not in ("0", "false", "False")
+# Under /tmp because the container runs with readOnlyRootFilesystem and /tmp
+# is the emptyDir the chart already mounts.
+GIT_MIRROR_DIR     = os.environ.get("GIT_MIRROR_DIR", "/tmp/config-mirrors")
+GIT_MIRROR_TIMEOUT = _env_int("GIT_MIRROR_TIMEOUT", 180)
+# git over HTTPS does NOT accept the same credential shape as the REST API.
+# Verified live (2026-07-30): Basic auth with the account email and the
+# Atlassian API token works for api.bitbucket.org and is rejected by
+# bitbucket.org git, which then asks for a username and, with prompts
+# disabled, fails with "could not read Username". Bitbucket expects the fixed
+# username "x-bitbucket-api-token-auth" with an API token. Overridable,
+# because a classic app password wants the real Bitbucket username instead.
+GIT_HTTP_USER      = os.environ.get("GIT_HTTP_USER", "x-bitbucket-api-token-auth")
+
+
+def _git_auth_header(user: str = None) -> str:
+    return "Basic " + _base64.b64encode(
+        f"{user or GIT_HTTP_USER}:{BB_TOKEN}".encode()).decode()
+
+
+# The two credential shapes Bitbucket accepts over git HTTPS, tried in order:
+# an Atlassian API token (the fixed token-auth username, what this pod has
+# today) and a classic app password (the account's own username). Trying both
+# costs one extra call once per pod, and without it a credential swap would
+# silently send every read back to the REST API forever, which is exactly the
+# problem this feature exists to remove.
+_GIT_USER_CANDIDATES = [GIT_HTTP_USER, BB_USER]
+_GIT_AUTH_HEADER   = _git_auth_header()
+
+_mirror_lock       = threading.Lock()      # serialises clone/fetch per repo
+_mirror_ready      = {}                    # repo -> True once cloned
+_mirror_sha_seen   = {}                    # (repo, sha) -> bool, presence cache
+_mirror_disabled   = False                 # set after a hard failure
+_git_credential_resolved = False           # probe runs once per pod
+
+
+def _mirror_state_reset():
+    """Forget clone/presence state. Used by tests and after a hard failure."""
+    global _mirror_disabled, _git_credential_resolved
+    with _mirror_lock:
+        _mirror_ready.clear()
+        _mirror_sha_seen.clear()
+        _mirror_disabled = False
+        _git_credential_resolved = False
+
+
+def _git_env(auth_header: str = None) -> dict:
+    """Environment for every git call.
+
+    The Bitbucket credential travels as an http.extraHeader supplied through
+    GIT_CONFIG_* env vars, never on the command line: argv is visible in the
+    process list and gets echoed back in error messages. HOME is inherited as-is:
+    the chart already sets HOME=/tmp for argocd's own config, which is the same
+    writable emptyDir the mirrors live under, so git's config has somewhere to
+    go without this needing its own override.
+    """
+    env = dict(os.environ)
+    env.update({
+        "GIT_TERMINAL_PROMPT": "0",       # never block waiting for a password
+        "GIT_CONFIG_NOSYSTEM": "1",
+        "GIT_CONFIG_COUNT": "1",
+        "GIT_CONFIG_KEY_0": "http.extraHeader",
+        "GIT_CONFIG_VALUE_0": f"Authorization: {auth_header or _GIT_AUTH_HEADER}",
+    })
+    return env
+
+
+def _git_run(args, cwd=None, timeout=None, auth_header=None):
+    """Run git and return the CompletedProcess, or None if it could not run."""
+    try:
+        return subprocess.run([GIT_BIN, *args], cwd=cwd, capture_output=True,
+                              text=True, env=_git_env(auth_header),
+                              timeout=timeout or GIT_MIRROR_TIMEOUT)
+    except Exception as e:
+        debug(f"[mirror] git {' '.join(args[:2])} failed to run: {e}")
+        return None
+
+
+def _resolve_git_credential(probe_url: str):
+    """Pick the credential shape that this Bitbucket account actually accepts.
+
+    Done once per pod with `git ls-remote`, which is cheap and, unlike a
+    clone, fails fast. Auth failures over git HTTPS surface as "could not read
+    Username" rather than a clear 401, so probing here turns a silent
+    permanent fallback into one clear log line at startup.
+    """
+    global _GIT_AUTH_HEADER, _git_credential_resolved
+    if _git_credential_resolved:
+        return
+    for user in _GIT_USER_CANDIDATES:
+        if not user:
+            continue
+        header = _git_auth_header(user)
+        r = _git_run(["ls-remote", "--quiet", probe_url, "HEAD"],
+                     timeout=60, auth_header=header)
+        if r is not None and r.returncode == 0:
+            _GIT_AUTH_HEADER = header
+            _git_credential_resolved = True
+            log(f"[mirror] git credential accepted for user {user!r}")
+            return
+    log("[mirror] no git credential shape was accepted -- every read will "
+        "fall back to the Bitbucket API", "WARNING")
+    _git_credential_resolved = True
+
+
+def _mirror_path(repo: str) -> str:
+    return os.path.join(GIT_MIRROR_DIR, f"{repo}.git")
+
+
+def mirror_sync(repo: str):
+    """Clone the mirror once, then fetch it. Called once per repo per
+    iteration. Never raises: a mirror problem must slow nothing down except
+    the mirror itself, with the API still serving every read."""
+    if not GIT_MIRROR_ENABLED or _mirror_disabled:
+        return
+    path = _mirror_path(repo)
+    with _mirror_lock:
+        try:
+            os.makedirs(GIT_MIRROR_DIR, exist_ok=True)
+        except Exception as e:
+            log(f"[mirror] cannot create {GIT_MIRROR_DIR}: {e} -- "
+                f"falling back to the Bitbucket API", "WARNING")
+            return
+        t0 = time.monotonic()
+        if not os.path.isdir(os.path.join(path, "objects")):
+            url = f"https://bitbucket.org/{BB_WORKSPACE}/{repo}.git"
+            _resolve_git_credential(url)
+            r = _git_run(["clone", "--mirror", "--quiet", url, path])
+            if r is None or r.returncode != 0:
+                detail = (r.stderr or "")[:200] if r else "git not runnable"
+                log(f"[mirror] clone of {repo} failed: {detail} -- "
+                    f"falling back to the Bitbucket API", "WARNING")
+                _mirror_ready[repo] = False
+                return
+            _mirror_ready[repo] = True
+            log(f"[mirror] cloned {repo} in {time.monotonic() - t0:.1f}s")
+        r = _git_run(["--git-dir", path, "fetch", "--prune", "--quiet", "origin"])
+        if r is None or r.returncode != 0:
+            detail = (r.stderr or "")[:200] if r else "git not runnable"
+            log(f"[mirror] fetch of {repo} failed: {detail} -- serving what "
+                f"the mirror already has, API covers the rest", "WARNING")
+            return
+        _mirror_ready[repo] = True
+        # Shas that were absent may exist now, so the presence cache for this
+        # repo has to go. Keeping it would pin a miss for the whole pod life.
+        for k in [k for k in _mirror_sha_seen if k[0] == repo]:
+            _mirror_sha_seen.pop(k, None)
+        debug(f"[mirror] {repo} fetched in {time.monotonic() - t0:.1f}s")
+
+
+def _mirror_has_sha(repo: str, sha: str) -> bool:
+    """Is this commit in the mirror? Cached per (repo, sha): without it every
+    file read pays a second subprocess, doubling the cost of the thing this
+    is meant to make cheap."""
+    key = (repo, sha)
+    with _mirror_lock:
+        if key in _mirror_sha_seen:
+            return _mirror_sha_seen[key]
+    r = _git_run(["--git-dir", _mirror_path(repo), "cat-file", "-e",
+                  f"{sha}^{{commit}}"], timeout=30)
+    ok = bool(r) and r.returncode == 0
+    with _mirror_lock:
+        _mirror_sha_seen[key] = ok
+    return ok
+
+
+def _git_read_file(repo: str, sha: str, filepath: str):
+    """Read one file at one commit from the mirror.
+
+    Returns (content, BB_OK), (None, BB_NOT_FOUND), or None for a miss.
+    """
+    if not GIT_MIRROR_ENABLED or _mirror_disabled or not repo or not sha:
+        return None
+    path = _mirror_path(repo)
+    if not os.path.isdir(os.path.join(path, "objects")):
+        return None
+    if not _mirror_has_sha(repo, sha):
+        return None
+    # Same normalisation as _bb_fetch_cached, so both readers agree on what
+    # the same file is.
+    clean = posixpath.normpath(str(filepath).replace("$config/", "").lstrip("/"))
+    r = _git_run(["--git-dir", path, "cat-file", "blob", f"{sha}:{clean}"],
+                 timeout=30)
+    if r is None:
+        return None
+    if r.returncode != 0:
+        # The commit is present, so "not in this tree" is a fact, the same
+        # answer the API gives with a 404.
+        return None, BB_NOT_FOUND
+    _count_bb_call("mirror_reads")
+    return r.stdout, BB_OK
+
+
 def _bb_fetch_status(filepath, sha, repo=None):
     """Fetch a raw file from a config repo at a commit SHA.
 
@@ -1900,8 +2118,14 @@ def _bb_fetch_status(filepath, sha, repo=None):
     mass PR (one call per value file), so it gains the most from
     connection reuse.
     """
+    _repo = repo or _repo_for_sha(sha) or BB_REPO
+    # COPS-2564: the local mirror answers first. A miss (None) means it cannot
+    # answer, not that the file is absent, so the API call below still runs.
+    _hit = _git_read_file(_repo, sha, filepath)
+    if _hit is not None:
+        return _hit
     url = (f"https://api.bitbucket.org/2.0/repositories/"
-           f"{BB_WORKSPACE}/{repo or _repo_for_sha(sha) or BB_REPO}/src/{sha}/{filepath}")
+           f"{BB_WORKSPACE}/{_repo}/src/{sha}/{filepath}")
     req = urllib.request.Request(url, headers={"Authorization": _BB_AUTH_HEADER})
     for attempt in range(3):
         # v2.13.0 (COPS-2543): brake with the whole pool before spending an
@@ -3000,7 +3224,8 @@ _bb_api_sem = threading.Semaphore(BB_API_CONCURRENCY)
 # cache hit is deliberately NOT counted and the number keeps meaning "calls
 # we made". Plain ints under a lock: += on a shared int is not atomic under
 # 16 diff workers, and an undercount would defeat the purpose.
-_bb_calls = {"file_fetches": 0, "rest_calls": 0, "rate_limited": 0}
+_bb_calls = {"file_fetches": 0, "rest_calls": 0, "rate_limited": 0,
+             "mirror_reads": 0}
 _bb_calls_lock = threading.Lock()
 
 
@@ -7867,6 +8092,10 @@ def main_iteration():
             base_sha = main_info["target"]["hash"]
             _register_sha_repo(base_sha, repo)
             log(f"[{repo}] Base SHA (main): {base_sha[:8]}")
+            # COPS-2564: one fetch per repo per iteration replaces hundreds of
+            # per-file API calls. Inside this try on purpose: a git problem
+            # must not starve the other repos, and reads fall back anyway.
+            mirror_sync(repo)
             # Invalidate the main-side render cache whenever THIS repo's main
             # moves. _main_render_sha became a per-repo dict; the cache clear
             # stays whole-cache (same correctness as before, slightly
@@ -7950,7 +8179,9 @@ def main_iteration():
         _diff_stats["last_iteration_bb_429s"] = bbs["rate_limited"]
     bb_note = (f" | bitbucket: {bb_total} call(s) "
                f"({bbs['file_fetches']} file, {bbs['rest_calls']} rest)"
-               + (f", {bbs['rate_limited']} rate limited" if bbs["rate_limited"] else ""))
+               + (f", {bbs['rate_limited']} rate limited" if bbs["rate_limited"] else "")
+               + (f" | mirror served {bbs['mirror_reads']} file read(s)"
+                  if bbs["mirror_reads"] else ""))
     if totals:
         rollup = ", ".join(f"{k}={v}" for k, v in sorted(totals.items()))
         unhealthy = totals.get(OUT_INDETERMINATE, 0) + totals.get(OUT_ERROR, 0)
