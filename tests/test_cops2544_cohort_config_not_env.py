@@ -167,8 +167,15 @@ def test_missing_cohort_config_blocks_new_env(monkeypatch):
 def test_cohort_present_renders_normally(monkeypatch):
     calls = {"render": 0}
     def fake_fetch(clean, sha, repo=None):
-        assert clean == COHORT_FILE
-        return "---\n", m.BB_OK
+        # COPS-2552: _evaluate_new_envs also resolves prefix/customerName/
+        # suffix (GSA-name-length guard) before rendering, which fetches
+        # the ancestor chain in addition to the cohort file. Only the
+        # cohort path needs real content here; anything else legitimately
+        # 404s (mirrors ignoreMissingValueFiles) and the name resolves to
+        # "unresolved" -- not this test's concern.
+        if clean == COHORT_FILE:
+            return "---\n", m.BB_OK
+        return None, m.BB_NOT_FOUND
     def fake_render(info, sha):
         calls["render"] += 1
         return EXPECTED_GREEN_RENDER
@@ -183,13 +190,25 @@ def test_aec_path_skips_cohort_check(monkeypatch):
     aec_dir = "gcp/aec/private-cloud/gb1-b/pv-aec-x-a"
     cand = {"name": "pv-aec-x-a", "config_file": f"{aec_dir}/customer.yaml",
             "env_dir": aec_dir, "all_yaml_files": []}
+    # COPS-2552 note: the immediate parent's config.yaml is BOTH what the
+    # (skipped-for-aec) cohort check would have fetched AND a legitimate
+    # ancestor level the GSA-name guard fetches for every candidate,
+    # aec included (the live incident this ticket fixes was itself an aec
+    # environment, so that guard must run there too). A specific-path
+    # assertion can no longer distinguish "cohort check ran" from "GSA
+    # check's ancestor walk ran"; what actually matters, and what this test
+    # verifies, is the OUTCOME: an aec candidate is never blocked as
+    # "cohort missing" and still renders, regardless of which paths any
+    # guard along the way happens to touch.
     def fake_fetch(clean, sha, repo=None):
-        raise AssertionError(f"aec path must not trigger a cohort fetch: {clean}")
+        return None, m.BB_NOT_FOUND
     monkeypatch.setattr(m, "_bb_fetch_status", fake_fetch)
     monkeypatch.setattr(m, "_render_new_env_diff",
                         lambda info, sha: EXPECTED_GREEN_RENDER)
     lines, structural, total = m._evaluate_new_envs([cand], PR_SHA)
     assert structural == []
+    assert not any("cohort" in l.lower() and "does not exist" in l.lower()
+                   for l in lines), "aec candidate must never get the cohort-missing block"
 
 
 def test_transient_cohort_fetch_error_does_not_block(monkeypatch):

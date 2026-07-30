@@ -1824,6 +1824,7 @@ REASON_UNEXPECTED    = "unexpected_error"
 # indistinguishable from "no version bump" and produced a green "no changes"
 # comment, hiding the rejection from reviewers (v2.4.9).
 REASON_INVALID_VERSION = "invalid_version"
+REASON_NAME_TOO_LONG   = "name_too_long"      # COPS-2552: derived GCP service account name rejected
 # `helm template` failed specifically because a value file is not parseable
 # YAML (as opposed to a valid-but-incomplete chart render). Distinct hint so
 # the author knows to fix their YAML syntax rather than chart values (v2.4.9).
@@ -1838,7 +1839,14 @@ RETRYABLE_REASONS = {REASON_OCI_PULL, REASON_METADATA, REASON_TIMEOUT, REASON_RE
 # Reasons that permanently block the PR (the deployer would fail the same way).
 PERMANENT_REASONS = {REASON_OCI_NOT_FOUND, REASON_INVALID_VERSION,
                      REASON_INVALID_YAML, REASON_MISSING_REQUIRED,
-                     REASON_SCHEMA_INVALID}
+                     REASON_SCHEMA_INVALID, REASON_NAME_TOO_LONG}
+# COPS-2552: a name that violates GCP's IAMServiceAccount id rules is exactly
+# as deterministic as an invalid chart version or invalid YAML -- it cannot
+# resolve on retry, only on a new commit that shortens the name. Helm renders
+# it fine and ArgoCD applies it successfully (both only see a valid k8s
+# object name), so this is the one class of failure no render- or sync-based
+# check could ever catch; only an explicit assertion on the resolved values
+# does. See _check_gsa_name.
 # COPS-2554: MISSING_REQUIRED and SCHEMA_INVALID joined the permanent set
 # alongside invalid_yaml/invalid_version. All four are deterministic given
 # the same pr_sha -- an environment missing a required value, or violating
@@ -1857,6 +1865,7 @@ _REASON_HINTS = {
     REASON_RENDER:        "helm template failed to render the chart with these values",
     REASON_MISSING_REQUIRED: "a value the chart requires is missing from this environment's hierarchy",
     REASON_SCHEMA_INVALID: "this environment's values fail the chart's values.schema.json validation",
+    REASON_NAME_TOO_LONG: "the derived GCP service account name violates a hard Google IAM limit",
     REASON_TIMEOUT:       f"a diff step exceeded {DIFF_TIMEOUT}s",
     REASON_UNEXPECTED:    "an unexpected error occurred while computing the diff",
     REASON_INVALID_VERSION: "appspace.version was rejected as unsafe/invalid — not a valid OCI tag",
@@ -3313,6 +3322,29 @@ def _evaluate_new_envs(new_env_candidates: list, pr_sha: str) -> tuple:
                     "error": reason, "blocked": True,
                 })
                 continue
+
+        # COPS-2552 (live incident, Derek 2026-07-29): a derived GCP service
+        # account name over 30 chars renders and syncs FINE (valid YAML,
+        # valid k8s object name) and only fails later inside the Config
+        # Connector reconcile loop against the GCP IAM API -- ArgoCD reports
+        # Synced, health Degraded, and the real cause (IAMServiceAccount
+        # UpdateFailed) is invisible unless someone opens `kubectl describe`
+        # on that specific object. Check it here, before the chart render,
+        # using the identical ancestor-chain _render_new_env_diff itself
+        # renders with, so this can never disagree with what actually ships.
+        _chain, _chain_vals = _new_env_value_chain(env_info, pr_sha)
+        _names = _effective_derived_names(_chain, _chain_vals)
+        _gsa_status, _gsa_detail = _check_gsa_name(_names)
+        if _gsa_status == "invalid":
+            log(f"  new env {env_info['name']}: blocked - {_gsa_detail}",
+                "WARNING")
+            new_env_sections.append({
+                "name": env_info["name"], "version": "unknown",
+                "files": env_info["all_yaml_files"], "n_res": 0,
+                "kind_counts": None, "workloads": None,
+                "error": _gsa_detail, "blocked": True,
+            })
+            continue
         render_result = _render_new_env_diff(env_info, pr_sha)
         # Returns (rendered_manifest, error [, n_res [, version]])
         rendered   = render_result[0]
@@ -3423,6 +3455,43 @@ def _evaluate_new_envs(new_env_candidates: list, pr_sha: str) -> tuple:
     return lines, structural_envs, total_new
 
 
+def _new_env_value_chain(env_info: dict, pr_sha: str, repo: str = None) -> tuple:
+    """Build and fetch the value-file chain for a new-environment candidate:
+    every ancestor config.yaml from the repo root down to env_dir's parent,
+    plus the environment's own added files, root-to-leaf -- the exact
+    cascade a live Application uses (COPS-2545 F1, verified against
+    pv-dkv-a-ms.spec.sources[0].helm.valueFiles). Missing ancestor levels
+    are skipped, mirroring ignoreMissingValueFiles.
+
+    Extracted out of _render_new_env_diff (COPS-2552) so the GSA-name-length
+    guard in _evaluate_new_envs can resolve prefix/customerName/suffix from
+    the identical chain the chart render itself will use, instead of a
+    second, independently-maintained copy of the same ancestor-walk logic
+    silently drifting from this one over time.
+
+    Returns (ordered_value_files, vals) -- "$config/"-prefixed paths and
+    their fetched content, the same shapes _effective_chart_version and
+    _effective_derived_names expect.
+    """
+    ancestor_levels = []
+    probe = env_info["env_dir"]
+    while "/" in probe:
+        probe = probe.rsplit("/", 1)[0]
+        ancestor_levels.append(f"$config/{probe}/config.yaml")
+    ancestor_levels.reverse()  # root first, most specific last
+    env_own = sorted(set(
+        f"$config/{f}" for f in env_info["all_yaml_files"]
+        if f.endswith((".yaml", ".yml"))
+    ))
+    if not env_own:
+        env_own = [f"$config/{env_info['config_file']}"]
+    # dict.fromkeys keeps first occurrence: ancestors first, env files last
+    # (helm: later files win, so the env overrides its ancestors).
+    ordered = list(dict.fromkeys(ancestor_levels + env_own))
+    vals = _fetch_value_files(ordered, pr_sha)
+    return ordered, vals
+
+
 def _render_new_env_diff(env_info: dict, pr_sha: str) -> tuple:
     """Attempt to render a new environment's chart and return all resources as diff.
 
@@ -3505,34 +3574,9 @@ def _render_new_env_diff(env_info: dict, pr_sha: str) -> tuple:
     if not chart_path:
         return None, "chart pull returned None (registry login may have failed)", 0, version
 
-    # 4. Gather value files: the FULL root-to-leaf ancestor chain plus the
-    # env's own files, mirroring the exact cascade a live Application uses
-    # (verified against pv-dkv-a-ms.spec.sources[0].helm.valueFiles).
-    # COPS-2545 (F1): before this fix only the env's own changed files were
-    # passed to helm, so every new environment failed on values defined at
-    # upper levels (cloudShortName lives in gcp/config.yaml), the failure
-    # matched the allowed first-deploy shape, and the preview silently
-    # degraded to boilerplate. It also meant a broken ancestor added in the
-    # same PR was never even parsed. Missing levels skip themselves inside
-    # _fetch_value_files, mirroring ignoreMissingValueFiles.
-    ancestor_levels = []
-    probe = env_info["env_dir"]
-    while "/" in probe:
-        probe = probe.rsplit("/", 1)[0]
-        ancestor_levels.append(f"$config/{probe}/config.yaml")
-    ancestor_levels.reverse()  # root first, most specific last
-    env_own = sorted(set(
-        f"$config/{f}" for f in env_info["all_yaml_files"]
-        if f.endswith((".yaml", ".yml"))
-    ))
-    if not env_own:
-        env_own = [f"$config/{config_file}"]
-    # dict.fromkeys keeps first occurrence: ancestors first, env files last
-    # (helm: later files win, so the env overrides its ancestors).
-    value_files_prefixed = list(dict.fromkeys(ancestor_levels + env_own))
-
-    # 5. Fetch value file contents
-    vals = _fetch_value_files(value_files_prefixed, pr_sha)
+    # 4-5. Gather and fetch the value-file chain (COPS-2545 F1, extracted to
+    # _new_env_value_chain in COPS-2552 so the GSA-name guard shares it).
+    value_files_prefixed, vals = _new_env_value_chain(env_info, pr_sha)
     if not vals:
         return None, "could not fetch value files from Bitbucket", 0, version
 
@@ -4672,6 +4716,117 @@ def _effective_chart_version(ordered_value_files: list, vals: dict):
     return version
 
 
+# COPS-2552: GCP service account id rules. IAMServiceAccount account IDs
+# must be 6-30 chars, matching [a-z]([-a-z0-9]*[a-z0-9]). Verified live
+# (2026-07-29): pv-universalhollywood--aec1-a-es (32 chars) was rejected
+# with "does not have length between 6 and 30." while the control case
+# pv-pfizer--aec1-a-es (20 chars) came up clean, same chart, same pattern.
+_GSA_ID_MIN = 6
+_GSA_ID_MAX = 30
+_GSA_ID_RE  = re.compile(r"^[a-z]([-a-z0-9]*[a-z0-9])?$")
+
+# The four appspace.* keys _helpers.tpl's "appspace.fullcustomername" and the
+# GSA id are built from, dotted-path as PyYAML/_flatten_yaml renders them,
+# and the chart's own default for the one that is not always set.
+_DERIVED_NAME_KEYS = {
+    "prefix":        "appspace.prefix",
+    "customerName":  "appspace.customerName",
+    "suffix":        "appspace.suffix",
+    "esSuffix":      "appspace.externalSecretsTool.suffix",
+}
+_DERIVED_NAME_DEFAULTS = {"esSuffix": "es"}
+
+
+def _effective_derived_names(ordered_value_files: list, vals: dict) -> dict:
+    """Effective prefix/customerName/suffix/esSuffix across ordered value
+    files, root to leaf, LAST FILE WINS PER KEY -- true helm -f deep-merge
+    semantics (unlike _extract_chart_version_checked's own single-file
+    direct-child scan, this must read whichever file in the chain last sets
+    EACH key independently, since the three are essentially never all in
+    the same file: COPS-2552's own incident had prefix/suffix in a tier
+    config.yaml and customerName in customer.yaml).
+
+    Uses yaml.safe_load + _flatten_yaml per file (already the established
+    pattern for reading arbitrary declared keys, see
+    _summarize_input_changes) rather than a bespoke line-scanner, since the
+    correctness need here is a real recursive merge, not the OCI-tag-safety
+    scanning _extract_chart_version_checked does. A file missing from vals
+    (404, or unparseable YAML) is skipped, never fatal -- mirrors
+    ignoreMissingValueFiles.
+
+    Returns a dict with all four keys always present; unresolved ones are
+    None except esSuffix, which falls back to the chart's own real default
+    ("es") since an unset value still reaches GCP as "es" -- the whole point
+    of this check is what actually happens, not what was explicitly typed.
+    """
+    resolved = {}
+    for vf in ordered_value_files:
+        content = vals.get(vf)
+        if not content:
+            continue
+        try:
+            flat = _flatten_yaml(yaml.safe_load(content) or {})
+        except yaml.YAMLError:
+            continue
+        for key, dotted in _DERIVED_NAME_KEYS.items():
+            if dotted in flat and flat[dotted] is not None:
+                resolved[key] = str(flat[dotted])
+    return {k: resolved.get(k, _DERIVED_NAME_DEFAULTS.get(k)) for k in _DERIVED_NAME_KEYS}
+
+
+def _check_gsa_name(names: dict):
+    """Validate the derived GCP service account id against GCP's own rules.
+
+    Returns (status, detail):
+      "ok"         — the id is a valid GCP resource id. detail is None.
+      "unresolved" — prefix/customerName/suffix could not all be resolved
+                     from the value chain (this candidate/app does not
+                     apply). detail is None. Not the same as "invalid" --
+                     collapsing the two would let a resolution gap in OUR
+                     code look like a rejection of the ENVIRONMENT's name,
+                     the same false-negative/false-positive confusion FIX A
+                     (v2.4.9) already fixed once for appspace.version.
+      "invalid"    — the id violates a GCP rule. detail explains which one,
+                     the exact arithmetic, and the maximum customerName
+                     length for this prefix/suffix, for the PR comment.
+
+    GSA id = "{prefix}-{customerName}-{suffix}-{esSuffix}", the chart's own
+    appspace.fullcustomername (_helpers.tpl) with "-{esSuffix}" appended.
+    """
+    prefix, customer, suffix, es = (names.get("prefix"), names.get("customerName"),
+                                     names.get("suffix"), names.get("esSuffix"))
+    # is-None, not truthiness: an explicitly-blank value (e.g. esSuffix set
+    # to "" in config) is a REAL, resolved value that still reaches GCP and
+    # must be validated (it produces a trailing hyphen); only a value that
+    # was never found anywhere in the chain (None) means "unresolved".
+    if prefix is None or customer is None or suffix is None or es is None:
+        return "unresolved", None
+    gsa_id = f"{prefix}-{customer}-{suffix}-{es}"
+    length = len(gsa_id)
+    if length > _GSA_ID_MAX:
+        max_customer = _GSA_ID_MAX - (len(prefix) + len(suffix) + len(es) + 3)
+        return "invalid", (
+            f"Environment name too long for GCP. `{gsa_id}` is {length} "
+            f"characters, GCP service account IDs allow {_GSA_ID_MIN}-"
+            f"{_GSA_ID_MAX}. `appspace.customerName` must be at most "
+            f"{max_customer} characters given `prefix: {prefix}` and "
+            f"`suffix: {suffix}`. This is a hard Google limit, not an "
+            f"Appspace one, and it cannot be worked around in the chart "
+            f"without renaming the resource.")
+    if length < _GSA_ID_MIN:
+        return "invalid", (
+            f"Environment name too short for GCP. `{gsa_id}` is {length} "
+            f"characters, GCP service account IDs require at least "
+            f"{_GSA_ID_MIN}.")
+    if not _GSA_ID_RE.match(gsa_id):
+        return "invalid", (
+            f"Derived GCP service account id `{gsa_id}` is not a valid GCP "
+            f"resource id (must start with a lowercase letter, contain only "
+            f"lowercase letters/digits/hyphens, and not end with a hyphen). "
+            f"This is a hard Google limit, not an Appspace one.")
+    return "ok", None
+
+
 def _parse_version_tuple(version: str):
     """Leading dotted-numeric part of a chart version as an int tuple.
 
@@ -4700,6 +4855,44 @@ def _is_version_downgrade(current: str, new: str) -> bool:
     cur_t += (0,) * (length - len(cur_t))
     new_t += (0,) * (length - len(new_t))
     return new_t < cur_t
+
+
+def _pr_gsa_name_checked(app, pr_sha, main_sha):
+    """Check whether this PR makes an EXISTING app's derived GCP service
+    account name invalid, by comparing the effective prefix/customerName/
+    suffix at main vs at the PR head.
+
+    COPS-2552, hook point 2 (the new-environment path is hook point 1, in
+    _evaluate_new_envs). Returns (blocked, detail):
+      blocked — True only when the PR CHANGES one of the three keys AND the
+                new, PR-side derived name violates a GCP rule. An
+                already-invalid name this PR does not touch is left alone
+                by design: validating unconditionally would also block
+                unrelated PRs that merely happen to touch an already-broken
+                env, a behaviour change the ticket calls out as worth
+                deciding explicitly rather than by accident.
+      detail  — the human-readable explanation for the PR comment, or None.
+
+    Uses the app's own full value-file chain (_app_value_files_map) exactly
+    as the live Application declares it -- no ancestor-walking needed here,
+    unlike the new-environment path, since that chain already IS the real
+    cascade for an app that exists today.
+    """
+    value_files = _app_value_files_map.get(app, [])
+    if not value_files:
+        return False, None
+    main_vals = _fetch_value_files(value_files, main_sha)
+    pr_vals   = _fetch_value_files(value_files, pr_sha)
+    main_names = _effective_derived_names(value_files, main_vals)
+    pr_names   = _effective_derived_names(value_files, pr_vals)
+    if (main_names["prefix"] == pr_names["prefix"]
+            and main_names["customerName"] == pr_names["customerName"]
+            and main_names["suffix"] == pr_names["suffix"]):
+        return False, None  # PR does not touch these keys -- out of scope
+    status, detail = _check_gsa_name(pr_names)
+    if status == "invalid":
+        return True, detail
+    return False, None
 
 
 def _run_one_diff(app, pr_sha, main_sha, chart_revision=None, changed_paths=None, renames=None):
@@ -6993,6 +7186,32 @@ def process_pr(pr, path_map, base_sha="", repo=None):
             log(f"PR #{pr_id}: appspace.version rejected as unsafe/invalid for "
                 f"{len(invalid_version_apps)} app(s): "
                 f"{', '.join(sorted(invalid_version_apps))}", "WARNING", pr=pr_id)
+
+        # COPS-2552 (live incident, Derek 2026-07-29): the same class of
+        # check as invalid_version_apps above, but for a PR that renames an
+        # EXISTING environment (edits prefix/customerName/suffix) into a
+        # name whose derived GCP service account id violates GCP's own
+        # rules. Helm renders fine and ArgoCD would apply it successfully,
+        # so nothing else in this pipeline can ever catch it. Only apps
+        # whose PR-side effective names actually DIFFER from main are
+        # checked -- an already-broken env this PR does not touch is
+        # deliberately left alone (see _pr_gsa_name_checked's docstring).
+        gsa_invalid_apps = {}
+        with ThreadPoolExecutor(max_workers=max(1, min(DIFF_WORKERS, len(affected)))) as ex:
+            gsa_futs = {ex.submit(_pr_gsa_name_checked, app, pr_sha, base_sha): app
+                        for app in affected}
+            for fut in as_completed(gsa_futs):
+                app = gsa_futs[fut]
+                try:
+                    blocked, detail = fut.result()
+                except Exception:
+                    blocked, detail = False, None
+                if blocked:
+                    gsa_invalid_apps[app] = detail
+        if gsa_invalid_apps:
+            log(f"PR #{pr_id}: environment name too long for GCP for "
+                f"{len(gsa_invalid_apps)} app(s): "
+                f"{', '.join(sorted(gsa_invalid_apps))}", "WARNING", pr=pr_id)
         if pr_chart_revisions:
             unique_bumps = sorted(set(pr_chart_revisions.values()))
             log(f"PR #{pr_id}: chart version bumps detected for "
@@ -7025,6 +7244,10 @@ def process_pr(pr, path_map, base_sha="", repo=None):
                 # unsafe/invalid value, do not diff against the current revision
                 # (that would render identically and show a misleading green "no
                 # changes"). Report it as a permanent, blocking failure instead.
+                if app in gsa_invalid_apps:
+                    result = DiffResult("", [], 0, False, gsa_invalid_apps[app],
+                                        OUT_INDETERMINATE, REASON_NAME_TOO_LONG)
+                    return app, result, round(time.monotonic() - t0, 1)
                 if app in invalid_version_apps:
                     result = DiffResult("", [], 0, False,
                                         "appspace.version was rejected as unsafe/invalid",
