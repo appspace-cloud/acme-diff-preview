@@ -5446,6 +5446,11 @@ VERTEX_LOCATION          = os.environ.get("VERTEX_LOCATION", "us-central1")
 # gemini-2.5-flash: better reasoning than lite, still fast and cheap.
 # One call per PR run (not per resource), so cost impact is negligible.
 VERTEX_MODEL             = os.environ.get("VERTEX_MODEL", "gemini-2.5-flash")
+# COPS-2555: simple, reversible on/off switch for the whole feature, same
+# convention as DIFF_UI_ENABLED/LEADER_ELECTION_ENABLED. Defaults ON so no
+# other deployment of this chart is affected unless it opts out explicitly.
+AI_SUMMARY_ENABLED       = os.environ.get(
+    "AI_SUMMARY_ENABLED", "true").strip().lower() in ("1", "true", "yes")
 
 # Thresholds for switching between inline and collapsed diff display.
 # Bitbucket does NOT render HTML <details>/<summary> tags, so there is no
@@ -5919,6 +5924,12 @@ def generate_ai_summary(app_results: dict) -> str | None:
       BODY:    per-app bullet sections
       LAST:    critical flag line
     """
+    if not AI_SUMMARY_ENABLED:
+        # COPS-2555: disabled by operator request. Short-circuits before any
+        # prompt building or Vertex AI call, not just before rendering, so
+        # disabling this also removes its cost/latency, not only its output.
+        print("      [AI] AI_SUMMARY_ENABLED=false — skipping AI call")
+        return None
     try:
         results = {app: _result(v) for app, v in app_results.items()}
         # Use pre-parsed sections from DiffResult — never re-parse.

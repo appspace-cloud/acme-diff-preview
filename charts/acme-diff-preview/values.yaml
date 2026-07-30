@@ -21,6 +21,13 @@ replicaCount: 1
 leaderElection:
   enabled: true
 
+# Vertex AI (Gemini) generated summary in the PR comment ("AI Analysis"
+# section). Purely additive to the deterministic diff/warnings sections,
+# which render identically either way. Disabling it also skips the Vertex
+# AI call entirely (not just its output), so it costs nothing while off.
+aiSummary:
+  enabled: true
+
 # Optional PriorityClass so the pods are not the first candidates for
 # preemption under node pressure. Empty = cluster default.
 priorityClassName: ""
@@ -30,7 +37,7 @@ image:
   # Kept in sync with Chart.yaml appVersion (RELEASING.md). This default had
   # drifted since v2.7.0; it never bit us because acme-infrastructure pins the
   # tag explicitly, but anyone installing the chart as-is got a stale image.
-  tag: "2.13.8"
+  tag: "2.13.9"
   pullPolicy: IfNotPresent
 
 # Log verbosity for the diff-preview service. Set to DEBUG to emit the full
