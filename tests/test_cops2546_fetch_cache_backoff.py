@@ -176,6 +176,7 @@ def test_cache_is_bounded_no_second_unbounded_dict():
     bounded_or_intentional = {
         # name                            how its growth is bounded
         "_vf_cache",                      # _bound_vf_cache(), every iteration
+        "_yaml_cache",                    # _bound_yaml_cache(), same VF_CACHE_MAX
         "_main_render_cache",             # MAIN_RENDER_CACHE_MAX, evict-half
         "_identity_rename_verdict_cache", # _IDENTITY_RENAME_CACHE_MAX, evict-half
         "_comment_id_cache",              # pruned with _seen by the stale sweep

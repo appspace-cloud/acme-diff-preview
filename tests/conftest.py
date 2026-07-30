@@ -49,8 +49,11 @@ def _clear_sha_fetch_cache():
     # _retry_backoff is module-level too: a transient failure registered by one
     # test would otherwise make the next test's PR be skipped before it does
     # any work, which surfaces as an empty result list far from the cause.
-    for d in (_m._vf_cache, _m._vf_inflight, _m._retry_backoff):
+    # _yaml_cache (COPS-2562) shares the (sha, path) keying of _vf_cache and
+    # therefore the same cross-test poisoning risk: two tests faking the same
+    # sha with different content must never see each other's parse.
+    for d in (_m._vf_cache, _m._vf_inflight, _m._retry_backoff, _m._yaml_cache):
         d.clear()
     yield
-    for d in (_m._vf_cache, _m._vf_inflight, _m._retry_backoff):
+    for d in (_m._vf_cache, _m._vf_inflight, _m._retry_backoff, _m._yaml_cache):
         d.clear()
