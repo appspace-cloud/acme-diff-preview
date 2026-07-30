@@ -2126,7 +2126,20 @@ def _bb_fetch_status(filepath, sha, repo=None):
         return _hit
     url = (f"https://api.bitbucket.org/2.0/repositories/"
            f"{BB_WORKSPACE}/{_repo}/src/{sha}/{filepath}")
-    req = urllib.request.Request(url, headers={"Authorization": _BB_AUTH_HEADER})
+    # COPS-2550: this bypasses http() on purpose (JSON parsing there breaks
+    # YAML/text content), so it must set its own User-Agent explicitly.
+    # header_items() (used by _pooled_urlopen) only carries headers set
+    # explicitly on the Request -- urlopen's IMPLICIT default is not one of
+    # them -- so a request built with only Authorization went out with none
+    # at all. Confirmed against a real Bitbucket support export: this was
+    # 6255 of 9270 requests (67%) in the incident, all logged as
+    # "Amazon CloudFront" (Bitbucket's front end stamps that on any request
+    # that arrives with no User-Agent), which is why our own traffic was
+    # first misread as an unrelated AWS service.
+    req = urllib.request.Request(url, headers={
+        "Authorization": _BB_AUTH_HEADER,
+        "User-Agent": _user_agent(),
+    })
     for attempt in range(3):
         # v2.13.0 (COPS-2543): brake with the whole pool before spending an
         # attempt, so a 429 another thread already hit does not cost this one
