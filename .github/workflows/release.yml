@@ -121,5 +121,28 @@ jobs:
             fi
             NOTES=$(git for-each-ref "refs/tags/$TAG" --format='%(contents)')
             echo "Creating release for $TAG"
-            gh release create "$TAG" --title "$TAG" --notes "$NOTES" --verify-tag
+            # COPS-2556: this job runs on BOTH triggers (see the comment on
+            # this job above), so on every normal release it races the OTHER
+            # run of this same workflow triggered moments apart (main push vs
+            # tag push) for the SAME tag. The `gh release view` check above
+            # is a check-then-act guard and cannot fully close that race: it
+            # runs before the other run has necessarily finished, so both can
+            # pass the check and one of the two `create` calls then fails
+            # with "already exists" (live on v2.13.9, HTTP 422). That failure
+            # means this job's actual goal — a release exists for this tag —
+            # is already satisfied, so it must not turn the job red. Only a
+            # genuinely different failure (bad token, real API error, etc.)
+            # should still fail loudly.
+            if ! gh release create "$TAG" --title "$TAG" --notes "$NOTES" --verify-tag 2>/tmp/release-create-err.txt; then
+              if gh release view "$TAG" >/dev/null 2>&1; then
+                echo "$TAG: release now exists (created concurrently by the" \
+                     "other trigger of this workflow) — treating as success."
+                cat /tmp/release-create-err.txt
+              else
+                echo "::error::Failed to create release for $TAG and it" \
+                     "still does not exist:"
+                cat /tmp/release-create-err.txt
+                exit 1
+              fi
+            fi
           done
