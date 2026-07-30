@@ -317,3 +317,49 @@ def test_new_env_value_chain_shared_helper_exists_and_is_used_by_render():
     render_body_start = src.index("def _render_new_env_diff(")
     render_body = src[render_body_start:render_body_start + 4000]
     assert "_new_env_value_chain(" in render_body
+
+
+# ── the blocked-block headline must match the ACTUAL reason ─────────────────
+#
+# Found by the live verification on PR 3830, not by any unit test: the
+# GSA-name block reused COPS-2544's blocking path, whose headline is
+# hardcoded to "a required cohort config.yaml is missing". That headline is
+# simply false for a name-length rejection and directly contradicts the
+# correct explanation printed right underneath it -- exactly the kind of
+# self-contradicting output an operator has to untangle. Three different
+# reasons now share this path (missing cohort, unparseable cohort, name too
+# long), so the headline has to come from the finding, not be baked in.
+
+def test_blocked_headline_names_the_length_problem_not_the_cohort(monkeypatch):
+    files = {p.replace("$config/", ""): c for p, c in
+             {ROOT: ROOT_CONTENT, TIER: TIER_CONTENT, CUST: LIVE_CUST_CONTENT}.items()}
+    monkeypatch.setattr(m, "_bb_fetch_status",
+                        lambda path, sha, repo=None:
+                        (files[path], m.BB_OK) if path in files else (None, m.BB_NOT_FOUND))
+    monkeypatch.setattr(m, "_render_new_env_diff",
+                        lambda info, sha: (_ for _ in ()).throw(AssertionError("no render")))
+    env_info = {"name": "pv-universalhollywood--aec1-a",
+                "config_file": CUST.replace("$config/", ""),
+                "env_dir": CUST.replace("$config/", "").rsplit("/", 1)[0],
+                "all_yaml_files": [CUST.replace("$config/", "")]}
+    lines, structural, _ = m._evaluate_new_envs([env_info], "prsha")
+    joined = "\n".join(lines)
+    assert "cohort" not in joined.lower(), (
+        "a name-length rejection must not be announced as a missing cohort file")
+    assert "too long for GCP" in joined
+
+
+def test_blocked_headline_still_names_the_cohort_when_that_is_the_reason(monkeypatch):
+    """Regression guard: COPS-2544's own case must keep its accurate headline."""
+    cohort = "gcp/prod/private-cloud/gb1-b/hardcoded/migrationtest/config.yaml"
+    env_dir = "gcp/prod/private-cloud/gb1-b/hardcoded/migrationtest/pv-copstest-a"
+    monkeypatch.setattr(m, "_bb_fetch_status",
+                        lambda path, sha, repo=None: (None, m.BB_NOT_FOUND))
+    monkeypatch.setattr(m, "_render_new_env_diff",
+                        lambda info, sha: (_ for _ in ()).throw(AssertionError("no render")))
+    env_info = {"name": "pv-copstest-a", "config_file": f"{env_dir}/customer.yaml",
+                "env_dir": env_dir, "all_yaml_files": [f"{env_dir}/customer.yaml"]}
+    lines, structural, _ = m._evaluate_new_envs([env_info], "prsha")
+    joined = "\n".join(lines)
+    assert structural == ["pv-copstest-a"]
+    assert "cohort" in joined.lower() and cohort in joined

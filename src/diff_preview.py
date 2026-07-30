@@ -3300,6 +3300,8 @@ def _evaluate_new_envs(new_env_candidates: list, pr_sha: str) -> tuple:
                         "files": env_info["all_yaml_files"], "n_res": 0,
                         "kind_counts": None, "workloads": None,
                         "error": reason, "blocked": True,
+                        "blocked_headline": ("a required cohort `config.yaml` "
+                                             "cannot be parsed"),
                     })
                     continue
             if _cohort_st == BB_NOT_FOUND:
@@ -3320,6 +3322,8 @@ def _evaluate_new_envs(new_env_candidates: list, pr_sha: str) -> tuple:
                     "files": env_info["all_yaml_files"], "n_res": 0,
                     "kind_counts": None, "workloads": None,
                     "error": reason, "blocked": True,
+                    "blocked_headline": ("a required cohort `config.yaml` is "
+                                         "missing"),
                 })
                 continue
 
@@ -3343,6 +3347,8 @@ def _evaluate_new_envs(new_env_candidates: list, pr_sha: str) -> tuple:
                 "files": env_info["all_yaml_files"], "n_res": 0,
                 "kind_counts": None, "workloads": None,
                 "error": _gsa_detail, "blocked": True,
+                "blocked_headline": ("this environment's name is too long for "
+                                     "GCP"),
             })
             continue
         render_result = _render_new_env_diff(env_info, pr_sha)
@@ -3387,9 +3393,17 @@ def _evaluate_new_envs(new_env_candidates: list, pr_sha: str) -> tuple:
                 lines.append(f"- *... {len(sec['files'])-15} more files*")
             lines.append("")
         if sec.get("blocked"):
+            # COPS-2552: three different findings now block here (missing
+            # cohort file, unparseable cohort file, name too long for GCP),
+            # so the headline must come from the finding. It used to be
+            # hardcoded to the cohort case, which announced a name-length
+            # rejection as "a required cohort config.yaml is missing" --
+            # false, and directly contradicting the correct explanation
+            # printed right underneath. Caught by the live PR 3830
+            # verification, not by any unit test.
             lines.append(
-                "\u26d4 **Blocked: a required cohort `config.yaml` is "
-                "missing.**")
+                f"\u26d4 **Blocked: "
+                f"{sec.get('blocked_headline', 'this PR cannot work as written')}.**")
             lines.append("")
             lines.append(f"This PR cannot work as written: {sec['error']}")
         elif sec["kind_counts"] is not None:
