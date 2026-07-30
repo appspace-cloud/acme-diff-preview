@@ -1845,8 +1845,9 @@ PERMANENT_REASONS = {REASON_OCI_NOT_FOUND, REASON_INVALID_VERSION,
 # resolve on retry, only on a new commit that shortens the name. Helm renders
 # it fine and ArgoCD applies it successfully (both only see a valid k8s
 # object name), so this is the one class of failure no render- or sync-based
-# check could ever catch; only an explicit assertion on the resolved values
-# does. See _check_gsa_name.
+# check could ever catch; only an explicit assertion on the declared name
+# does. See _check_customer_name (COPS-2562, the cheap successor of
+# COPS-2552's _check_gsa_name).
 # COPS-2554: MISSING_REQUIRED and SCHEMA_INVALID joined the permanent set
 # alongside invalid_yaml/invalid_version. All four are deterministic given
 # the same pr_sha -- an environment missing a required value, or violating
@@ -2720,6 +2721,202 @@ def _backoff_clear(sk):
 # Storage contract is _fetch_value_files': content for BB_OK, None for
 # BB_NOT_FOUND, and nothing at all for BB_ERROR, because a transient failure
 # must never be cached as a fact. Status is therefore derivable on read.
+# ── COPS-2562: cheap environment-name validation ────────────────────────────
+#
+# COPS-2552 resolved prefix/customerName/suffix/esSuffix through each app's
+# ENTIRE value-file chain at BOTH shas to rebuild the exact GCP service
+# account id. Correct, but on a mass version bump (PR 3831: 212 apps, 14
+# changed files) that was ~65s of a 121.5s iteration and the single largest
+# consumer of Bitbucket API calls, on a token shared with the Azure DevOps
+# pipelines (COPS-2543).
+#
+# The expensive part existed only to learn two values that are constants in
+# practice. Verified across all three config repos, 2026-07-30:
+#   appspace.prefix                     13 decls, {pv, cl},  always 2 chars
+#   appspace.suffix                    307 decls, {a, b, c}, always 1 char
+#   appspace.externalSecretsTool.suffix  0 decls, chart default "es", 2 chars
+# so len(GSA id) == len(customerName) + 8 and GCP's 30-char limit means
+# customerName <= 22. The cap below is 20, leaving two characters of margin
+# for a future longer prefix/suffix/esSuffix or another derived resource
+# without having to model each resource type again. Longest real name today
+# is 19 ("westinghousenuclear"), across 322 environments, so nothing needs
+# grandfathering.
+CUSTOMER_NAME_MAX = 20
+
+# Deliberately NOT the strict GCP id regex. pv-3ds-c is a real live prod
+# environment: "3ds" starts with a digit and fails ^[a-z]..., but the full
+# id "pv-3ds-c-es" is valid because the prefix supplies the leading letter.
+# Validating customerName alone with the strict pattern would block it.
+_CUSTOMER_NAME_RE = re.compile(r"^[a-z0-9]([a-z0-9-]*[a-z0-9])?$")
+
+
+def _check_customer_name(name):
+    """Validate appspace.customerName. Returns (status, detail).
+
+    "ok" / "invalid" / "unresolved" -- the three-way distinction FIX A
+    (v2.4.9) established, so "not declared here" can never be mistaken for
+    "rejected".
+    """
+    if not name:
+        return "unresolved", None
+    name = str(name)
+    if len(name) > CUSTOMER_NAME_MAX:
+        return "invalid", (
+            f"`appspace.customerName` is {len(name)} characters "
+            f"(`{name}`), the maximum is {CUSTOMER_NAME_MAX}. The derived GCP "
+            f"service account id is `<prefix>-<customerName>-<suffix>-es`, and "
+            f"GCP rejects service account IDs longer than 30 characters, which "
+            f"leaves {CUSTOMER_NAME_MAX} for the name plus margin. This is a "
+            f"hard Google limit, not an Appspace one: the environment would "
+            f"deploy and then silently fail, with ArgoCD reporting Synced "
+            f"while every pod sits in CreateContainerConfigError. Shorten the "
+            f"name and push again.")
+    if not _CUSTOMER_NAME_RE.match(name):
+        return "invalid", (
+            f"`appspace.customerName` (`{name}`) must contain only lowercase "
+            f"letters, digits and hyphens, and must not start or end with a "
+            f"hyphen. It becomes part of a GCP service account id, which GCP "
+            f"validates strictly.")
+    return "ok", None
+
+
+def _warn_if_name_invariant_broken(flat: dict):
+    """The cap encodes an invariant that lives in the config repos, not in a
+    schema: prefix is always 2 chars and suffix always 1. If that ever
+    changes, the arithmetic behind CUSTOMER_NAME_MAX stops holding, so make
+    it surface loudly instead of silently under-protecting."""
+    prefix = flat.get("appspace.prefix")
+    suffix = flat.get("appspace.suffix")
+    if prefix is not None and len(str(prefix)) > 2:
+        log(f"appspace.prefix {prefix!r} is longer than the 2 characters "
+            f"CUSTOMER_NAME_MAX={CUSTOMER_NAME_MAX} assumes -- the cap may no "
+            f"longer guarantee a valid GCP service account id (COPS-2562)",
+            "WARNING")
+    if suffix is not None and len(str(suffix)) > 1:
+        log(f"appspace.suffix {suffix!r} is longer than the 1 character "
+            f"CUSTOMER_NAME_MAX={CUSTOMER_NAME_MAX} assumes -- the cap may no "
+            f"longer guarantee a valid GCP service account id (COPS-2562)",
+            "WARNING")
+
+
+# The two basenames an environment's identity can live in -- the same pair
+# _detect_new_env_candidates keys on. Exact basename membership, not
+# endswith: "mycustomer.yaml" is not an identity file and must not be
+# fetched or flagged.
+_IDENTITY_BASENAMES = frozenset({"customer.yaml", "config.yaml"})
+
+# COPS-2562 point 3: cache the PARSED yaml, not just the text. gcp/config.yaml
+# is 1543 lines and was re-parsed once per app (212x on a mass bump) even
+# though _vf_cache already had the text. Same (sha, path) key and the same
+# bound as _vf_cache -- an unbounded dict here would leak in a pod that runs
+# for weeks (COPS-2546).
+_yaml_cache: dict = {}
+
+
+def _bound_yaml_cache():
+    with _vf_cache_lock:
+        if len(_yaml_cache) <= VF_CACHE_MAX:
+            return
+        drop = len(_yaml_cache) - VF_CACHE_MAX // 2
+        for k in list(_yaml_cache)[:drop]:
+            _yaml_cache.pop(k, None)
+
+
+def _flat_yaml_cached(path: str, sha: str, repo: str = None) -> dict:
+    """Flattened YAML of a file at a sha, parsed at most once per (sha, path).
+
+    Content at a git sha is immutable, so a fetched parse (including {} for
+    an unparseable or 404 file) is a stable fact and caches forever. A
+    TRANSIENT fetch failure (BB_ERROR: 429/5xx/network) is the one thing
+    that is NOT a fact: it returns {} for this call but is never cached,
+    the same storage contract _vf_cache documents. Caching it would let a
+    single rate-limited fetch silently disable the name check for that
+    (sha, path) for the lifetime of the pod.
+
+    The key uses the same normalization as _bb_fetch_cached, so
+    "$config/gcp/x.yaml" and "gcp/x.yaml" share one entry and one parse.
+
+    Callers get the CACHED dict itself, not a copy: treat it as read-only.
+    Mutating it would poison every later reader of the same (sha, path).
+    """
+    key = (sha, posixpath.normpath(str(path).replace("$config/", "").lstrip("/")))
+    with _vf_cache_lock:
+        if key in _yaml_cache:
+            return _yaml_cache[key]
+    content, status = _bb_fetch_cached(path, sha, repo=repo)
+    if status == BB_ERROR:
+        return {}
+    if status != BB_OK or not content:
+        flat = {}
+    else:
+        try:
+            flat = _flatten_yaml(yaml.safe_load(content) or {})
+        except yaml.YAMLError:
+            flat = {}
+    with _vf_cache_lock:
+        _yaml_cache[key] = flat
+    # Outside the insert lock: _vf_cache_lock is a plain Lock, not an RLock,
+    # and _bound_yaml_cache takes it again.
+    _bound_yaml_cache()
+    return flat
+
+
+# COPS-2562 point 2 (reuse fetches across shas in prep): deleting the GSA
+# chain walk above resolved this on its own. Audited every remaining
+# base-sha read in the prep path -- _rename_identity_confirmed and
+# _augment_renames_with_identity_moves read files that are DELETED at
+# pr_sha (so main is the only side that has them), _changed_files_with_bad_names
+# reads base only for a changed file already suspected of a violation, and
+# _summarize_input_changes needs both sides by definition. None of them
+# re-reads an UNTOUCHED file at two shas, which was exactly what the old
+# per-app chain walk did. A helper for that case was written and then
+# removed: with the walk gone it had no caller, and dead scaffolding is the
+# same over-engineering this ticket set out to undo.
+def _changed_files_with_bad_names(changed_files, pr_sha, base_sha,
+                                  repo: str = None) -> dict:
+    """Identity files this PR adds or edits whose customerName is invalid.
+
+    Returns {path: detail}. Only reads the CHANGED files themselves -- never
+    an ancestor chain -- which is the whole performance point of COPS-2562:
+    customerName is declared in the environment's own leaf file (309 in
+    customer.yaml, 13 in a public-cloud config.yaml, 0 inherited in a way
+    that matters here).
+
+    Only flags names this PR INTRODUCES or CHANGES: a name that is already
+    over the cap on both sides is deliberately left alone, the same scope
+    decision COPS-2552 made, so an unrelated PR touching an already-broken
+    environment is not blocked by accident.
+    """
+    bad = {}
+    for path in (changed_files or []):
+        if str(path).rsplit("/", 1)[-1] not in _IDENTITY_BASENAMES:
+            continue
+        try:
+            pr_flat = _flat_yaml_cached(path, pr_sha, repo=repo)
+            # BEFORE the customerName skip: tier config.yaml files declare
+            # prefix/suffix WITHOUT a customerName, and those are exactly
+            # the files where a longer prefix would first appear. Warning
+            # only on files that also declare a name would miss the drift.
+            _warn_if_name_invariant_broken(pr_flat)
+            pr_name = pr_flat.get("appspace.customerName")
+            if pr_name is None:
+                continue
+            status, detail = _check_customer_name(pr_name)
+            if status != "invalid":
+                continue
+            base_name = _flat_yaml_cached(path, base_sha, repo=repo).get(
+                "appspace.customerName")
+            if base_name == pr_name:
+                continue  # pre-existing, not introduced by this PR
+            bad[path] = detail
+        except Exception as e:
+            # Same fail-open the old per-app pool gave each future: one
+            # broken file must never take down the whole prep phase.
+            log(f"customerName check failed for {path}, skipping this "
+                f"file (fail-open): {e}", "WARNING")
+    return bad
+
+
 def _bb_fetch_cached(filepath, sha, repo=None):
     """_bb_fetch_status with (sha, path) caching and singleflight.
 
@@ -3336,9 +3533,10 @@ def _evaluate_new_envs(new_env_candidates: list, pr_sha: str) -> tuple:
         # on that specific object. Check it here, before the chart render,
         # using the identical ancestor-chain _render_new_env_diff itself
         # renders with, so this can never disagree with what actually ships.
-        _chain, _chain_vals = _new_env_value_chain(env_info, pr_sha)
-        _names = _effective_derived_names(_chain, _chain_vals)
-        _gsa_status, _gsa_detail = _check_gsa_name(_names)
+        _env_flat = _flat_yaml_cached(env_info["config_file"], pr_sha)
+        _warn_if_name_invariant_broken(_env_flat)
+        _gsa_status, _gsa_detail = _check_customer_name(
+            _env_flat.get("appspace.customerName"))
         if _gsa_status == "invalid":
             log(f"  new env {env_info['name']}: blocked - {_gsa_detail}",
                 "WARNING")
@@ -3477,15 +3675,13 @@ def _new_env_value_chain(env_info: dict, pr_sha: str, repo: str = None) -> tuple
     pv-dkv-a-ms.spec.sources[0].helm.valueFiles). Missing ancestor levels
     are skipped, mirroring ignoreMissingValueFiles.
 
-    Extracted out of _render_new_env_diff (COPS-2552) so the GSA-name-length
-    guard in _evaluate_new_envs can resolve prefix/customerName/suffix from
-    the identical chain the chart render itself will use, instead of a
-    second, independently-maintained copy of the same ancestor-walk logic
-    silently drifting from this one over time.
+    Extracted out of _render_new_env_diff (COPS-2552). The GSA-name guard
+    that originally shared it was replaced in COPS-2562 by a cheap cap read
+    straight from the environment's own leaf file, so this is once again
+    used only by the chart render itself.
 
     Returns (ordered_value_files, vals) -- "$config/"-prefixed paths and
-    their fetched content, the same shapes _effective_chart_version and
-    _effective_derived_names expect.
+    their fetched content, the shape _effective_chart_version expects.
     """
     ancestor_levels = []
     probe = env_info["env_dir"]
@@ -3930,12 +4126,20 @@ def _is_sensitive_kind(header: str) -> bool:
 
 
 def _detect_deleted_resources(sections: list) -> list:
-    """Headers of sections that DELETE a resource entirely: at least one
-    removed content line and zero added content lines (diff of full
-    manifest vs empty — see _diff_resources)."""
+    """Headers of sections that DELETE a resource entirely.
+
+    A true deletion is the manifest diffed against empty (_diff_resources
+    with an absent PR side): every content line is a minus and there are NO
+    context lines. Bodies come from difflib.unified_diff with its default 3
+    context lines, so any partial change where at least one line survives
+    always carries context lines (they start with a space). "Minus lines and
+    no plus lines" alone is NOT enough -- that is also the signature of a
+    change that only removes lines from a manifest that still exists, and
+    it made PR 3829 report 110 deletions for a removed `replicas:` line and
+    PR 6956 report 2480 for a removed tolerations block (COPS-2563)."""
     deleted = []
     for header, body in sections:
-        minus = plus = 0
+        minus = plus = context = 0
         for line in body.splitlines():
             if line.startswith("+++") or line.startswith("---"):
                 continue
@@ -3943,7 +4147,9 @@ def _detect_deleted_resources(sections: list) -> list:
                 plus += 1
             elif line.startswith("-"):
                 minus += 1
-        if minus and not plus:
+            elif line.startswith(" "):
+                context += 1
+        if minus and not plus and not context:
             deleted.append(header)
     return deleted
 
@@ -4730,117 +4936,6 @@ def _effective_chart_version(ordered_value_files: list, vals: dict):
     return version
 
 
-# COPS-2552: GCP service account id rules. IAMServiceAccount account IDs
-# must be 6-30 chars, matching [a-z]([-a-z0-9]*[a-z0-9]). Verified live
-# (2026-07-29): pv-universalhollywood--aec1-a-es (32 chars) was rejected
-# with "does not have length between 6 and 30." while the control case
-# pv-pfizer--aec1-a-es (20 chars) came up clean, same chart, same pattern.
-_GSA_ID_MIN = 6
-_GSA_ID_MAX = 30
-_GSA_ID_RE  = re.compile(r"^[a-z]([-a-z0-9]*[a-z0-9])?$")
-
-# The four appspace.* keys _helpers.tpl's "appspace.fullcustomername" and the
-# GSA id are built from, dotted-path as PyYAML/_flatten_yaml renders them,
-# and the chart's own default for the one that is not always set.
-_DERIVED_NAME_KEYS = {
-    "prefix":        "appspace.prefix",
-    "customerName":  "appspace.customerName",
-    "suffix":        "appspace.suffix",
-    "esSuffix":      "appspace.externalSecretsTool.suffix",
-}
-_DERIVED_NAME_DEFAULTS = {"esSuffix": "es"}
-
-
-def _effective_derived_names(ordered_value_files: list, vals: dict) -> dict:
-    """Effective prefix/customerName/suffix/esSuffix across ordered value
-    files, root to leaf, LAST FILE WINS PER KEY -- true helm -f deep-merge
-    semantics (unlike _extract_chart_version_checked's own single-file
-    direct-child scan, this must read whichever file in the chain last sets
-    EACH key independently, since the three are essentially never all in
-    the same file: COPS-2552's own incident had prefix/suffix in a tier
-    config.yaml and customerName in customer.yaml).
-
-    Uses yaml.safe_load + _flatten_yaml per file (already the established
-    pattern for reading arbitrary declared keys, see
-    _summarize_input_changes) rather than a bespoke line-scanner, since the
-    correctness need here is a real recursive merge, not the OCI-tag-safety
-    scanning _extract_chart_version_checked does. A file missing from vals
-    (404, or unparseable YAML) is skipped, never fatal -- mirrors
-    ignoreMissingValueFiles.
-
-    Returns a dict with all four keys always present; unresolved ones are
-    None except esSuffix, which falls back to the chart's own real default
-    ("es") since an unset value still reaches GCP as "es" -- the whole point
-    of this check is what actually happens, not what was explicitly typed.
-    """
-    resolved = {}
-    for vf in ordered_value_files:
-        content = vals.get(vf)
-        if not content:
-            continue
-        try:
-            flat = _flatten_yaml(yaml.safe_load(content) or {})
-        except yaml.YAMLError:
-            continue
-        for key, dotted in _DERIVED_NAME_KEYS.items():
-            if dotted in flat and flat[dotted] is not None:
-                resolved[key] = str(flat[dotted])
-    return {k: resolved.get(k, _DERIVED_NAME_DEFAULTS.get(k)) for k in _DERIVED_NAME_KEYS}
-
-
-def _check_gsa_name(names: dict):
-    """Validate the derived GCP service account id against GCP's own rules.
-
-    Returns (status, detail):
-      "ok"         — the id is a valid GCP resource id. detail is None.
-      "unresolved" — prefix/customerName/suffix could not all be resolved
-                     from the value chain (this candidate/app does not
-                     apply). detail is None. Not the same as "invalid" --
-                     collapsing the two would let a resolution gap in OUR
-                     code look like a rejection of the ENVIRONMENT's name,
-                     the same false-negative/false-positive confusion FIX A
-                     (v2.4.9) already fixed once for appspace.version.
-      "invalid"    — the id violates a GCP rule. detail explains which one,
-                     the exact arithmetic, and the maximum customerName
-                     length for this prefix/suffix, for the PR comment.
-
-    GSA id = "{prefix}-{customerName}-{suffix}-{esSuffix}", the chart's own
-    appspace.fullcustomername (_helpers.tpl) with "-{esSuffix}" appended.
-    """
-    prefix, customer, suffix, es = (names.get("prefix"), names.get("customerName"),
-                                     names.get("suffix"), names.get("esSuffix"))
-    # is-None, not truthiness: an explicitly-blank value (e.g. esSuffix set
-    # to "" in config) is a REAL, resolved value that still reaches GCP and
-    # must be validated (it produces a trailing hyphen); only a value that
-    # was never found anywhere in the chain (None) means "unresolved".
-    if prefix is None or customer is None or suffix is None or es is None:
-        return "unresolved", None
-    gsa_id = f"{prefix}-{customer}-{suffix}-{es}"
-    length = len(gsa_id)
-    if length > _GSA_ID_MAX:
-        max_customer = _GSA_ID_MAX - (len(prefix) + len(suffix) + len(es) + 3)
-        return "invalid", (
-            f"Environment name too long for GCP. `{gsa_id}` is {length} "
-            f"characters, GCP service account IDs allow {_GSA_ID_MIN}-"
-            f"{_GSA_ID_MAX}. `appspace.customerName` must be at most "
-            f"{max_customer} characters given `prefix: {prefix}` and "
-            f"`suffix: {suffix}`. This is a hard Google limit, not an "
-            f"Appspace one, and it cannot be worked around in the chart "
-            f"without renaming the resource.")
-    if length < _GSA_ID_MIN:
-        return "invalid", (
-            f"Environment name too short for GCP. `{gsa_id}` is {length} "
-            f"characters, GCP service account IDs require at least "
-            f"{_GSA_ID_MIN}.")
-    if not _GSA_ID_RE.match(gsa_id):
-        return "invalid", (
-            f"Derived GCP service account id `{gsa_id}` is not a valid GCP "
-            f"resource id (must start with a lowercase letter, contain only "
-            f"lowercase letters/digits/hyphens, and not end with a hyphen). "
-            f"This is a hard Google limit, not an Appspace one.")
-    return "ok", None
-
-
 def _parse_version_tuple(version: str):
     """Leading dotted-numeric part of a chart version as an int tuple.
 
@@ -4869,44 +4964,6 @@ def _is_version_downgrade(current: str, new: str) -> bool:
     cur_t += (0,) * (length - len(cur_t))
     new_t += (0,) * (length - len(new_t))
     return new_t < cur_t
-
-
-def _pr_gsa_name_checked(app, pr_sha, main_sha):
-    """Check whether this PR makes an EXISTING app's derived GCP service
-    account name invalid, by comparing the effective prefix/customerName/
-    suffix at main vs at the PR head.
-
-    COPS-2552, hook point 2 (the new-environment path is hook point 1, in
-    _evaluate_new_envs). Returns (blocked, detail):
-      blocked — True only when the PR CHANGES one of the three keys AND the
-                new, PR-side derived name violates a GCP rule. An
-                already-invalid name this PR does not touch is left alone
-                by design: validating unconditionally would also block
-                unrelated PRs that merely happen to touch an already-broken
-                env, a behaviour change the ticket calls out as worth
-                deciding explicitly rather than by accident.
-      detail  — the human-readable explanation for the PR comment, or None.
-
-    Uses the app's own full value-file chain (_app_value_files_map) exactly
-    as the live Application declares it -- no ancestor-walking needed here,
-    unlike the new-environment path, since that chain already IS the real
-    cascade for an app that exists today.
-    """
-    value_files = _app_value_files_map.get(app, [])
-    if not value_files:
-        return False, None
-    main_vals = _fetch_value_files(value_files, main_sha)
-    pr_vals   = _fetch_value_files(value_files, pr_sha)
-    main_names = _effective_derived_names(value_files, main_vals)
-    pr_names   = _effective_derived_names(value_files, pr_vals)
-    if (main_names["prefix"] == pr_names["prefix"]
-            and main_names["customerName"] == pr_names["customerName"]
-            and main_names["suffix"] == pr_names["suffix"]):
-        return False, None  # PR does not touch these keys -- out of scope
-    status, detail = _check_gsa_name(pr_names)
-    if status == "invalid":
-        return True, detail
-    return False, None
 
 
 def _run_one_diff(app, pr_sha, main_sha, chart_revision=None, changed_paths=None, renames=None):
@@ -7201,31 +7258,24 @@ def process_pr(pr, path_map, base_sha="", repo=None):
                 f"{len(invalid_version_apps)} app(s): "
                 f"{', '.join(sorted(invalid_version_apps))}", "WARNING", pr=pr_id)
 
-        # COPS-2552 (live incident, Derek 2026-07-29): the same class of
-        # check as invalid_version_apps above, but for a PR that renames an
-        # EXISTING environment (edits prefix/customerName/suffix) into a
-        # name whose derived GCP service account id violates GCP's own
-        # rules. Helm renders fine and ArgoCD would apply it successfully,
-        # so nothing else in this pipeline can ever catch it. Only apps
-        # whose PR-side effective names actually DIFFER from main are
-        # checked -- an already-broken env this PR does not touch is
-        # deliberately left alone (see _pr_gsa_name_checked's docstring).
+        # COPS-2562: the name check is now O(changed identity files), not
+        # O(apps x chain x 2 shas). It reads only the files this PR actually
+        # touches -- customerName always lives in the environment's own leaf
+        # file -- so a pure version bump does no value-chain resolution at
+        # all. Replaces the second prep ThreadPoolExecutor entirely (point 4:
+        # one pass, not two serial pools over the same apps).
+        bad_name_files = _changed_files_with_bad_names(changed, pr_sha, base_sha,
+                                                       repo=repo)
         gsa_invalid_apps = {}
-        with ThreadPoolExecutor(max_workers=max(1, min(DIFF_WORKERS, len(affected)))) as ex:
-            gsa_futs = {ex.submit(_pr_gsa_name_checked, app, pr_sha, base_sha): app
-                        for app in affected}
-            for fut in as_completed(gsa_futs):
-                app = gsa_futs[fut]
-                try:
-                    blocked, detail = fut.result()
-                except Exception:
-                    blocked, detail = False, None
-                if blocked:
-                    gsa_invalid_apps[app] = detail
-        if gsa_invalid_apps:
-            log(f"PR #{pr_id}: environment name too long for GCP for "
-                f"{len(gsa_invalid_apps)} app(s): "
-                f"{', '.join(sorted(gsa_invalid_apps))}", "WARNING", pr=pr_id)
+        if bad_name_files:
+            for _app, _files in _app_to_files.items():
+                for _f in _files:
+                    if _f in bad_name_files:
+                        gsa_invalid_apps[_app] = bad_name_files[_f]
+                        break
+            log(f"PR #{pr_id}: appspace.customerName too long/invalid in "
+                f"{len(bad_name_files)} file(s), blocking "
+                f"{len(gsa_invalid_apps)} app(s)", "WARNING", pr=pr_id)
         if pr_chart_revisions:
             unique_bumps = sorted(set(pr_chart_revisions.values()))
             log(f"PR #{pr_id}: chart version bumps detected for "
