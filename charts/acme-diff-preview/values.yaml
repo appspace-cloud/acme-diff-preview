@@ -32,12 +32,17 @@ aiSummary:
 # preemption under node pressure. Empty = cluster default.
 priorityClassName: ""
 
+# Size of the writable /tmp emptyDir. It holds helm scratch files and, since
+# v2.15.0, the local git mirrors of the config repos (COPS-2564), which
+# replace one Bitbucket API call per value file with one fetch per iteration.
+tmpSizeLimit: "1Gi"
+
 image:
   repository: us-central1-docker.pkg.dev/appspace-devops/artifact/acme-diff-preview
   # Kept in sync with Chart.yaml appVersion (RELEASING.md). This default had
   # drifted since v2.7.0; it never bit us because acme-infrastructure pins the
   # tag explicitly, but anyone installing the chart as-is got a stale image.
-  tag: "2.14.0"
+  tag: "2.15.0"
   pullPolicy: IfNotPresent
 
 # Log verbosity for the diff-preview service. Set to DEBUG to emit the full
@@ -80,6 +85,14 @@ diff:
   warmWorkers: 4
   # warmThreshold was removed — it had no effect after the warm-diff pass was
   # replaced by the pre-pull phase. Keeping the key here is intentionally omitted.
+
+  # COPS-2564: read config-repo files from a local git mirror instead of one
+  # Bitbucket API call per file. A single fetch per repo per iteration replaces
+  # what used to be roughly one call per changed value file per PR (measured:
+  # ~780 calls for one acme-config-prod PR touching gcp/config.yaml). Kill
+  # switch for a fast rollback to the pure-API path with no redeploy of code,
+  # only this value.
+  gitMirrorEnabled: true
 
 # Full-diff web UI (Atlantis-style). Default ON (verified safe: the ArgoCD
 # hub Ingress extraPaths only forward /jfrog-webhook and /diff-preview/webhook

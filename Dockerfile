@@ -13,8 +13,11 @@ ARG HELM_VERSION=v3.21.2
 # publishes a combined `cli_checksums.txt` for the release. We fetch the
 # official checksum file alongside each artifact and verify, failing the build
 # on any mismatch.
+# git (COPS-2564): config files are read from local mirrors instead of one
+# Bitbucket API call per file. Unlike curl below, it is NOT purged: it is a
+# runtime dependency now.
 RUN apt-get update && apt-get install -y --no-install-recommends \
-        curl ca-certificates \
+        curl ca-certificates git \
     && curl -fsSL \
         "https://github.com/argoproj/argo-cd/releases/download/${ARGOCD_VERSION}/argocd-linux-amd64" \
         -o /tmp/argocd \
@@ -39,7 +42,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && rm -rf /var/lib/apt/lists/*
 
 # Verify binaries
-RUN argocd version --client 2>&1 | head -1 && helm version --short
+RUN argocd version --client 2>&1 | head -1 && helm version --short \
+    && git --version
 
 # Runtime Python dependencies (hash-pinned, see requirements.txt).
 COPY requirements.txt /tmp/requirements.txt

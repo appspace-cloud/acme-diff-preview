@@ -134,6 +134,10 @@ spec:
               value: {{ .warmWorkers | quote }}
             {{- end }}
             {{- /* warmThreshold removed — no effect after warm-diff pass was replaced by pre-pull */ -}}
+            {{- if hasKey . "gitMirrorEnabled" }}
+            - name: GIT_MIRROR_ENABLED
+              value: {{ .gitMirrorEnabled | quote }}
+            {{- end }}
             {{- end }}
             {{- with .Values.diffUi }}
             # Full-diff web UI (Atlantis-style): the complete, untruncated
@@ -217,4 +221,10 @@ spec:
             {{- toYaml .Values.resources | nindent 12 }}
       volumes:
         - name: tmp
-          emptyDir: {}
+          # COPS-2564: /tmp now also holds the local git mirrors of the config
+          # repos, which is why it is sized explicitly. Measured today: prod
+          # 16Mi, dev 71Mi, stage 13Mi of .git, so 1Gi leaves a lot of room for
+          # growth and for helm's own scratch files. The container has
+          # readOnlyRootFilesystem, so this emptyDir is the only writable path.
+          emptyDir:
+            sizeLimit: {{ .Values.tmpSizeLimit | default "1Gi" }}

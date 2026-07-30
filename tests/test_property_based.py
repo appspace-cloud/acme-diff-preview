@@ -29,7 +29,7 @@ os.environ["DIFF_HTTP_POOLING"] = "off"
 import sys
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
 
-from hypothesis import example, given, settings, strategies as st
+from hypothesis import assume, example, given, settings, strategies as st
 
 import diff_preview as m  # noqa: E402
 
@@ -108,12 +108,33 @@ def test_redact_never_leaks_a_sensitive_value(marker, key, value):
     assert "[REDACTED]" in out
 
 
+# Every character str.splitlines() treats as a line boundary. Text made ONLY
+# of these has no content lines at all, which is the one input class where
+# idempotency and the line-structure contract cannot both hold (COPS-2561).
+_LINE_TERMINATORS = "\n\r\v\f\x1c\x1d\x1e\x85\u2028\u2029"
+
+
 @given(st.text(max_size=2000))
 def test_redact_is_idempotent(text):
     # Redacting already-redacted text must change nothing: [REDACTED]
     # placeholders and untouched lines are both fixed points. A violation
     # would mean the masking output itself re-triggers (or un-triggers)
     # masking, i.e. the result depends on how many times the pipeline ran.
+    #
+    # COPS-2561: scoped to text with at least one real character. For input
+    # that is nothing but line terminators ('\r\r', '\x1e\r'), each pass
+    # drops one terminator, because _redact_sensitive rebuilds its output with
+    # splitlines() + join() and join only puts separators BETWEEN lines. That
+    # drop is deliberate and asserted by
+    # test_redact_never_raises_and_preserves_line_structure, whose contract
+    # (len(out.split("\n")) == max(len(text.splitlines()), 1)) production
+    # really depends on: redaction must never merge, drop or invent lines.
+    # The two properties are incompatible for terminator-only input, and the
+    # line-structure one wins, so this property is narrowed rather than the
+    # function changed. _redact_sensitive is never applied twice anywhere in
+    # production. The accepted edge is pinned by
+    # test_cops2562_customer_name_cap.py::test_terminator_only_input_shrinks_by_design.
+    assume(text.strip(_LINE_TERMINATORS))
     once = m._redact_sensitive(text)
     assert m._redact_sensitive(once) == once
 
