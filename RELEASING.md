@@ -73,6 +73,36 @@ They can be the same bump or different — keep them in sync with what changed.
 6. Update `acme-infrastructure` config with the new chart version and image tag,
    open a PR, and let Atlantis apply it.
 
+## Where the image actually lives: JFrog, then GKE pulls it through a proxy
+
+`docker.yml` pushes the image to **JFrog** (`docker-dev.repo.appspace.com`)
+and nowhere else. GKE never talks to JFrog directly. The chart's
+`image.repository` default, and every real infra pin, point at
+`us-central1-docker.pkg.dev/appspace-devops/artifact/acme-diff-preview`,
+a Google Artifact Registry **remote repository** configured as a
+pull-through proxy in front of JFrog.
+
+This matters right after a tag push. `gcloud artifacts docker tags list`
+on that Artifact Registry path can show nothing for the brand new tag,
+because the proxy only caches a tag once something has actually pulled it,
+even though the JFrog push already succeeded and `docker.yml` reported
+success. Reading that gap as "the image did not get pushed" costs real
+debugging time, and it has already happened during a real release.
+
+**To confirm a fresh tag is actually resolvable, check the manifest
+through the proxy directly, not the tag-listing command:**
+
+```bash
+TOKEN=$(gcloud auth print-access-token)
+curl -s -o /dev/null -w "%{http_code}\n" \
+  -H "Authorization: Bearer $TOKEN" \
+  -H "Accept: application/vnd.docker.distribution.manifest.v2+json" \
+  "https://us-central1-docker.pkg.dev/v2/appspace-devops/artifact/acme-diff-preview/manifests/<tag>"
+```
+
+`200` means the tag is pullable, whether or not it shows up in the tag
+list yet.
+
 ## Critical: never push the image manually AND push a git tag for the same version
 
 If you push a Docker image manually with `docker push` and then also push the
@@ -101,7 +131,7 @@ cleanly without error.
 |---|---|---|
 | `ci.yml` | PR or push to `main` | Tests + helm lint + docker build (no push) |
 | `release.yml` | Push to `main` | Publishes Helm chart to GitHub Pages via chart-releaser, and ensures every `v*` tag has a matching GitHub Release (see below) |
-| `docker.yml` | Push of `v*` tag | Builds and pushes Docker image to JFrog Artifact Registry |
+| `docker.yml` | Push of `v*` tag | Builds and pushes Docker image to JFrog. GKE never pulls from JFrog directly; it goes through the Artifact Registry proxy, see above |
 
 ## GitHub Releases (human-readable, one per `v*` tag)
 
