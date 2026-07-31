@@ -5403,7 +5403,6 @@ def _run_one_diff(app, pr_sha, main_sha, chart_revision=None, changed_paths=None
     # default the old path-based detection could never see.
     env_move       = _detect_env_move(value_files, renames, main_sha, pr_sha)
     moved_pr_vals  = None
-    pr_value_files = value_files
     if env_move:
         old_env_dir, new_env_dir = env_move
         pr_value_files = _rebase_value_files(value_files, old_env_dir, new_env_dir)
