@@ -21,8 +21,6 @@ sections it already detects, and reorders instead of dropping.
 import os
 import sys
 
-import pytest
-
 os.environ.setdefault("BB_USER", "test-user")
 os.environ.setdefault("BB_TOKEN", "test-token")
 os.environ.setdefault("ARGOCD_PASS", "test-pass")
