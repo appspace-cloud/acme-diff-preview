@@ -240,6 +240,14 @@ LOG_LEVEL          = os.environ.get("LOG_LEVEL", "INFO").upper()
 DEBUG              = LOG_LEVEL == "DEBUG"
 MAX_RESOURCES_FULL = 5       # resources shown with full diff block
 MAX_DIFF_CHARS     = 2000    # chars per resource diff block
+# COPS-2567: slots inside the display budget kept for the risk sections we
+# already detect (deletions first, then replicas zeroed). Sections are sorted
+# by resource key, so an alphabetically late kind (HorizontalPodAutoscaler,
+# PodDisruptionBudget, Secret, ServiceAccount, VerticalPodAutoscaler) used to
+# be pushed out of the body by ordinary Deployment changes. Half of
+# AI_MAX_SECTIONS_PER_APP (10), kept as a literal because that constant is
+# defined further down this module.
+RISK_SECTION_RESERVE = 5
 DISPLAY_BODY_MAX_CHARS = 6000  # v2.5.8: hard cap per resource body in the PR
                                # comment, WITH an explicit marker (protects
                                # the footer/status token from the blunt
@@ -4483,6 +4491,30 @@ def _detect_replicas_zeroed(sections: list) -> list:
     return zeroed
 
 
+def _prioritise_risk_sections(sections: list, deleted: list, zeroed: list,
+                              reserve: int) -> list:
+    """Move risk sections to the front, up to `reserve` of them.
+
+    COPS-2567. Sections arrive sorted by resource key, and the display caps
+    take a flat prefix of that order. On acme-config-prod PR 3845 the ten
+    display slots were filled by /apps/Deployment sections alone, so the five
+    /autoscaling/HorizontalPodAutoscaler deletions the comment shouted about
+    were never shown. A reviewer asked to verify a deletion needs to see it.
+
+    This REORDERS and never drops, so n_res and every consumer of the full
+    list keep working. Only the caps applied afterwards remove anything.
+    `reserve` bounds the damage in the other direction: a PR with 200
+    deletions must still show some ordinary changes.
+    """
+    risky = set(deleted or []) | set(zeroed or [])
+    if not risky:
+        return sections            # common case: byte for byte as before
+    head, tail = [], []
+    for item in sections:
+        (head if item[0] in risky else tail).append(item)
+    return head[:reserve] + tail + head[reserve:]
+
+
 def _package_sections(filtered_sections: list):
     """Build (clean_diff, capped_sections, deleted, zeroed) from the FULL
     filtered section list. Detection runs here — before the display and
@@ -4490,6 +4522,12 @@ def _package_sections(filtered_sections: list):
     lost again (the PR-6773 bug)."""
     deleted = _detect_deleted_resources(filtered_sections)
     zeroed  = _detect_replicas_zeroed(filtered_sections)
+    # COPS-2567: detecting a deletion is only half the job. Give the risk
+    # sections a reserved share of the display budget before the caps below
+    # cut the list, otherwise the shouty block names resources the reviewer
+    # cannot see anywhere in the comment.
+    filtered_sections = _prioritise_risk_sections(
+        filtered_sections, deleted, zeroed, RISK_SECTION_RESERVE)
     display_secs = filtered_sections[:MAX_RESOURCES_FULL]
     truncated_parts = []
     for hdr, body in display_secs:
@@ -6808,7 +6846,8 @@ def _result(value):
     return DiffResult("", [], 0, False, None, OUT_NO_DIFF, "clean")
 
 
-def _format_app_diff_block(app, sections, diff_text, show_diff=True, n_res=None):
+def _format_app_diff_block(app, sections, diff_text, show_diff=True, n_res=None,
+                           risk_headers=None):
     """Return a list of markdown lines for one app's diff block.
 
     sections is DiffResult.sections — already truncated to display budget.
@@ -6818,6 +6857,9 @@ def _format_app_diff_block(app, sections, diff_text, show_diff=True, n_res=None)
     103 resources showed "10 resource(s) changed" and only 10 diffs, with no
     hint that 93 more changed silently (FIX B). show_diff=False outputs just
     the header line (large-mode table overflow).
+    risk_headers (COPS-2567) is the set of deleted/zeroed headers for this app.
+    When one of them is on display the sections are no longer a plain prefix,
+    so the truncation note must not keep saying "first".
     Bitbucket does NOT render HTML <details>/<summary>, so we never use them.
     """
     shown = len(sections) if sections else 0
@@ -6828,11 +6870,16 @@ def _format_app_diff_block(app, sections, diff_text, show_diff=True, n_res=None)
         return out
     if sections:
         if total > shown:
-            out += [
-                f"> \U0001f50d Showing first {shown} of {total} changed "
-                f"resources. See ArgoCD for the full set.",
-                "",
-            ]
+            # COPS-2567: only claim a plain prefix when it still is one.
+            n_risk = sum(1 for hdr, _ in sections if hdr in (risk_headers or ()))
+            if n_risk:
+                note = (f"> \U0001f50d Showing {shown} of {total} changed "
+                        f"resources, the {n_risk} highest-risk one(s) first. "
+                        f"See ArgoCD for the full set.")
+            else:
+                note = (f"> \U0001f50d Showing first {shown} of {total} changed "
+                        f"resources. See ArgoCD for the full set.")
+            out += [note, ""]
         for hdr, body in sections:
             # Redaction happens here, at display time, so the diff engine
             # still compares real values and detects Secret changes.
@@ -7220,8 +7267,12 @@ def format_comment(pr_sha, app_results, skipped_apps=None, base_sha="",
             show_diff = (inline_set is None) or (app in inline_set)
             # sections are already truncated in DiffResult — no re-parsing.
             # Pass r.n_res so the header shows the REAL count (FIX B).
-            lines += _format_app_diff_block(app, r.sections, r.text,
-                                            show_diff=show_diff, n_res=r.n_res)
+            # COPS-2567: pass the risk headers too, so the truncation note
+            # tells the truth about how the shown sections were picked.
+            lines += _format_app_diff_block(
+                app, r.sections, r.text, show_diff=show_diff, n_res=r.n_res,
+                risk_headers=set(r.deleted_resources or [])
+                | set(r.replicas_zeroed or []))
 
         else:
             lines += [f"\u2705 **`{app}`** \u2014 no manifest changes", ""]

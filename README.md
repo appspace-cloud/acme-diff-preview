@@ -50,6 +50,11 @@ and QA apps when CI publishes a new chart, so they pick it up past the OCI cache
 The one rule the tool never breaks: **a failure is never reported as "no changes".**
 If a diff could not be computed, the status says so and the PR is not marked clean.
 
+Only a slice of an app's changed resources is printed with a full diff block.
+Deletions and replica zeroings get a reserved share of that slice, so the
+resources the shouty blocks name are the ones you actually see first. Details
+in [docs/internals.md](docs/internals.md#which-resources-make-it-into-the-comment-body).
+
 ## How the diff works
 
 ArgoCD is used **only** for discovery: at startup, and every 5 minutes, one
