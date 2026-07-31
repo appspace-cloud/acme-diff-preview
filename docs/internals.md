@@ -7,6 +7,7 @@ here is required to use the tool; it is for people changing it or debugging it.
 
 - [Why an empty `microservices.definitions` is blocked](#why-an-empty-microservicesdefinitions-is-blocked)
 - [Handling mass version bumps](#handling-mass-version-bumps-hundreds-of-apps-in-one-pr)
+- [Which resources make it into the comment body](#which-resources-make-it-into-the-comment-body)
 - [Secret-leak and comment-integrity hardening](#secret-leak-and-comment-integrity-hardening)
 - [Full-diff web UI](#full-diff-web-ui-atlantis-style)
 
@@ -86,6 +87,38 @@ start of each iteration so a long-lived pod cannot fill node ephemeral storage.
 > on a mass PR a worker spends most of its wall time sleeping. Simple and
 > correct; a requeue-based design would raise throughput but is a larger
 > change. Revisit only if blip-storms during mass bumps become common.
+
+### Which resources make it into the comment body
+
+An app can change hundreds of resources, so only a slice of them is printed
+with a full diff block. The counts in the headline and in the `N resource(s)
+changed` line are always the real totals; the cap only controls what is shown.
+
+Two rules decide the slice:
+
+- **Detection runs on the full list, before any cap.** Deletions and
+  replica zeroings are found by `_detect_deleted_resources` and
+  `_detect_replicas_zeroed` inside `_package_sections`, on every section.
+  A deletion sitting at position 111 of a mass diff is still named
+  (the PR-6773 lesson, v2.5.26).
+- **Risk sections get a reserved share of the display budget**
+  (`RISK_SECTION_RESERVE`, COPS-2567). Sections arrive sorted by resource
+  key, so `/apps/Deployment` always sorts before
+  `/autoscaling/HorizontalPodAutoscaler`. Taking a plain prefix meant that on
+  acme-config-prod PR 3845 the ten display slots went to Deployments and none
+  of the five HPA deletions the comment shouted about were visible anywhere in
+  the body. The block told the reviewer to verify five deletions and showed no
+  evidence for any of them, which reads exactly like a false positive.
+
+`_prioritise_risk_sections` reorders and never drops, so `n_res` and any
+consumer of the full section list are unaffected; only the caps remove
+anything. The reserve is deliberately a share, not the whole budget: a PR that
+deletes 200 resources must still show some ordinary changes. When no deletion
+and no zeroing exist, the list is returned untouched, so the ordinary case is
+byte for byte what it was before.
+
+The truncation note reflects this. It says `Showing first N of M` only while
+the slice really is a prefix, and names the risk-first ordering otherwise.
 
 ### Secret-leak and comment-integrity hardening
 
