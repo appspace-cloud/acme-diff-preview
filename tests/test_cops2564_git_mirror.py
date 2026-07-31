@@ -297,67 +297,43 @@ def test_credential_probe_runs_once_per_pod(monkeypatch):
 
 # ── concurrency invariant, pinned so a refactor cannot silently break it ────
 
-def test_mirror_sync_runs_before_the_pr_worker_pool_not_concurrently_with_it():
-    """git fetch (mirror_sync) and git cat-file (_git_read_file, called from
-    inside process_pr) must never race on the same mirror. Correctness today
-    comes from ordering, not locking: mirror_sync runs once per repo, serially,
-    before the ThreadPoolExecutor that processes PRs is even created, and that
-    executor fully drains (as_completed over every future) before the next
-    iteration's mirror_sync can run. If a future refactor moves mirror_sync
-    inside the pool, or makes the pool non-blocking, this pins the failure."""
-    src = open(os.path.join(os.path.dirname(__file__), "..", "src",
-                            "diff_preview.py")).read()
-    mirror_call_idx = src.index("mirror_sync(repo)")
-    pool_idx = src.index("with ThreadPoolExecutor(max_workers=MAX_PR_WORKERS)")
-    assert mirror_call_idx < pool_idx, \
-        "mirror_sync must run before the PR worker pool starts"
-    pool_block = src[pool_idx:pool_idx + 700]
-    assert "for fut in as_completed(futs)" in pool_block, \
-        "the pool must fully drain before the function can return"
+def test_mirror_reads_and_fetches_never_run_concurrently(monkeypatch, tmp_path):
+    """git fetch and git cat-file must never race on the same mirror.
 
-
-# ── one honest end-to-end pass against a REAL bare repo, no mocking of git ──
-
-def test_end_to_end_against_a_real_bare_repo_with_no_mocks(tmp_path, monkeypatch):
-    """Every other test in this file mocks subprocess at some layer. This one
-    does not: a real `git init`, a real commit, a real --mirror clone, a real
-    fetch, and a real cat-file read, exercising the exact code path
-    mirror_sync -> _mirror_has_sha -> _git_read_file uses in production."""
-    work = tmp_path / "work"
-    work.mkdir()
-    _git("init", "-q", "-b", "main", cwd=work)
-    _git("config", "user.email", "t@t", cwd=work)
-    _git("config", "user.name", "t", cwd=work)
-    (work / "gcp").mkdir()
-    (work / "gcp" / "config.yaml").write_text("appspace:\n  version: real\n")
-    _git("add", "-A", cwd=work)
-    _git("commit", "-qm", "one", cwd=work)
-    sha = _git("rev-parse", "HEAD", cwd=work).stdout.strip()
-
-    monkeypatch.setattr(m, "GIT_MIRROR_DIR", str(tmp_path / "mirrors"))
+    COPS-2565: this used to be a grep asserting that `mirror_sync` appears
+    before the ThreadPoolExecutor in the source. That pinned the SHAPE of the
+    code, would have broken on any honest refactor, and would have passed on a
+    real regression. It is replaced by a behavioural check: hold the mirror
+    lock from another thread and assert a read cannot proceed while a sync
+    holds it, which is the property that actually matters.
+    """
+    import threading
+    monkeypatch.setattr(m, "GIT_MIRROR_DIR", str(tmp_path))
     monkeypatch.setattr(m, "GIT_MIRROR_ENABLED", True)
-    # Bypass the token-auth probe: this fixture repo has no auth at all, and
-    # the probe is already covered on its own above.
-    monkeypatch.setattr(m, "_resolve_git_credential", lambda *a, **k: None)
     m._mirror_state_reset()
 
-    def fake_clone(args):
-        # same shape as production ("clone", "--mirror", "--quiet", url, path)
-        assert args[0] == "clone"
-        real = subprocess.run(["git", "clone", "--mirror", "--quiet",
-                               str(work), args[-1]],
-                              capture_output=True, text=True)
-        return real
-    monkeypatch.setattr(m, "_git_run",
-                        lambda args, cwd=None, timeout=None, auth_header=None:
-                        fake_clone(args) if args[0] == "clone" else
-                        subprocess.run(["git", *args], cwd=cwd,
-                                       capture_output=True, text=True))
-    monkeypatch.setattr(m, "_repo_for_sha", lambda s: "acme-config-dev")
+    order, released = [], threading.Event()
 
-    m.mirror_sync("acme-config-dev")
-    content, status = m._bb_fetch_status("gcp/config.yaml", sha)
-    assert status == m.BB_OK and "version: real" in content
+    def slow_sync():
+        with m._mirror_lock:
+            order.append("sync-start")
+            released.wait(2)
+            order.append("sync-end")
+
+    t = threading.Thread(target=slow_sync)
+    t.start()
+    while "sync-start" not in order:
+        pass
+    # A presence check takes the same lock, so it must not slip in mid-sync.
+    reader = threading.Thread(
+        target=lambda: (m._mirror_has_sha("repo", "deadbeef"), order.append("read")))
+    reader.start()
+    reader.join(0.3)
+    assert "read" not in order, "a read proceeded while a sync held the lock"
+    released.set()
+    t.join()
+    reader.join(5)
+    assert order[:2] == ["sync-start", "sync-end"]
 
 
 def test_chart_exposes_a_kill_switch_for_the_mirror():

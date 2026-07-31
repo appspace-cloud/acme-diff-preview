@@ -2362,7 +2362,12 @@ HELM_CACHE_DIR  = os.environ.get("HELM_CACHE_DIR", "/tmp/acme-helm-cache")
 # Pin the Kubernetes version helm renders against so charts that branch on
 # .Capabilities.KubeVersion produce stable, cluster-representative output. Both
 # the main and PR renders use the same value, so the diff stays consistent.
-KUBE_VERSION    = os.environ.get("KUBE_VERSION", "1.30.0")
+# COPS-2565: verified 2026-07-31 that every GKE cluster in appspace-cloud and
+# appspace-devops runs 1.35.x, so rendering against 1.30.0 was five minors
+# behind. One constant is enough precisely because they all share a version,
+# and because no chart branches on Helm .Capabilities today (guarded by a test).
+# If either of those stops being true, this needs to become per-cluster.
+KUBE_VERSION    = os.environ.get("KUBE_VERSION", "1.35.5")
 
 # Dev OCI registries may republish charts with the same tag (CI fast-loop). Cache
 # dev-registry chart versions for at most this many seconds before re-pulling.
@@ -5159,6 +5164,23 @@ def _summarize_resources_dict(resources: dict) -> tuple:
     return len(resources), kind_counts, sorted(workloads)
 
 
+def _decommission_cascades(identity_file: str, main_sha: str) -> bool:
+    """True only when this environment opted into cascade deletion.
+
+    COPS-2539: `appspace.decommission: true` in the environment's own
+    customer.yaml templates ArgoCD's resources-finalizer onto its Applications,
+    and that finalizer is what makes removing the folder actually delete the
+    workloads. Without it, `preserveResourcesOnDeletion: true` on every
+    ApplicationSet leaves them running.
+
+    Fails CLOSED on any doubt (unreadable file, unparseable YAML, missing key):
+    orphaning is the default everywhere, so an unknown must never render as the
+    reassuring "it will all be cleaned up".
+    """
+    flat = _flat_yaml_cached(identity_file, main_sha)
+    return str(flat.get("appspace.decommission", "")).lower() == "true"
+
+
 def _evaluate_env_decommissions(candidates: list, pr_sha: str, main_sha: str) -> tuple:
     """Build the decommission warning block for confirmed deletions.
 
@@ -5195,6 +5217,17 @@ def _evaluate_env_decommissions(candidates: list, pr_sha: str, main_sha: str) ->
                 kind_counts[k] = kind_counts.get(k, 0) + v
             workloads.update(wl)
 
+        # COPS-2565: does this environment actually cascade-delete its
+        # resources? Every ApplicationSet sets preserveResourcesOnDeletion:
+        # true, so removing an environment deletes the Application and LEAVES
+        # THE WORKLOADS RUNNING, unless the COPS-2539 gate is opted into with
+        # appspace.decommission: true, which templates ArgoCD's cascade
+        # finalizer on. Read from the environment's own identity file at the
+        # base sha, which is already fetched. Anything other than a confident
+        # "true" is treated as orphaning: that is both the default and, as of
+        # 2026-07-31, the only case that exists in any repo, so a wrong guess
+        # must never be the reassuring one.
+        cascade = _decommission_cascades(c["identity_file"], main_sha)
         lines += [
             f"# \U0001f5d1\ufe0f\u26a0\ufe0f ENVIRONMENT DECOMMISSION \u26a0\ufe0f\U0001f5d1\ufe0f",
             "",
@@ -5203,16 +5236,35 @@ def _evaluate_env_decommissions(candidates: list, pr_sha: str, main_sha: str) ->
             f"This is a destructive, hard-to-reverse change — verify this is intentional.**",
             "",
         ]
+        if not cascade:
+            lines += [
+                "\u26a0\ufe0f **The ArgoCD Application is removed, but its resources "
+                "are NOT deleted — they keep running.** This environment has not "
+                "opted into cascade deletion, and the ApplicationSet sets "
+                "`preserveResourcesOnDeletion: true`, so every workload below is "
+                "left orphaned in the cluster: still running, still costing money, "
+                "still holding IPs and disks, and no longer managed by ArgoCD.",
+                "",
+                "To delete them together with the Application, set "
+                "`appspace.decommission: true` in the environment's `customer.yaml` "
+                "and let it sync BEFORE the folder is removed (COPS-2539). "
+                "Otherwise they have to be cleaned up by hand.",
+                "",
+            ]
         if any_rendered and total:
             kind_breakdown = ", ".join(
                 f"{n} {k}" for k, n in sorted(kind_counts.items(), key=lambda kv: (-kv[1], kv[0])))
-            lines.append(f"- **Resources that will be removed:** {total} total \u2014 {kind_breakdown}")
+            label = ("**Resources that will be removed:**" if cascade
+                     else "**Resources that will be LEFT RUNNING (orphaned):**")
+            lines.append(f"- {label} {total} total \u2014 {kind_breakdown}")
             if workloads:
                 shown = sorted(workloads)[:DECOM_WORKLOADS_MAX_SHOWN]
                 apps_str = ", ".join(f"`{w}`" for w in shown)
                 more = (f" *(+{len(workloads) - DECOM_WORKLOADS_MAX_SHOWN} more, truncated)*"
                         if len(workloads) > DECOM_WORKLOADS_MAX_SHOWN else "")
-                lines.append(f"- **Applications removed:** {apps_str}{more}")
+                wl_label = ("**Applications removed:**" if cascade
+                            else "**Workloads left running:**")
+                lines.append(f"- {wl_label} {apps_str}{more}")
         else:
             lines.append("- *(resource preview unavailable \u2014 the deletion itself is confirmed)*")
         lines.append("")

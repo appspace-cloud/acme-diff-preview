@@ -5,96 +5,74 @@
 ![Coverage](badges/coverage.svg)
 ![Version](badges/version.svg)
 
-ACME Diff Preview service for Appspace. A long-running Kubernetes Deployment
-that does two distinct jobs:
+**Shows you what ArgoCD is about to change, before you merge.**
 
-1. **PR diff comments** — watches Bitbucket PRs on the configured config repos
-   and, for every affected app, renders the chart with `helm template` for
-   both the PR and the `main` revision, diffs the two locally, and posts a
-   formatted comment with a Vertex AI Gemini summary. Multi-repo (COPS-2507):
-   the path map is partitioned by each Application's git source, so a PR can
-   only ever match, fetch from, and comment on its own repo. Repos are
-   configured via `DIFF_REPOS` (chart value `diff.repos`), e.g.
-   `acme-config-dev;acme-config-stage`. Production runs both `acme-config-dev`
-   and `acme-config-stage` with no scope restriction — every ArgoCD app in
-   the repo is reachable, GCP or Azure alike, and any tree the repo has that
-   ArgoCD does not manage (e.g. a legacy-pipeline path) simply matches zero
-   apps and gets the "No ArgoCD apps affected" comment rather than a diff.
-   `acme-config-prod` isn't wired in yet — pending its own ArgoCD onboarding.
-   An optional `:scopes` suffix on a repo entry (e.g. `acme-config-stage:gcp/`)
-   can still fully hide an in-repo tree regardless of app matching, if a repo
-   ever needs that; a PR with zero in-scope files is then skipped in full
-   silence instead of getting the "no apps affected" comment. New-environment
-   evaluation resolves `appspace.version` through the config.yaml hierarchy
-   at the PR sha, since most environments inherit it from a cohort-level file.
+Open a PR on a config repo and this service replies with a comment listing every
+Kubernetes resource that will change, per environment, as a real diff. The point
+is a controlled PR model: nothing reaches a cluster that a reviewer has not seen
+first.
 
-2. **JFrog OCI webhook** — receives push events from JFrog when CI publishes
-   a new Helm chart to `helm-oci-dev`, finds every dev/QA ArgoCD app tracking
-   that chart version, and hard-refreshes them to bypass the OCI cache.
+```
+PR opened on acme-config-*
+        │
+        ├─ which ArgoCD apps does this PR touch?        (app inventory, refreshed every 5 min)
+        ├─ render each app at main         ──┐
+        ├─ render each app at the PR sha   ──┴─ diff the two, resource by resource
+        │
+        └─ one comment on the PR  +  one build status (green / blocked)
+```
 
-An optional CronJob can sweep every app in the configured projects as a
-fallback safety net. It ships **disabled** (`hardRefresh.enabled: false`): the
-webhook above already refreshes exactly the apps that track the chart that was
-just published, while a full sweep pushed enough traffic through the
-argocd-agent principal that spoke-hosted apps started getting cut off by the
-30s load-balancer timeout. Enable it only if webhook delivery proves
-unreliable.
+Two things to know up front:
+
+- **It renders locally.** `helm template` for both sides, diffed in Python. ArgoCD
+  is used only to discover which apps exist and how they are configured, never to
+  perform the diff. No spoke agent is contacted.
+- **It compares desired against desired,** the PR against `main`, not against the
+  live cluster. That is accurate here because every ApplicationSet runs with
+  `selfHeal: true`, so live state tracks `main` closely (measured 2026-07-31:
+  1020 of 1021 apps Synced).
+
+It also runs a second, unrelated job: a **JFrog webhook** that hard-refreshes dev
+and QA apps when CI publishes a new chart, so they pick it up past the OCI cache.
 
 ---
 
-## How the diff works (pure helm template, no agent round-trips)
+## Reading a comment
 
-ArgoCD is used **only** for discovery: at startup (and every 5 min) a single
-`argocd app list` builds an in-memory map of each app's chart name, target
-revision, OCI registry, value files and namespace. The diff itself never touches
-a spoke agent. For each affected app the service:
+| Signal | Meaning |
+|---|---|
+| ✅ no manifest changes | Rendered output is byte-identical. Safe. |
+| ⚠️ N resource(s) will change | Normal diff. Review it. |
+| ❔ diff unavailable | **Not** the same as "no changes". Something failed and the app was NOT evaluated. |
+| 🗑️ RESOURCE(S) DELETED | Resources disappear from the rendered output entirely. |
+| 🗑️ ENVIRONMENT DECOMMISSION | A whole environment is being removed. Read the block: by default its workloads are **orphaned, not deleted**. |
 
-1. `helm pull oci://<registry>/<chart> --version <X> --untar` for both the PR and
-   the `main` chart version (cached locally, pulled once per pod lifetime).
-2. Fetches the app's value files from Bitbucket at the PR sha and the main sha.
-3. Runs `helm template` for each side and diffs the rendered YAML resource by
-   resource in Python.
+The one rule the tool never breaks: **a failure is never reported as "no changes".**
+If a diff could not be computed, the status says so and the PR is not marked clean.
 
-This is entirely local. Typical latency is ~4-6s/app with a warm chart cache vs
-20-360s when diffs went through the agents. When the PR bumps `appspace.version`
-(the OCI chart `targetRevision`), the new version is read from the PR config file
-and used for the PR render so the diff shows the real image changes.
+## How the diff works
 
-## Diff outcomes and debugging
+ArgoCD is used **only** for discovery: at startup, and every 5 minutes, one
+`argocd app list` builds an in-memory map of each app's chart, target revision,
+OCI registry, value files and namespace. Then, per affected app:
 
-Every diff resolves to one of these outcomes:
+1. `helm pull` the chart for both the PR and the `main` version (cached per pod).
+2. Read the app's value files at both shas, from a **local git mirror** of the
+   config repo (COPS-2564). One `git fetch` per repo per iteration replaces what
+   used to be one Bitbucket API call per file.
+3. `helm template` each side and diff the rendered YAML, resource by resource.
 
-| Outcome | Meaning | PR comment |
-|---|---|---|
-| `diff` | The rendered manifests differ | ⚠️ N resource(s) will change |
-| `no_diff` | Manifests match (or only noise/checksum changes) | ✅ No manifest changes |
-| `indeterminate` | The diff could **not** be computed | ❔ diff unavailable (reason) |
-| `error` | Unexpected per-PR exception | ❌ error |
+Typical latency is 4 to 6 seconds per app with a warm chart cache. If the PR bumps
+`appspace.version`, the new chart version is used for the PR side, so the diff
+shows the real image changes.
 
-`indeterminate` is the important one: it is **never** rendered as a green
-"no changes". Each indeterminate carries a short reason (set directly by
-`_run_one_diff`, no stderr guessing). The full detail is in the pod logs at
-`LOG_LEVEL=DEBUG`:
+**Which repos:** set by `DIFF_REPOS` (`diff.repos`), e.g.
+`acme-config-dev;acme-config-stage;acme-config-prod`. The path map is partitioned
+per repo, so a PR can only ever match and comment on its own repo. An optional
+`:scope` suffix (`acme-config-stage:gcp/`) hides a tree entirely; a PR with no
+in-scope files is skipped silently rather than getting a "no apps affected" reply.
 
-| Reason | Retry? | Cause |
-|---|---|---|
-| `oci_not_found` | no (permanent) | the chart version does not exist in the registry — posts a **FAILED** build status because the deployer would fail the same way |
-| `oci_pull_failed` | yes | `helm pull` / `helm registry login` failed (network or credentials) |
-| `metadata_pending` | yes | the app was added since the last 5-min discovery refresh |
-| `render_failed` | no (soft) | `helm template` failed to render the chart with these values |
-| `timeout` | yes | a pull/fetch/render step exceeded `DIFF_TIMEOUT` |
-
-Only `oci_not_found` blocks the PR. Every other reason is a soft "diff
-unavailable" (build status stays SUCCESSFUL so a transient blip never blocks a
-merge), and the PR is left **un-seen** so the next loop re-evaluates it — once
-the OCI/Bitbucket path recovers the comment flips to the real diff.
-
-To see exactly why a diff failed:
-
-```bash
-kubectl -n argocd logs deploy/acme-diff-preview | grep '"outcome"'
-# or, for full per-step detail, set logLevel: DEBUG in the Helm values
-```
+---
 
 ## Merge-blocking guards
 
@@ -106,102 +84,13 @@ before any diff, that no rendered diff would make obvious to a reviewer.
 | Guard | What it catches | Why it is dangerous |
 |---|---|---|
 | Structural new-env failure | a new environment missing a required value (e.g. `appspace.version`) | the environment cannot render at all on merge |
-| **Empty `microservices.definitions`** | a value file (typically `cicd-versions.yaml`) with `appspace.microservices.definitions` present but **null/empty** | see below |
+| **Empty `microservices.definitions`** | a value file (typically `cicd-versions.yaml`) with `appspace.microservices.definitions` present but **null/empty** | silently deletes every microservice on merge ([details](docs/internals.md#why-an-empty-microservicesdefinitions-is-blocked)) |
 
-### Why an empty `microservices.definitions` is blocked
+See [docs/internals.md](docs/internals.md) for the reasoning behind each guard,
+how mass version bumps are handled, the secret-leak hardening, and the
+full-diff web UI.
 
-ArgoCD merges an environment's Helm value files in order, with the per-env
-`cicd-versions.yaml` **last**. A file shaped like
-
-```yaml
-appspace:
-  microservices:
-    definitions:        # <- key present, no children => YAML null
-```
-
-collapses the **entire** `microservices.definitions` map to null in Helm's
-`merge`, wiping every per-service `image.name` override the chart ships
-(`appspace-platformservice`, `appspace-webhookservice`, `appspace-screenshot`,
-…). Each affected service then falls back to the chart helper's derived
-`appspace-<key>` name — a registry path that for these services has never
-held an image — so the whole environment goes `ImagePullBackOff` on the next
-sync. This is the COPR-31637 incident.
-
-The guard flags a `definitions` key that is present but null/empty. A
-**missing** `definitions` key is safe (the chart's own map is kept intact) and
-is deliberately **not** blocked. To remove per-env overrides, delete the
-`definitions:` key entirely — never leave it present but empty. See
-[`docs/microservices-definitions-guard.md`](docs/microservices-definitions-guard.md)
-for the full incident write-up and the exact detection rule.
-
-### Handling mass version bumps (hundreds of apps in one PR)
-
-Bumping a chart `version:` across many clusters in a single PR is a normal
-operation. Because the diff is a local `helm template` render with no agent
-round-trips, the fan-out is cheap and the only shared resource is the Bitbucket
-API used to fetch value files. What keeps it fast and reliable:
-
-- **Chart-cache warm-up** — one representative app per distinct OCI chart is
-  pulled first, so the rest reuse the local tarball (`WARM_WORKERS`/`WARM_THRESHOLD`).
-- **Bitbucket API rate limiting + safe caching** — a global semaphore
-  (`BB_API_CONCURRENCY`) caps concurrent calls; value files are cached by
-  immutable `(commit_sha, path)`, and a transient error is never cached as
-  "missing" so one app's rate-limit blip can't poison the others.
-  A 429 is a property of the *token*, not of the one request that received it,
-  so the pause is **shared**: the first caller to be rate limited publishes a
-  deadline (`Retry-After` when Bitbucket sends it, `BB_RATELIMIT_FALLBACK`
-  when it does not, capped at `BB_RATELIMIT_MAX_PAUSE`) and every other
-  Bitbucket call brakes with it, waiting *outside* the semaphore so a sleeping
-  thread does not hold a concurrency slot. This covers both the value-file
-  path and the poll loop; non-Bitbucket hosts (Vertex AI, the GCP metadata
-  server) keep their own per-request backoff and never trip the shared gate.
-  429s log at `WARNING` **with the endpoint**, and a value file that could not
-  be read is reported separately from one that is genuinely absent — the two
-  used to share a single `debug()` line, which made rate limiting
-  indistinguishable from a real gap in the values hierarchy.
-- **Retry with backoff + jitter** — transient reasons (`oci_pull_failed`,
-  `metadata_pending`, `timeout`) retry in-process up to `DIFF_RETRIES` times.
-- **AI summary at scale** — only the `AI_MAX_APPS` apps with the most changed
-  resources go into the prompt (with a "+N omitted" note); the deterministic
-  headline still covers every app.
-- **Comment truncation preserves the footer** — an oversized comment is cut
-  in the middle, never at the end, so the machine-readable `[clean|permanent|
-  transient]`/`[base:...]` tokens always survive for SHA dedup.
-- **Timeout hygiene** — a diff that hits `DIFF_TIMEOUT` cancels every subtask
-  it had queued on the shared pool, so retries can't amplify congestion when
-  the registry or renders are already slow.
-- **Over the cap is permanent for that commit** — beyond `MAX_APPS_PER_RUN`
-  affected apps, that commit's overflow set is never evaluated (FAILED status,
-  comment names the knob); raise the cap or split the PR.
-
-The on-disk chart cache is bounded (`HELM_CACHE_MAX_CHARTS`) and pruned at the
-start of each iteration so a long-lived pod cannot fill node ephemeral storage.
-
-> **Known trade-off — retries sleep in-worker.** A transient failure retries
-> with backoff inside the same `DIFF_WORKERS` slot, so during a registry blip
-> on a mass PR a worker spends most of its wall time sleeping. Simple and
-> correct; a requeue-based design would raise throughput but is a larger
-> change. Revisit only if blip-storms during mass bumps become common.
-
-### Secret-leak and comment-integrity hardening
-
-The rendered diff and the AI summary both derive from PR-controlled content,
-so several layers guard what reaches the Bitbucket comment:
-
-- **Kind-aware, structural redaction** — `kind: Secret` bodies are whole-masked;
-  other kinds get key-name redaction that also handles YAML block scalars and
-  the `- name:/value:` env-var shape, applied at display time so the diff
-  engine still compares real values.
-- **Error details are redacted too** — a `helm template` YAML error echoes the
-  offending source line; that gets masked before it can reach the comment.
-- **Comment-injection is neutralized** — triple-backtick sequences in rendered
-  values can't break out of the bot's diff fence to inject a fake status line.
-- **AI output is sanitized** — the model summary has Markdown images, raw
-  HTML, and HTML comments stripped before posting; the AI never sets the
-  build status itself.
-- **Isolated helm pulls** — each `helm pull` runs with a private `HELM_*`
-  home so concurrent pulls of different chart versions can't corrupt helm
-  3.x's unlocked shared OCI blob cache.
+---
 
 ### Tuning knobs (env vars / Helm values)
 
@@ -214,7 +103,7 @@ so several layers guard what reaches the Bitbucket comment:
 | `DIFF_RETRIES` | `diff.retries` | `5` | Attempts per diff (backoff + jitter) |
 | `WARM_WORKERS` | `diff.warmWorkers` | `4` | Parallel chart warm-up pulls |
 | `WARM_THRESHOLD` | `diff.warmThreshold` | `8` | Min apps before warm-up kicks in |
-| `KUBE_VERSION` | `kubeVersion` | `1.30.0` | `--kube-version` passed to `helm template` |
+| `KUBE_VERSION` | `kubeVersion` | `1.35.5` | `--kube-version` passed to `helm template`. Matches the real GKE clusters; keep it in step with them |
 | `BB_API_CONCURRENCY` | — | `30` | Max concurrent Bitbucket API calls |
 | `BB_RATELIMIT_FALLBACK` | — | `15` | Shared pause after a 429 that carries no `Retry-After`. Sized to Bitbucket's ~60s window, not to a single retry |
 | `BB_RATELIMIT_MAX_PAUSE` | — | `60` | Cap on the shared pause, so a broken `Retry-After` cannot stall a PR |
@@ -225,102 +114,13 @@ so several layers guard what reaches the Bitbucket comment:
 | `DIFF_OCI_FAIL_ERROR_THRESHOLD` | — | `3` | Consecutive systemic chart-pull failures after which failures log at ERROR instead of WARNING |
 | `DIFF_IGNORE_RESOURCES` | — | *(empty)* | Extra comma-separated resource-name substrings to hide from every diff, on top of the built-in `micro-versions-info` |
 | `DIFF_HTTP_POOLING` | — | `on` | HTTP keep-alive pooling: one persistent TLS connection per worker thread and host. `off` routes every request through plain `urlopen`. Auto-defers to `urlopen` when a proxy is configured. Visible in `/diff-preview/stats` (`http_pool_reuses`/`http_pool_fresh_conns`/`http_pool_fallbacks`) |
-| `DIFF_UI_ENABLED` | `diffUi.enabled` | `true` | Full-diff web UI (see below). Persists artifacts + serves `/diff/*` in-cluster; safe by default since no ingress path exposes it externally |
+| `DIFF_UI_ENABLED` | `diffUi.enabled` | `true` | Full-diff web UI ([details](docs/internals.md#full-diff-web-ui-atlantis-style)). Persists artifacts + serves `/diff/*` in-cluster; safe by default since no ingress path exposes it externally |
 | `DIFF_UI_BASE_URL` | `diffUi.baseUrl` | *(empty)* | External base URL the build status deep-links to. Empty = status keeps linking to the comment |
 | `DIFF_UI_DIR` | `diffUi.dir` | `/tmp/acme-diff-ui` | Artifact directory (bounded, pruned oldest-first) |
 | `DIFF_UI_MAX_ARTIFACTS` | `diffUi.maxArtifacts` | `500` | Max stored artifacts before pruning |
-| — | `diffUi.ingress.enabled` | `false` | Externally reachable, IAP-gated Service + BackendConfig for the UI (see below) |
+| — | `diffUi.ingress.enabled` | `false` | Externally reachable, IAP-gated Service + BackendConfig for the UI ([details](docs/internals.md#full-diff-web-ui-atlantis-style)) |
 
-### Full-diff web UI (Atlantis-style)
 
-The PR comment has a hard Bitbucket size limit (`MAX_COMMENT_BYTES`, ~245KB):
-an oversized comment is cut in the middle and, until now, the complete output
-only existed in the pod logs. With `DIFF_UI_ENABLED` (**on by default**, see
-below), the service persists the COMPLETE, untruncated comment body for the
-PR (already redacted, the exact text the comment would carry), together with
-the same at-a-glance context the comment header shows (base commit, apps
-evaluated, per-outcome breakdown), and serves it on the health port. Like the
-PR comment itself, there is exactly one live artifact per `(repo, pr)`: each
-new commit overwrites the previous diff in place (atomic write), so the page
-always reflects the latest generated output, and a build-status link that
-embeds an older commit sha still resolves to the PR's current diff rather than
-404. The page is rendered Azure DevOps-style (dense line-numbered diff table,
-GitHub diff palette, sticky header) with a Light / Auto / Dark appearance
-switch (persisted per browser; Auto follows the OS). Very large diffs render a
-capped, scrollable window first with a "show full output" control that reveals
-the rest in place (nothing is dropped; `/raw` is always byte-exact). Every
-page names the service explicitly ("acme-diff-preview" wordmark, "ACME Diff
-Preview" label) so a reviewer landing here from a build status link never has
-to guess which tool posted it:
-
-| Method | Path | Description |
-|---|---|---|
-| `GET` | `/diff/<repo>/<pr>/<sha>` | Full diff rendered as HTML (everything escaped); serves the PR's latest diff even if `<sha>` is stale |
-| `GET` | `/diff/<repo>/<pr>/<sha>/raw` | Exact plain-text body |
-
-**Why the default is on and why that is safe.** The ArgoCD hub Ingress
-`extraPaths` forward exactly two paths to this Service, `/jfrog-webhook` and
-`/diff-preview/webhook`, never a wildcard (defined in `acme-infrastructure`,
-not this chart). Turning `DIFF_UI_ENABLED` on does not add a new externally
-reachable path: `/diff/*` is only reachable in-cluster or via
-`kubectl port-forward`, exactly like `/diff-preview/stats` already is.
-`DIFF_UI_BASE_URL` stays empty by default, so the Bitbucket build status
-keeps linking to the comment, never to a host with no access control in
-front of it.
-
-**Reaching it from a browser, behind SSO.** This is a SEPARATE, explicit
-opt-in: `diffUi.ingress.enabled` (default `false`). When set, the chart
-renders a second Service, `<release>-acme-diff-preview-ui`, selecting the
-exact same pods on the exact same port, with a GKE `BackendConfig`
-(`cloud.google.com/backend-config` annotation) enabling Google
-Identity-Aware Proxy on that Service only. The primary Service (the
-webhooks) is never touched, since JFrog and Bitbucket authenticate with an
-HMAC signature and could never complete an interactive Google login. This
-mirrors how ArgoCD itself is protected here (`argocd-dex-server` + Google
-OAuth, COPS-2479): the same Google identity gates this page.
-
-Turning it on is simpler than it sounds. GKE 1.29.4-gke.1043000+ supports
-IAP with a Google-managed OAuth client, and this cluster runs 1.35.x
-(verified live). The default path needs just:
-
-1. Set `diffUi.ingress.enabled: true`. No custom OAuth client, no secret
-   to provision, GKE manages the client itself.
-2. Grant access to real people/groups: Cloud Console → Security →
-   Identity-Aware Proxy → select this backend → Add principal →
-   "IAP-secured Web App User". This step is unavoidable either way, it is
-   the actual access-control layer, independent of the OAuth client.
-3. Wire the new `<release>-acme-diff-preview-ui` Service into the hub
-   Ingress' host/path rules and the TLS certificate for that host: both
-   live in `acme-infrastructure`, tracked as follow-up work in the ticket,
-   not in this chart.
-
-A custom OAuth client is also supported, for orgs that specifically need
-one instead of the Google-managed client: set both
-`secrets.iapOauthClientIdKey` and `secrets.iapOauthClientSecretKey` (both
-empty by default) to GCP Secret Manager key names, which makes the chart
-create the `ExternalSecret` that fills the `BackendConfig`'s
-`oauthclientCredentials`. Leaving either one empty keeps the
-Google-managed path.
-
-One project-level prerequisite either path shares, per Google's own docs:
-the GKE service agent needs the `compute.backendServices.update` IAM
-permission. This is granted automatically on almost every GCP project
-(it is part of the default `Kubernetes Engine Service Agent` role) and is
-project-level IAM, not something this chart can set or verify; if IAP
-enablement silently does not take effect, check this first.
-
-If step 3 is not done yet while `diffUi.ingress.enabled` is `true`, the
-BackendConfig and Service simply exist unused; nothing else in the
-cluster, and no other Application, is affected. Once the host is live, set
-`DIFF_UI_BASE_URL` to it (e.g. `https://acme-diff-preview.appspace.com`, the
-same `acme-diff-preview` slug this chart already uses for the Service name)
-so the Bitbucket build status becomes the permalink to that exact commit's
-page, mirroring how the Atlantis commit-status "Details" link opens the
-full plan output. The comment stays as the summary either way. Storage v1
-is a bounded local directory (atomic writes, oldest-pruned); a durable GCS
-backend is separate follow-up work tracked in the ticket.
-
----
 
 ## Repository layout
 
@@ -354,6 +154,9 @@ acme-diff-preview/
     ├── release.yml            Push to main: publish Helm chart to GitHub Pages
     └── docker.yml             Push of v* tag: build + push image to JFrog
 ```
+
+---
+
 
 ---
 
@@ -402,6 +205,9 @@ failing, then the full suite, then live pod verification.
 
 ---
 
+
+---
+
 ## HTTP endpoints
 
 All endpoints are served on port **8080** inside the pod.
@@ -438,6 +244,9 @@ The stats endpoint returns something like:
   "started_at": "2026-06-25T10:00:00+00:00"
 }
 ```
+
+---
+
 
 ---
 
@@ -525,7 +334,7 @@ image:
 logLevel: INFO
 
 # Kubernetes version helm renders against (--kube-version).
-kubeVersion: "1.30.0"
+kubeVersion: "1.35.5"
 
 argocd:
   server: argocd.appspace.com
