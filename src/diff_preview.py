@@ -5202,6 +5202,60 @@ def _summarize_resources_dict(resources: dict) -> tuple:
     return len(resources), kind_counts, sorted(workloads)
 
 
+_CASCADE_KEEP_CRD_REASON = "CRD (shared with other environments)"
+_CASCADE_KEEP_POLICY_REASON = "helm.sh/resource-policy: keep"
+_CASCADE_KEEP_DELETE_FALSE_REASON = "sync-options: Delete=false"
+
+
+def _cascade_retention_reason(type_key: str, doc_text) -> str:
+    """Why ArgoCD's cascade delete SKIPS this resource, or "" if it deletes it.
+
+    Mirrors shouldBeDeleted (controller/appcontroller.go), which is the only
+    authority on what a cascade actually removes:
+
+        !kube.IsCRD(obj) && !isSelfReferencedApp(app, kube.GetObjectRef(obj)) &&
+        (deleteOption == nil || *deleteOption != synccommon.SyncValueFalse) &&
+        !resourceutil.HasAnnotationOption(obj, helm.ResourcePolicyAnnotation,
+                                          helm.ResourcePolicyKeep)
+
+    The self-reference clause is about the Application object itself, which
+    never appears in a rendered manifest, so only the other three apply here.
+
+    doc_text is the rendered document. Anything that is not a string (older
+    callers pass placeholder values) is treated as carrying no annotations,
+    which errs towards counting a resource as deleted: overstating the
+    destruction is the safe direction for a warning.
+    """
+    if type_key.split("/")[-1] == "CustomResourceDefinition":
+        return _CASCADE_KEEP_CRD_REASON
+    if not isinstance(doc_text, str):
+        return ""
+    for line in doc_text.splitlines():
+        stripped = line.strip()
+        if ":" not in stripped:
+            continue
+        key, value = stripped.split(":", 1)
+        value = _strip_trailing_comment(value.strip()).strip("\"'")
+        if key.strip() == "helm.sh/resource-policy" and value == "keep":
+            return _CASCADE_KEEP_POLICY_REASON
+        if key.strip() == "argocd.argoproj.io/sync-options" and "Delete=false" in value:
+            return _CASCADE_KEEP_DELETE_FALSE_REASON
+    return ""
+
+
+def _split_resources_by_cascade_fate(resources: dict) -> tuple:
+    """(deleted_subdict, {(type_key, reason): count}) for a cascade delete."""
+    deleted, retained = {}, {}
+    for key, doc in resources.items():
+        reason = _cascade_retention_reason(key[0], doc)
+        if reason:
+            rk = (key[0], reason)
+            retained[rk] = retained.get(rk, 0) + 1
+        else:
+            deleted[key] = doc
+    return deleted, retained
+
+
 def _decommission_cascades(identity_file: str, main_sha: str) -> bool:
     """True only when this environment opted into cascade deletion.
 
@@ -5217,6 +5271,23 @@ def _decommission_cascades(identity_file: str, main_sha: str) -> bool:
     """
     flat = _flat_yaml_cached(identity_file, main_sha)
     return str(flat.get("appspace.decommission", "")).lower() == "true"
+
+
+def _decommission_purges_data(identity_file: str, main_sha: str) -> bool:
+    """True only when the environment armed BOTH decommission flags.
+
+    COPS-2572: `appspace.decommissionPurgeData` is inert on its own. The
+    charts gate every purge resource on `and decommission decommissionPurgeData`
+    so that a stray copy of the purge flag into an unarmed environment does
+    nothing, and this must agree with them or the warning either cries wolf
+    or stays quiet on a real data deletion.
+
+    Fails CLOSED exactly like _decommission_cascades: anything other than a
+    confident "true" on both means no purge is claimed.
+    """
+    flat = _flat_yaml_cached(identity_file, main_sha)
+    return (str(flat.get("appspace.decommission", "")).lower() == "true"
+            and str(flat.get("appspace.decommissionPurgeData", "")).lower() == "true")
 
 
 def _evaluate_env_decommissions(candidates: list, pr_sha: str, main_sha: str) -> tuple:
@@ -5238,9 +5309,13 @@ def _evaluate_env_decommissions(candidates: list, pr_sha: str, main_sha: str) ->
             _app_chart_revision_map[a] for a in c["apps"]
             if _app_chart_revision_map.get(a)
         })
-        total = 0
-        kind_counts: dict = {}
-        workloads: set = set()
+        # Two tallies, because the answer depends on whether this
+        # environment cascades. Orphaning leaves EVERYTHING running,
+        # including the CRDs, so that branch must keep counting the lot.
+        # A cascade skips whatever shouldBeDeleted excludes.
+        all_total, all_kinds, all_workloads = 0, {}, set()
+        del_total, del_kinds, del_workloads = 0, {}, set()
+        retained_counts: dict = {}
         any_rendered = False
         for app in c["apps"]:
             try:
@@ -5250,10 +5325,19 @@ def _evaluate_env_decommissions(candidates: list, pr_sha: str, main_sha: str) ->
                 continue
             any_rendered = True
             n, kc, wl = _summarize_resources_dict(resources)
-            total += n
+            all_total += n
             for k, v in kc.items():
-                kind_counts[k] = kind_counts.get(k, 0) + v
-            workloads.update(wl)
+                all_kinds[k] = all_kinds.get(k, 0) + v
+            all_workloads.update(wl)
+
+            deleted_only, retained = _split_resources_by_cascade_fate(resources)
+            dn, dkc, dwl = _summarize_resources_dict(deleted_only)
+            del_total += dn
+            for k, v in dkc.items():
+                del_kinds[k] = del_kinds.get(k, 0) + v
+            del_workloads.update(dwl)
+            for k, v in retained.items():
+                retained_counts[k] = retained_counts.get(k, 0) + v
 
         # COPS-2565: does this environment actually cascade-delete its
         # resources? Every ApplicationSet sets preserveResourcesOnDeletion:
@@ -5266,6 +5350,10 @@ def _evaluate_env_decommissions(candidates: list, pr_sha: str, main_sha: str) ->
         # 2026-07-31, the only case that exists in any repo, so a wrong guess
         # must never be the reassuring one.
         cascade = _decommission_cascades(c["identity_file"], main_sha)
+        purges_data = _decommission_purges_data(c["identity_file"], main_sha)
+        total = del_total if cascade else all_total
+        kind_counts = del_kinds if cascade else all_kinds
+        workloads = del_workloads if cascade else all_workloads
         lines += [
             f"# \U0001f5d1\ufe0f\u26a0\ufe0f ENVIRONMENT DECOMMISSION \u26a0\ufe0f\U0001f5d1\ufe0f",
             "",
@@ -5289,6 +5377,26 @@ def _evaluate_env_decommissions(candidates: list, pr_sha: str, main_sha: str) ->
                 "Otherwise they have to be cleaned up by hand.",
                 "",
             ]
+        elif purges_data:
+            # COPS-2572: both flags armed. This is the only state in which
+            # customer data is destroyed, so it cannot read like the ordinary
+            # destructive-but-recoverable case above.
+            lines += [
+                "\U0001f6a8 **DATA WILL BE PERMANENTLY DESTROYED.** This environment "
+                "also has `appspace.decommissionPurgeData: true`, so Config Connector "
+                "empties and deletes the BigQuery dataset and the user content bucket "
+                "as part of the cascade. **That data is not recoverable afterwards.** "
+                "Only the content backup bucket is deliberately left behind.",
+                "",
+            ]
+        else:
+            lines += [
+                "\u2705 **Data is not purged.** The BigQuery dataset and the content "
+                "bucket are abandoned rather than deleted, so they survive in GCP and "
+                "stay recoverable. Destroying them needs `appspace.decommissionPurgeData: "
+                "true` as a separate, reviewed change (COPS-2572).",
+                "",
+            ]
         if any_rendered and total:
             kind_breakdown = ", ".join(
                 f"{n} {k}" for k, n in sorted(kind_counts.items(), key=lambda kv: (-kv[1], kv[0])))
@@ -5303,6 +5411,17 @@ def _evaluate_env_decommissions(candidates: list, pr_sha: str, main_sha: str) ->
                 wl_label = ("**Applications removed:**" if cascade
                             else "**Workloads left running:**")
                 lines.append(f"- {wl_label} {apps_str}{more}")
+        if cascade and retained_counts:
+            # Silently dropping these would be worse than the overcount they
+            # replace: shared CRDs and a kept Namespace are exactly what got
+            # left behind on the pv-qa-99-a pilot, and the Namespace surviving
+            # is what kept 12 cloned secrets alive in it.
+            retained_str = ", ".join(
+                f"{n} {tk} ({reason})"
+                for (tk, reason), n in sorted(retained_counts.items(),
+                                              key=lambda kv: (-kv[1], kv[0])))
+            lines.append(
+                f"- **Retained (ArgoCD will NOT delete these):** {retained_str}")
         else:
             lines.append("- *(resource preview unavailable \u2014 the deletion itself is confirmed)*")
         lines.append("")
