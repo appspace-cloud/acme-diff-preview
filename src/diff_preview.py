@@ -5383,18 +5383,18 @@ def _evaluate_env_decommissions(candidates: list, pr_sha: str, main_sha: str) ->
             # destructive-but-recoverable case above.
             lines += [
                 "\U0001f6a8 **DATA WILL BE PERMANENTLY DESTROYED.** This environment "
-                "also has `appspace.decommissionPurgeData: true`, so Config Connector "
-                "empties and deletes the BigQuery dataset and the user content bucket "
-                "as part of the cascade. **That data is not recoverable afterwards.** "
-                "Only the content backup bucket is deliberately left behind.",
+                + "also has `appspace.decommissionPurgeData: true`, so Config Connector "
+                + "empties and deletes the BigQuery dataset and the user content bucket "
+                + "as part of the cascade. **That data is not recoverable afterwards.** "
+                + "Only the content backup bucket is deliberately left behind.",
                 "",
             ]
         else:
             lines += [
                 "\u2705 **Data is not purged.** The BigQuery dataset and the content "
-                "bucket are abandoned rather than deleted, so they survive in GCP and "
-                "stay recoverable. Destroying them needs `appspace.decommissionPurgeData: "
-                "true` as a separate, reviewed change (COPS-2572).",
+                + "bucket are abandoned rather than deleted, so they survive in GCP and "
+                + "stay recoverable. Destroying them needs `appspace.decommissionPurgeData: "
+                + "true` as a separate, reviewed change (COPS-2572).",
                 "",
             ]
         if any_rendered and total:
