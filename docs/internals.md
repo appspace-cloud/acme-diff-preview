@@ -8,6 +8,7 @@ here is required to use the tool; it is for people changing it or debugging it.
 - [Why an empty `microservices.definitions` is blocked](#why-an-empty-microservicesdefinitions-is-blocked)
 - [Handling mass version bumps](#handling-mass-version-bumps-hundreds-of-apps-in-one-pr)
 - [Which resources make it into the comment body](#which-resources-make-it-into-the-comment-body)
+- [Superseding an in-flight render](#superseding-an-in-flight-render)
 - [Secret-leak and comment-integrity hardening](#secret-leak-and-comment-integrity-hardening)
 - [Full-diff web UI](#full-diff-web-ui-atlantis-style)
 
@@ -119,6 +120,88 @@ byte for byte what it was before.
 
 The truncation note reflects this. It says `Showing first N of M` only while
 the slice really is a prefix, and names the risk-first ordering otherwise.
+
+### Superseding an in-flight render
+
+Two pushes landing on the same PR inside one render window used to mean the
+first render ran to completion against a commit that was already dead,
+published that diff into the shared PR comment, and only then did the real
+commit get rendered. Measured on acme-config-prod PR 3837: 6m17s from the
+final push to the final result, 3m10s of it rendering a commit nobody would
+ever merge, and for ~10s the PR carried a build status for one commit next to
+a comment describing another.
+
+The webhook already knew. `pullrequest.id`, `pullrequest.source.commit.hash`
+and `repository.full_name` all arrive in the body, which `do_POST` read,
+HMAC-verified, and then discarded, deciding purely on the `X-Event-Key`
+header.
+
+**How it works now**
+
+- The webhook handler records a hint, `(repo, pr_id) -> newest sha`, under its
+  own lock (`_seen_lock` already guards three structures and is held by the PR
+  workers; this one is written from HTTP handler threads).
+- `process_pr` **arms** on entry by atomically popping any pending hint. A pop,
+  not a clear: a webhook that lands while the PR is still queued behind others
+  (`PR_WORKERS=3`, minutes on a busy iteration) writes its hint *before*
+  `process_pr` runs, and clearing would destroy the only signal that the
+  snapshot is already stale. Popping also means a hint the snapshot already
+  reflects, typically the very webhook that started this iteration, is consumed
+  without aborting a perfectly correct run.
+- Three check points: at entry, inside the `as_completed` loop in
+  `process_batch` (where the wasted minutes are actually saved, cancelling the
+  queued futures exactly like the SIGTERM drain does), and once more after the
+  batch so a supersede detected on the final future still prevents publication.
+
+**Abort semantics.** A superseded run writes nothing: no comment, no build
+status, and crucially no `_seen` entry, so the PR is re-rendered rather than
+skipped. The backoff is deliberately not fed either, since a supersede is not
+a transient failure and must not slow the retry down. The `INPROGRESS` already
+posted sits on a sha that is no longer the tip, so Bitbucket shows only the
+new tip's statuses and it is inert. No change is needed to the wake path:
+`_wake` was already set by the superseding webhook and is only cleared after
+the iteration, so the next pass starts immediately on the new sha.
+
+**Livelock guard.** A PR pushed to faster than it can render would abort
+forever and never publish anything. After `SUPERSEDE_MAX_CONSECUTIVE_ABORTS`
+consecutive aborts the run is allowed to finish; the counter resets whenever a
+run publishes a real result.
+
+**Two details worth keeping straight**
+
+- The repo key comes from `repository.full_name` (`workspace/slug`), never
+  `repository.name`, which is a *display* name and can differ from the slug
+  entirely. Keying off the display name would make hints silently never match
+  and the whole feature a no-op with no error anywhere.
+- Hints are recorded only for `pullrequest:created` and `pullrequest:updated`.
+  Comment, approval and decline events also start with `pullrequest:` and also
+  embed a full pull request entity, but their sha is just the current tip.
+  All of them still wake the loop, exactly as before.
+
+**The wake path is sacred.** This is the first thing that ever parses the
+webhook body, so it is the first thing that could break the wake, and a broken
+wake fails *silently*: the service just degrades to the 60s safety-net tick
+and everything feels sluggish until somebody notices. So `_wake.set()` is the
+first statement in the `pullrequest:` branch, before anything touches the
+payload; `_maybe_record_supersede_hint` is total (every parse failure, missing
+key, wrong type or unknown repo simply means "no hint"); and
+`tests/test_cops2575_supersede.py` asserts the ordering on the handler source
+itself plus a table of hostile payloads that must each still return 200 and
+still wake the loop.
+
+Hints are only trusted when HMAC verification actually ran. `_verify_bb_hmac`
+is permissive when `BB_WEBHOOK_SECRET` is empty, and an unauthenticated POST
+that can abort in-flight renders is a cheap denial of service.
+
+**Observability.** `/diff-preview/stats` now reports `bb_webhook` counters
+(`received`, `rejected_hmac`, `rejected_format`, `wakes`, `hints_recorded`,
+`supersedes_triggered`, `last_received_at`, plus `hmac_strict` and
+`supersede_enabled`), and `_diff_stats` tracks whether each iteration was
+started by a webhook or by the safety-net tick. That ratio is what catches the
+failures no unit test can: the hook deleted or disabled in Bitbucket, the URL
+changed, an ingress rule dropping the POST, or the secret drifting out of sync
+after a rotation. In all of those the code is perfectly correct and the
+service is quietly running on the 60s poll.
 
 ### Secret-leak and comment-integrity hardening
 
