@@ -42,7 +42,7 @@ image:
   # Kept in sync with Chart.yaml appVersion (RELEASING.md). This default had
   # drifted since v2.7.0; it never bit us because acme-infrastructure pins the
   # tag explicitly, but anyone installing the chart as-is got a stale image.
-  tag: "2.18.1"
+  tag: "2.19.0"
   pullPolicy: IfNotPresent
 
 # Log verbosity for the diff-preview service. Set to DEBUG to emit the full
@@ -69,8 +69,13 @@ diff:
   # hidden regardless of app matching. Empty string = historical dev-only
   # single-repo behavior.
   repos: ""
-  # Hard cap on apps diffed per PR (covers 600+ apps/PR with headroom).
-  maxAppsPerRun: 800
+  # Hard cap on apps diffed per PR. Crossing it is a hard merge block: the
+  # over-cap apps are not evaluated and the build status goes FAILED, since
+  # a partial evaluation must not look like full coverage. Sized at roughly
+  # 1.7x the largest fleet (acme-config-prod, 863 apps over 282 envs as of
+  # 2026-08). Watch max_affected_apps_seen in /diff-preview/stats and raise
+  # this before the gap closes.
+  maxAppsPerRun: 1500
   # Parallel per-app helm-template diffs within one PR.
   workers: 16
   # Parallel PR processing workers.

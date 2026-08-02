@@ -249,8 +249,16 @@ def test_capacity_knobs_configurable():
     assert 'DIFF_WORKERS       = _env_int("DIFF_WORKERS", 16)' in src, (
         "DIFF_WORKERS must be env-configurable (default 16)"
     )
-    assert 'MAX_APPS_PER_RUN   = _env_int("MAX_APPS_PER_RUN", 800)' in src, (
-        "MAX_APPS_PER_RUN must be env-configurable (default 800) to cover 600+ apps"
+    assert 'MAX_APPS_PER_RUN   = _env_int("MAX_APPS_PER_RUN"' in src, (
+        "MAX_APPS_PER_RUN must be env-configurable"
+    )
+    # The default has to clear the largest real fleet with room to grow, not
+    # merely exist. Crossing the cap is a hard merge block, so a default that
+    # trails the fleet turns the biggest production PRs into blocked ones.
+    # acme-config-prod was 863 apps over 282 environments in 2026-08.
+    assert _import_module().MAX_APPS_PER_RUN >= 1200, (
+        "MAX_APPS_PER_RUN default leaves too little headroom over the "
+        "production fleet"
     )
     assert 'MAX_PR_WORKERS  = _env_int("PR_WORKERS", 3)' in src, (
         "MAX_PR_WORKERS must be env-configurable via PR_WORKERS"

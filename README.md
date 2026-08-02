@@ -101,7 +101,7 @@ full-diff web UI.
 
 | Env | Helm value | Default | Purpose |
 |---|---|---|---|
-| `MAX_APPS_PER_RUN` | `diff.maxAppsPerRun` | `800` | Hard cap on apps diffed per PR |
+| `MAX_APPS_PER_RUN` | `diff.maxAppsPerRun` | `1500` | Hard cap on apps diffed per PR. Crossing it blocks the merge (over-cap apps are not evaluated, so the status is `FAILED` rather than a false green). Sized at roughly 1.7x the largest fleet; `/diff-preview/stats` publishes `max_affected_apps_seen` beside `max_apps_per_run` so the remaining headroom is visible before it runs out |
 | `DIFF_WORKERS` | `diff.workers` | `16` | Parallel per-app diffs within one PR |
 | `PR_WORKERS` | `diff.prWorkers` | `3` | PRs processed in parallel |
 | `DIFF_TIMEOUT` | `diff.timeout` | `120` | Seconds per diff step |
