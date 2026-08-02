@@ -108,6 +108,8 @@ full-diff web UI.
 | `DIFF_RETRIES` | `diff.retries` | `5` | Attempts per diff (backoff + jitter) |
 | `WARM_WORKERS` | `diff.warmWorkers` | `4` | Parallel chart warm-up pulls |
 | `WARM_THRESHOLD` | `diff.warmThreshold` | `8` | Min apps before warm-up kicks in |
+| `SUPERSEDE_ABORT_ENABLED` | `diff.supersedeAbortEnabled` | `true` | Let a newer push abort a render already in flight ([details](docs/internals.md#superseding-an-in-flight-render)). Off = the pre-COPS-2575 behaviour, a dead commit is rendered to completion and published |
+| `SUPERSEDE_MAX_CONSECUTIVE_ABORTS` | `diff.supersedeMaxConsecutiveAborts` | `3` | Livelock guard: after this many consecutive aborts on one PR, the run finishes regardless so the PR always eventually gets a comment |
 | `KUBE_VERSION` | `kubeVersion` | `1.35.5` | `--kube-version` passed to `helm template`. Matches the real GKE clusters; keep it in step with them |
 | `BB_API_CONCURRENCY` | — | `30` | Max concurrent Bitbucket API calls |
 | `BB_RATELIMIT_FALLBACK` | — | `15` | Shared pause after a 429 that carries no `Retry-After`. Sized to Bitbucket's ~60s window, not to a single retry |

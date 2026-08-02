@@ -138,6 +138,14 @@ spec:
             - name: GIT_MIRROR_ENABLED
               value: {{ .gitMirrorEnabled | quote }}
             {{- end }}
+            {{- if hasKey . "supersedeAbortEnabled" }}
+            - name: SUPERSEDE_ABORT_ENABLED
+              value: {{ .supersedeAbortEnabled | quote }}
+            {{- end }}
+            {{- if .supersedeMaxConsecutiveAborts }}
+            - name: SUPERSEDE_MAX_CONSECUTIVE_ABORTS
+              value: {{ .supersedeMaxConsecutiveAborts | quote }}
+            {{- end }}
             {{- end }}
             {{- with .Values.diffUi }}
             # Full-diff web UI (Atlantis-style): the complete, untruncated

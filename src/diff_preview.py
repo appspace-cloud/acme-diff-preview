@@ -385,6 +385,25 @@ _jfrog_stats:      dict          = {
 }
 _jfrog_stats_lock: threading.Lock = threading.Lock()
 
+# COPS-2575: Bitbucket webhook counters, exposed under "bb_webhook" on
+# GET /diff-preview/stats. The JFrog webhook has had counters since v2.5.x;
+# the Bitbucket one had none, which is why nobody could tell at a glance
+# whether webhooks were even arriving. The failure this catches is the one no
+# unit test can: the hook deleted or disabled in Bitbucket, the URL changed,
+# an ingress rule dropping the POST, or BB_WEBHOOK_SECRET drifting out of sync
+# after a rotation. In all of those the code is perfectly correct and the
+# service quietly degrades to the 60s safety-net tick.
+_bb_webhook_stats:      dict          = {
+    "received": 0,             # all POSTs reaching /diff-preview/webhook
+    "rejected_hmac": 0,        # HMAC verification failed
+    "rejected_format": 0,      # bad/oversized Content-Length, refused pre-read
+    "wakes": 0,                # pullrequest:* events that woke the loop
+    "hints_recorded": 0,       # payloads that yielded a usable supersede hint
+    "supersedes_triggered": 0, # renders actually aborted as superseded
+    "last_received_at": None,  # ISO timestamp of the most recent POST
+}
+_bb_webhook_stats_lock: threading.Lock = threading.Lock()
+
 # Bounded worker pool for webhook-triggered hard refreshes. A CI republish
 # burst (dozens of distinct chart versions in a minute) previously spawned
 # one daemon thread per event — an uncapped thundering herd on the ArgoCD
@@ -413,6 +432,11 @@ _diff_stats:      dict          = {
     # v2.5.19 (M8): visibility into the v2.5.18 scale machinery — are these
     # paths firing in production, and how often?
     "comments_truncated": 0,       # comments that exceeded MAX_COMMENT_BYTES
+    # COPS-2575: webhook-triggered vs safety-net-triggered iterations. If the
+    # webhook silently dies, safety_net climbs and webhook flatlines.
+    "iters_webhook_triggered": 0,
+    "iters_safetynet_triggered": 0,
+    "last_iteration_trigger": None,
     "ai_prompt_capped": 0,         # AI prompts capped at AI_MAX_APPS
     "diff_retries": 0,             # per-diff transient retries performed
     "futures_cancelled": 0,        # subtask futures cancelled on abnormal exit
@@ -450,6 +474,128 @@ _wake           = threading.Event()  # set by POST /diff-preview/webhook
 _seen_lock      = threading.Lock()   # guards _seen, _force_recompute and _pr_chart_targets
 _force_recompute: set  = set()   # PR ids that must bypass dedup once (chart republished)
 _pr_chart_targets: dict = {}     # pr_id -> {(chart, version), ...} builds each open PR renders with
+
+# ── COPS-2575: supersede an in-flight render ──────────────────────────────────
+# The webhook already carries which PR moved to which commit; before this it
+# was parsed for nothing and only the X-Event-Key header was used. Without it,
+# two pushes inside one render window made the first render run to completion
+# against a dead commit and publish that result (acme-config-prod PR 3837:
+# 190s wasted, and for ~10s a build status for one commit sat next to a
+# comment describing another).
+#
+# Own lock on purpose: _seen_lock already guards three structures and is taken
+# by the PR workers, whereas this dict is written from HTTP handler threads.
+_pr_superseded: dict       = {}   # (repo, pr_id) -> newest sha seen from a webhook
+_pr_supersede_aborts: dict = {}   # (repo, pr_id) -> consecutive aborts, livelock guard
+_supersede_lock            = threading.Lock()
+# A PR pushed to faster than it can render would abort forever and never
+# publish anything. After this many consecutive aborts, let the run finish.
+SUPERSEDE_MAX_CONSECUTIVE_ABORTS = _env_int("SUPERSEDE_MAX_CONSECUTIVE_ABORTS", 3)
+SUPERSEDE_ABORT_ENABLED = os.environ.get(
+    "SUPERSEDE_ABORT_ENABLED", "true").strip().lower() in ("1", "true", "yes")
+# Bitbucket sends 12-char short hashes in both the PR list API and the webhook
+# payload, but normalise anyway so a future 40-char source cannot break the
+# comparison in the silent direction (always superseded / never superseded).
+_SHA_CMP_LEN = 12
+
+
+def _sha_eq(a: str, b: str) -> bool:
+    if not a or not b:
+        return False
+    return a[:_SHA_CMP_LEN] == b[:_SHA_CMP_LEN]
+
+
+def _record_supersede_hint(repo: str, pr_id: int, sha: str) -> None:
+    """Record that (repo, pr_id) has moved to `sha`. Called from the webhook
+    handler thread. Never raises: the wake path must not depend on this."""
+    if not SUPERSEDE_ABORT_ENABLED:
+        return
+    try:
+        with _supersede_lock:
+            _pr_superseded[(repo, pr_id)] = sha
+        with _bb_webhook_stats_lock:
+            _bb_webhook_stats["hints_recorded"] += 1
+    except Exception:
+        # Deliberately swallowed and deliberately silent. This runs on the
+        # webhook thread, where _wake.set() has already happened, and the
+        # hint is a pure optimisation: losing one only means the render is
+        # not aborted early, which is exactly the pre-COPS-2575 behaviour.
+        # Logging here would be worse than useless, since the only plausible
+        # cause is memory pressure, and that is the moment you least want an
+        # extra allocation on the wake path.
+        pass
+
+
+def _arm_supersede(sk, pr_sha: str):
+    """Consume any pending hint for `sk` and report whether it supersedes.
+
+    Atomic pop, deliberately NOT a blind clear. A webhook that lands while the
+    PR is still queued behind others (MAX_PR_WORKERS=3, minutes on a busy
+    iteration) writes its hint before this runs; clearing it would destroy the
+    one signal that the snapshot is already stale, which is the exact bug
+    being fixed. Popping means each hint is consumed exactly once, so a hint
+    the current snapshot already reflects cannot abort a correct run either.
+
+    Returns the newer sha, or None to proceed.
+    """
+    if not SUPERSEDE_ABORT_ENABLED:
+        return None
+    with _supersede_lock:
+        pending = _pr_superseded.pop(sk, None)
+    if pending and not _sha_eq(pending, pr_sha):
+        return pending
+    return None
+
+
+def _superseded(sk, pr_sha: str):
+    """Peek (no consume) at whether a newer commit arrived mid-render.
+
+    Returns the newer sha, or None. Honours the livelock guard: once a PR has
+    aborted SUPERSEDE_MAX_CONSECUTIVE_ABORTS times in a row, this reports
+    "not superseded" so the run completes and the PR finally gets a comment.
+    """
+    if not SUPERSEDE_ABORT_ENABLED:
+        return None
+    with _supersede_lock:
+        pending = _pr_superseded.get(sk)
+        aborts  = _pr_supersede_aborts.get(sk, 0)
+    if aborts >= SUPERSEDE_MAX_CONSECUTIVE_ABORTS:
+        return None
+    if pending and not _sha_eq(pending, pr_sha):
+        return pending
+    return None
+
+
+def _note_supersede_abort(sk) -> int:
+    with _supersede_lock:
+        n = _pr_supersede_aborts.get(sk, 0) + 1
+        _pr_supersede_aborts[sk] = n
+    with _bb_webhook_stats_lock:
+        _bb_webhook_stats["supersedes_triggered"] += 1
+    return n
+
+
+def _note_supersede_complete(sk) -> None:
+    with _supersede_lock:
+        _pr_supersede_aborts.pop(sk, None)
+
+
+def _prune_supersede_state(open_keys, polled_repos=None) -> None:
+    """Drop state for PRs that are no longer open, so the dicts do not grow
+    one entry per force-pushed-then-closed PR for the life of the pod.
+
+    Mirrors the _stale() rule used for _seen and _pr_chart_targets: only evict
+    keys belonging to a repo that was actually polled this round, so a repo
+    temporarily missing from the snapshot does not get its state wiped.
+    """
+    keep = set(open_keys)
+    repos = set(polled_repos) if polled_repos is not None else {k[0] for k in keep}
+    with _supersede_lock:
+        for d in (_pr_superseded, _pr_supersede_aborts):
+            for k in [k for k in d
+                      if not isinstance(k, tuple) or (k[0] in repos and k not in keep)]:
+                del d[k]
+
 
 # ── Health tracking ───────────────────────────────────────────────────────────
 # _last_ok: updated by a background heartbeat thread while the main loop runs.
@@ -608,6 +754,14 @@ class _HealthHandler(BaseHTTPRequestHandler):
             # HA: which replica owns the poll loop right now. No elector
             # wired (tests, single-process runs) counts as leading.
             payload["is_leader"] = _should_run_iteration(_leader)
+            # COPS-2575: Bitbucket webhook health. A dead webhook is otherwise
+            # invisible: the code stays correct and the service just runs on
+            # the 60s safety net. Comparing wakes against safety-net ticks in
+            # the iteration log is what makes that obvious.
+            with _bb_webhook_stats_lock:
+                payload["bb_webhook"] = dict(_bb_webhook_stats)
+            payload["bb_webhook"]["hmac_strict"] = bool(BB_WEBHOOK_SECRET)
+            payload["bb_webhook"]["supersede_enabled"] = SUPERSEDE_ABORT_ENABLED
             data = json.dumps(payload, indent=2).encode()
             self.send_response(200)
             self.send_header("Content-Type", "application/json")
@@ -695,15 +849,24 @@ class _HealthHandler(BaseHTTPRequestHandler):
             # (HMAC is verified AFTER the body is read) could exhaust pod memory
             # or hang this thread forever on an open connection (v2.5.2 C1).
             if length <= 0 or length > JFROG_MAX_BODY_BYTES:
+                with _bb_webhook_stats_lock:
+                    _bb_webhook_stats["received"] += 1
+                    _bb_webhook_stats["rejected_format"] += 1
+                    _bb_webhook_stats["last_received_at"] = datetime.now(timezone.utc).isoformat()
                 self.send_response(413)
                 self.end_headers()
                 return
             body = self.rfile.read(length)
+            with _bb_webhook_stats_lock:
+                _bb_webhook_stats["received"] += 1
+                _bb_webhook_stats["last_received_at"] = datetime.now(timezone.utc).isoformat()
 
             # HMAC-SHA256 verification (Bitbucket X-Hub-Signature header).
             # Permissive when BB_WEBHOOK_SECRET is not set (backward compat).
             if not _verify_bb_hmac(body, self.headers.get("X-Hub-Signature", "")):
                 log("Bitbucket webhook: HMAC verification failed — rejecting request", "WARNING")
+                with _bb_webhook_stats_lock:
+                    _bb_webhook_stats["rejected_hmac"] += 1
                 self.send_response(401)
                 self.end_headers()
                 return
@@ -714,7 +877,17 @@ class _HealthHandler(BaseHTTPRequestHandler):
                 # are the standby and this is not already a relay, relay it
                 # to the leader so processing starts in <1s instead of on
                 # the leader's 60s safety-net tick.
+                #
+                # COPS-2575: _wake.set() stays the FIRST statement here, before
+                # anything touches the payload. The wake is the single most
+                # load-bearing behaviour in the service and it fails silently
+                # (the service just degrades to the 60s tick), so no parsing
+                # bug is ever allowed to suppress it. tests/test_cops2575_
+                # supersede.py asserts this ordering on the source itself.
                 _wake.set()
+                with _bb_webhook_stats_lock:
+                    _bb_webhook_stats["wakes"] += 1
+                _maybe_record_supersede_hint(event_key, body)
                 relayed_in = self.headers.get("X-ADP-Forwarded", "") == "1"
                 if relayed_in or _should_run_iteration(_leader):
                     log(f"Webhook received: {event_key} — waking loop")
@@ -863,6 +1036,59 @@ def _verify_bb_hmac(body: bytes, header: str) -> bool:
     expected = hmac.new(BB_WEBHOOK_SECRET.encode(), body, hashlib.sha256).hexdigest()
     return hmac.compare_digest(sig.encode("utf-8", errors="replace"),
                                 expected.encode("ascii"))
+
+
+# COPS-2575: which pullrequest:* events actually mean "the tip moved".
+# Every pullrequest:* event wakes the loop, as it always has, but comment,
+# approval and decline events also embed a full pullrequest entity whose
+# source.commit.hash is simply the current tip. Recording hints from those
+# adds nothing and couples this to unrelated activity.
+_SUPERSEDE_EVENTS = ("pullrequest:created", "pullrequest:updated")
+
+
+def _maybe_record_supersede_hint(event_key: str, body: bytes) -> None:
+    """Best-effort: note which PR moved to which commit, from the webhook body.
+
+    NEVER raises and never affects the wake. Every failure mode here (bad
+    JSON, missing keys, wrong types, unknown repo, non-UTF8 bytes) simply
+    means "no hint", which degrades to exactly the pre-COPS-2575 behaviour.
+
+    Only trusted when HMAC verification actually ran. _verify_bb_hmac is
+    permissive when BB_WEBHOOK_SECRET is empty, and an unauthenticated POST
+    that can abort in-flight renders is a cheap denial of service. Production
+    sets the secret, so this only guards local and misconfigured deployments.
+    """
+    try:
+        if not SUPERSEDE_ABORT_ENABLED or not BB_WEBHOOK_SECRET:
+            return
+        if event_key not in _SUPERSEDE_EVENTS:
+            return
+        payload = json.loads(body.decode("utf-8"))
+        if not isinstance(payload, dict):
+            return
+        pr = payload.get("pullrequest")
+        repo_obj = payload.get("repository")
+        if not isinstance(pr, dict) or not isinstance(repo_obj, dict):
+            return
+        pr_id = pr.get("id")
+        if not isinstance(pr_id, int) or isinstance(pr_id, bool):
+            return
+        sha = (((pr.get("source") or {}).get("commit") or {}).get("hash"))
+        if not isinstance(sha, str) or not sha:
+            return
+        # repository.full_name carries "workspace/slug". repository.name is a
+        # DISPLAY name and can differ from the slug entirely, so keying off it
+        # would make hints silently never match (COPS-2575 analysis).
+        full_name = repo_obj.get("full_name")
+        if not isinstance(full_name, str) or "/" not in full_name:
+            return
+        workspace, _, slug = full_name.partition("/")
+        if workspace != BB_WORKSPACE or slug not in REPOS:
+            return
+        _record_supersede_hint(slug, pr_id, sha)
+    except Exception:
+        # Deliberately silent and total: the wake already happened.
+        return
 
 
 def _invalidate_for_republish(chart_name: str, chart_version: str) -> None:
@@ -7499,6 +7725,21 @@ def process_pr(pr, path_map, base_sha="", repo=None):
     if dest != "main":
         return
 
+    # COPS-2575: arm the supersede check. Atomic pop, not a clear: a webhook
+    # that landed while this PR sat queued behind others (MAX_PR_WORKERS=3,
+    # minutes on a busy iteration) wrote its hint BEFORE we got here, and
+    # clearing it would destroy the only signal that this snapshot is already
+    # stale. Popping also means a hint the snapshot already reflects (the very
+    # webhook that started this iteration) cannot abort a correct run.
+    _armed_newer = _arm_supersede(sk, pr_sha)
+    if _armed_newer:
+        _n = _note_supersede_abort(sk)
+        log(f"PR #{pr_id}: superseded before render started "
+            f"({pr_sha[:8]} -> {_armed_newer[:8]}), skipping "
+            f"(consecutive={_n})", pr=pr_id, event="superseded",
+            old_sha=pr_sha[:12], new_sha=_armed_newer[:12], stage="entry")
+        return  # _seen NOT set → the newer sha is rendered on the next pass
+
     # A chart republish (JFrog webhook) can force this PR to recompute once,
     # bypassing both dedups below. Consume-once: if the recompute then fails,
     # the error-comment retry path takes over on the next iteration.
@@ -7785,6 +8026,9 @@ def process_pr(pr, path_map, base_sha="", repo=None):
 
         app_results   = app_results  # pre-populated above with any confirmed-decommission results
         any_hard_error = False   # OUT_ERROR — unexpected failure
+        # COPS-2575: set to the newer sha the moment a mid-render supersede is
+        # detected, so the guard after the batch can refuse to publish.
+        _superseded_sha = None
         any_unknown    = False   # OUT_INDETERMINATE — diff not computable
         outcome_counts = Counter()
         reason_counts  = Counter()
@@ -7907,12 +8151,31 @@ def process_pr(pr, path_map, base_sha="", repo=None):
             Checks _shutdown between futures so SIGTERM drains gracefully instead
             of waiting for the entire batch to complete before yielding.
             """
-            nonlocal any_hard_error, any_unknown
+            nonlocal any_hard_error, any_unknown, _superseded_sha
             if not apps:
                 return
             with ThreadPoolExecutor(max_workers=max(1, min(workers, len(apps)))) as ex:
                 futures = {ex.submit(run_diff, app): app for app in apps}
                 for fut in as_completed(futures):
+                    # COPS-2575: a newer push makes every remaining diff
+                    # pointless. Same treatment as SIGTERM below, cancel the
+                    # queued futures and break, because the partial-results
+                    # guard after this batch already refuses to publish an
+                    # incomplete run. This is where the 190 wasted seconds on
+                    # acme-config-prod PR 3837 are actually saved.
+                    if not _superseded_sha:
+                        _newer = _superseded(sk, pr_sha)
+                        if _newer:
+                            _superseded_sha = _newer
+                            log(f"PR #{pr_id}: superseded mid-render "
+                                f"({pr_sha[:8]} -> {_newer[:8]}), cancelling "
+                                f"{sum(1 for f in futures if not f.done())} queued diff(s)",
+                                pr=pr_id, event="superseded",
+                                old_sha=pr_sha[:12], new_sha=_newer[:12],
+                                stage="batch", apps_done=len(app_results))
+                            for f in futures:
+                                f.cancel()
+                            break
                     if _shutdown:
                         log(f"SIGTERM received mid-batch — draining remaining futures",
                             "WARNING")
@@ -8013,6 +8276,28 @@ def process_pr(pr, path_map, base_sha="", repo=None):
         # skip the pull step and go straight to helm template. No separate warm-up
         # diff pass is needed (the old ArgoCD repo-server warm-up no longer applies).
         process_batch(affected, DIFF_WORKERS)
+
+        # COPS-2575: a newer commit landed while this render was running. Do
+        # not publish anything for a dead commit: no comment (it would
+        # overwrite the shared PR comment with a diff nobody will merge) and
+        # no build status. The INPROGRESS already posted sits on a sha that is
+        # no longer the tip, so Bitbucket shows only the new tip's statuses and
+        # it is inert; fix_stuck_inprogress covers the pathological case.
+        # _seen is deliberately NOT set and the backoff is deliberately NOT
+        # fed: a supersede is not a transient failure and must not slow the
+        # retry down. _wake was already set by the superseding webhook and is
+        # only cleared after the iteration, so the next pass starts at once.
+        _late_supersede = _superseded_sha or _superseded(sk, pr_sha)
+        if _late_supersede:
+            _n = _note_supersede_abort(sk)
+            log(f"PR #{pr_id}: superseded ({pr_sha[:8]} -> {_late_supersede[:8]}) "
+                f"after {len(app_results)}/{total_apps_this_run} app(s), "
+                f"discarding this render, no comment and no status "
+                f"(consecutive={_n})",
+                pr=pr_id, event="superseded", old_sha=pr_sha[:12],
+                new_sha=_late_supersede[:12], stage="post_batch",
+                apps_done=len(app_results), apps_total=total_apps_this_run)
+            return  # _seen NOT set → the newer sha renders on the next pass
 
         # If SIGTERM arrived mid-batch, results are incomplete — do NOT post them
         # as a final comment (could show false green on partial evaluation). Leave
@@ -8243,6 +8528,9 @@ def process_pr(pr, path_map, base_sha="", repo=None):
             with _seen_lock:
                 _seen[sk] = (pr_sha, base_sha)
             _backoff_clear(sk)
+            # COPS-2575: this PR published a real result, so the livelock
+            # guard's consecutive-abort streak is over.
+            _note_supersede_complete(sk)
         else:
             # COPS-2546: still unseen (so it retries), but with escalating
             # spacing instead of every iteration.
@@ -8380,6 +8668,8 @@ def main_iteration():
     with _comment_id_cache_lock:
         for stale_k in [k for k in _comment_id_cache if _stale(k)]:
             del _comment_id_cache[stale_k]
+    # COPS-2575: same eviction rule for the supersede hint/abort state.
+    _prune_supersede_state(open_keys, polled_repos)
 
     totals = Counter()
     work = []
@@ -8443,6 +8733,19 @@ def main():
         max_apps_per_run=MAX_APPS_PER_RUN, diff_timeout=DIFF_TIMEOUT,
         diff_retries=DIFF_RETRIES, warm_workers=WARM_WORKERS,
         kube_version=KUBE_VERSION, log_level=LOG_LEVEL, vertex_model=VERTEX_MODEL)
+
+    # COPS-2575 self-check: a silently permissive pod after a secret-mount
+    # problem is worth one log line. Never logs the value, only whether strict
+    # verification is active, and therefore whether supersede hints are
+    # trusted at all (an unauthenticated POST that can abort in-flight renders
+    # would be a cheap denial of service, so hints need a verified sender).
+    if BB_WEBHOOK_SECRET:
+        log("Bitbucket webhook: HMAC strict mode active",
+            hmac_strict=True, supersede_abort=SUPERSEDE_ABORT_ENABLED)
+    else:
+        log("Bitbucket webhook: BB_WEBHOOK_SECRET is EMPTY, permissive mode, "
+            "any unsigned POST is accepted and supersede hints are ignored",
+            "WARNING", hmac_strict=False, supersede_abort=False)
 
     # Self-check: the entire diff engine depends on an OCI pull, which needs
     # OCI_PASS. Without it _helm_login fails and EVERY diff returns "diff
@@ -8525,9 +8828,27 @@ def main():
             _idle_timeout = 60 if not _standby_logged else 5
             with _progress_lock:
                 _loop_idle = True
-            _wake.wait(timeout=_idle_timeout)
+            _woken = _wake.wait(timeout=_idle_timeout)
             with _progress_lock:
                 _loop_idle = False
+            # COPS-2575: record WHY the next iteration is about to run. A
+            # webhook that has silently stopped arriving (deleted in
+            # Bitbucket, ingress dropping the POST, secret drifted after a
+            # rotation) leaves the code perfectly correct and the service
+            # quietly running on the 60s poll. A ratio of safety-net ticks to
+            # webhook wakes is what makes that visible.
+            #
+            # Event.wait() already returns the flag, so this needs no extra
+            # is_set() call: asking the event a second time would both race
+            # (a webhook can land in between) and couple the loop to a method
+            # that test doubles for _wake are not required to provide.
+            with _diff_stats_lock:
+                if _woken:
+                    _diff_stats["iters_webhook_triggered"] += 1
+                    _diff_stats["last_iteration_trigger"] = "webhook"
+                else:
+                    _diff_stats["iters_safetynet_triggered"] += 1
+                    _diff_stats["last_iteration_trigger"] = "safety_net"
             _wake.clear()
 
     log("Shutdown complete", "WARNING")

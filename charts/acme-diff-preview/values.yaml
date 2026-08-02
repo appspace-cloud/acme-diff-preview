@@ -42,7 +42,7 @@ image:
   # Kept in sync with Chart.yaml appVersion (RELEASING.md). This default had
   # drifted since v2.7.0; it never bit us because acme-infrastructure pins the
   # tag explicitly, but anyone installing the chart as-is got a stale image.
-  tag: "2.17.2"
+  tag: "2.18.0"
   pullPolicy: IfNotPresent
 
 # Log verbosity for the diff-preview service. Set to DEBUG to emit the full
@@ -93,6 +93,18 @@ diff:
   # switch for a fast rollback to the pure-API path with no redeploy of code,
   # only this value.
   gitMirrorEnabled: true
+
+  # COPS-2575: let a newer push abort a render that is already in flight.
+  # Without it, two pushes inside one render window make the first render run
+  # to completion against a commit that is already dead and publish that
+  # result into the shared PR comment (acme-config-prod PR 3837: 190s wasted,
+  # and for ~10s a build status for one commit next to a comment describing
+  # another). Kill switch for a rollback via values only, no image change.
+  supersedeAbortEnabled: true
+  # A PR pushed to faster than it can render would abort forever and never
+  # publish anything. After this many consecutive aborts, the run is allowed
+  # to finish regardless.
+  supersedeMaxConsecutiveAborts: 3
 
 # Full-diff web UI (Atlantis-style). Default ON (verified safe: the ArgoCD
 # hub Ingress extraPaths only forward /jfrog-webhook and /diff-preview/webhook
