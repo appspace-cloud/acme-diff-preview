@@ -436,6 +436,11 @@ _diff_stats:      dict          = {
     # webhook silently dies, safety_net climbs and webhook flatlines.
     "iters_webhook_triggered": 0,
     "iters_safetynet_triggered": 0,
+    # COPS-2576: a standby's loop passes, counted apart. Its 5s reactive
+    # wait is a leadership-handoff poll, not the 60s safety net, so mixing
+    # it into the pair above made the safety-net-to-webhook ratio useless
+    # on a standby (it climbed ~12x faster and meant nothing).
+    "iters_standby_wait": 0,
     "last_iteration_trigger": None,
     "ai_prompt_capped": 0,         # AI prompts capped at AI_MAX_APPS
     "diff_retries": 0,             # per-diff transient retries performed
@@ -8843,7 +8848,20 @@ def main():
             # (a webhook can land in between) and couple the loop to a method
             # that test doubles for _wake are not required to provide.
             with _diff_stats_lock:
-                if _woken:
+                if _standby_logged:
+                    # COPS-2576: a standby pass runs no iteration whichever
+                    # way its wait ended, and its 5s poll is not the safety
+                    # net. Counting it in the pair below made the ratio the
+                    # webhook-health alert reads meaningless on a standby
+                    # (measured live: standby 414 "safety net" ticks vs the
+                    # leader's 48 over the same 34 minutes), and a webhook
+                    # wake here would pad the healthy side just as wrongly.
+                    # The role is decided by the same variable that chose
+                    # the wait timeout above, so this classification can
+                    # never disagree with the wait that produced it.
+                    _diff_stats["iters_standby_wait"] += 1
+                    _diff_stats["last_iteration_trigger"] = "standby_wait"
+                elif _woken:
                     _diff_stats["iters_webhook_triggered"] += 1
                     _diff_stats["last_iteration_trigger"] = "webhook"
                 else:

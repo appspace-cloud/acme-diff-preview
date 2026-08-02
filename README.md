@@ -290,7 +290,12 @@ rolling deploys with no availability gap:
   Lease runs it (`leaderElection.enabled`, on by default). The standby takes
   over in seconds when the leader dies, and instantly on a clean shutdown
   (the leader releases the lease on SIGTERM). `GET /diff-preview/stats`
-  exposes `is_leader` per replica.
+  exposes `is_leader` per replica. Iteration-trigger counters are
+  role-aware: `iters_webhook_triggered` and `iters_safetynet_triggered`
+  count only on the leader, while a standby's short 5s handoff polls count
+  in `iters_standby_wait`. The safety-net-to-webhook ratio (the
+  webhook-health signal) is therefore meaningful on any pod, with no
+  `is_leader` filter needed.
 - The chart ships the rest of the disruption armor: `RollingUpdate` with
   `maxUnavailable: 0`, a PodDisruptionBudget (rendered only above one
   replica), node and zone topology spread, a `preStop` sleep for clean
