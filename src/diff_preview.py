@@ -257,7 +257,7 @@ DISPLAY_BODY_MAX_CHARS = 6000  # v2.5.8: hard cap per resource body in the PR
 # The diff is a pure local `helm template` render (no ArgoCD agent round-trips),
 # so the client can fan out wide: the only shared limit is the Bitbucket API
 # (BB_API_CONCURRENCY) used to fetch value files.
-MAX_APPS_PER_RUN   = _env_int("MAX_APPS_PER_RUN", 800)   # cover 600+ apps/PR with headroom
+MAX_APPS_PER_RUN   = _env_int("MAX_APPS_PER_RUN", 1500)  # ~1.7x the largest fleet (see README)
 DIFF_WORKERS       = _env_int("DIFF_WORKERS", 16)        # parallel per-app helm-template diffs
 DIFF_TIMEOUT       = _env_int("DIFF_TIMEOUT", 120)       # seconds per diff (OCI cache-miss pulls are slow)
 WARM_WORKERS       = _env_int("WARM_WORKERS", 4)         # parallel chart-cache warm-up pulls
@@ -323,6 +323,24 @@ def _make_leader_elector():
         on_event=lambda msg: log(
             f"[leader] {msg}",
             "WARNING" if ("non-fatal" in msg or "failed" in msg) else "INFO"))
+
+
+def _record_affected_apps(count: int) -> None:
+    """Track the largest single-run app demand, before any cap truncation.
+
+    Published next to the cap so remaining headroom is readable without
+    digging through logs. It records the demand rather than the batch
+    actually run: pegging it at the cap would hide precisely the overflow
+    this exists to reveal.
+    """
+    with _diff_stats_lock:
+        if count > _diff_stats.get("max_affected_apps_seen", 0):
+            _diff_stats["max_affected_apps_seen"] = count
+    if count > MAX_APPS_PER_RUN:
+        log(f"app cap exceeded: {count} affected, cap {MAX_APPS_PER_RUN}, "
+            f"{count - MAX_APPS_PER_RUN} not evaluated")
+    elif count > MAX_APPS_PER_RUN * 0.9:
+        log(f"app cap headroom low: {count} affected, cap {MAX_APPS_PER_RUN}")
 
 
 def _should_run_iteration(elector) -> bool:
@@ -442,6 +460,13 @@ _diff_stats:      dict          = {
     # on a standby (it climbed ~12x faster and meant nothing).
     "iters_standby_wait": 0,
     "last_iteration_trigger": None,
+    # COPS-2577: largest number of apps a single run was asked to evaluate.
+    # The cap is a hard merge block once crossed (over-cap apps are not
+    # evaluated, so the status is FAILED rather than a false green), which
+    # means an undersized cap first shows up as a blocked production PR.
+    # This is the demand before truncation, so the gap to MAX_APPS_PER_RUN
+    # is the real remaining headroom.
+    "max_affected_apps_seen": 0,
     "ai_prompt_capped": 0,         # AI prompts capped at AI_MAX_APPS
     "diff_retries": 0,             # per-diff transient retries performed
     "futures_cancelled": 0,        # subtask futures cancelled on abnormal exit
@@ -754,6 +779,9 @@ class _HealthHandler(BaseHTTPRequestHandler):
             with _diff_stats_lock:
                 payload = dict(_diff_stats)
             payload["version"] = APP_VERSION   # v2.5.19 (F1): running version
+            # COPS-2577: the high-water mark in the payload is meaningless
+            # on its own; the cap it is approaching has to travel with it.
+            payload["max_apps_per_run"] = MAX_APPS_PER_RUN
             # COPS-2507: which repos (and scopes) this instance is serving.
             payload["repos"] = {r: (c["scopes"] or ["*"]) for r, c in REPOS.items()}
             # HA: which replica owns the poll loop right now. No elector
@@ -8015,6 +8043,7 @@ def process_pr(pr, path_map, base_sha="", repo=None):
             affected = [a for a in affected if a not in decommissioned_apps]
 
         skipped_apps = []
+        _record_affected_apps(len(affected))
         if len(affected) > MAX_APPS_PER_RUN:
             skipped_apps = affected[MAX_APPS_PER_RUN:]
             affected    = affected[:MAX_APPS_PER_RUN]
