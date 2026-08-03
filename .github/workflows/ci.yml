@@ -39,6 +39,16 @@ jobs:
 
       - name: Commit updated badges (main only)
         if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+        # COPS-2580: this step must never fail the job. It is a cosmetic
+        # follow-up to a test run that already passed, and after main
+        # branch protection started requiring status checks on every ref
+        # update, a direct push here (bot-authored, never went through a
+        # PR) can be rejected by GitHub itself ("N of N required status
+        # checks are expected") with no way for this exact commit to ever
+        # satisfy that requirement. Losing a badge refresh once in a while
+        # is harmless; failing the "test" required check over it would
+        # incorrectly block every future PR merge on a cosmetic step.
+        continue-on-error: true
         run: |
           if git diff --quiet -- badges/; then
             echo "Badges unchanged, nothing to commit."
