@@ -91,18 +91,21 @@ start of each iteration so a long-lived pod cannot fill node ephemeral storage.
 
 ### Which resources make it into the comment body
 
-An app can change hundreds of resources, so only a slice of them is printed
-with a full diff block. The counts in the headline and in the `N resource(s)
-changed` line are always the real totals; the cap only controls what is shown.
+An app can change hundreds of resources. Sections are stored up to
+`FULL_SECTIONS_MAX_PER_APP` (400, memory-bounded, not an arbitrary display
+cutoff), which covers every real app seen so far with plenty of headroom. The
+counts in the headline and in the `N resource(s) changed` line are always the
+real totals; the cap only bites in the rare case a single app really does
+exceed it.
 
-Two rules decide the slice:
+Two rules decide what is shown, in order:
 
 - **Detection runs on the full list, before any cap.** Deletions and
   replica zeroings are found by `_detect_deleted_resources` and
   `_detect_replicas_zeroed` inside `_package_sections`, on every section.
   A deletion sitting at position 111 of a mass diff is still named
   (the PR-6773 lesson, v2.5.26).
-- **Risk sections get a reserved share of the display budget**
+- **Risk sections get a reserved share of the display order**
   (`RISK_SECTION_RESERVE`, COPS-2567). Sections arrive sorted by resource
   key, so `/apps/Deployment` always sorts before
   `/autoscaling/HorizontalPodAutoscaler`. Taking a plain prefix meant that on
@@ -120,6 +123,48 @@ byte for byte what it was before.
 
 The truncation note reflects this. It says `Showing first N of M` only while
 the slice really is a prefix, and names the risk-first ordering otherwise.
+With the storage cap this generous, real apps almost never truncate at all
+now; the note mostly exists for the pathological case.
+
+### Grouping apps with an identical diff (COPS-2579)
+
+A shared ancestor file (for example `gcp/config.yaml`) can change one thing
+for every environment in a fleet at once. Before COPS-2579, each app's
+sections were capped at 10 for storage (a limit meant only for the AI
+summary prompt, reused by mistake as the comment's own storage cap), and the
+comment showed a fixed top few apps inline and a one-line summary for the
+rest. On acme-config-prod PR #3837 (removing a Spot compute-class override
+from 248 apps, 67 resources changed per app) this meant 60 of 16616 real
+diff sections were ever shown, repeated as 6 arbitrary, mutually duplicate
+copies, and the scheduling fields under review were masked by an unrelated
+redaction bug on top of that.
+
+Each app's DiffResult now carries a `fingerprint`: a stable hash of its full
+(pre-cap) section list, independent of section order and of the app name
+itself (`_fingerprint_sections`). `format_comment` groups changed apps by
+this fingerprint (`_group_changed_apps_by_fingerprint`) and renders ONE full
+representative diff per distinct fingerprint, with the complete list of
+member environments named above it, instead of one diff per app. The
+overview table still lists every app individually (so per-environment
+visibility is not lost) and labels which diff group it belongs to.
+
+Apps with no fingerprint (a legacy or hand-built `DiffResult`, for example in
+a test that constructs one directly instead of going through
+`_package_sections`) always form their own singleton group and never merge
+with anything, so this is fully backward compatible with any code path that
+does not compute a real fingerprint.
+
+Total output size is now bounded by the number of DISTINCT diffs in a PR, not
+by the number of apps: a PR where 248 apps share one change produces one full
+diff; a PR where 248 apps each have a genuinely different change still
+produces up to 248, protected the same way it always was by the per-body
+(`DISPLAY_BODY_MAX_CHARS`) and whole-comment (`MAX_COMMENT_BYTES`)
+truncation.
+
+The same grouped, complete comment body is what gets persisted to the
+full-diff web UI (see below), so the page shows the same complete picture
+without any extra work.
+
 
 ### Superseding an in-flight render
 
@@ -234,7 +279,21 @@ only existed in the pod logs. With `DIFF_UI_ENABLED` (**on by default**, see
 below), the service persists the COMPLETE, untruncated comment body for the
 PR (already redacted, the exact text the comment would carry), together with
 the same at-a-glance context the comment header shows (base commit, apps
-evaluated, per-outcome breakdown), and serves it on the health port. Like the
+evaluated, per-outcome breakdown), and serves it on the health port.
+
+Before COPS-2579 this claim was only partly true: the persisted body was the
+SAME body posted as the comment, and that body was itself capped per app
+(10 sections) and per PR (a fixed top few apps shown inline). For a large
+ancestor-file change the page ended up byte for byte identical to the
+truncated comment, not a real "full output" (measured on acme-config-prod PR
+#3837: 60 of 16616 real diff sections visible in both places). Now that
+`format_comment` stores each app's full (memory-bounded) sections and groups
+apps with an identical diff instead of picking an arbitrary top-N (see
+"Grouping apps with an identical diff" above), the exact same persistence
+call carries the complete content automatically, with no changes needed to
+this module.
+
+Like the
 PR comment itself, there is exactly one live artifact per `(repo, pr)`: each
 new commit overwrites the previous diff in place (atomic write), so the page
 always reflects the latest generated output, and a build-status link that

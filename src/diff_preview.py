@@ -52,6 +52,7 @@ SHA dedup:
 - Cross-pod: compares comment SHA; skips and fixes stuck INPROGRESS if needed
 """
 import json, os, posixpath, random, re, shutil, signal, socket, ssl, sys, subprocess, time, threading, urllib.error, urllib.parse, urllib.request
+import hashlib
 import yaml  # PyYAML (requirements.txt) - input root-cause panel only, v2.6.2
 import diff_ui  # full-diff web UI (same-dir module, stdlib only)
 import leader  # Lease-based leader election (same-dir module, stdlib only)
@@ -2061,8 +2062,18 @@ OUT_DECOMMISSIONED = "decommissioned"
 #   reason   : short machine code for logs/metrics
 DiffResult = namedtuple("DiffResult",
                         ["text", "sections", "n_res", "has_diff", "error", "outcome", "reason",
-                         "version_change", "deleted_resources", "replicas_zeroed"],
-                        defaults=[None, None, None])
+                         "version_change", "deleted_resources", "replicas_zeroed",
+                         "fingerprint"],
+                        defaults=[None, None, None, None])
+# fingerprint (COPS-2579): stable hash of this app's FULL (pre-cap) section
+# list, set only on the OUT_DIFF success path. Two apps whose changes are
+# byte-for-byte identical (a shared ancestor-file edit rolled out the same
+# way to many environments, e.g. acme-config-prod PR #3837 touching 248
+# apps with the identical 67-resource change) get the SAME fingerprint, so
+# format_comment can group them and show one full representative diff
+# instead of many arbitrary truncated duplicates. None on every other
+# outcome and on legacy/coerced results (_result()) — those never group.
+
 # version_change (v2.5.8): (main_rev, pr_rev) when the PR changes this app's
 # chart targetRevision, else None. Lets format_comment shout on downgrades.
 # It has a default so the many existing 7-positional-arg constructions keep
@@ -4774,13 +4785,36 @@ def _prioritise_risk_sections(sections: list, deleted: list, zeroed: list,
     return head[:reserve] + tail + head[reserve:]
 
 
+def _fingerprint_sections(sections: list) -> str:
+    """Stable hash of a FULL (pre-cap) section list.
+
+    Two apps whose real change is byte-for-byte identical (a shared
+    ancestor-file edit applied the same way to many environments) must
+    fingerprint to the SAME value regardless of: which order the diff
+    workers finished in, what order sections happen to be sorted in for
+    ONE app, or how many other apps or environments exist in the run.
+    Sorting the normalized (header, body) pairs here makes the hash
+    independent of section order; nothing here depends on the app name,
+    since headers never carry it (e.g. "/apps/Deployment active-broadcast"
+    names the resource inside the chart, not the environment).
+    """
+    normalized = sorted(f"{hdr}\x01{body}" for hdr, body in sections)
+    blob = "\x00".join(normalized)
+    return hashlib.sha256(blob.encode("utf-8", errors="replace")).hexdigest()
+
+
 def _package_sections(filtered_sections: list):
-    """Build (clean_diff, capped_sections, deleted, zeroed) from the FULL
-    filtered section list. Detection runs here — before the display and
-    AI caps — so a deletion at position 111 of a mass diff can never be
-    lost again (the PR-6773 bug)."""
+    """Build (clean_diff, stored_sections, deleted, zeroed, fingerprint)
+    from the FULL filtered section list. Detection runs here — before the
+    display and AI caps — so a deletion at position 111 of a mass diff can
+    never be lost again (the PR-6773 bug). The fingerprint is computed on
+    the full list too (COPS-2579), before FULL_SECTIONS_MAX_PER_APP trims
+    it for storage, so a genuinely-identical change still fingerprints the
+    same even for an app whose resource count is at the storage limit.
+    """
     deleted = _detect_deleted_resources(filtered_sections)
     zeroed  = _detect_replicas_zeroed(filtered_sections)
+    fingerprint = _fingerprint_sections(filtered_sections)
     # COPS-2567: detecting a deletion is only half the job. Give the risk
     # sections a reserved share of the display budget before the caps below
     # cut the list, otherwise the shouty block names resources the reviewer
@@ -4793,7 +4827,8 @@ def _package_sections(filtered_sections: list):
         body_t = body[:MAX_DIFF_CHARS] + "\n... (truncated)" if len(body) > MAX_DIFF_CHARS else body
         truncated_parts.append(f"===== {hdr} =====\n{body_t}")
     clean_diff = "\n".join(truncated_parts)
-    return clean_diff, filtered_sections[:AI_MAX_SECTIONS_PER_APP], deleted, zeroed
+    return (clean_diff, filtered_sections[:FULL_SECTIONS_MAX_PER_APP],
+            deleted, zeroed, fingerprint)
 
 
 def _diff_resources(main_res: dict, pr_res: dict) -> str:
@@ -6134,11 +6169,11 @@ def argocd_diff(app, pr_sha, main_sha, chart_revision=None, changed_paths=None, 
         # Truncate to display budget NOW so we never hold the full YAML in
         # memory — but detect deletions/zeroings FIRST, on the full list
         # (v2.5.26: the PR-6773 lesson, see _package_sections).
-        clean_diff, capped_sections, deleted_res, zeroed_res = \
+        clean_diff, capped_sections, deleted_res, zeroed_res, fingerprint = \
             _package_sections(filtered_sections)
         return DiffResult(clean_diff, capped_sections,
                           n_res, True, None, OUT_DIFF, "changes", version_change,
-                          deleted_res, zeroed_res)
+                          deleted_res, zeroed_res, fingerprint)
     # Exhausted retries
     return _indeterminate(last_reason, last_detail or "unknown error")
 
@@ -6527,17 +6562,28 @@ AI_SUMMARY_ENABLED       = os.environ.get(
 
 # Thresholds for switching between inline and collapsed diff display.
 # Bitbucket does NOT render HTML <details>/<summary> tags, so there is no
-# real "collapse" available. For large PRs we show a compact summary table +
-# truncated inline diffs instead of trying to use <details>.
+# real "collapse" available. For large PRs we show a compact summary table,
+# plus (COPS-2579) one full diff per distinct fingerprint group instead of
+# a fixed top-N of apps -- see _group_changed_apps_by_fingerprint.
 LARGE_PR_APP_THRESHOLD   = 5       # changed apps above this -> large mode
 LARGE_PR_DIFF_BYTES      = 40_000  # total diff bytes above this -> large mode
-# In large mode, show the diff for the top N most-changed apps inline.
-# Others get a table row only (no diff block) to stay within the 245KB limit.
-LARGE_PR_INLINE_APPS     = _env_int("LARGE_PR_INLINE_APPS", 6)
 
 # Limits for what we send to the model.
 AI_MAX_SECTIONS_PER_APP  = 10
 AI_MAX_BODY_CHARS        = 1500
+# COPS-2579: DiffResult.sections used to be hard-capped to
+# AI_MAX_SECTIONS_PER_APP (10) at diff time -- a cap meant for the AI
+# prompt (see the independent re-slice at generate_ai_summary's
+# `sections[:AI_MAX_SECTIONS_PER_APP]`) that got reused as the STORAGE cap
+# too, so any resource past #10 was discarded before the comment or the
+# diff-UI page could ever show it (measured: 60 of 16616 sections shown on
+# acme-config-prod PR #3837). Sections are now stored up to this much more
+# generous, memory-bounded limit instead. Chosen from history: the largest
+# real per-app resource count seen to date is ~111 (COPS PR #6773 note),
+# so this leaves several times that much headroom before the rare
+# truncation note kicks in, while still bounding worst-case memory for a
+# run with MAX_APPS_PER_RUN concurrent apps (the COPS-2543 OOM lesson).
+FULL_SECTIONS_MAX_PER_APP = _env_int("FULL_SECTIONS_MAX_PER_APP", 400)
 # v2.5.18 (FINDINGS_SCALE S1): cap how many APPS go into the prompt. The two
 # caps above bound each app's contribution but not the number of apps, so a
 # mass version bump built an unbounded prompt: measured 4.3MB (~1.08M tokens)
@@ -6546,8 +6592,10 @@ AI_MAX_BODY_CHARS        = 1500
 # Vertex call failed on length and the comment posted without AI), after
 # uploading megabytes per attempt. 40 apps x 10 sections x ~1.5KB ≈ 700KB
 # (~180K tokens) — wide margin. The apps with the largest diffs are kept
-# (same top-N idea as LARGE_PR_INLINE_APPS) and the model is told how many
-# were omitted; the deterministic headline still counts ALL apps.
+# (a top-N-by-size idea, same shape the comment used to use for its own
+# inline cutoff before COPS-2579 replaced that with fingerprint grouping)
+# and the model is told how many were omitted; the deterministic headline
+# still counts ALL apps.
 AI_MAX_APPS              = _env_int("AI_MAX_APPS", 40)
 
 def _gcp_access_token() -> str:
@@ -6635,6 +6683,41 @@ _SENSITIVE_KEYS = re.compile(
     r'|connection[-_]?string|dsn|mongodb[-_]?uri|postgres[-_]?url'
     r'|encryption[-_]?key|signing[-_]?key)',
 )
+# COPS-2579: only bare "key" is exempted below, by exact structural field
+# name -- NOT bare "pass" or "auth". An earlier draft of this fix also
+# dropped those two, on the (untested) theory that they might over-match
+# things like "compassRegion" or "authorEmail". The existing test suite
+# caught the real cost of that: test_redact_pass_abbreviation pins that a
+# field literally named "redisPass" (no "password" substring at all) must
+# still be redacted, and the same abbreviation shape plausibly exists for
+# auth fields (serviceAuth, basicAuth) with no compound alternative that
+# would catch them. Removing bare key/pass/auth without evidence each one
+# is actually a live false positive would trade a proven leak-prevention
+# behavior for a hypothetical cosmetic one -- not a trade this module
+# makes. Only "key" had a concrete, audited false positive (tolerations
+# `key:`, `topologyKey:` on acme-config-prod PR #3837): that one is fixed
+# precisely, by name, below.
+# Bare "key" is kept (it is the only way to catch an arbitrary custom field
+# like sshKey/gpgKey that no explicit compound names), which means it still
+# over-matches two Kubernetes API field names that are also bare "key":
+# a toleration's `key:` (the taint key it tolerates) and a node/pod affinity
+# matchExpressions item's `key:` (the label key being matched), plus the
+# compound `topologyKey:` in topologySpreadConstraints. All three are fixed,
+# structural PodSpec field names -- never used to hold a secret value --
+# unlike `kind: Secret` data keys, which are arbitrary and still get
+# whole-masked regardless of name by _redact_secret_section. Exempt them by
+# exact name instead of narrowing the regex further, so the fix is precise
+# and does not quietly reopen a real "*Key" secret field.
+_SCHEDULING_FIELD_EXEMPT = frozenset({"key", "topologykey"})
+
+
+def _is_scheduling_field(key_part: str) -> bool:
+    """True if key_part (the 'name:' text captured before the value, e.g.
+    'topologyKey: ' or '- key: ') names a structural Kubernetes scheduling
+    field that must never be treated as sensitive, regardless of substring
+    overlap with _SENSITIVE_KEYS. See _SCHEDULING_FIELD_EXEMPT above."""
+    name = key_part.strip().lstrip("-").strip().rstrip(":=").strip().strip('"\'')
+    return name.lower() in _SCHEDULING_FIELD_EXEMPT
 
 # v2.5.21 (F1): hard cap on the helm-error text fed to _redact_error_detail's
 # regex, applied BEFORE matching to kill the quadratic backtracking. Far above
@@ -6937,7 +7020,8 @@ def _redact_sensitive(text: str) -> str:
             in_block = False  # dedented out of the block -> normal handling
         # Match key: value or key=value patterns (YAML / env-style).
         m = re.match(r'^([+\- ]*)([\w.\-/]+\s*[:=]\s*)(.+)$', line)
-        if m and _SENSITIVE_KEYS.search(m.group(2)):
+        if (m and _SENSITIVE_KEYS.search(m.group(2))
+                and not _is_scheduling_field(m.group(2))):
             redacted_lines.append(f"{m.group(1)}{m.group(2)}[REDACTED]")
             if _is_block_scalar_opener(m.group(3).strip()):
                 marker_len = 1 if line[:1] in "+- " else 0
@@ -7335,6 +7419,66 @@ def _flatten_yaml(node, prefix=""):
     return out
 
 
+_MICROSERVICE_KEY_RE = re.compile(
+    r"^appspace\.microservices\.definitions\.([^.]+)\.(.+)$")
+INPUT_ROLLUP_MIN_SERVICES = 3  # collapse only when it actually saves space
+
+
+def _service_and_rest(key: str):
+    """Split 'appspace.microservices.definitions.<service>.<rest>' into
+    (service, rest). Returns (None, key) for any key outside that shape,
+    so the caller leaves it un-rolled-up."""
+    m = _MICROSERVICE_KEY_RE.match(key)
+    return (m.group(1), m.group(2)) if m else (None, key)
+
+
+def _rollup_by_service(keys: list, sig_fn, render_group, render_single) -> list:
+    """Group full dotted keys sharing the
+    appspace.microservices.definitions.<service>.<rest> shape by (rest,
+    sig_fn(key)), collapsing any group of INPUT_ROLLUP_MIN_SERVICES or
+    more services into ONE line via render_group(rest, sig, services).
+    Smaller groups and any key outside that shape render individually via
+    render_single(key) -- the exact same per-key line as before this
+    existed, so a typical small PR (one or two services touched) is
+    byte-for-byte unchanged.
+
+    v2.7.0, born from acme-config-prod PR #3837: removing the Spot
+    compute-class override from 67 services rendered as 67 near-identical
+    bullets, capped at 25 lines with "+110 more" and no way for a reviewer
+    to tell it was one change applied 67 times.
+    """
+    buckets, order, singles = {}, [], []
+    for k in keys:
+        service, rest = _service_and_rest(k)
+        if service is None:
+            singles.append(k)
+            continue
+        bucket_key = (rest, sig_fn(k))
+        if bucket_key not in buckets:
+            buckets[bucket_key] = []
+            order.append(bucket_key)
+        buckets[bucket_key].append(service)
+
+    lines = []
+    for rest, sig in order:
+        services = sorted(buckets[(rest, sig)])
+        if len(services) >= INPUT_ROLLUP_MIN_SERVICES:
+            lines.append(render_group(rest, sig, services))
+        else:
+            for s in services:
+                lines.append(render_single(
+                    f"appspace.microservices.definitions.{s}.{rest}"))
+    for k in singles:
+        lines.append(render_single(k))
+    return lines
+
+
+def _fmt_service_list(services: list, shown: int = 8) -> str:
+    head = ", ".join(services[:shown])
+    more = f" (+{len(services) - shown} more)" if len(services) > shown else ""
+    return f"{head}{more}"
+
+
 def _summarize_input_changes(changed_files, pr_sha, base_sha, repo=None) -> list:
     """Markdown block: key-level changes this PR makes to its value files.
 
@@ -7373,14 +7517,36 @@ def _summarize_input_changes(changed_files, pr_sha, base_sha, repo=None) -> list
         if not (removed or added or changed):
             continue
         file_lines = [f"`{path}`:"]
-        for k in removed:
-            file_lines.append(f"- \u26a0\ufe0f **removed** `{k}` "
-                              f"(was {_fmt_input_val(k, old_flat[k])})")
-        for k in changed:
-            file_lines.append(f"- `{k}`: {_fmt_input_val(k, old_flat[k])} "
-                              f"\u2192 {_fmt_input_val(k, new_flat[k])}")
-        for k in added:
-            file_lines.append(f"- **added** `{k}` = {_fmt_input_val(k, new_flat[k])}")
+        file_lines += _rollup_by_service(
+            removed,
+            sig_fn=lambda k: _fmt_input_val(k, old_flat[k]),
+            render_group=lambda rest, val, services: (
+                f"- \u26a0\ufe0f **removed** `{rest}` (was {val}) from "
+                f"**{len(services)} services**: {_fmt_service_list(services)}"),
+            render_single=lambda k: (
+                f"- \u26a0\ufe0f **removed** `{k}` "
+                f"(was {_fmt_input_val(k, old_flat[k])})"),
+        )
+        file_lines += _rollup_by_service(
+            changed,
+            sig_fn=lambda k: (_fmt_input_val(k, old_flat[k]),
+                              _fmt_input_val(k, new_flat[k])),
+            render_group=lambda rest, sig, services: (
+                f"- `{rest}`: {sig[0]} \u2192 {sig[1]} for "
+                f"**{len(services)} services**: {_fmt_service_list(services)}"),
+            render_single=lambda k: (
+                f"- `{k}`: {_fmt_input_val(k, old_flat[k])} "
+                f"\u2192 {_fmt_input_val(k, new_flat[k])}"),
+        )
+        file_lines += _rollup_by_service(
+            added,
+            sig_fn=lambda k: _fmt_input_val(k, new_flat[k]),
+            render_group=lambda rest, val, services: (
+                f"- **added** `{rest}` = {val} for "
+                f"**{len(services)} services**: {_fmt_service_list(services)}"),
+            render_single=lambda k: (
+                f"- **added** `{k}` = {_fmt_input_val(k, new_flat[k])}"),
+        )
         if len(file_lines) - 1 > budget:
             keep = max(budget, 1)
             file_lines = file_lines[:keep + 1] + [
@@ -7410,13 +7576,61 @@ def _comment_header(pr_sha: str) -> str:
     return f"**Commit** `{pr_sha[:8]}` \u2192 `main` | `{_repo_for_sha(pr_sha) or BB_REPO}`"
 
 
+def _app_sort_key(app: str, r) -> tuple:
+    """Deterministic ordering for both the overview table and the per-app
+    section list (COPS-2579 item 5): anything worth a reviewer's attention
+    (changed, decommissioned, error, indeterminate) sorts before a plain
+    no-diff app, and app names sort alphabetically within each bucket.
+    Replaces the previous unsorted worker-completion order."""
+    return (0 if r.outcome != OUT_NO_DIFF else 1, app)
+
+
+def _group_changed_apps_by_fingerprint(changed_apps: list) -> list:
+    """Group (app, DiffResult) pairs whose full diff is byte-for-byte
+    identical (same fingerprint) into one entry each, so format_comment can
+    show a single full representative diff per group instead of one per
+    app (COPS-2579 item 2 -- the fix for acme-config-prod PR #3837, where
+    248 apps sharing the exact same 67-resource change showed as 6
+    arbitrary, truncated, mutually-duplicate diffs).
+
+    Apps with no fingerprint (legacy/coerced DiffResult, e.g. from
+    _result()'s 3-tuple path, or hand-built in a test) always form their
+    own singleton group -- they never merge with anything, since None is
+    never equal to another None group's identity here.
+
+    Returns [(representative_app, member_apps, representative_result), ...]
+    sorted by representative_app name, with member_apps sorted too, so the
+    grouping is fully deterministic regardless of the input order
+    (changed_apps arrives in worker-completion order).
+    """
+    buckets, order = {}, []
+    for app, r in changed_apps:
+        key = r.fingerprint if r.fingerprint else ("__no_fingerprint__", app)
+        if key not in buckets:
+            buckets[key] = []
+            order.append(key)
+        buckets[key].append((app, r))
+    groups = []
+    for key in order:
+        members = sorted(buckets[key], key=lambda x: x[0])
+        rep_app, rep_r = members[0]
+        groups.append((rep_app, [a for a, _ in members], rep_r))
+    groups.sort(key=lambda g: g[0])
+    return groups
+
+
 def format_comment(pr_sha, app_results, skipped_apps=None, base_sha="",
                     new_env_lines=None, new_env_structural=False, new_env_desc="",
                     decommission_lines=None, input_change_lines=None):
     """Format the full PR comment. Never uses <details>/<summary> — Bitbucket
     does not render them. Large changesets get a compact summary table at the
-    top (all apps, one row each) and inline diffs for the top-N most-changed
-    apps only to stay well inside the 245KB comment limit.
+    top (all apps, one row each) and, for the diff sections below, apps
+    whose FULL diff is byte-for-byte identical (COPS-2579: a shared
+    ancestor-file change rolled out the same way to many environments) are
+    grouped so the comment shows one complete representative diff per
+    distinct change instead of many arbitrary, truncated duplicates. Total
+    size still stays well inside the 245KB comment limit via the per-body
+    and global truncation that already existed.
 
     new_env_lines/new_env_structural/new_env_desc (v2.5.4, Finding 4): a PR
     can touch existing apps AND add brand-new environments in the same
@@ -7440,6 +7654,18 @@ def format_comment(pr_sha, app_results, skipped_apps=None, base_sha="",
         len(changed_apps) > LARGE_PR_APP_THRESHOLD
         or total_diff_bytes > LARGE_PR_DIFF_BYTES
     )
+
+    # COPS-2579: group changed apps whose full diff is byte-for-byte
+    # identical. diff_group_for_app maps EVERY member app (including the
+    # representative) to (representative_app, member_apps, representative
+    # DiffResult), so the per-app loop below can render each group exactly
+    # once, at the representative's sorted position, and skip every other
+    # member without leaving a gap.
+    diff_groups = _group_changed_apps_by_fingerprint(changed_apps)
+    diff_group_for_app = {}
+    for rep_app, members, rep_r in diff_groups:
+        for m in members:
+            diff_group_for_app[m] = (rep_app, members, rep_r)
 
     mode_label = "large" if is_large else "small"
     print(f"    [comment] mode={mode_label} | changed_apps={len(changed_apps)} | "
@@ -7540,47 +7766,43 @@ def format_comment(pr_sha, app_results, skipped_apps=None, base_sha="",
         lines += [
             "#### Changeset overview",
             "",
-            "| App | Status | Resources |",
-            "|-----|--------|-----------|",
+            "| App | Status | Changed resources | Diff group |",
+            "|-----|--------|--------------------|------------|",
         ]
+        # COPS-2579 item 2: label apps that belong to a multi-member
+        # fingerprint group, so the table still lists every app (full
+        # per-environment transparency) while making the duplication
+        # visible and pointing at the one full diff shown below.
+        multi_groups = [g for g in diff_groups if len(g[1]) > 1]
+        group_label = {}
+        for idx, (rep_app, members, _rep_r) in enumerate(multi_groups, 1):
+            for m in members:
+                group_label[m] = f"Group {idx}"
         no_change_count = 0
-        for app, r in results.items():
+        for app, r in sorted(results.items(), key=lambda kv: _app_sort_key(*kv)):
             if r.outcome == OUT_DIFF:
-                lines.append(f"| `{app}` | \u26a0\ufe0f changed | {r.n_res} |")
+                label = group_label.get(app, "\u2014")
+                lines.append(f"| `{app}` | \u26a0\ufe0f changed | {r.n_res} | {label} |")
             elif r.outcome == OUT_DECOMMISSIONED:
-                lines.append(f"| `{app}` | \U0001f5d1\ufe0f decommissioned | \u2014 |")
+                lines.append(f"| `{app}` | \U0001f5d1\ufe0f decommissioned | \u2014 | \u2014 |")
             elif r.outcome == OUT_INDETERMINATE:
-                lines.append(f"| `{app}` | \u2754 diff unavailable | \u2014 |")
+                lines.append(f"| `{app}` | \u2754 diff unavailable | \u2014 | \u2014 |")
             elif r.outcome == OUT_ERROR:
-                lines.append(f"| `{app}` | \u274c error | \u2014 |")
+                lines.append(f"| `{app}` | \u274c error | \u2014 | \u2014 |")
             else:
                 no_change_count += 1
         if no_change_count:
-            lines.append(f"| *(+{no_change_count} more)* | \u2705 no changes | \u2014 |")
+            lines.append(f"| *(+{no_change_count} more)* | \u2705 no changes | \u2014 | \u2014 |")
         lines += [""]
 
     # ── Per-app diff sections ─────────────────────────────────────────
-    # Use r.n_res (total resource count, pre-computed) for sorting — no
-    # re-parsing of diff text needed.
-    if is_large and changed_apps:
-        inline_set = {
-            app for app, r in sorted(
-                changed_apps,
-                key=lambda x: x[1].n_res,
-                reverse=True,
-            )[:LARGE_PR_INLINE_APPS]
-        }
-        if len(changed_apps) > LARGE_PR_INLINE_APPS:
-            lines += [
-                f"> \U0001f50d Showing inline diffs for the {LARGE_PR_INLINE_APPS} "
-                f"most-changed apps. All {len(changed_apps)} changed apps listed in the "
-                f"table above.",
-                "",
-            ]
-    else:
-        inline_set = None
+    # COPS-2579: no more arbitrary top-N inline cutoff. Every distinct
+    # diff (fingerprint group) gets its own full representative diff below;
+    # apps are visited in sorted order (_app_sort_key) and any OUT_DIFF app
+    # that is not its group's representative is skipped here -- it was
+    # already accounted for when the representative rendered.
 
-    for app, r in results.items():
+    for app, r in sorted(results.items(), key=lambda kv: _app_sort_key(*kv)):
         if r.outcome == OUT_ERROR:
             any_error = True
             lines += [f"\u274c **`{app}`** \u2014 error: {(r.error or '')[:200]}", ""]
@@ -7640,17 +7862,31 @@ def format_comment(pr_sha, app_results, skipped_apps=None, base_sha="",
                 ]
 
         elif r.outcome == OUT_DIFF:
+            rep_app, members, rep_r = diff_group_for_app[app]
+            if app != rep_app:
+                # Already rendered together with the group's representative.
+                continue
             any_change = True
-            total_changed += r.n_res
-            show_diff = (inline_set is None) or (app in inline_set)
-            # sections are already truncated in DiffResult — no re-parsing.
-            # Pass r.n_res so the header shows the REAL count (FIX B).
+            total_changed += rep_r.n_res * len(members)
+            if len(members) > 1:
+                # COPS-2579: name every environment this exact change
+                # applies to, right above its one full diff, instead of
+                # duplicating that diff once per environment.
+                lines += [
+                    f"> \U0001f501 Identical diff across "
+                    f"**{len(members)} environments**: "
+                    f"{_fmt_service_list(members)}",
+                    "",
+                ]
+            # sections now hold the FULL (memory-bounded) list — no more
+            # arbitrary top-N inline cutoff (COPS-2579).
+            # Pass n_res so the header shows the REAL count (FIX B).
             # COPS-2567: pass the risk headers too, so the truncation note
             # tells the truth about how the shown sections were picked.
             lines += _format_app_diff_block(
-                app, r.sections, r.text, show_diff=show_diff, n_res=r.n_res,
-                risk_headers=set(r.deleted_resources or [])
-                | set(r.replicas_zeroed or []))
+                rep_app, rep_r.sections, rep_r.text, show_diff=True, n_res=rep_r.n_res,
+                risk_headers=set(rep_r.deleted_resources or [])
+                | set(rep_r.replicas_zeroed or []))
 
         else:
             lines += [f"\u2705 **`{app}`** \u2014 no manifest changes", ""]
