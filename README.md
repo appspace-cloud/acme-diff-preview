@@ -50,10 +50,14 @@ and QA apps when CI publishes a new chart, so they pick it up past the OCI cache
 The one rule the tool never breaks: **a failure is never reported as "no changes".**
 If a diff could not be computed, the status says so and the PR is not marked clean.
 
-Only a slice of an app's changed resources is printed with a full diff block.
-Deletions and replica zeroings get a reserved share of that slice, so the
-resources the shouty blocks name are the ones you actually see first. Details
-in [docs/internals.md](docs/internals.md#which-resources-make-it-into-the-comment-body).
+Apps whose full diff is byte-for-byte identical (a shared ancestor-file
+change rolled out the same way to many environments, e.g. removing a
+compute-class override across a whole fleet) are grouped: the comment shows
+one complete representative diff plus the full list of environments it
+applies to, instead of a separate, arbitrarily-truncated copy per app.
+Deletions and replica zeroings get a reserved share of the display order, so
+the resources the shouty blocks name are the ones you actually see first.
+Details in [docs/internals.md](docs/internals.md#which-resources-make-it-into-the-comment-body).
 
 ## How the diff works
 
@@ -116,6 +120,7 @@ full-diff web UI.
 | `BB_RATELIMIT_MAX_PAUSE` | — | `60` | Cap on the shared pause, so a broken `Retry-After` cannot stall a PR |
 | `HELM_CACHE_MAX_CHARTS` | — | `60` | Max pulled chart versions kept on disk |
 | `AI_MAX_APPS` | — | `40` | Max changed apps included in the AI summary prompt |
+| `FULL_SECTIONS_MAX_PER_APP` | — | `400` | Max changed resources stored per app for the comment, the diff-group fingerprint and the full-diff web UI page (memory-bounded, not an arbitrary display cutoff) |
 | `DIFF_OCI_SELFCHECK_INTERVAL` | — | `900` | Seconds between periodic OCI self-checks (`helm show chart` against a known-good ref). First check ~60s after start; `0` disables. Result in `/diff-preview/stats` as `oci_selfcheck` |
 | `DIFF_OCI_SELFCHECK_REF` | — | *(last successful pull)* | Optional fixed reference `registry/chart:version` for the self-check |
 | `DIFF_OCI_FAIL_ERROR_THRESHOLD` | — | `3` | Consecutive systemic chart-pull failures after which failures log at ERROR instead of WARNING |

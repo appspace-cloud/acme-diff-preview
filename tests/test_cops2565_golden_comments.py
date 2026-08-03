@@ -66,10 +66,11 @@ def deterministic(monkeypatch):
 
 def _result(text="", sections=None, n_res=0, has_diff=False, error=None,
             outcome=None, reason=None, version_change=None,
-            deleted_resources=None, replicas_zeroed=None):
+            deleted_resources=None, replicas_zeroed=None, fingerprint=None):
     return m.DiffResult(text, sections if sections is not None else [], n_res,
                         has_diff, error, outcome or m.OUT_NO_DIFF, reason,
-                        version_change, deleted_resources, replicas_zeroed)
+                        version_change, deleted_resources, replicas_zeroed,
+                        fingerprint)
 
 
 def _assert_golden(name: str, body: str):
@@ -192,13 +193,21 @@ def test_golden_all_clean():
 
 
 def test_golden_large_pr_switches_to_summary_table():
-    """The PR 3837 shape: hundreds of apps. Must stay inside Bitbucket's
-    245KB comment limit and degrade to a table, not truncate mid-diff."""
+    """The PR 3837 shape: hundreds of apps sharing the exact same change
+    (COPS-2579). The real diff engine would fingerprint all of them
+    identically, since their full section lists are byte-for-byte the
+    same -- reproduced here explicitly, since this test's `_result()`
+    builds a DiffResult directly instead of going through
+    _package_sections. Must show ONE full representative diff plus the
+    full member list, not 60 individual dumps and not an arbitrary top-N,
+    while staying inside Bitbucket's 245KB comment limit."""
+    shared_sections = [("/apps/Deployment broadcast", ORDINARY)]
+    shared_fp = m._fingerprint_sections(shared_sections)
     results = {}
     for i in range(60):
         results[f"pv-env-{i:03d}-ms"] = _result(
-            ORDINARY, [("/apps/Deployment broadcast", ORDINARY)], 4, True,
-            outcome=m.OUT_DIFF)
+            ORDINARY, shared_sections, 4, True,
+            outcome=m.OUT_DIFF, fingerprint=shared_fp)
     body = m.format_comment(PR_SHA, results, base_sha=BASE_SHA)
     assert len(body) < 245_000, f"comment would be rejected: {len(body)} bytes"
     _assert_golden("large_pr_summary_table", body)

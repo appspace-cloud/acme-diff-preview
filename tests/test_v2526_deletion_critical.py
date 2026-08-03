@@ -89,11 +89,17 @@ def test_deletion_sections_survive_the_noise_filter():
 
 def test_package_sections_detects_before_the_cap(monkeypatch):
     """The 111-resource lesson: detection must see sections BEYOND
-    AI_MAX_SECTIONS_PER_APP. Put the deletion LAST behind >10 fillers."""
+    AI_MAX_SECTIONS_PER_APP. Put the deletion LAST behind >10 fillers.
+
+    COPS-2579: storage is no longer capped at AI_MAX_SECTIONS_PER_APP (10)
+    -- that cap turned out to be the root cause of a much bigger bug (a
+    large-PR comment showing 60 of 16616 real diff sections). Storage is
+    now bounded by the much more generous FULL_SECTIONS_MAX_PER_APP, so all
+    16 sections here (15 fillers + the deletion) survive into `capped`."""
     fillers = [(f"/apps/Deployment filler-{i}", MOD_BODY) for i in range(15)]
     full = fillers + [SECTIONS[0]]
-    clean_diff, capped, deleted, zeroed = m._package_sections(full)
-    assert len(capped) == m.AI_MAX_SECTIONS_PER_APP
+    clean_diff, capped, deleted, zeroed, fingerprint = m._package_sections(full)
+    assert len(capped) == len(full)
     assert deleted == ["/external-secrets.io/ExternalSecret card-deployment-key"], \
         "deletion beyond the section cap was lost — the PR-6773 bug"
     assert zeroed == []

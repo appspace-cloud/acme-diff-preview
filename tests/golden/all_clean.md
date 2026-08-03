@@ -4,11 +4,11 @@
 
 ---
 
+✅ **`pv-acme-a-glb`** — no manifest changes
+
 ✅ **`pv-acme-a-ms`** — no manifest changes
 
 ✅ **`pv-acme-a-ss`** — no manifest changes
-
-✅ **`pv-acme-a-glb`** — no manifest changes
 
 ---
 **Status:** ✅ No manifest changes

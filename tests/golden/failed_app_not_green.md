@@ -4,9 +4,9 @@
 
 ---
 
-✅ **`pv-acme-a-ms`** — no manifest changes
-
 ❔ **`pv-acme-a-ss`** — diff unavailable (could not pull the OCI chart (registry login or network))
+
+✅ **`pv-acme-a-ms`** — no manifest changes
 
 ---
 **Status:** ❔ Diff incomplete — 1 app(s) could not be evaluated (NOT confirmed unchanged)
