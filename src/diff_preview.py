@@ -4396,15 +4396,84 @@ def _render_new_env_diff(env_info: dict, pr_sha: str) -> tuple:
     return rendered, None, resource_count, version
 
 
+def _resolve_effective_pr_chart_revision(app, pr_sha, main_sha=None, renames=None):
+    """Effective appspace.version for an app at pr_sha (Helm last-wins).
+
+    COPR-31756: a parent cohort config.yaml bump must not be treated as the
+    app's new chart revision when a later valueFile (typically customer.yaml)
+    still pins a different version. Returns None when the chain cannot be
+    resolved or no file sets appspace.version.
+
+    Safety: if the chain includes a customer.yaml and that file could not be
+    fetched (and was not filled via a trusted rename), return None instead of
+    letting an ancestor win. A missing leaf under Bitbucket flakiness would
+    otherwise reintroduce the false-downgrade this ticket fixed.
+    """
+    value_files = _app_value_files_map.get(app) or []
+    if not value_files:
+        return None
+    pr_value_files = value_files
+    if renames:
+        env_move = _detect_env_move(value_files, renames, main_sha, pr_sha)
+        if env_move:
+            old_env_dir, new_env_dir = env_move
+            pr_value_files = _rebase_value_files(value_files, old_env_dir, new_env_dir)
+    try:
+        vals = _fetch_value_files(pr_value_files, pr_sha)
+    except Exception as e:
+        log(f"_resolve_effective_pr_chart_revision: value fetch failed for "
+            f"{app}: {str(e)[:150]}", "WARNING", app=app)
+        return None
+    # Per-file renames (customer.yaml moved without a full tier move): fill
+    # 404s from the rename target so last-wins still sees the leaf pin.
+    if renames:
+        trusted_dirs = _trusted_rename_dirs(renames, main_sha, pr_sha)
+        for vf in pr_value_files:
+            if vals.get(vf):
+                continue
+            clean = posixpath.normpath(vf.replace("$config/", "").lstrip("/"))
+            if clean not in renames:
+                continue
+            new_clean = renames[clean]
+            if not _is_trusted_rename(clean, new_clean, trusted_dirs, main_sha, pr_sha):
+                continue
+            new_key = (pr_sha, new_clean)
+            with _vf_cache_lock:
+                cached = _vf_cache.get(new_key, ...)
+            if cached is ...:
+                raw, status = _bb_fetch_status(new_clean, pr_sha)
+                if status in (BB_OK, BB_NOT_FOUND):
+                    with _vf_cache_lock:
+                        _vf_cache[new_key] = raw
+                content = raw
+            else:
+                content = cached
+            if content:
+                vals[vf] = content
+    # Refuse ancestor-only resolution when the leaf pin file is in the chain
+    # but missing from vals. cicd-versions.yaml is often last and rarely sets
+    # appspace.version; customer.yaml is the pin that mattered in #3859.
+    for vf in pr_value_files:
+        base = vf.rsplit("/", 1)[-1]
+        if base == "customer.yaml" and vf not in vals:
+            debug(f"effective chart revision skipped: customer.yaml unread for {app}",
+                  app=app)
+            return None
+    return _effective_chart_version(pr_value_files, vals)
+
+
 def _pr_chart_revision(app, candidate_files, pr_sha):
     """Return the new OCI chart targetRevision for an app if the PR changes it.
 
     Strategy: candidate_files is this app's own subset of the PR's changed
     files, already matched against path_map by the caller (see
     _match_files_to_apps, v2.4.8). Fetch each one from Bitbucket at pr_sha
-    and search for an `appspace.version` YAML key. That value is the new
-    helm chart targetRevision (the ApplicationSet sets
-    spec.sources[1].targetRevision = appspace.version).
+    and search for an `appspace.version` YAML key.
+
+    COPR-31756: when a changed file touches appspace.version, the returned
+    revision is the EFFECTIVE value across the app's full Helm valueFiles
+    chain (last-wins), not the parent file's version alone. A cohort parent
+    bump under a child that still pins its own version is therefore a no-op.
 
     PERF FIX (v2.4.8): this function used to re-derive candidate_files by
     scanning the full changed_files list against path_map on every call --
@@ -4415,34 +4484,8 @@ def _pr_chart_revision(app, candidate_files, pr_sha):
     Returns the new revision string if it differs from the current one cached in
     _app_chart_revision_map, otherwise returns None.
     """
-    current_rev = _app_chart_revision_map.get(app)
-    if not current_rev:
-        return None
-    for filepath in candidate_files:
-        # Route through _vf_cache so parallel calls for the same (pr_sha, path)
-        # from different apps share one Bitbucket API call instead of all fetching
-        # in parallel. The cache key is (sha, clean_path) same as _fetch_value_files.
-        clean = posixpath.normpath(filepath.lstrip("/"))
-        cache_key = (pr_sha, clean)
-        with _vf_cache_lock:
-            cached = _vf_cache.get(cache_key, ...)   # use ... as sentinel for "absent"
-        if cached is ...:
-            # Not yet in cache — fetch and store (only definitive results)
-            raw, status = _bb_fetch_status(clean, pr_sha)
-            if status in (BB_OK, BB_NOT_FOUND):
-                with _vf_cache_lock:
-                    _vf_cache[cache_key] = raw
-            content = raw
-        else:
-            content = cached
-        if not content:
-            continue
-        new_rev = _extract_chart_version(content)
-        if new_rev and new_rev != current_rev:
-            debug(f"chart version override: {current_rev} -> {new_rev}",
-                  app=app, file=filepath)
-            return new_rev
-    return None
+    new_rev, _invalid = _pr_chart_revision_checked(app, candidate_files, pr_sha)
+    return new_rev
 
 
 def _pr_chart_revision_checked(app, candidate_files, pr_sha, main_sha=None, renames=None):
@@ -4466,11 +4509,18 @@ def _pr_chart_revision_checked(app, candidate_files, pr_sha, main_sha=None, rena
     main_sha (v2.5.15, Finding 7): required to identity-verify an
     identity-file rename before following it (see _rename_identity_confirmed)
     — without it, this falls back to the pre-v2.5.15 unconditional trust.
+
+    COPR-31756: once any candidate touches appspace.version, the bump is
+    resolved via the full valueFiles chain (Helm last-wins). Falling back to
+    the first changed-file version only when the live valueFiles map is not
+    yet cached for the app.
     """
     current_rev = _app_chart_revision_map.get(app)
     if not current_rev:
         return None, False
     invalid = False
+    saw_version = False
+    fallback_rev = None
     trusted_dirs = _trusted_rename_dirs(renames, main_sha, pr_sha) if renames else set()
     for filepath in candidate_files:
         clean = posixpath.normpath(filepath.lstrip("/"))
@@ -4511,10 +4561,57 @@ def _pr_chart_revision_checked(app, candidate_files, pr_sha, main_sha=None, rena
         if vstatus == "invalid":
             invalid = True
             continue
-        if new_rev and new_rev != current_rev:
-            debug(f"chart version override: {current_rev} -> {new_rev}",
-                  app=app, file=filepath)
-            return new_rev, invalid
+        if new_rev:
+            saw_version = True
+            if new_rev != current_rev and fallback_rev is None:
+                fallback_rev = new_rev
+                debug(f"chart version candidate: {current_rev} -> {new_rev}",
+                      app=app, file=filepath)
+
+    if not saw_version:
+        # COPR-31756: a customer.yaml edit that REMOVES appspace.version does
+        # not set saw_version (no version key left), but the effective chart
+        # revision still changes — it falls through to the parent default.
+        # Re-resolve whenever a customer.yaml in this app's chain was touched
+        # (including via a trusted rename of that path).
+        leaf_touched = False
+        vfs = _app_value_files_map.get(app) or []
+        if vfs:
+            chain_customer = set()
+            for vf in vfs:
+                clean_vf = posixpath.normpath(vf.replace("$config/", "").lstrip("/"))
+                if clean_vf.endswith("/customer.yaml") or clean_vf == "customer.yaml":
+                    chain_customer.add(clean_vf)
+            for filepath in candidate_files:
+                clean = posixpath.normpath(str(filepath).lstrip("/").replace("$config/", ""))
+                if clean in chain_customer:
+                    leaf_touched = True
+                    break
+                if renames and clean in chain_customer and clean in renames:
+                    leaf_touched = True
+                    break
+        if not leaf_touched:
+            return None, invalid
+
+    # When the live ArgoCD valueFiles chain is cached, always resolve the
+    # effective revision from that chain (Helm last-wins). Do NOT fall back
+    # to the changed parent's version — that is exactly the COPR-31756 false
+    # downgrade (parent bump under a still-pinned customer.yaml).
+    if _app_value_files_map.get(app):
+        effective = _resolve_effective_pr_chart_revision(
+            app, pr_sha, main_sha=main_sha, renames=renames)
+        if effective and effective != current_rev:
+            debug(f"chart version override (effective): {current_rev} -> {effective}",
+                  app=app)
+            return effective, invalid
+        return None, invalid
+
+    # No live valueFiles cached for this app yet — keep the pre-COPR-31756
+    # fallback so unit tests and early-cache races still see a bump.
+    if fallback_rev:
+        debug(f"chart version override (fallback): {current_rev} -> {fallback_rev}",
+              app=app)
+        return fallback_rev, invalid
     return None, invalid
 
 
