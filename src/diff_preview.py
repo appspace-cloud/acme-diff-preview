@@ -4403,6 +4403,11 @@ def _resolve_effective_pr_chart_revision(app, pr_sha, main_sha=None, renames=Non
     app's new chart revision when a later valueFile (typically customer.yaml)
     still pins a different version. Returns None when the chain cannot be
     resolved or no file sets appspace.version.
+
+    Safety: if the chain includes a customer.yaml and that file could not be
+    fetched (and was not filled via a trusted rename), return None instead of
+    letting an ancestor win. A missing leaf under Bitbucket flakiness would
+    otherwise reintroduce the false-downgrade this ticket fixed.
     """
     value_files = _app_value_files_map.get(app) or []
     if not value_files:
@@ -4445,6 +4450,15 @@ def _resolve_effective_pr_chart_revision(app, pr_sha, main_sha=None, renames=Non
                 content = cached
             if content:
                 vals[vf] = content
+    # Refuse ancestor-only resolution when the leaf pin file is in the chain
+    # but missing from vals. cicd-versions.yaml is often last and rarely sets
+    # appspace.version; customer.yaml is the pin that mattered in #3859.
+    for vf in pr_value_files:
+        base = vf.rsplit("/", 1)[-1]
+        if base == "customer.yaml" and vf not in vals:
+            debug(f"effective chart revision skipped: customer.yaml unread for {app}",
+                  app=app)
+            return None
     return _effective_chart_version(pr_value_files, vals)
 
 

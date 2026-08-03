@@ -90,3 +90,63 @@ def test_fallback_without_value_files_map_keeps_old_behavior(monkeypatch):
             f"appspace:\n  version: {PARENT_NEW}\n", m.BB_OK))
     new_rev, invalid = m._pr_chart_revision_checked(APP, [PARENT], "prsha-fallback")
     assert (new_rev, invalid) == (PARENT_NEW, False)
+
+
+def test_missing_customer_yaml_does_not_invent_parent_bump(monkeypatch):
+    # If customer.yaml is in the live chain but unread (404 / flaky Bitbucket),
+    # do NOT let the parent alone decide the bump — that reintroduces #3859.
+    _setup(monkeypatch, {
+        PARENT: f"appspace:\n  version: {PARENT_NEW}\n",
+        # CUSTOMER intentionally absent from files dict -> BB_NOT_FOUND
+    })
+    new_rev, invalid = m._pr_chart_revision_checked(APP, [PARENT], "prsha-miss")
+    assert invalid is False
+    assert new_rev is None
+
+
+def test_rename_with_value_files_map_still_detects_bump(monkeypatch):
+    # Production always has valueFiles cached. A customer.yaml rename+bump
+    # must still resolve via the chain (old path 404, rename fill-in).
+    old_customer = CUSTOMER
+    new_customer = "gcp/prod/private-cloud/na2-a/accelerated/pv-pt279981116-renamed-c/customer.yaml"
+    child_new = "2603.2.0-20260803001-dev"
+    m._app_chart_revision_map[APP] = PINNED
+    m._app_value_files_map[APP] = [
+        f"$config/{PARENT}",
+        f"$config/{old_customer}",
+    ]
+    m._vf_cache.clear()
+
+    def fake_fetch(clean, sha, repo=None):
+        clean = str(clean).replace("$config/", "").lstrip("/")
+        if clean == PARENT:
+            return f"appspace:\n  version: {PARENT_NEW}\n", m.BB_OK
+        if clean == new_customer:
+            return (
+                "appspace:\n"
+                "  customerName: pt-279981116\n"
+                "  suffix: c\n"
+                f"  version: {child_new}\n",
+                m.BB_OK,
+            )
+        if clean == old_customer and sha == "mainsha":
+            return (
+                "appspace:\n"
+                "  customerName: pt-279981116\n"
+                "  suffix: c\n"
+                f"  version: {PINNED}\n",
+                m.BB_OK,
+            )
+        return None, m.BB_NOT_FOUND
+
+    monkeypatch.setattr(m, "_bb_fetch_status", fake_fetch)
+    monkeypatch.setattr(m, "_bb_fetch_cached",
+                        lambda path, sha, repo=None: fake_fetch(path, sha, repo=repo))
+
+    new_rev, invalid = m._pr_chart_revision_checked(
+        APP, [old_customer], "prsha-rename",
+        main_sha="mainsha",
+        renames={old_customer: new_customer},
+    )
+    assert invalid is False
+    assert new_rev == child_new
