@@ -104,6 +104,18 @@ def test_missing_customer_yaml_does_not_invent_parent_bump(monkeypatch):
     assert new_rev is None
 
 
+def test_removing_customer_version_pin_falls_through_to_parent(monkeypatch):
+    # PR edits only customer.yaml and deletes appspace.version. Effective
+    # revision must become the parent default, not stay silently on the
+    # live pin (false clean).
+    _setup(monkeypatch, {
+        PARENT: f"appspace:\n  version: {PARENT_NEW}\n",
+        CUSTOMER: "appspace:\n  customerName: pt-279981116\n",
+    })
+    new_rev, invalid = m._pr_chart_revision_checked(APP, [CUSTOMER], "prsha-unpin")
+    assert (new_rev, invalid) == (PARENT_NEW, False)
+
+
 def test_rename_with_value_files_map_still_detects_bump(monkeypatch):
     # Production always has valueFiles cached. A customer.yaml rename+bump
     # must still resolve via the chain (old path 404, rename fill-in).

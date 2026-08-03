@@ -4569,7 +4569,29 @@ def _pr_chart_revision_checked(app, candidate_files, pr_sha, main_sha=None, rena
                       app=app, file=filepath)
 
     if not saw_version:
-        return None, invalid
+        # COPR-31756: a customer.yaml edit that REMOVES appspace.version does
+        # not set saw_version (no version key left), but the effective chart
+        # revision still changes — it falls through to the parent default.
+        # Re-resolve whenever a customer.yaml in this app's chain was touched
+        # (including via a trusted rename of that path).
+        leaf_touched = False
+        vfs = _app_value_files_map.get(app) or []
+        if vfs:
+            chain_customer = set()
+            for vf in vfs:
+                clean_vf = posixpath.normpath(vf.replace("$config/", "").lstrip("/"))
+                if clean_vf.endswith("/customer.yaml") or clean_vf == "customer.yaml":
+                    chain_customer.add(clean_vf)
+            for filepath in candidate_files:
+                clean = posixpath.normpath(str(filepath).lstrip("/").replace("$config/", ""))
+                if clean in chain_customer:
+                    leaf_touched = True
+                    break
+                if renames and clean in chain_customer and clean in renames:
+                    leaf_touched = True
+                    break
+        if not leaf_touched:
+            return None, invalid
 
     # When the live ArgoCD valueFiles chain is cached, always resolve the
     # effective revision from that chain (Helm last-wins). Do NOT fall back
