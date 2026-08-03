@@ -82,6 +82,29 @@ def _validate(repo, pr_id, sha):
     return str(repo), pr_s, str(sha)
 
 
+def _assert_within_base_dir(path: str, base_dir: str) -> str:
+    """Confirm `path` resolves inside `base_dir` after normalization.
+
+    COPS-2580: the regex validation in _validate() already makes traversal
+    impossible for any input that reaches here (no "/" or leading "." is
+    ever in the character classes _REPO_RE/_PR_RE/_SHA_RE allow), but
+    CodeQL's py/path-injection query does not recognize manual
+    regex.match() calls as a sanitizer barrier. This normalize-then-check
+    idiom is the exact one CodeQL's own documentation recommends, so it
+    makes the guarantee visible to static analysis (closing the alert
+    legitimately) and adds a second, independent layer of defense that
+    stays correct even if the regexes above are ever loosened.
+
+    Returns path unchanged on success; raises ValueError if it would
+    resolve outside base_dir.
+    """
+    norm_base = os.path.abspath(base_dir)
+    norm_path = os.path.abspath(path)
+    if norm_path != norm_base and not norm_path.startswith(norm_base + os.sep):
+        raise ValueError(f"path escapes base_dir: {path!r} not under {base_dir!r}")
+    return path
+
+
 def _artifact_path(base_dir, repo, pr_id, sha):
     # Keyed by (repo, pr) only, NOT by sha: one live artifact per PR, exactly
     # like the single PR comment that gets updated in place on every commit.
@@ -90,7 +113,8 @@ def _artifact_path(base_dir, repo, pr_id, sha):
     # is, so the build-status link never 404s just because the tip moved. The
     # sha is still validated (below) and stored inside the artifact.
     repo, pr_s, sha = _validate(repo, pr_id, sha)
-    return os.path.join(base_dir, f"{repo}__{pr_s}.json")
+    path = os.path.join(base_dir, f"{repo}__{pr_s}.json")
+    return _assert_within_base_dir(path, base_dir)
 
 
 # ── durable GCS layer ───────────────────────────────────────────────────────
