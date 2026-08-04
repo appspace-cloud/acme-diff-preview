@@ -3332,6 +3332,20 @@ def _warn_if_name_invariant_broken(flat: dict):
 # one was added and silently shadowed this).
 _IDENTITY_BASENAMES = ("customer.yaml", "config.yaml")
 
+# Platform runbooks for pause-autosync / delete / Linux VMs / etc. Always
+# point at the folder, never a specific markdown filename: docs get renamed
+# and a pinned path goes stale in every PR comment.
+ACME_COMPONENTS_DOCS_URL = (
+    "https://bitbucket.org/appspace-cloud/acme-components/browse/documentation"
+)
+
+
+def _acme_components_docs_line(prefix: str = "Full procedure") -> str:
+    """One markdown line linking the shared acme-components documentation/ folder."""
+    return (
+        f"{prefix}: [`acme-components` `documentation/`]({ACME_COMPONENTS_DOCS_URL})."
+    )
+
 
 # COPS-2562 point 3: cache the PARSED yaml, not just the text. gcp/config.yaml
 # is 1543 lines and was re-parsed once per app (212x on a mass bump) even
@@ -5816,6 +5830,8 @@ def _evaluate_env_decommissions(candidates: list, pr_sha: str, main_sha: str) ->
         else:
             lines.append("- *(resource preview unavailable \u2014 the deletion itself is confirmed)*")
         lines.append("")
+        lines.append(_acme_components_docs_line())
+        lines.append("")
         envs_reported.append(c["env_name"])
     return lines, envs_reported
 
@@ -7742,6 +7758,8 @@ def _summarize_appspace_state_changes(changed_files, pr_sha, base_sha, path_map,
                 f"environment will not receive any further config changes until " +
                 f"the flag is removed.",
                 "",
+                _acme_components_docs_line(),
+                "",
             ]
         elif was_paused and not is_paused:
             lines += [
@@ -7752,6 +7770,8 @@ def _summarize_appspace_state_changes(changed_files, pr_sha, base_sha, path_map,
                 f"environment drifted while paused, resuming applies the " +
                 f"accumulated diff immediately \u2014 check its sync status before " +
                 f"merging if that matters.",
+                "",
+                _acme_components_docs_line(),
                 "",
             ]
         elif is_paused:
@@ -7780,26 +7800,33 @@ def _summarize_appspace_state_changes(changed_files, pr_sha, base_sha, path_map,
                 f"removed in a later PR, its resources will be deleted rather " +
                 f"than left running.{purge_note}",
                 "",
-                f"**This is Phase 1 of the decommission runbook.** Until the " +
-                f"folder is removed, nothing changes for `{env_name}`: every " +
-                f"workload keeps running, disks stay held, costs keep accruing, " +
-                f"and the environment is still fully managed by ArgoCD. If that " +
-                f"is the point of this PR (arming ahead of a scheduled removal), " +
-                f"this is exactly the expected state.",
+                f"**This is Phase 2 of the delete procedure** (arming the " +
+                f"cascade). Until the folder is removed, nothing changes for " +
+                f"`{env_name}`: every workload keeps running, disks stay held, " +
+                f"costs keep accruing, and the environment is still fully " +
+                f"managed by ArgoCD. If that is the point of this PR (arming " +
+                f"ahead of a scheduled removal), this is exactly the expected " +
+                f"state.",
                 "",
-                f"What the remaining phases do:",
-                f"- **Phase 2 (optional):** `appspace.decommissionPurgeData: true` " +
-                f"approves destroying the BigQuery dataset and the user content " +
-                f"bucket. Without it the cascade abandons them, recoverable, in " +
-                f"GCP. The flag is inert unless Phase 1 is armed too.",
+                f"What the other phases do:",
+                f"- **Before you start (optional):** a recovery snapshot of the " +
+                f"Linux VM data disk, only if you want a recovery point.",
+                f"- **Phase 1:** `allowDeletion: true` (and " +
+                f"`confirmProdDeletion: true` on Azure stage/prod) so the real " +
+                f"VM, disk and IP can be deleted with the cascade. Skip if there " +
+                f"are no `deployLinuxServicesK8s` VMs. Can share this PR with " +
+                f"Phase 2.",
+                f"- **Phase 2 (this PR):** `appspace.decommission: true`. " +
+                f"Optional `appspace.decommissionPurgeData: true` also destroys " +
+                f"the BigQuery dataset and the user content bucket; without it " +
+                f"the cascade abandons them, recoverable, in GCP.",
                 f"- **Phase 3:** a later PR removes this environment's folder. " +
                 f"That PR, and only that PR, triggers the actual deletion: the " +
                 f"Applications and every resource they manage, including the " +
                 f"Config Connector cloud resources. It gets its own panel with " +
                 f"the full rendered inventory of what is removed and what is " +
                 f"retained. Even a full cascade leaves the content backup bucket " +
-                f"and some namespace-level leftovers behind, per the runbook's " +
-                f"what-survives section.",
+                f"and some namespace-level leftovers behind.",
                 "",
                 f"**Before merging the Phase 3 folder removal, verify the " +
                 f"finalizer is actually live on the hub** \u2014 removing the " +
@@ -7810,8 +7837,7 @@ def _summarize_appspace_state_changes(changed_files, pr_sha, base_sha, path_map,
                 f"get application {sorted(app_names)[0]} " +
                 f"-o jsonpath='{{.metadata.finalizers}}'",
                 f"```",
-                f"Full procedure: `acme-components` " +
-                f"`documentation/environment-decommission-runbook.md`.",
+                _acme_components_docs_line(),
                 "",
             ]
         elif was_armed and not is_armed:

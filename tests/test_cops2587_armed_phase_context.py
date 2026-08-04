@@ -1,13 +1,16 @@
 """The DECOMMISSION ARMED panel must teach the phase model (COPS-2587).
 
 COPS-2584 made the arm visible; this makes it understandable. A reviewer of
-a Phase 1 PR (e.g. acme-config-prod #3860, the pv-ukhsa-a arm) should not
-need the runbook from memory to answer: what happens right now (nothing --
+a Phase 2 arming PR (e.g. acme-config-prod #3860, the pv-ukhsa-a arm) should
+not need the runbook from memory to answer: what happens right now (nothing --
 the environment stays fully live and billing), what happens next (Phase 3,
 a later folder-removal PR, is what actually deletes), what must be checked
 before Phase 3 (the finalizer must be live on the hub -- the exact
 verification whose omission nearly orphaned pv-ukhsa-a), and what survives
-even a full cascade (the content backup bucket, per the runbook).
+even a full cascade (the content backup bucket).
+
+Phase numbers follow acme-components `documentation/` (delete procedure):
+Phase 1 = allowDeletion, Phase 2 = decommission, Phase 3 = remove folder.
 
 Everything here is additive text inside the existing ARMED branch. Every
 COPS-2584 assertion must keep passing untouched.
@@ -49,7 +52,7 @@ def _armed_output(monkeypatch, purge=False):
 
 def test_armed_names_the_phase_model(monkeypatch):
     out = _armed_output(monkeypatch)
-    assert "Phase 1" in out
+    assert "Phase 2" in out
     assert "Phase 3" in out
 
 
@@ -74,12 +77,12 @@ def test_armed_says_what_survives_a_full_cascade(monkeypatch):
     out = _armed_output(monkeypatch)
     low = out.lower()
     assert "content backup bucket" in low
-    assert "runbook" in low or "environment-decommission-runbook" in low
+    assert "documentation/" in low or "documentation`" in out or m.ACME_COMPONENTS_DOCS_URL in out
 
 
 def test_armed_points_at_the_phase3_inventory_panel(monkeypatch):
     """The rendered what-gets-deleted inventory lives on the Phase 3 PR.
-    Phase 1 must say so instead of duplicating it."""
+    Phase 2 must say so instead of duplicating it."""
     out = _armed_output(monkeypatch)
     low = out.lower()
     assert "inventory" in low or "its own" in low
@@ -88,7 +91,7 @@ def test_armed_points_at_the_phase3_inventory_panel(monkeypatch):
 def test_armed_with_purge_still_carries_the_data_destruction_note(monkeypatch):
     out = _armed_output(monkeypatch, purge=True)
     assert "permanently destroy" in out.lower()
-    assert "Phase 1" in out
+    assert "Phase 2" in out
 
 
 def test_cops2584_wording_contract_still_holds(monkeypatch):
@@ -113,7 +116,7 @@ def test_disarmed_panel_is_unchanged(monkeypatch):
     out = "\n".join(m._summarize_appspace_state_changes(
         [IDENT], "prsha", "mainsha", PATH_MAP))
     assert "DISARMED" in out.upper()
-    assert "Phase 1" not in out
+    assert "Phase 2" not in out
     assert "kubectl" not in out
 
 
@@ -126,4 +129,5 @@ def test_paused_panel_is_unchanged(monkeypatch):
     out = "\n".join(m._summarize_appspace_state_changes(
         [IDENT], "prsha", "mainsha", PATH_MAP))
     assert "PAUSED" in out.upper()
-    assert "Phase 1" not in out
+    assert "Phase 2" not in out
+    assert "Phase 3" not in out

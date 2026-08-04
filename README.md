@@ -60,8 +60,9 @@ into an ordinary added/removed/changed key. Pausing or resuming, arming or
 disarming, all name the environment and every Application it affects.
 Resuming a long-paused environment also gets a reminder that the accumulated
 diff applies immediately; arming decommission is explicit that nothing is
-deleted by that PR alone. See `acme-components/documentation/pausing-auto-sync.md`
-and `environment-decommission-runbook.md` for what each flag actually does.
+deleted by that PR alone. See
+[acme-components `documentation/`](https://bitbucket.org/appspace-cloud/acme-components/browse/documentation)
+for what each flag actually does (pause auto-sync, delete an environment, etc.).
 
 Apps whose full diff is byte-for-byte identical (a shared ancestor-file
 change rolled out the same way to many environments, e.g. removing a
