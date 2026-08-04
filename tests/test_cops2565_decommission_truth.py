@@ -41,6 +41,7 @@ os.environ.setdefault("BB_TOKEN", "t")
 os.environ.setdefault("ARGOCD_PASS", "t")
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
 
+import pytest
 import diff_preview as m
 
 IDENT = "gcp/prod/private-cloud/eu1-b/weekly/pv-foo-c/customer.yaml"
@@ -133,6 +134,7 @@ def test_kube_version_matches_the_real_clusters():
     assert (int(major), int(minor)) >= (1, 35), m.KUBE_VERSION
 
 
+@pytest.mark.local_components
 def test_no_chart_relies_on_helm_capabilities_yet():
     """The reason a single constant is enough. Helm's .Capabilities are famously
     unreliable when rendering outside the target cluster, so the day a chart
