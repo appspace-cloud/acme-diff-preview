@@ -269,7 +269,7 @@ def test_process_pr_structural_new_env_with_oci_not_found_composes_combined_desc
     sinks, plan = world
     monkeypatch.setattr(m, "_detect_new_env_candidates", lambda *a, **k: [{"name": "pv-newenv-a"}])
     monkeypatch.setattr(m, "_evaluate_new_envs", lambda *a, **k:
-                        ([], ["pv-newenv-a"], 0))
+                        ([], ["pv-newenv-a"], 0, []))
     plan["pv-orch-a-ms"] = m.DiffResult("", [], 0, False, "chart not found",
                                         m.OUT_INDETERMINATE, m.REASON_OCI_NOT_FOUND)
     m.process_pr(_mk_pr(pr_id=504), PATH_MAP, base_sha=BASE_SHA)

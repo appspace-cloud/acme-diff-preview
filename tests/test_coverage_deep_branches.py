@@ -651,7 +651,7 @@ def test_process_pr_structural_plus_hard_error_desc(world, monkeypatch):
     monkeypatch.setattr(m, "_detect_new_env_candidates",
                         lambda *a, **k: [{"name": "pv-newenv-a"}])
     monkeypatch.setattr(m, "_evaluate_new_envs",
-                        lambda *a, **k: ([], ["pv-newenv-a"], 0))
+                        lambda *a, **k: ([], ["pv-newenv-a"], 0, []))
     plan["pv-orch-a-ms"] = m.DiffResult("", [], 0, False, "boom",
                                         m.OUT_ERROR, "unexpected")
     m.process_pr(_mk_pr(pr_id=604), PATH_MAP, base_sha=BASE_SHA)
@@ -664,7 +664,7 @@ def test_process_pr_structural_plus_invalid_config_desc(world, monkeypatch):
     monkeypatch.setattr(m, "_detect_new_env_candidates",
                         lambda *a, **k: [{"name": "pv-newenv-a"}])
     monkeypatch.setattr(m, "_evaluate_new_envs",
-                        lambda *a, **k: ([], ["pv-newenv-a"], 0))
+                        lambda *a, **k: ([], ["pv-newenv-a"], 0, []))
     plan["pv-orch-a-ms"] = m.DiffResult("", [], 0, False, "bad yaml",
                                         m.OUT_INDETERMINATE, m.REASON_INVALID_YAML)
     m.process_pr(_mk_pr(pr_id=605), PATH_MAP, base_sha=BASE_SHA)
@@ -677,7 +677,7 @@ def test_process_pr_structural_alone_desc(world, monkeypatch):
     monkeypatch.setattr(m, "_detect_new_env_candidates",
                         lambda *a, **k: [{"name": "pv-newenv-a"}])
     monkeypatch.setattr(m, "_evaluate_new_envs",
-                        lambda *a, **k: ([], ["pv-newenv-a"], 0))
+                        lambda *a, **k: ([], ["pv-newenv-a"], 0, []))
     m.process_pr(_mk_pr(pr_id=606), PATH_MAP, base_sha=BASE_SHA)
     state, desc = sinks.statuses[-1]
     assert state == "FAILED" and desc.endswith("pv-newenv-a")
@@ -697,7 +697,7 @@ def test_process_pr_clean_with_new_envs_success_desc(world, monkeypatch):
     monkeypatch.setattr(m, "_detect_new_env_candidates",
                         lambda *a, **k: [{"name": "pv-newenv-a"}])
     monkeypatch.setattr(m, "_evaluate_new_envs",
-                        lambda *a, **k: (["### New Environment(s) Detected"], [], 9))
+                        lambda *a, **k: (["### New Environment(s) Detected"], [], 9, []))
     m.process_pr(_mk_pr(pr_id=608), PATH_MAP, base_sha=BASE_SHA)
     state, desc = sinks.statuses[-1]
     assert state == "SUCCESSFUL" and "new environment(s) will be created" in desc
