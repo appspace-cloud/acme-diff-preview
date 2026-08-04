@@ -10,3 +10,6 @@ coverage.json
 # mutation testing (mutmut) working tree and hypothesis' example database
 mutants/
 .hypothesis/
+
+# generated locally by scripts/generate_badges.py; published to the 'badges' branch by CI
+badges/
