@@ -7,7 +7,6 @@ function they exercise.
 """
 import os, sys, threading
 import pytest
-import yaml
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
 os.environ.setdefault("BB_USER", "t")
