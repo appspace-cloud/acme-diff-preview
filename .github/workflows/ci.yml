@@ -22,14 +22,15 @@ jobs:
           python-version: "3.12"
 
       - name: Run tests with coverage
-        # COPS-2595: this run is SERIAL on purpose. The suite is now ~2.5 min
-        # (was ~20) after removing dead sleep time, so parallelism is no longer
-        # needed to make CI bearable. Running it with -n auto --dist loadfile
-        # is faster still (~30s) but currently surfaces pre-existing cross-file
-        # test pollution: files pass in isolation and fail when a worker runs
-        # them alongside others. That is a real latent bug in test isolation,
-        # tracked separately -- do not enable parallel CI until it is fixed,
-        # and do not "fix" it by reordering or retrying.
+        # COPS-2595 removed the dead sleep time (20 min -> 2.5). COPS-2596
+        # then fixed the cross-file test pollution that had been blocking
+        # parallel runs, so this is now -n auto --dist loadfile: ~30s.
+        #
+        # loadfile keeps every test in a file on ONE worker. That matters
+        # because diff_preview has module-level mutable globals which tests
+        # reset per file; xdist workers are separate PROCESSES, so each gets
+        # its own copy. Do not switch to the default --dist load without
+        # thinking: it scatters a file's tests across workers.
         #
         # COVERAGE_CORE=sysmon uses PEP 669 (Python 3.12+) instead of the C
         # tracer, which cuts coverage overhead substantially. It is disabled
@@ -39,7 +40,8 @@ jobs:
           COVERAGE_CORE: sysmon
         run: |
           pip install -r requirements-dev.txt --quiet
-          pytest tests/ -q --cov=src --cov-report=term --cov-report=json
+          pytest tests/ -q -n auto --dist loadfile \
+            --cov=src --cov-report=term --cov-report=json
 
       - name: Syntax check Python
         run: |

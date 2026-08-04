@@ -10,7 +10,7 @@ Every change to this service — a bugfix, a hardening pass, a refactor, even a
    that never failed never proved anything.
 2. Implement the fix.
 3. Run **that test file** until it's green, then run the **entire suite**
-   (`python3 -m pytest tests/ -q` — ~2.5 minutes since COPS-2595; see
+   (`python3 -m pytest tests/ -q -n auto --dist loadfile` — ~30 seconds; see
    TESTING.md) — a change that only touches one function
    can still break an unrelated test elsewhere (shared globals, locks,
    caches). Never ship on a partial run.
