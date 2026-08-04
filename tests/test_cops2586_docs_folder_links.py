@@ -89,8 +89,9 @@ def test_paused_links_documentation_folder(monkeypatch):
 
 def test_source_has_no_stale_doc_filenames():
     """Guard the whole module, not only the panels exercised above."""
-    src = open(os.path.join(os.path.dirname(__file__), "..", "src",
-                            "diff_preview.py"), encoding="utf-8").read()
+    src_path = os.path.join(os.path.dirname(__file__), "..", "src", "diff_preview.py")
+    with open(src_path, encoding="utf-8") as f:
+        src = f.read()
     for stale in (
         "environment-decommission-runbook",
         "pausing-auto-sync",
