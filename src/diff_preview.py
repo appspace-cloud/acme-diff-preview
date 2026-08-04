@@ -7780,6 +7780,39 @@ def _summarize_appspace_state_changes(changed_files, pr_sha, base_sha, path_map,
                 f"removed in a later PR, its resources will be deleted rather "
                 f"than left running.{purge_note}",
                 "",
+                f"**This is Phase 1 of the decommission runbook.** Until the "
+                f"folder is removed, nothing changes for `{env_name}`: every "
+                f"workload keeps running, disks stay held, costs keep accruing, "
+                f"and the environment is still fully managed by ArgoCD. If that "
+                f"is the point of this PR (arming ahead of a scheduled removal), "
+                f"this is exactly the expected state.",
+                "",
+                f"What the remaining phases do:",
+                f"- **Phase 2 (optional):** `appspace.decommissionPurgeData: true` "
+                f"approves destroying the BigQuery dataset and the user content "
+                f"bucket. Without it the cascade abandons them, recoverable, in "
+                f"GCP. The flag is inert unless Phase 1 is armed too.",
+                f"- **Phase 3:** a later PR removes this environment's folder. "
+                f"That PR, and only that PR, triggers the actual deletion: the "
+                f"Applications and every resource they manage, including the "
+                f"Config Connector cloud resources. It gets its own panel with "
+                f"the full rendered inventory of what is removed and what is "
+                f"retained. Even a full cascade leaves the content backup bucket "
+                f"and some namespace-level leftovers behind, per the runbook's "
+                f"what-survives section.",
+                "",
+                f"**Before merging the Phase 3 folder removal, verify the "
+                f"finalizer is actually live on the hub** \u2014 removing the "
+                f"folder without it orphans every resource instead of deleting "
+                f"them:",
+                f"```",
+                f"kubectl --context gcp-shared-devops-na1-a -n argocd "
+                f"get application {sorted(app_names)[0]} "
+                f"-o jsonpath='{{.metadata.finalizers}}'",
+                f"```",
+                f"Full procedure: `acme-components` "
+                f"`documentation/environment-decommission-runbook.md`.",
+                "",
             ]
         elif was_armed and not is_armed:
             lines += [
