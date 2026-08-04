@@ -4013,7 +4013,52 @@ def _summarize_rendered_manifest(rendered: str) -> tuple:
     return total, kind_counts, sorted(workloads)
 
 
-def _evaluate_new_envs(new_env_candidates: list, pr_sha: str) -> tuple:
+def _redact_rendered_manifest(rendered: str) -> str:
+    """Redact a full rendered multi-document manifest before it can reach a
+    PR comment or the full-diff artifact (v2.25.0).
+
+    Mirrors _redact_for_display per document instead of per diff section: a
+    v1 `kind: Secret` document is whole-masked; every other document gets
+    the key-name redaction plus the two-line k8s env-var pass. Kinds merely
+    containing "Secret" (ExternalSecret, SealedSecret) hold references, not
+    values, and are NOT whole-masked. Structural scheduling fields (`key`,
+    `topologyKey`) stay exempt from redaction via _redact_sensitive itself.
+    """
+    out = []
+    for doc in rendered.split("\n---"):
+        kind = None
+        for line in doc.splitlines():
+            if line.startswith("kind:"):
+                kind = line.split(":", 1)[1].strip()
+                break
+        if kind == "Secret":
+            # _redact_secret_section is built for diff section BODIES whose
+            # header carries the resource identity — on a whole document it
+            # would mask `kind:` and `metadata.name:` too, leaving an
+            # anonymous blob. Keep the identity part (apiVersion / kind /
+            # metadata) readable, but still run it through the standard
+            # key-name redaction (chart-authored annotations could hold
+            # values), and whole-mask everything from the first top-level
+            # `data:` / `stringData:` on with the proven Secret masker
+            # (covers block scalars, multi-line PEM blobs, etc.).
+            doc_lines = doc.split("\n")
+            split_at = next((i for i, l in enumerate(doc_lines)
+                             if l.startswith(("data:", "stringData:"))),
+                            None)
+            if split_at is None:
+                out.append(_redact_k8s_env_pairs(_redact_sensitive(doc)))
+            else:
+                head = "\n".join(doc_lines[:split_at])
+                tail = "\n".join(doc_lines[split_at:])
+                out.append(_redact_k8s_env_pairs(_redact_sensitive(head))
+                           + "\n" + _redact_secret_section(tail))
+        else:
+            out.append(_redact_k8s_env_pairs(_redact_sensitive(doc)))
+    return "\n---".join(out)
+
+
+def _evaluate_new_envs(new_env_candidates: list, pr_sha: str,
+                       with_full_output: bool = False) -> tuple:
     """Render and classify a list of new-environment candidates.
 
     v2.5.4 (Finding 4): extracted from process_pr's inline logic so the same
@@ -4036,6 +4081,7 @@ def _evaluate_new_envs(new_env_candidates: list, pr_sha: str) -> tuple:
                           all successfully-rendered new environments.
     """
     new_env_sections = []
+    full_sections = []      # (name, version, n_res, redacted manifest)
     for env_info in new_env_candidates:
         # v2.13.2 (COPS-2544, explicit request): every ApplicationSet with a
         # customer.yaml git generator also loads `{{env}}/../config.yaml` as
@@ -4149,6 +4195,13 @@ def _evaluate_new_envs(new_env_candidates: list, pr_sha: str) -> tuple:
                 "files": env_info["all_yaml_files"], "n_res": total or n_res,
                 "kind_counts": kind_counts, "workloads": workloads, "error": None,
             })
+            if with_full_output:
+                # v2.25.0: keep the complete (redacted) manifest so the
+                # caller can append it after the summary — the comment
+                # inlines what fits, the full-diff artifact keeps it all.
+                full_sections.append((env_name, display_version,
+                                      total or n_res,
+                                      _redact_rendered_manifest(rendered)))
         else:
             log(f"  new env {env_name}: render failed - {render_err}", "WARNING")
             new_env_sections.append({
@@ -4247,7 +4300,30 @@ def _evaluate_new_envs(new_env_candidates: list, pr_sha: str) -> tuple:
         s["name"] for s in new_env_sections
         if s["error"] and _new_env_status(s["error"])[1] is False
     ]
-    return lines, structural_envs, total_new
+    if not with_full_output:
+        return lines, structural_envs, total_new
+    # v2.25.0: the complete rendered output as a separate appendix block.
+    # Kept OUT of `lines` on purpose: it must always be spliced at the very
+    # end of the comment body, so the footer-preserving middle-cut truncation
+    # sacrifices the manifest first and never the summary or, in mixed PRs,
+    # the existing-app diffs.
+    full_lines = []
+    if full_sections:
+        full_lines = [
+            "### \U0001f4c4 Full rendered output", "",
+            "The complete redacted manifest of everything that will be "
+            "created on merge, kept for traceability. If Bitbucket "
+            "truncates this comment, the untruncated output stays "
+            "available through the build status link.", "",
+        ]
+        for name, ver, nres, redacted in full_sections:
+            full_lines += [
+                f"#### `{name}` — chart `{ver}`, {nres} resource(s)", "",
+                "```yaml",
+                redacted.strip("\n"),
+                "```", "",
+            ]
+    return lines, structural_envs, total_new, full_lines
 
 
 def _new_env_value_chain(env_info: dict, pr_sha: str, repo: str = None) -> tuple:
@@ -8018,7 +8094,7 @@ def _group_changed_apps_by_fingerprint(changed_apps: list) -> list:
 def format_comment(pr_sha, app_results, skipped_apps=None, base_sha="",
                     new_env_lines=None, new_env_structural=False, new_env_desc="",
                     decommission_lines=None, input_change_lines=None,
-                    appspace_state_lines=None):
+                    appspace_state_lines=None, appendix_lines=None):
     """Format the full PR comment. Never uses <details>/<summary> — Bitbucket
     does not render them. Large changesets get a compact summary table at the
     top (all apps, one row each) and, for the diff sections below, apps
@@ -8354,6 +8430,13 @@ def format_comment(pr_sha, app_results, skipped_apps=None, base_sha="",
     if new_env_lines:
         lines += ["---"] + new_env_lines
 
+    # ── Appendix (v2.25.0): full rendered output of new environments ──
+    # Always the LAST content before the footer: the middle-cut truncation
+    # keeps the head of the body, so anything above (summaries, existing-app
+    # diffs) survives at the appendix's expense — never the other way round.
+    if appendix_lines:
+        lines += ["---"] + appendix_lines
+
     # ── Footer ───────────────────────────────────────────────────────
     unknown_note = ""
     if any_unknown:
@@ -8645,25 +8728,33 @@ def process_pr(pr, path_map, base_sha="", repo=None):
             # No existing ArgoCD app matched the changed files.
             if new_env_candidates:
                 post_build_status(pr_sha, "INPROGRESS", "Rendering new environment(s)...", pr_id=pr_id)
-                new_env_lines, structural_envs, total_new = _evaluate_new_envs(new_env_candidates, pr_sha)
+                new_env_lines, structural_envs, total_new, new_env_full_lines = \
+                    _evaluate_new_envs(new_env_candidates, pr_sha,
+                                       with_full_output=True)
 
                 lines = [
                     f"## \U0001f52d {STATUS_NAME}", "",
                     _comment_header(pr_sha), "",
                 ] + new_env_lines
 
+                # v2.25.0: complete rendered output after the summary. The
+                # comment inlines what fits (footer-preserving truncation in
+                # upsert_comment); the full-diff artifact below keeps it all.
+                if new_env_full_lines:
+                    lines += ["---"] + new_env_full_lines
+
                 if structural_envs:
+                    state = "FAILED"
                     desc = (f"{len(structural_envs)} new environment(s) have a "
                             f"structural config problem: {', '.join(structural_envs)}")
-                    post_build_status(pr_sha, "FAILED", desc, pr_id=pr_id)
                     status_line = (
                         f"**Status:** \u274c New environment(s) with a structural "
                         f"problem that must be fixed before merge: "
                         f"{', '.join(f'`{e}`' for e in structural_envs)}")
                     clean_tag = "[blocked]"
                 else:
+                    state = "SUCCESSFUL"
                     desc = f"{len(new_env_candidates)} new environment(s), ~{total_new} resource(s) to create"
-                    post_build_status(pr_sha, "SUCCESSFUL", desc, pr_id=pr_id)
                     status_line = (
                         f"**Status:** \u2705 New environment(s) - all resources "
                         f"will be created on merge")
@@ -8673,7 +8764,15 @@ def process_pr(pr, path_map, base_sha="", repo=None):
                     status_line,
                     f"*{_ts()} \u2014 {COMMENT_MARKER} {clean_tag}" + (f" [base:{base_sha[:8]}]" if base_sha else "") + "*",
                 ]
-                upsert_comment(pr_id, "\n".join(lines), existing_id, repo=repo)
+                body = "\n".join(lines)
+                # v2.25.0: this path never persisted a full-diff artifact, so
+                # new-env-only PRs had no full-output page at all. Save it
+                # BEFORE the final build status so the status icon deep-links
+                # to the complete page (same standard as the diff path).
+                _save_diff_ui_artifact(repo, pr_id, pr_sha, body,
+                                       base_sha=base_sha)
+                post_build_status(pr_sha, state, desc, pr_id=pr_id)
+                upsert_comment(pr_id, body, existing_id, repo=repo)
                 with _seen_lock:
                     _seen[sk] = (pr_sha, base_sha)
                 return
@@ -9045,8 +9144,11 @@ def process_pr(pr, path_map, base_sha="", repo=None):
         # Bitbucket build status to block — a broken or unvalidated new
         # environment must never hide behind an unrelated app's clean diff.
         new_env_lines, structural_envs, total_new = ([], [], 0)
+        new_env_full_lines = []
         if new_env_candidates:
-            new_env_lines, structural_envs, total_new = _evaluate_new_envs(new_env_candidates, pr_sha)
+            new_env_lines, structural_envs, total_new, new_env_full_lines = \
+                _evaluate_new_envs(new_env_candidates, pr_sha,
+                                   with_full_output=True)
         new_env_desc = (
             f"{len(structural_envs)} new environment(s) have a structural "
             f"config problem: {', '.join(structural_envs)}"
@@ -9083,7 +9185,8 @@ def process_pr(pr, path_map, base_sha="", repo=None):
                                new_env_desc=new_env_desc,
                                decommission_lines=decommission_lines or None,
                                input_change_lines=input_change_lines or None,
-                               appspace_state_lines=appspace_state_lines or None)
+                               appspace_state_lines=appspace_state_lines or None,
+                               appendix_lines=new_env_full_lines or None)
         comment_kb = round(len(body.encode()) / 1024, 1)
         # Full-diff UI: persist the full body BEFORE upsert (which truncates over
         # MAX_COMMENT_BYTES) so the web UI serves the complete diff, with the

@@ -165,8 +165,8 @@ def test_process_pr_new_env_branch_renders_and_reports(world, monkeypatch):
                           "env_dir": "gcp/dev/private-cloud/ap1/custom/pv-new-x-a",
                           "all_yaml_files": ["gcp/dev/private-cloud/ap1/custom/pv-new-x-a/customer.yaml"]}])
     monkeypatch.setattr(m, "_evaluate_new_envs",
-                        lambda cands, pr_sha:
-                        (["- `pv-new-x-a`: renders cleanly (12 resources)"], [], 1))
+                        lambda cands, pr_sha, **k:
+                        (["- `pv-new-x-a`: renders cleanly (12 resources)"], [], 1, []))
     m.process_pr(_mk_pr(pr_id=993), PATH_MAP, base_sha=BASE_SHA)
     assert any("pv-new-x-a" in b for b in sinks.upserts), sinks.upserts[:1]
     states = [s for s, _ in sinks.statuses]
@@ -184,9 +184,9 @@ def test_process_pr_structural_new_env_blocks_the_pr(world, monkeypatch):
                           "env_dir": "gcp/dev/private-cloud/ap1/custom/pv-new-y-a",
                           "all_yaml_files": ["gcp/dev/private-cloud/ap1/custom/pv-new-y-a/customer.yaml"]}])
     monkeypatch.setattr(m, "_evaluate_new_envs",
-                        lambda cands, pr_sha:
+                        lambda cands, pr_sha, **k:
                         (["- `pv-new-y-a`: missing required value appspace.version"],
-                         ["pv-new-y-a"], 1))
+                         ["pv-new-y-a"], 1, []))
     m.process_pr(_mk_pr(pr_id=994), PATH_MAP, base_sha=BASE_SHA)
     states = [s for s, _ in sinks.statuses]
     assert states[-1] == "FAILED", sinks.statuses
