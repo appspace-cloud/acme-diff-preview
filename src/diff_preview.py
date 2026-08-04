@@ -5873,7 +5873,41 @@ def _decommission_purges_data(identity_file: str, main_sha: str) -> bool:
             and str(flat.get("appspace.decommissionPurgeData", "")).lower() == "true")
 
 
-def _evaluate_env_decommissions(candidates: list, pr_sha: str, main_sha: str) -> tuple:
+def _decommission_fully_phased(identity_file: str, main_sha: str) -> bool:
+    """True when a folder-deletion PR arrives properly phased, per
+    acme-components documentation/delete.md (checked against the current
+    default branch, automation-dev/2603.2.0):
+
+      phase 2 first — `appspace.decommission: true` live at base, so the
+        cascade actually runs when the folder goes;
+      phase 1 as applicable — when the identity file itself declares
+        `appspace.infra.deployLinuxServicesK8s`, the VM deletion must be
+        armed too (`defaults.allowDeletion: true`), or the real VM, disk
+        and IP survive the cascade under the KCC/ASO abandon policy.
+
+    VMs declared only at cohort level are invisible here on purpose: this
+    reads the same single file the cascade decision reads, and fails
+    CLOSED on anything unreadable, exactly like _decommission_cascades.
+    """
+    if not _decommission_cascades(identity_file, main_sha):
+        return False
+    content, status = _bb_fetch_cached(identity_file, main_sha)
+    if status != BB_OK or not content:
+        return False
+    try:
+        flat = _flatten_yaml(yaml.safe_load(content) or {})
+    except Exception:
+        return False
+    has_vms = any(k.startswith("appspace.infra.deployLinuxServicesK8s")
+                  for k in flat)
+    if not has_vms:
+        return True
+    val = flat.get("appspace.infra.deployLinuxServicesK8s.defaults.allowDeletion")
+    return str(val).strip().lower() == "true"
+
+
+def _evaluate_env_decommissions(candidates: list, pr_sha: str, main_sha: str,
+                                 with_full_output: bool = False) -> tuple:
     """Build the decommission warning block for confirmed deletions.
 
     Confirms each candidate's identity file is genuinely gone at pr_sha
@@ -5881,9 +5915,14 @@ def _evaluate_env_decommissions(candidates: list, pr_sha: str, main_sha: str) ->
     Best-effort resource listing: a render failure does not suppress the
     warning, since the deletion itself is already confirmed fact.
 
-    Returns (markdown_lines, env_names_reported).
+    Returns (markdown_lines, env_names_reported). With with_full_output=True
+    a third element is added: a "Full rendered output" appendix carrying the
+    complete redacted manifests of everything the cascade removes, ONLY for
+    deletions that are properly phased (_decommission_fully_phased) — an
+    orphaning deletion removes nothing, so there is nothing to audit.
     """
     lines, envs_reported = [], []
+    full_lines = []
     for c in candidates:
         _content, status = _bb_fetch_cached(c["identity_file"], pr_sha)
         if status != BB_NOT_FOUND:
@@ -5900,6 +5939,14 @@ def _evaluate_env_decommissions(candidates: list, pr_sha: str, main_sha: str) ->
         del_total, del_kinds, del_workloads = 0, {}, set()
         retained_counts: dict = {}
         any_rendered = False
+        # Read the base-side flags once, before the render loop: the cascade
+        # decision drives which tally the panel shows, and (v2.26.0) whether
+        # the full deleted manifests are collected for the audit appendix.
+        cascade = _decommission_cascades(c["identity_file"], main_sha)
+        purges_data = _decommission_purges_data(c["identity_file"], main_sha)
+        collect_full = (with_full_output and cascade
+                        and _decommission_fully_phased(c["identity_file"], main_sha))
+        app_deleted_docs: dict = {}
         for app in c["apps"]:
             try:
                 resources = _render_main_side_resources(app, main_sha)
@@ -5914,6 +5961,8 @@ def _evaluate_env_decommissions(candidates: list, pr_sha: str, main_sha: str) ->
             all_workloads.update(wl)
 
             deleted_only, retained = _split_resources_by_cascade_fate(resources)
+            if collect_full and deleted_only:
+                app_deleted_docs[app] = deleted_only
             dn, dkc, dwl = _summarize_resources_dict(deleted_only)
             del_total += dn
             for k, v in dkc.items():
@@ -5932,8 +5981,6 @@ def _evaluate_env_decommissions(candidates: list, pr_sha: str, main_sha: str) ->
         # "true" is treated as orphaning: that is both the default and, as of
         # 2026-07-31, the only case that exists in any repo, so a wrong guess
         # must never be the reassuring one.
-        cascade = _decommission_cascades(c["identity_file"], main_sha)
-        purges_data = _decommission_purges_data(c["identity_file"], main_sha)
         total = del_total if cascade else all_total
         kind_counts = del_kinds if cascade else all_kinds
         workloads = del_workloads if cascade else all_workloads
@@ -6009,7 +6056,34 @@ def _evaluate_env_decommissions(candidates: list, pr_sha: str, main_sha: str) ->
             lines.append("- *(resource preview unavailable \u2014 the deletion itself is confirmed)*")
         lines.append("")
         envs_reported.append(c["env_name"])
-    return lines, envs_reported
+        if collect_full and app_deleted_docs:
+            parts = []
+            for app in sorted(app_deleted_docs):
+                docs = app_deleted_docs[app]
+                body = "\n---\n".join(
+                    d.strip("\n") for _k, d in sorted(docs.items()))
+                parts.append(f"# \u2500\u2500 Application: {app} \u2500\u2500\n{body}")
+            assembled = _redact_rendered_manifest("\n---\n".join(parts))
+            n_docs = sum(len(v) for v in app_deleted_docs.values())
+            full_lines += [
+                "### \U0001f4c4 Full rendered output \u2014 everything that "
+                "will be DELETED", "",
+                f"Complete redacted manifests of every resource the cascade "
+                f"removes for `{c['env_name']}`, rendered from `main` (the "
+                f"state being deleted) and kept untruncated on the full-diff "
+                f"page for audit. Shown because this deletion is properly "
+                f"phased: the cascade was armed before this PR. Retained "
+                f"resources are excluded on purpose \u2014 this is exactly "
+                f"what goes away.", "",
+                f"#### `{c['env_name']}` \u2014 {n_docs} resource(s) across "
+                f"{len(app_deleted_docs)} application(s)", "",
+                "```yaml",
+                assembled,
+                "```", "",
+            ]
+    if not with_full_output:
+        return lines, envs_reported
+    return lines, envs_reported, full_lines
 
 
 def _apps_to_skip_for_decommission(candidates: list, confirmed_envs: list) -> set:
@@ -7292,6 +7366,17 @@ def _redact_sensitive(text: str) -> str:
     _redact_k8s_env_pairs covered that shape. Same block-tracking as the other
     two redactors.
     """
+    # Idempotence guard (property-test finding, inputs like '0\r\r' or
+    # '0\x85'): splitlines-plus-join drops trailing terminators one per
+    # pass and normalizes exotic ones to \n, so content-bearing text
+    # ending in ANY of splitlines' terminators changed on every pass.
+    # Drop all trailing terminators up front: one stable fixed point,
+    # same documented rule that a trailing newline is dropped.
+    # Terminator-only input keeps its shrink-by-one behaviour, pinned by
+    # test_terminator_only_input_shrinks_by_design.
+    _terms = "\n\r\x0b\x0c\x1c\x1d\x1e\x85\u2028\u2029"
+    if text.strip(_terms):
+        text = text.rstrip(_terms)
     redacted_lines = []
     in_block = False
     block_indent = 0
@@ -8720,9 +8805,11 @@ def process_pr(pr, path_map, base_sha="", repo=None):
         decommission_candidates = _detect_env_decommission_candidates(
             changed, path_map, renames, main_sha=base_sha, pr_sha=pr_sha)
         decommission_lines, decommissioned_envs = ([], [])
+        decom_full_lines = []
         if decommission_candidates:
-            decommission_lines, decommissioned_envs = _evaluate_env_decommissions(
-                decommission_candidates, pr_sha, base_sha)
+            decommission_lines, decommissioned_envs, decom_full_lines = \
+                _evaluate_env_decommissions(decommission_candidates, pr_sha,
+                                            base_sha, with_full_output=True)
             if decommissioned_envs:
                 log(f"PR #{pr_id}: environment decommission detected: "
                     f"{decommissioned_envs}", "WARNING", pr=pr_id)
@@ -9189,7 +9276,7 @@ def process_pr(pr, path_map, base_sha="", repo=None):
                                decommission_lines=decommission_lines or None,
                                input_change_lines=input_change_lines or None,
                                appspace_state_lines=appspace_state_lines or None,
-                               appendix_lines=new_env_full_lines or None)
+                               appendix_lines=((decom_full_lines or []) + (new_env_full_lines or [])) or None)
         comment_kb = round(len(body.encode()) / 1024, 1)
         # Full-diff UI: persist the full body BEFORE upsert (which truncates over
         # MAX_COMMENT_BYTES) so the web UI serves the complete diff, with the
