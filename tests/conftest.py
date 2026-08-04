@@ -98,3 +98,40 @@ def _no_real_sleep(request, monkeypatch):
     import diff_preview as _m
     monkeypatch.setattr(_m.time, "sleep", lambda _s: None)
     yield
+
+
+# ── No leaked background threads from the test suite ────────────────────────
+#
+# main() starts a daemon thread (_start_oci_selfcheck_loop) that runs an
+# authenticated OCI pull check on a timer. Six tests call m.main(); only two
+# of them stubbed the loop out, so the other four spawned a REAL thread that
+# outlived the test and kept running while unrelated tests executed.
+#
+# Two consequences, one cosmetic and one not:
+#
+#   * It printed "OCI self-check FAILED ... helm registry login failed" into
+#     the middle of an otherwise-green run, because CI has no registry
+#     credentials and no usable helm binary. That output escapes pytest's
+#     per-test capture (it comes from a thread running between tests), so a
+#     passing suite looked like it was erroring.
+#   * A background thread doing real work during unrelated tests is a
+#     flakiness source, and _no_real_sleep above makes it worse: with
+#     time.sleep neutralised the loop's 60s delay and its interval wait both
+#     return instantly, turning a slow poller into a hot loop.
+#
+# Stubbing the STARTER (not _oci_selfcheck itself) leaves every test that
+# exercises the self-check LOGIC untouched, e.g. tests/test_v2525_oci_selfcheck.py
+# calls _oci_selfcheck() directly and never goes near the thread.
+#
+# A test that deliberately drives the starter itself -- fakes threading.Thread
+# and time.sleep and then calls _start_oci_selfcheck_loop() to walk the loop
+# body synchronously -- must opt out, because it calls the very function this
+# stubs. Mark it @pytest.mark.no_thread_stub.
+@pytest.fixture(autouse=True)
+def _no_background_selfcheck_thread(request, monkeypatch):
+    if request.node.get_closest_marker("no_thread_stub"):
+        yield          # this test drives the starter on purpose
+        return
+    import diff_preview as _m
+    monkeypatch.setattr(_m, "_start_oci_selfcheck_loop", lambda: None)
+    yield
