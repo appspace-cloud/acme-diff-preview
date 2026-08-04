@@ -51,7 +51,12 @@ jobs:
           COVERAGE_CORE: sysmon
         run: |
           pip install -r requirements-dev.txt --quiet
-          pytest tests/ -q --cov=src --cov-report=term --cov-report=json
+          # The kind-cluster contract tests are opt-in and run for real in
+          # the dedicated kind-integration job below. Deselect them here
+          # instead of letting them show up as skipped: an 's' in this log
+          # reads like something was lost, while 'deselected' says excluded
+          # on purpose.
+          pytest tests/ -q -m "not kind and not local_components" --cov=src --cov-report=term --cov-report=json
 
       - name: Syntax check Python
         run: |
