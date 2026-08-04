@@ -7810,8 +7810,7 @@ def _summarize_appspace_state_changes(changed_files, pr_sha, base_sha, path_map,
                 f"get application {sorted(app_names)[0]} " +
                 f"-o jsonpath='{{.metadata.finalizers}}'",
                 f"```",
-                f"Full procedure: `acme-components` " +
-                f"`documentation/environment-decommission-runbook.md`.",
+                f"Full procedure: see `acme-components` `documentation/`.",
                 "",
             ]
         elif was_armed and not is_armed:

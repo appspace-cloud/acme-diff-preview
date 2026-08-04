@@ -74,7 +74,7 @@ def test_armed_says_what_survives_a_full_cascade(monkeypatch):
     out = _armed_output(monkeypatch)
     low = out.lower()
     assert "content backup bucket" in low
-    assert "runbook" in low or "environment-decommission-runbook" in low
+    assert "documentation/" in low or "acme-components" in low
 
 
 def test_armed_points_at_the_phase3_inventory_panel(monkeypatch):
