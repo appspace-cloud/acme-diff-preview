@@ -46,9 +46,22 @@ and QA apps when CI publishes a new chart, so they pick it up past the OCI cache
 | ❔ diff unavailable | **Not** the same as "no changes". Something failed and the app was NOT evaluated. |
 | 🗑️ RESOURCE(S) DELETED | Resources disappear from the rendered output entirely. |
 | 🗑️ ENVIRONMENT DECOMMISSION | A whole environment is being removed. Read the block: by default its workloads are **orphaned, not deleted**. |
+| ⏸️/▶️ Auto-sync PAUSED/RESUMED | `appspace.autosync` was toggled. Shown even when it is the ONLY change — no rendered manifest is touched, so the resource diff has nothing to say. |
+| 🔒 DECOMMISSION ARMED / 🔓 DISARMED | `appspace.decommission` (and `decommissionPurgeData`) was toggled on a LIVE environment. Different from the block above: nothing is deleted yet, this is the flag that decides what happens the day the folder actually goes. |
 
 The one rule the tool never breaks: **a failure is never reported as "no changes".**
 If a diff could not be computed, the status says so and the PR is not marked clean.
+
+**Application-level state flags** (COPS-2584): `appspace.autosync` and
+`appspace.decommission` change ArgoCD's behaviour for a whole environment
+without touching a single template, so they get their own panel — the
+headline, shown before even the config-change list — instead of blending
+into an ordinary added/removed/changed key. Pausing or resuming, arming or
+disarming, all name the environment and every Application it affects.
+Resuming a long-paused environment also gets a reminder that the accumulated
+diff applies immediately; arming decommission is explicit that nothing is
+deleted by that PR alone. See `acme-components/documentation/pausing-auto-sync.md`
+and `environment-decommission-runbook.md` for what each flag actually does.
 
 Apps whose full diff is byte-for-byte identical (a shared ancestor-file
 change rolled out the same way to many environments, e.g. removing a

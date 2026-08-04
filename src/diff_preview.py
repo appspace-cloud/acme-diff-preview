@@ -7657,6 +7657,160 @@ def _summarize_input_changes(changed_files, pr_sha, base_sha, repo=None) -> list
     return ["### \U0001f4dd Config changes in this PR", ""] + out
 
 
+def _autosync_paused(flat: dict) -> bool:
+    """Mirrors the ApplicationSet templatePatch condition exactly (COPS-2583):
+    `{{- if eq (printf "%v" .appspace.autosync) "false" }}`. Only the literal
+    string "false" pauses auto-sync -- a missing key, true, or any other
+    value leaves it on. This must never diverge from the production
+    condition, or the warning could say the opposite of what ArgoCD does."""
+    return str(flat.get("appspace.autosync", "")).lower() == "false"
+
+
+def _decommission_armed_flat(flat: dict) -> bool:
+    """Same parsing _decommission_cascades uses, applied to an already
+    flattened dict instead of re-fetching from Bitbucket."""
+    return str(flat.get("appspace.decommission", "")).lower() == "true"
+
+
+def _purge_armed_flat(flat: dict) -> bool:
+    """Same fail-closed AND _decommission_purges_data uses: purge is inert
+    unless decommission is armed too."""
+    return (_decommission_armed_flat(flat)
+            and str(flat.get("appspace.decommissionPurgeData", "")).lower() == "true")
+
+
+def _summarize_appspace_state_changes(changed_files, pr_sha, base_sha, path_map, repo=None) -> list:
+    """Markdown block calling out changes to Application-level state flags
+    read from a LIVE environment's own customer.yaml/config.yaml:
+    appspace.autosync (COPS-2583) and appspace.decommission /
+    appspace.decommissionPurgeData (COPS-2539/COPS-2572).
+
+    COPS-2584: both flags change ArgoCD's behaviour for an entire
+    environment without touching a single rendered manifest, so every
+    existing symptom panel (chart diff, resource diff) shows nothing, and
+    _summarize_input_changes reports the key change with the same weight as
+    any other line in customer.yaml. A PR that freezes an environment, or
+    arms it for a later deletion, must not read like a no-op next to a
+    green "no manifest changes" status.
+
+    Reuses the SAME _bb_fetch_cached cache _summarize_input_changes already
+    populates for these files -- a second read of the same (path, sha) is a
+    cache hit, not a second Bitbucket call. Only fires for identity files
+    that are a currently-live environment's own file (present in path_map)
+    AND present on both sides of the diff; a file that exists on only one
+    side is new-env or decommission-by-deletion territory, already covered
+    by their own dedicated panels, and must not get a second, possibly
+    contradictory message here.
+    """
+    lines = []
+    seen = set()
+    for f in changed_files or []:
+        clean = posixpath.normpath(f.lstrip("/"))
+        if clean in seen:
+            continue
+        if posixpath.basename(clean) not in _IDENTITY_BASENAMES:
+            continue
+        apps = path_map.get(clean)
+        if not apps:
+            continue  # not a currently-live environment's own identity file
+        seen.add(clean)
+
+        new_txt, st_new = _bb_fetch_cached(clean, pr_sha, repo=repo)
+        old_txt, st_old = _bb_fetch_cached(clean, base_sha, repo=repo)
+        if st_new != BB_OK or st_old != BB_OK:
+            continue  # added/deleted file -- new-env/decommission-by-deletion territory
+
+        try:
+            new_flat = _flatten_yaml(yaml.safe_load(new_txt) or {})
+            old_flat = _flatten_yaml(yaml.safe_load(old_txt) or {})
+        except yaml.YAMLError:
+            continue  # unparseable -- _summarize_input_changes already flags this
+
+        env_name = posixpath.basename(posixpath.dirname(clean))
+        app_names = sorted(a.split("/")[-1] for a in apps)
+        app_list = ", ".join(f"`{a}`" for a in app_names)
+
+        # -- autosync (COPS-2583) --
+        was_paused, is_paused = _autosync_paused(old_flat), _autosync_paused(new_flat)
+        if not was_paused and is_paused:
+            lines += [
+                f"### \u23f8\ufe0f Auto-sync PAUSED for `{env_name}`",
+                "",
+                f"`appspace.autosync: false` was added to this environment's "
+                f"`customer.yaml`. Automated sync stops for {app_list} \u2014 "
+                f"resources keep running and manual sync still works, but this "
+                f"environment will not receive any further config changes until "
+                f"the flag is removed.",
+                "",
+            ]
+        elif was_paused and not is_paused:
+            lines += [
+                f"### \u25b6\ufe0f Auto-sync RESUMED for `{env_name}`",
+                "",
+                f"`appspace.autosync: false` was removed from this environment's "
+                f"`customer.yaml`. Automated sync resumes for {app_list}. If this "
+                f"environment drifted while paused, resuming applies the "
+                f"accumulated diff immediately \u2014 check its sync status before "
+                f"merging if that matters.",
+                "",
+            ]
+        elif is_paused:
+            lines += [
+                f"*`{env_name}` remains paused (`appspace.autosync: false`) \u2014 "
+                f"this PR's other changes to it will not be applied until it "
+                f"resumes: {app_list}.*",
+                "",
+            ]
+
+        # -- decommission / decommissionPurgeData (COPS-2539/COPS-2572) --
+        was_armed, is_armed = _decommission_armed_flat(old_flat), _decommission_armed_flat(new_flat)
+        was_purge, is_purge = _purge_armed_flat(old_flat), _purge_armed_flat(new_flat)
+        if not was_armed and is_armed:
+            purge_note = (
+                " **`appspace.decommissionPurgeData: true` is also set \u2014 the "
+                "cascade will permanently destroy the BigQuery dataset and the "
+                "user content bucket, not just the workloads.**"
+                if is_purge else "")
+            lines += [
+                f"## \U0001f512\u26a0\ufe0f DECOMMISSION ARMED for `{env_name}` \u26a0\ufe0f\U0001f512",
+                "",
+                f"**`appspace.decommission: true` was added.** This PR deletes "
+                f"nothing by itself, but {app_list} are now eligible for the "
+                f"cascade-delete finalizer: once this environment's folder is "
+                f"removed in a later PR, its resources will be deleted rather "
+                f"than left running.{purge_note}",
+                "",
+            ]
+        elif was_armed and not is_armed:
+            lines += [
+                f"### \U0001f513 Decommission DISARMED for `{env_name}`",
+                "",
+                f"`appspace.decommission` was removed. {app_list} are no longer "
+                f"eligible for cascade deletion if this environment's folder is "
+                f"removed later.",
+                "",
+            ]
+        elif is_armed and not was_purge and is_purge:
+            lines += [
+                f"## \U0001f6a8 PURGE ARMED for already-decommissioned `{env_name}` \U0001f6a8",
+                "",
+                f"**`appspace.decommissionPurgeData: true` was added to an "
+                f"environment already armed for decommission.** {app_list} will "
+                f"now permanently destroy the BigQuery dataset and the user "
+                f"content bucket when the cascade runs, not just abandon them.",
+                "",
+            ]
+        elif is_armed and was_purge and not is_purge:
+            lines += [
+                f"*`{env_name}` decommission remains armed, but "
+                f"`appspace.decommissionPurgeData` was removed \u2014 data is no "
+                f"longer purged by the cascade.*",
+                "",
+            ]
+
+    return lines
+
+
 def _comment_header(pr_sha: str) -> str:
     """The one true '**Commit**' header line for EVERY comment body.
 
@@ -7718,7 +7872,8 @@ def _group_changed_apps_by_fingerprint(changed_apps: list) -> list:
 
 def format_comment(pr_sha, app_results, skipped_apps=None, base_sha="",
                     new_env_lines=None, new_env_structural=False, new_env_desc="",
-                    decommission_lines=None, input_change_lines=None):
+                    decommission_lines=None, input_change_lines=None,
+                    appspace_state_lines=None):
     """Format the full PR comment. Never uses <details>/<summary> — Bitbucket
     does not render them. Large changesets get a compact summary table at the
     top (all apps, one row each) and, for the diff sections below, apps
@@ -7736,6 +7891,14 @@ def format_comment(pr_sha, app_results, skipped_apps=None, base_sha="",
     a broken new environment as blocking even if every existing app's own
     diff is perfectly clean — a reviewer must never see a plain green check
     while an unvalidated new environment rode along in the same PR.
+
+    appspace_state_lines (COPS-2584): the markdown block from
+    _summarize_appspace_state_changes calling out an autosync pause/resume
+    or a decommission arm/disarm. Rendered as the very first thing after the
+    header, before even the input-changes cause panel — these flags change
+    ArgoCD's behaviour for the whole environment while every other panel
+    (chart diff, resource diff, cause panel) would otherwise report nothing,
+    so this is the headline, not a footnote.
     """
     skipped_apps  = skipped_apps or []
     results       = {app: _result(v) for app, v in app_results.items()}
@@ -7779,6 +7942,14 @@ def format_comment(pr_sha, app_results, skipped_apps=None, base_sha="",
         f"## \U0001f52d {STATUS_NAME}", "",
         f"{_comment_header(pr_sha)}{large_label}", "",
     ]
+
+    # ── Application state-flag warning (COPS-2584) ───────────────────
+    # autosync pause/resume, decommission arm/disarm — shown before even the
+    # input-changes cause panel, since these flags change ArgoCD's behaviour
+    # for the whole environment while nothing else in the comment would
+    # otherwise say so.
+    if appspace_state_lines:
+        lines += appspace_state_lines
 
     # ── Input root-cause panel (v2.6.2) ──────────────────────────────
     # WHAT the PR edits at the values level, before any symptom below —
@@ -8724,13 +8895,20 @@ def process_pr(pr, path_map, base_sha="", repo=None):
         except Exception as e:  # cause panel must never break the comment
             log(f"    [comment] input-changes panel failed: {e}", "WARNING")
             input_change_lines = []
+        try:
+            appspace_state_lines = _summarize_appspace_state_changes(
+                changed, pr_sha, base_sha, path_map, repo=repo)
+        except Exception as e:  # state-flag panel must never break the comment
+            log(f"    [comment] appspace-state panel failed: {e}", "WARNING")
+            appspace_state_lines = []
         body = format_comment(pr_sha, app_results, skipped_apps, base_sha=base_sha,
                                new_env_lines=new_env_lines or None,
                                new_env_structural=bool(structural_envs
                                                         or moves_missing_cohort),
                                new_env_desc=new_env_desc,
                                decommission_lines=decommission_lines or None,
-                               input_change_lines=input_change_lines or None)
+                               input_change_lines=input_change_lines or None,
+                               appspace_state_lines=appspace_state_lines or None)
         comment_kb = round(len(body.encode()) / 1024, 1)
         # Full-diff UI: persist the full body BEFORE upsert (which truncates over
         # MAX_COMMENT_BYTES) so the web UI serves the complete diff, with the
