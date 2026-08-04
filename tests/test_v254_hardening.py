@@ -190,7 +190,18 @@ def test_fix_stuck_inprogress_legacy_diff_incomplete_text_now_failed(monkeypatch
 
 # ── Finding 6: get_pr_changed_files pairing + _run_one_diff / 
 #    _pr_chart_revision_checked following a renamed value file ──────────
-def test_get_pr_changed_files_returns_renames_dict():
+# COPS-2596: the three tests below used to assign m.bb / m._bb_fetch_status
+# DIRECTLY on the module instead of via monkeypatch, so the fakes survived the
+# test and stayed installed for the rest of the process. The last one left
+# _bb_fetch_status returning BB_NOT_FOUND for everything, which silently broke
+# tests/test_coverage_orchestration.py whenever it happened to run after this
+# file in the same worker -- green in the default alphabetical order, red under
+# xdist. Its fake also took only (clean, pr_sha) while the real function accepts
+# a repo kwarg, so callers blew up on an unexpected keyword.
+#
+# Always monkeypatch module globals. It is reverted at teardown; a bare
+# assignment is not.
+def test_get_pr_changed_files_returns_renames_dict(monkeypatch):
     pages = [{
         "values": [
             {"old": {"path": "gcp/dev/private-cloud/ap1/custom/pv-dev-05-a/customer.yaml"},
@@ -200,7 +211,7 @@ def test_get_pr_changed_files_returns_renames_dict():
         ],
         "next": "",
     }]
-    m.bb = lambda method, path, **kw: pages[0]
+    monkeypatch.setattr(m, "bb", lambda method, path, **kw: pages[0])
     files, renames = m.get_pr_changed_files(1234)
     assert renames == {
         "gcp/dev/private-cloud/ap1/custom/pv-dev-05-a/customer.yaml":
@@ -209,7 +220,7 @@ def test_get_pr_changed_files_returns_renames_dict():
     assert "gcp/dev/x/config.yaml" not in renames
 
 
-def test_pr_chart_revision_checked_follows_renamed_customer_yaml():
+def test_pr_chart_revision_checked_follows_renamed_customer_yaml(monkeypatch):
     # PR #6648 repro: customer.yaml renamed AND its appspace.version bumped
     # in the same commit. Must detect the bump by following the rename,
     # not silently miss it because the old path 404s.
@@ -218,11 +229,11 @@ def test_pr_chart_revision_checked_follows_renamed_customer_yaml():
     old_path = "gcp/dev/private-cloud/ap1/custom/pv-dev-06-a/customer.yaml"
     new_path = "gcp/dev/private-cloud/ap1/custom/pv-dev-06-renametest-a/customer.yaml"
 
-    def fake_fetch_status(clean, pr_sha):
+    def fake_fetch_status(clean, pr_sha, **kw):
         if clean == new_path:
             return "appspace:\n  version: 2603.0.1-renamed-dev\n", m.BB_OK
         return None, m.BB_NOT_FOUND
-    m._bb_fetch_status = fake_fetch_status
+    monkeypatch.setattr(m, "_bb_fetch_status", fake_fetch_status)
     m._vf_cache.clear()
 
     new_rev, invalid = m._pr_chart_revision_checked(
@@ -230,12 +241,13 @@ def test_pr_chart_revision_checked_follows_renamed_customer_yaml():
     assert (new_rev, invalid) == ("2603.0.1-renamed-dev", False)
 
 
-def test_pr_chart_revision_checked_no_rename_info_still_returns_none():
+def test_pr_chart_revision_checked_no_rename_info_still_returns_none(monkeypatch):
     # Guard: without a renames dict (or the file genuinely deleted), the
     # existing "no bump detected" behavior for a 404 must be unchanged.
     app = "test-app-no-rename-info"
     m._app_chart_revision_map[app] = "2603.0.0-dev"
-    m._bb_fetch_status = lambda clean, pr_sha: (None, m.BB_NOT_FOUND)
+    monkeypatch.setattr(m, "_bb_fetch_status",
+                        lambda clean, pr_sha, **kw: (None, m.BB_NOT_FOUND))
     m._vf_cache.clear()
     new_rev, invalid = m._pr_chart_revision_checked(
         app, ["gcp/dev/private-cloud/ap1/custom/pv-x-a/customer.yaml"], "prsha123")

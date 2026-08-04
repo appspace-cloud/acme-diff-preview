@@ -15,14 +15,14 @@ makes the suite prove less.
 ## The commands
 
 ```bash
-# The release gate. Serial, ~2.5 minutes. This is the one to use.
-python3 -m pytest tests/ -q
+# The release gate. ~30 seconds. This is the one to use.
+python3 -m pytest tests/ -q -n auto --dist loadfile
 
 # One file while iterating (seconds)
 python3 -m pytest tests/test_something.py -q
 
-# Parallel: ~30s, but see the warning below before trusting it
-python3 -m pytest tests/ -q -n auto --dist loadfile
+# Serial (~2.5 min), for debugging or when output ordering matters
+python3 -m pytest tests/ -q
 
 # Regenerating golden files -- MUST be serial (see below)
 UPDATE_GOLDEN=1 python3 -m pytest tests/test_cops2565_golden_comments.py -q
@@ -107,22 +107,7 @@ A per-test cap means a future non-hermetic test **fails fast and visibly**
 instead of quietly costing 30 seconds or hanging CI. This is a safety net, not
 a speed trick: a test that suddenly needs 60s is telling you something.
 
-### 3. `pytest-xdist` with `--dist loadfile` (installed, NOT yet the default)
-
-**Status: use with care.** The parallel run finishes in ~30s versus ~2.5 min
-serial, but it currently produces around a dozen failures that the serial run
-does not. Those are **not** caused by parallelism: each affected file passes on
-its own under xdist. They are pre-existing **cross-file test pollution** —
-tests that depend on state another file happened to leave behind, which the
-serial ordering silently satisfied. xdist exposes the coupling, it does not
-create it.
-
-Until that is fixed, **the serial run is the gate**, in CI and before release.
-Do not paper over the failures by reordering files, pinning an order, or
-retrying. Fixing them means finding the shared state and making each file
-hermetic — which is worth doing, and is tracked separately.
-
-The design below is why `loadfile` is the right mode once the coupling is gone.
+### 3. `pytest-xdist` with `--dist loadfile`
 
 
 `src/diff_preview.py` carries module-level mutable state that tests clear in
@@ -148,6 +133,15 @@ writing `tests/golden/*.md` at once corrupt each other. Read-only comparison
 is parallel-safe; `UPDATE_GOLDEN=1` is not. Always diff a regenerated golden
 before accepting it -- never regenerate blindly to make red go green.
 
+**Monkeypatch module globals, never assign to them.** `monkeypatch.setattr(m,
+"thing", fake)` is reverted at teardown; `m.thing = fake` is not, and the fake
+stays installed for every test that follows in that process. COPS-2596 was
+exactly this: three tests in `test_v254_hardening.py` assigned `m.bb` and
+`m._bb_fetch_status` directly, so one of them left `_bb_fetch_status` returning
+`BB_NOT_FOUND` for everything and quietly broke a different file. It passed in
+the default alphabetical order and failed under xdist, which is the worst kind
+of bug: invisible until the day the order changes.
+
 **No shared fixed paths.** Use `tmp_path` / `tmp_path_factory`. A hardcoded
 `/tmp/thing` collides across workers.
 
@@ -165,11 +159,9 @@ retry-until-green: that discards exactly the signal we most need.
 
 Read this section before changing tests or test config.
 
-1. **Run the full suite serially: `python3 -m pytest tests/ -q`.** It is ~2.5
-   minutes, not twenty. There is no longer an excuse to skip it, and
-   `RELEASING.md` requires it before every release. Do **not** use `-n auto`
-   as the gate yet: it is faster but currently red for reasons unrelated to
-   your change (see the xdist section above).
+1. **Run the full suite: `python3 -m pytest tests/ -q -n auto --dist loadfile`.**
+   It is ~30 seconds, not twenty minutes. There is no excuse to skip it, and
+   `RELEASING.md` requires it before every release.
 2. **The suite takes long enough to exceed a single tool-call timeout.** Run
    it in the background and poll:
    ```bash
