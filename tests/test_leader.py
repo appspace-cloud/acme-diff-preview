@@ -329,6 +329,7 @@ def test_event_hook_errors_never_propagate(tmp_path, monkeypatch):
     assert el.is_leader() is True
 
 
+@pytest.mark.realtime
 def test_start_and_stop_run_real_thread(tmp_path, monkeypatch):
     el, api, clock = _elector(tmp_path, monkeypatch, retry_period=0.01)
     el.start()
@@ -768,6 +769,7 @@ def test_release_joins_the_background_thread_before_touching_the_network(
     assert order == [("network", True)]   # join happened BEFORE the GET
 
 
+@pytest.mark.realtime
 def test_release_stops_a_real_background_thread_before_returning(
         tmp_path, monkeypatch):
     """End-to-end companion to the ordering test above, with a real
@@ -924,6 +926,7 @@ def test_set_leading_never_fires_acquired_while_staying_standby(tmp_path,
     assert el.is_leader() is False
 
 
+@pytest.mark.realtime
 def test_set_leading_only_fires_lost_on_a_real_leader_to_standby_edge(
         tmp_path, monkeypatch):
     # Regression pin: "elif was and not leading" must be AND, not OR.

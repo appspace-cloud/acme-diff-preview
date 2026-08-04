@@ -57,3 +57,44 @@ def _clear_sha_fetch_cache():
     yield
     for d in (_m._vf_cache, _m._vf_inflight, _m._retry_backoff, _m._yaml_cache):
         d.clear()
+
+
+# ── COPS-2595: no real waiting in the test suite ────────────────────────────
+#
+# Measured before this fixture existed: the full suite took ~20 minutes, and
+# the 40 slowest tests accounted for ~1,087s of the 1,224s total. Profiling a
+# single 29.4s test showed 27.0s of it inside time.sleep, with real TLS
+# handshakes alongside it.
+#
+# Tracing every sleep to its call site found the cause: those tests escape the
+# urlopen mock seam, reach the REAL Bitbucket and GCP endpoints, fail, and then
+# retry with hardcoded backoff:
+#
+#     _bb_fetch_cached -> _bb_fetch_status  18.0s   ((attempt + 1) * 2)
+#     _pr_chart_revision_checked -> same    12.0s
+#     _gcp_access_token -> http             3.0s    (2 ** attempt)
+#
+# Those waits are hardcoded, not env-tunable, so they cannot be turned down
+# from the outside. Neutralising sleep took that one test from 29.40s to 2.40s.
+#
+# Scope, stated precisely: diff_preview does `import time`, so _m.time IS the
+# stdlib time module and this patch is process-wide for the DURATION OF ONE
+# TEST. monkeypatch reverts it at teardown, so it never leaks between tests.
+#
+# The retry loops still execute in full: same number of attempts, same
+# branches, same log lines, same assertions. Nothing is skipped and no test is
+# weakened -- the only thing removed is dead wall-clock waiting for a network
+# the test never meant to touch. It also stops a genuinely non-hermetic test
+# from hiding behind a slow retry instead of failing visibly.
+#
+# Tests that need real elapsed time -- real threads, leader-election races,
+# anything where another thread must actually make progress during the wait --
+# opt out with @pytest.mark.realtime and get the untouched time.sleep.
+@pytest.fixture(autouse=True)
+def _no_real_sleep(request, monkeypatch):
+    if request.node.get_closest_marker("realtime"):
+        yield          # genuine timing test: leave time.sleep alone
+        return
+    import diff_preview as _m
+    monkeypatch.setattr(_m.time, "sleep", lambda _s: None)
+    yield
