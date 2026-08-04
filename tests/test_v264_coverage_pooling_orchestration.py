@@ -209,6 +209,7 @@ def test_oci_selfcheck_loop_disabled_when_interval_non_positive(monkeypatch):
     assert constructed == []
 
 
+@pytest.mark.no_thread_stub
 def test_oci_selfcheck_loop_survives_exception_and_honors_shutdown(monkeypatch):
     # L1979-1981 (exception swallowed) and L1983-1984 (shutdown observed
     # mid-wait) inside the daemon loop body, run synchronously (no real

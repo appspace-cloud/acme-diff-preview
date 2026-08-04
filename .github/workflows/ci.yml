@@ -17,7 +17,7 @@ jobs:
       - uses: actions/checkout@v5.0.0
 
       - name: Set up Python
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@v7.0.0
         with:
           python-version: "3.12"
 
@@ -66,15 +66,25 @@ jobs:
 
       - name: Commit updated badges (main only)
         if: github.ref == 'refs/heads/main' && github.event_name == 'push'
-        # COPS-2580: this step must never fail the job. It is a cosmetic
-        # follow-up to a test run that already passed, and after main
-        # branch protection started requiring status checks on every ref
-        # update, a direct push here (bot-authored, never went through a
-        # PR) can be rejected by GitHub itself ("N of N required status
-        # checks are expected") with no way for this exact commit to ever
-        # satisfy that requirement. Losing a badge refresh once in a while
-        # is harmless; failing the "test" required check over it would
-        # incorrectly block every future PR merge on a cosmetic step.
+        # COPS-2580 made this non-fatal. It still reported a red error and
+        # burned three attempts on something that cannot work, so it read
+        # like a real failure in an otherwise-green run.
+        #
+        # The push is blocked by the "main-protection" repository ruleset,
+        # which requires status checks on every ref update. A bot push can
+        # never satisfy that: the checks run ON that push, so the commit
+        # would have to pass checks that only start existing once it lands.
+        # Rebasing and retrying cannot help -- it is a policy, not a race.
+        #
+        # Deliberately NOT fixed by adding the Actions bot to the ruleset's
+        # bypass list. That would let ANY workflow write to main, which is a
+        # real widening of who can change the default branch of a tool that
+        # gates production, traded for a cosmetic badge. Not worth it.
+        #
+        # So: try once, and if the ruleset rejects it, say so plainly as a
+        # notice and stop. Badges then refresh whenever someone runs
+        # scripts/generate_badges.py and commits the result in a normal PR,
+        # which goes through review like everything else.
         continue-on-error: true
         run: |
           if git diff --quiet -- badges/; then
@@ -85,16 +95,15 @@ jobs:
           git config user.email "github-actions[bot]@users.noreply.github.com"
           git add badges/
           git commit -m "[COPS-2498] chore: update badges [skip ci]"
-          for attempt in 1 2 3; do
-            if git push origin HEAD:main; then
-              exit 0
-            fi
-            echo "Push rejected (attempt $attempt), rebasing onto latest main and retrying..."
-            git fetch origin main
-            git rebase origin/main || { git rebase --abort; exit 1; }
-          done
-          echo "::error::Could not push the badge update after 3 attempts."
-          exit 1
+          if git push origin HEAD:main 2>push.err; then
+            echo "Badges updated on main."
+            exit 0
+          fi
+          cat push.err
+          echo "::notice::Badge refresh skipped: the main-protection ruleset "\
+               "blocks bot pushes to main. Run scripts/generate_badges.py and "\
+               "commit badges/ in a normal PR to refresh them."
+          exit 0
 
   helm-lint:
     runs-on: ubuntu-latest
@@ -172,7 +181,7 @@ jobs:
       - uses: actions/checkout@v5.0.0
 
       - name: Set up Python
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@v7.0.0
         with:
           python-version: "3.12"
 
