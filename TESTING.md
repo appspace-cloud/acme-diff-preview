@@ -84,6 +84,23 @@ def test_two_replicas_hand_over_the_lease():
     ...
 ```
 
+For a whole module of real-clock tests, mark it once at module level, as
+`tests/test_leader_kind_integration.py` does:
+
+```python
+pytestmark = [pytest.mark.kind, pytest.mark.realtime, ...]
+```
+
+**Worked example of getting this wrong.** When the fixture first landed,
+`test_real_expiry_based_takeover` failed in the `kind-integration` job. It
+sleeps 3s to let a real 2s lease expire against a real API server and then
+asserts the standby took over. With sleep neutralised, no time passed, the
+lease never expired, and the takeover never happened -- `assert False is True`.
+
+That is the fixture behaving correctly: a test whose *subject* is the passage
+of time must keep real time. The fix is the marker, never loosening the
+fixture for everyone.
+
 ### 2. `pytest-timeout` as a guard
 
 A per-test cap means a future non-hermetic test **fails fast and visibly**

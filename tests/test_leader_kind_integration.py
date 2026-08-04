@@ -40,6 +40,13 @@ import leader  # noqa: E402
 
 pytestmark = [
     pytest.mark.kind,
+    # COPS-2595: every test in this file races a REAL lease against the REAL
+    # API server clock (e.g. test_real_expiry_based_takeover sleeps out a 2s
+    # lease to prove expiry-based takeover). The suite-wide sleep neutraliser
+    # would make that sleep return instantly, the lease would never expire and
+    # the takeover would never happen. Real clock required, so opt the whole
+    # module out.
+    pytest.mark.realtime,
     pytest.mark.skipif(
         os.environ.get("RUN_KIND_TESTS") != "1",
         reason="opt-in only: set RUN_KIND_TESTS=1 to run the real-cluster "
