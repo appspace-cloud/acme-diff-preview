@@ -8176,8 +8176,8 @@ def format_comment(pr_sha, app_results, skipped_apps=None, base_sha="",
         lines += [
             f"### \U0001f504 {n_ren} resource(s) RENAMED",
             "",
-            "Deleted and recreated under a new name in this PR, so nothing is "
-            "lost. Common when a name carries a content hash, or when a "
+            "Deleted and recreated under a new name in this PR, so nothing is " +
+            "lost. Common when a name carries a content hash, or when a " +
             "resource moves to a new identity.",
             "",
         ]
