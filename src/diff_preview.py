@@ -7736,10 +7736,10 @@ def _summarize_appspace_state_changes(changed_files, pr_sha, base_sha, path_map,
             lines += [
                 f"### \u23f8\ufe0f Auto-sync PAUSED for `{env_name}`",
                 "",
-                f"`appspace.autosync: false` was added to this environment's "
-                f"`customer.yaml`. Automated sync stops for {app_list} \u2014 "
-                f"resources keep running and manual sync still works, but this "
-                f"environment will not receive any further config changes until "
+                f"`appspace.autosync: false` was added to this environment's " +
+                f"`customer.yaml`. Automated sync stops for {app_list} \u2014 " +
+                f"resources keep running and manual sync still works, but this " +
+                f"environment will not receive any further config changes until " +
                 f"the flag is removed.",
                 "",
             ]
@@ -7747,17 +7747,17 @@ def _summarize_appspace_state_changes(changed_files, pr_sha, base_sha, path_map,
             lines += [
                 f"### \u25b6\ufe0f Auto-sync RESUMED for `{env_name}`",
                 "",
-                f"`appspace.autosync: false` was removed from this environment's "
-                f"`customer.yaml`. Automated sync resumes for {app_list}. If this "
-                f"environment drifted while paused, resuming applies the "
-                f"accumulated diff immediately \u2014 check its sync status before "
+                f"`appspace.autosync: false` was removed from this environment's " +
+                f"`customer.yaml`. Automated sync resumes for {app_list}. If this " +
+                f"environment drifted while paused, resuming applies the " +
+                f"accumulated diff immediately \u2014 check its sync status before " +
                 f"merging if that matters.",
                 "",
             ]
         elif is_paused:
             lines += [
-                f"*`{env_name}` remains paused (`appspace.autosync: false`) \u2014 "
-                f"this PR's other changes to it will not be applied until it "
+                f"*`{env_name}` remains paused (`appspace.autosync: false`) \u2014 " +
+                f"this PR's other changes to it will not be applied until it " +
                 f"resumes: {app_list}.*",
                 "",
             ]
@@ -7767,26 +7767,59 @@ def _summarize_appspace_state_changes(changed_files, pr_sha, base_sha, path_map,
         was_purge, is_purge = _purge_armed_flat(old_flat), _purge_armed_flat(new_flat)
         if not was_armed and is_armed:
             purge_note = (
-                " **`appspace.decommissionPurgeData: true` is also set \u2014 the "
-                "cascade will permanently destroy the BigQuery dataset and the "
+                " **`appspace.decommissionPurgeData: true` is also set \u2014 the " +
+                "cascade will permanently destroy the BigQuery dataset and the " +
                 "user content bucket, not just the workloads.**"
                 if is_purge else "")
             lines += [
                 f"## \U0001f512\u26a0\ufe0f DECOMMISSION ARMED for `{env_name}` \u26a0\ufe0f\U0001f512",
                 "",
-                f"**`appspace.decommission: true` was added.** This PR deletes "
-                f"nothing by itself, but {app_list} are now eligible for the "
-                f"cascade-delete finalizer: once this environment's folder is "
-                f"removed in a later PR, its resources will be deleted rather "
+                f"**`appspace.decommission: true` was added.** This PR deletes " +
+                f"nothing by itself, but {app_list} are now eligible for the " +
+                f"cascade-delete finalizer: once this environment's folder is " +
+                f"removed in a later PR, its resources will be deleted rather " +
                 f"than left running.{purge_note}",
+                "",
+                f"**This is Phase 1 of the decommission runbook.** Until the " +
+                f"folder is removed, nothing changes for `{env_name}`: every " +
+                f"workload keeps running, disks stay held, costs keep accruing, " +
+                f"and the environment is still fully managed by ArgoCD. If that " +
+                f"is the point of this PR (arming ahead of a scheduled removal), " +
+                f"this is exactly the expected state.",
+                "",
+                f"What the remaining phases do:",
+                f"- **Phase 2 (optional):** `appspace.decommissionPurgeData: true` " +
+                f"approves destroying the BigQuery dataset and the user content " +
+                f"bucket. Without it the cascade abandons them, recoverable, in " +
+                f"GCP. The flag is inert unless Phase 1 is armed too.",
+                f"- **Phase 3:** a later PR removes this environment's folder. " +
+                f"That PR, and only that PR, triggers the actual deletion: the " +
+                f"Applications and every resource they manage, including the " +
+                f"Config Connector cloud resources. It gets its own panel with " +
+                f"the full rendered inventory of what is removed and what is " +
+                f"retained. Even a full cascade leaves the content backup bucket " +
+                f"and some namespace-level leftovers behind, per the runbook's " +
+                f"what-survives section.",
+                "",
+                f"**Before merging the Phase 3 folder removal, verify the " +
+                f"finalizer is actually live on the hub** \u2014 removing the " +
+                f"folder without it orphans every resource instead of deleting " +
+                f"them:",
+                f"```",
+                f"kubectl --context gcp-shared-devops-na1-a -n argocd " +
+                f"get application {sorted(app_names)[0]} " +
+                f"-o jsonpath='{{.metadata.finalizers}}'",
+                f"```",
+                f"Full procedure: `acme-components` " +
+                f"`documentation/environment-decommission-runbook.md`.",
                 "",
             ]
         elif was_armed and not is_armed:
             lines += [
                 f"### \U0001f513 Decommission DISARMED for `{env_name}`",
                 "",
-                f"`appspace.decommission` was removed. {app_list} are no longer "
-                f"eligible for cascade deletion if this environment's folder is "
+                f"`appspace.decommission` was removed. {app_list} are no longer " +
+                f"eligible for cascade deletion if this environment's folder is " +
                 f"removed later.",
                 "",
             ]
@@ -7794,16 +7827,16 @@ def _summarize_appspace_state_changes(changed_files, pr_sha, base_sha, path_map,
             lines += [
                 f"## \U0001f6a8 PURGE ARMED for already-decommissioned `{env_name}` \U0001f6a8",
                 "",
-                f"**`appspace.decommissionPurgeData: true` was added to an "
-                f"environment already armed for decommission.** {app_list} will "
-                f"now permanently destroy the BigQuery dataset and the user "
+                f"**`appspace.decommissionPurgeData: true` was added to an " +
+                f"environment already armed for decommission.** {app_list} will " +
+                f"now permanently destroy the BigQuery dataset and the user " +
                 f"content bucket when the cascade runs, not just abandon them.",
                 "",
             ]
         elif is_armed and was_purge and not is_purge:
             lines += [
-                f"*`{env_name}` decommission remains armed, but "
-                f"`appspace.decommissionPurgeData` was removed \u2014 data is no "
+                f"*`{env_name}` decommission remains armed, but " +
+                f"`appspace.decommissionPurgeData` was removed \u2014 data is no " +
                 f"longer purged by the cascade.*",
                 "",
             ]
