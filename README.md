@@ -44,7 +44,8 @@ and QA apps when CI publishes a new chart, so they pick it up past the OCI cache
 | ✅ no manifest changes | Rendered output is byte-identical. Safe. |
 | ⚠️ N resource(s) will change | Normal diff. Review it. |
 | ❔ diff unavailable | **Not** the same as "no changes". Something failed and the app was NOT evaluated. |
-| 🗑️ RESOURCE(S) DELETED | Resources disappear from the rendered output entirely. |
+| 🗑️ RESOURCE(S) DELETED | Resources disappear from the rendered output entirely, with **no replacement in this PR**. Sensitive kinds are always listed in full and never truncated away. |
+| 🔄 resource(s) RENAMED | Deleted and recreated under a new name in the same PR, so nothing is lost. Typically a name carrying a content hash, or a resource moving to a new identity. These are deliberately kept **out** of the deletion count. |
 | 🗑️ ENVIRONMENT DECOMMISSION | A whole environment is being removed. Read the block: by default its workloads are **orphaned, not deleted**. |
 | ⏸️/▶️ Auto-sync PAUSED/RESUMED | `appspace.autosync` was toggled. Shown even when it is the ONLY change — no rendered manifest is touched, so the resource diff has nothing to say. |
 | 🔒 DECOMMISSION ARMED / 🔓 DISARMED | `appspace.decommission` (and `decommissionPurgeData`) was toggled on a LIVE environment. Different from the block above: nothing is deleted yet, this is the flag that decides what happens the day the folder actually goes. |

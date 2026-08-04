@@ -2063,8 +2063,8 @@ OUT_DECOMMISSIONED = "decommissioned"
 DiffResult = namedtuple("DiffResult",
                         ["text", "sections", "n_res", "has_diff", "error", "outcome", "reason",
                          "version_change", "deleted_resources", "replicas_zeroed",
-                         "fingerprint"],
-                        defaults=[None, None, None, None])
+                         "fingerprint", "renamed_resources"],
+                        defaults=[None, None, None, None, None])
 # fingerprint (COPS-2579): stable hash of this app's FULL (pre-cap) section
 # list, set only on the OUT_DIFF success path. Two apps whose changes are
 # byte-for-byte identical (a shared ancestor-file edit rolled out the same
@@ -4794,11 +4794,37 @@ _WORKLOAD_KINDS = ("Deployment", "StatefulSet", "ReplicaSet")
 
 
 def _section_kind(header: str) -> str:
-    """'/external-secrets.io/ExternalSecret card-deployment-key' -> 'ExternalSecret'."""
+    """'/external-secrets.io/ExternalSecret card-deployment-key' -> 'ExternalSecret'.
+
+    Headers are built as "/{type_key} {ns}/{name}" or "/{type_key} {name}"
+    (see _diff_resources). The kind therefore lives on the LEFT of the first
+    space, and must be read from there.
+
+    COPS-2594: the previous implementation split on the last slash first, so
+    for any namespaced resource it returned the resource NAME instead of the
+    kind -- "/v1/Secret my-ns/db-credentials" gave "db-credentials". That
+    silently made _is_sensitive_kind False for every namespaced Secret,
+    ExternalSecret, RoleBinding and so on, so a deleted namespaced Secret
+    was listed without the sensitive-kind flag and never got a reserved
+    display slot in _prioritise_risk_sections. Exactly the class of miss the
+    deleted-resources block exists to prevent (PR 6773)."""
     try:
-        return header.rsplit("/", 1)[-1].split(" ", 1)[0]
+        left = header.split(" ", 1)[0]
+        return left.rsplit("/", 1)[-1]
     except Exception:
         return ""
+
+
+def _section_name(header: str) -> str:
+    """'/batch/Job acme-secret-generator/pv-x-job-cb71f3d8' -> 'pv-x-job-cb71f3d8'.
+
+    The name is the last path component to the RIGHT of the first space, so
+    a namespace prefix is stripped."""
+    try:
+        right = header.split(" ", 1)[1]
+    except Exception:
+        return ""
+    return right.rsplit("/", 1)[-1].strip().strip('"')
 
 
 def _is_sensitive_kind(header: str) -> bool:
@@ -4832,6 +4858,86 @@ def _detect_deleted_resources(sections: list) -> list:
         if minus and not plus and not context:
             deleted.append(header)
     return deleted
+
+
+def _detect_created_resources(sections: list) -> list:
+    """Headers of sections that CREATE a resource entirely.
+
+    Exact mirror of _detect_deleted_resources: the manifest diffed against
+    an absent main side, so every content line is a plus and there are NO
+    context lines. Needed to tell a rename from a deletion (COPS-2594).
+    """
+    created = []
+    for header, body in sections:
+        minus = plus = context = 0
+        for line in body.splitlines():
+            if line.startswith("+++") or line.startswith("---"):
+                continue
+            if line.startswith("+"):
+                plus += 1
+            elif line.startswith("-"):
+                minus += 1
+            elif line.startswith(" "):
+                context += 1
+        if plus and not minus and not context:
+            created.append(header)
+    return created
+
+
+def _is_rename_of(old_header: str, new_header: str) -> bool:
+    """True when two headers plausibly name the SAME resource renamed.
+
+    Deliberately narrow. A false positive here SUPPRESSES a real deletion
+    warning, which is strictly worse than the noise this fixes, so this is
+    two explainable rules rather than a similarity score. Both additionally
+    require the same kind.
+
+    Rule A - hash rename: identical except the final `-<token>` segment.
+      pv-x-acme-secret-generator-cb71f3d8 -> pv-x-acme-secret-generator-3abbd629
+      (the Job name carries a content hash, so every version bump renames it)
+
+    Rule B - one token inserted or removed anywhere in the hyphen-token list.
+      ...-mediatransform-access -> ...-mediatransform-gsa-access
+      (mediatransform moved from workload identity to a dedicated GSA)
+    """
+    if _section_kind(old_header) != _section_kind(new_header):
+        return False
+    a, b = _section_name(old_header), _section_name(new_header)
+    if not a or not b or a == b:
+        return False
+
+    ta, tb = a.split("-"), b.split("-")
+
+    # Rule A: same length, differ only in the final token.
+    if len(ta) == len(tb) and len(ta) > 1 and ta[:-1] == tb[:-1]:
+        return True
+
+    # Rule B: exactly one token inserted or removed.
+    if abs(len(ta) - len(tb)) == 1:
+        longer, shorter = (ta, tb) if len(ta) > len(tb) else (tb, ta)
+        for i in range(len(longer)):
+            if longer[:i] + longer[i + 1:] == shorter:
+                return True
+    return False
+
+
+def _split_renames_from_deletions(deleted: list, created: list):
+    """Split a deletion list into (real_deletions, renames).
+
+    Each creation can absorb at most one deletion, so two deletions racing
+    for one creation leave the loser reported as a genuine deletion. Order
+    of the surviving deletions is preserved.
+    """
+    unused = list(created or [])
+    real, renames = [], []
+    for d in (deleted or []):
+        match = next((c for c in unused if _is_rename_of(d, c)), None)
+        if match is None:
+            real.append(d)
+        else:
+            unused.remove(match)
+            renames.append((d, match))
+    return real, renames
 
 
 def _detect_replicas_zeroed(sections: list) -> list:
@@ -4901,7 +5007,7 @@ def _fingerprint_sections(sections: list) -> str:
 
 
 def _package_sections(filtered_sections: list):
-    """Build (clean_diff, stored_sections, deleted, zeroed, fingerprint)
+    """Build (clean_diff, stored_sections, deleted, zeroed, fingerprint, renamed)
     from the FULL filtered section list. Detection runs here — before the
     display and AI caps — so a deletion at position 111 of a mass diff can
     never be lost again (the PR-6773 bug). The fingerprint is computed on
@@ -4910,6 +5016,13 @@ def _package_sections(filtered_sections: list):
     same even for an app whose resource count is at the storage limit.
     """
     deleted = _detect_deleted_resources(filtered_sections)
+    # COPS-2594: a resource whose name carries a content hash, or that moves
+    # to a new identity, is deleted and recreated in the SAME diff. Reporting
+    # those as deletions filled the block with noise (acme-config-prod PR
+    # 3882 shouted "54 RESOURCE(S) DELETED" for what was a rename-heavy
+    # version bump) and a block nobody trusts is as bad as no block at all.
+    created = _detect_created_resources(filtered_sections)
+    deleted, renamed = _split_renames_from_deletions(deleted, created)
     zeroed  = _detect_replicas_zeroed(filtered_sections)
     fingerprint = _fingerprint_sections(filtered_sections)
     # COPS-2567: detecting a deletion is only half the job. Give the risk
@@ -4925,7 +5038,7 @@ def _package_sections(filtered_sections: list):
         truncated_parts.append(f"===== {hdr} =====\n{body_t}")
     clean_diff = "\n".join(truncated_parts)
     return (clean_diff, filtered_sections[:FULL_SECTIONS_MAX_PER_APP],
-            deleted, zeroed, fingerprint)
+            deleted, zeroed, fingerprint, renamed)
 
 
 def _diff_resources(main_res: dict, pr_res: dict) -> str:
@@ -6266,11 +6379,11 @@ def argocd_diff(app, pr_sha, main_sha, chart_revision=None, changed_paths=None, 
         # Truncate to display budget NOW so we never hold the full YAML in
         # memory — but detect deletions/zeroings FIRST, on the full list
         # (v2.5.26: the PR-6773 lesson, see _package_sections).
-        clean_diff, capped_sections, deleted_res, zeroed_res, fingerprint = \
+        clean_diff, capped_sections, deleted_res, zeroed_res, fingerprint, renamed_res = \
             _package_sections(filtered_sections)
         return DiffResult(clean_diff, capped_sections,
                           n_res, True, None, OUT_DIFF, "changes", version_change,
-                          deleted_res, zeroed_res, fingerprint)
+                          deleted_res, zeroed_res, fingerprint, renamed_res)
     # Exhausted retries
     return _indeterminate(last_reason, last_detail or "unknown error")
 
@@ -8037,12 +8150,42 @@ def format_comment(pr_sha, app_results, skipped_apps=None, base_sha="",
             "access or destroy credentials/data.**",
             "",
         ]
-        shown = all_deleted[:20]
+        # COPS-2594: sensitive kinds are never truncated away. The whole
+        # point of this block is that a reviewer can see every deletion that
+        # can revoke access or destroy data, so those are listed first and in
+        # full; only the ordinary kinds are capped.
+        sensitive = [(a, h) for a, h in all_deleted if _is_sensitive_kind(h)]
+        ordinary  = [(a, h) for a, h in all_deleted if not _is_sensitive_kind(h)]
+        shown = sensitive + ordinary[:max(0, 20 - len(sensitive))]
         for app, hdr in shown:
             flag = "\U0001f510 " if _is_sensitive_kind(hdr) else ""
             lines.append(f"- {flag}`{app}` \u2192 `{hdr}`")
         if n_del > len(shown):
-            lines.append(f"- *(+{n_del - len(shown)} more)*")
+            lines.append(
+                f"- *(+{n_del - len(shown)} more, all non-sensitive kinds)*")
+        lines.append("")
+
+    # ── Renamed resources (COPS-2594) ────────────────────────────────
+    # Deleted and recreated under a new name in this same PR. Reported
+    # quietly and separately: it is not a deletion, but the reviewer should
+    # still see that the identity changed.
+    all_renamed = [(app, old_h, new_h) for app, r in results.items()
+                   for old_h, new_h in (r.renamed_resources or [])]
+    if all_renamed:
+        n_ren = len(all_renamed)
+        lines += [
+            f"### \U0001f504 {n_ren} resource(s) RENAMED",
+            "",
+            "Deleted and recreated under a new name in this PR, so nothing is " +
+            "lost. Common when a name carries a content hash, or when a " +
+            "resource moves to a new identity.",
+            "",
+        ]
+        for app, old_h, new_h in all_renamed[:10]:
+            lines.append(f"- `{app}` \u2192 `{_section_name(old_h)}` "
+                         f"\u2192 `{_section_name(new_h)}`")
+        if n_ren > 10:
+            lines.append(f"- *(+{n_ren - 10} more)*")
         lines.append("")
 
     if ai_summary:
