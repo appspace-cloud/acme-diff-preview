@@ -22,6 +22,21 @@ jobs:
           python-version: "3.12"
 
       - name: Run tests with coverage
+        # COPS-2595: this run is SERIAL on purpose. The suite is now ~2.5 min
+        # (was ~20) after removing dead sleep time, so parallelism is no longer
+        # needed to make CI bearable. Running it with -n auto --dist loadfile
+        # is faster still (~30s) but currently surfaces pre-existing cross-file
+        # test pollution: files pass in isolation and fail when a worker runs
+        # them alongside others. That is a real latent bug in test isolation,
+        # tracked separately -- do not enable parallel CI until it is fixed,
+        # and do not "fix" it by reordering or retrying.
+        #
+        # COVERAGE_CORE=sysmon uses PEP 669 (Python 3.12+) instead of the C
+        # tracer, which cuts coverage overhead substantially. It is disabled
+        # automatically if branch coverage is ever enabled below Python 3.14,
+        # so it is safe to set unconditionally.
+        env:
+          COVERAGE_CORE: sysmon
         run: |
           pip install -r requirements-dev.txt --quiet
           pytest tests/ -q --cov=src --cov-report=term --cov-report=json

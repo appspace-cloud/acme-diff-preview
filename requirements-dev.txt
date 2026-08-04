@@ -13,3 +13,11 @@ PyYAML==6.0.3
 hypothesis==6.161.0
 # Mutation testing (local, opt-in): `mutmut run` — config in pyproject.toml.
 mutmut==3.6.0
+# COPS-2595: suite speed and safety.
+# pytest-xdist  -- parallel workers; run with `-n auto --dist loadfile` so each
+#                  file's tests stay on one process (diff_preview has
+#                  module-level mutable globals). See TESTING.md.
+# pytest-timeout -- per-test cap so a non-hermetic test fails fast and visibly
+#                  instead of silently retrying against a real network.
+pytest-xdist==3.8.0
+pytest-timeout==2.4.0

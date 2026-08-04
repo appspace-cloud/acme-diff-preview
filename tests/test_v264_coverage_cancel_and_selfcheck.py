@@ -1,3 +1,4 @@
+import pytest
 """v2.6.4 coverage pass 3 — the last reachable lines from the full-suite run.
 
 After passes 1 and 2, a fresh full-suite coverage run left exactly 11 lines
@@ -56,6 +57,7 @@ REG = "registry.example.com"
 CHART = "appspace-ms"
 
 
+@pytest.mark.realtime
 def test_run_one_diff_timeout_cancels_a_still_queued_future(monkeypatch):
     monkeypatch.setitem(m._app_chart_map, APP, CHART)
     monkeypatch.setitem(m._app_chart_revision_map, APP, "2603.0.1")
