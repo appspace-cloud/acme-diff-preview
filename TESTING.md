@@ -15,14 +15,15 @@ makes the suite prove less.
 ## The commands
 
 ```bash
-# The release gate. ~30 seconds. This is the one to use.
-python3 -m pytest tests/ -q -n auto --dist loadfile
+# The release gate. Serial, ~2.5 min. This is the one to use.
+python3 -m pytest tests/ -q
 
 # One file while iterating (seconds)
 python3 -m pytest tests/test_something.py -q
 
-# Serial (~2.5 min), for debugging or when output ordering matters
-python3 -m pytest tests/ -q
+# Parallel, ~30s on a laptop. Useful for a fast inner loop, but NOT the gate
+# and not green on CI hardware yet -- see below.
+python3 -m pytest tests/ -q -n auto --dist loadfile
 
 # Regenerating golden files -- MUST be serial (see below)
 UPDATE_GOLDEN=1 python3 -m pytest tests/test_cops2565_golden_comments.py -q
@@ -107,7 +108,28 @@ A per-test cap means a future non-hermetic test **fails fast and visibly**
 instead of quietly costing 30 seconds or hanging CI. This is a safety net, not
 a speed trick: a test that suddenly needs 60s is telling you something.
 
-### 3. `pytest-xdist` with `--dist loadfile`
+### 3. `pytest-xdist` with `--dist loadfile` (local only, not the gate)
+
+**Do not enable this in CI yet.** It was enabled once and reverted the same
+day. Locally it is green in ~30s; the first run on a CI runner went red with
+three failures that never appear on a laptop, because a dev machine has idle
+cores and a CI runner has 2-4 under contention:
+
+| Test | Why it fails in parallel |
+|---|---|
+| `test_helm_login_success_is_cached_within_ttl` | helm login cache state, more pollution of the COPS-2596 class |
+| `test_helm_login_failure_clears_state_and_retries_next_call` | same |
+| `test_f1_redact_error_detail_bounds_input_size` | asserts redaction completes in under 1.0s; took 1.28s while competing for CPU |
+
+The third is the interesting one, and it is not a bug in the test's intent:
+the ReDoS guard genuinely works. A **wall-clock budget simply cannot survive
+CPU contention**, so that assertion needs rethinking (assert on input bounding
+directly rather than on elapsed time) rather than being given a bigger number.
+
+The lesson worth keeping: **verifying a parallel suite on a laptop proves
+nothing about CI.** Different core count, different contention, different
+result. Prove it on the runner before making it the gate.
+
 
 
 `src/diff_preview.py` carries module-level mutable state that tests clear in
@@ -159,9 +181,11 @@ retry-until-green: that discards exactly the signal we most need.
 
 Read this section before changing tests or test config.
 
-1. **Run the full suite: `python3 -m pytest tests/ -q -n auto --dist loadfile`.**
-   It is ~30 seconds, not twenty minutes. There is no excuse to skip it, and
-   `RELEASING.md` requires it before every release.
+1. **Run the full suite: `python3 -m pytest tests/ -q`.** It is ~2.5 minutes,
+   not twenty. There is no excuse to skip it, and `RELEASING.md` requires it
+   before every release. `-n auto --dist loadfile` is ~30s and fine for a fast
+   inner loop, but it is **not** the gate and is currently red on CI hardware
+   (see the xdist section above).
 2. **The suite takes long enough to exceed a single tool-call timeout.** Run
    it in the background and poll:
    ```bash
