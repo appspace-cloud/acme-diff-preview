@@ -22,15 +22,26 @@ jobs:
           python-version: "3.12"
 
       - name: Run tests with coverage
-        # COPS-2595 removed the dead sleep time (20 min -> 2.5). COPS-2596
-        # then fixed the cross-file test pollution that had been blocking
-        # parallel runs, so this is now -n auto --dist loadfile: ~30s.
+        # SERIAL on purpose. ~2.5 min, down from ~20 before COPS-2595.
         #
-        # loadfile keeps every test in a file on ONE worker. That matters
-        # because diff_preview has module-level mutable globals which tests
-        # reset per file; xdist workers are separate PROCESSES, so each gets
-        # its own copy. Do not switch to the default --dist load without
-        # thinking: it scatters a file's tests across workers.
+        # COPS-2596 enabled -n auto --dist loadfile here after verifying it
+        # green locally. That was wrong: a dev laptop has many idle cores, a
+        # CI runner has 2-4 under contention, and the very first run on main
+        # went red with three failures that never appear locally:
+        #
+        #   test_helm_login_success_is_cached_within_ttl
+        #   test_helm_login_failure_clears_state_and_retries_next_call
+        #       -- helm login cache state, more pollution of the COPS-2596
+        #          class that the local run did not surface
+        #   test_f1_redact_error_detail_bounds_input_size
+        #       -- asserts redaction finishes in under 1.0s; took 1.28s under
+        #          worker contention. The ReDoS guard is fine; a wall-clock
+        #          budget just cannot survive competing for CPU.
+        #
+        # Do not re-enable parallel here until those three are addressed AND
+        # it has been proven green on a CI runner, not only on a laptop. The
+        # timing assertion in particular needs rethinking rather than a
+        # bigger budget.
         #
         # COVERAGE_CORE=sysmon uses PEP 669 (Python 3.12+) instead of the C
         # tracer, which cuts coverage overhead substantially. It is disabled
@@ -40,8 +51,7 @@ jobs:
           COVERAGE_CORE: sysmon
         run: |
           pip install -r requirements-dev.txt --quiet
-          pytest tests/ -q -n auto --dist loadfile \
-            --cov=src --cov-report=term --cov-report=json
+          pytest tests/ -q --cov=src --cov-report=term --cov-report=json
 
       - name: Syntax check Python
         run: |
