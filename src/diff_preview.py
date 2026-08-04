@@ -4663,9 +4663,12 @@ def _pr_chart_revision_checked(app, candidate_files, pr_sha, main_sha=None, rena
                 if clean in chain_customer:
                     leaf_touched = True
                     break
-                if renames and clean in chain_customer and clean in renames:
-                    leaf_touched = True
-                    break
+                # (A second check for "renamed customer.yaml" used to sit
+                # here, but its condition required `clean in chain_customer`
+                # again, which the branch above has already broken on -- it
+                # was unreachable. The rename case is still covered: a
+                # rename's OLD path stays in candidate_files and in the live
+                # chain, so the check above fires for it.)
         if not leaf_touched:
             return None, invalid
 
