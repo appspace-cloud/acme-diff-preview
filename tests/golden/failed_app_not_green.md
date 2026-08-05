@@ -2,7 +2,14 @@
 
 **Commit** `abc12345` → `main` | `acme-config-prod`
 
+### 🧭 Merge summary
+
+⚠️ **Review before merging** (1 item(s))
+
+- ❔ **1 app(s) could not be diffed** — the comment below cannot prove they are safe
+
 ---
+
 
 ❔ **`pv-acme-a-ss`** — diff unavailable (could not pull the OCI chart (registry login or network))
 

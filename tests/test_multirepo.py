@@ -481,7 +481,10 @@ def test_comment_places_input_changes_before_warnings(monkeypatch):
     assert "Config changes in this PR" in body
     hdr  = body.index("ACME Diff Preview")
     root = body.index("Config changes in this PR")
-    diff_block = body.index("appx")
+    # Anchor on the per-app diff BLOCK heading, not the bare app name: the
+    # merge summary above also names the app (as its environment) when it
+    # flags the downgrade, so a bare "appx" would match there first.
+    diff_block = body.index("**`appx`**")
     assert hdr < root < diff_block, \
         "cause must come right after the header, before per-app symptoms"
 

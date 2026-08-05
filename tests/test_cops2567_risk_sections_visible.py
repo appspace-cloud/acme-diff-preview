@@ -70,7 +70,7 @@ def _pr3845_sections():
 def test_every_deletion_is_visible_in_the_displayed_sections():
     """The PR-3845 bug: named in the block, absent from the body."""
     full = _pr3845_sections()
-    _, capped, deleted, _, _, _ = m._package_sections(full)
+    _, capped, deleted, _, _, _, _ = m._package_sections(full)
 
     assert len(deleted) == 5, "precondition: the fixture must contain 5 deletions"
     shown = {hdr for hdr, _ in capped}
@@ -86,14 +86,14 @@ def test_reordering_preserves_every_section_up_to_the_storage_cap():
     Priority reordering must never drop or duplicate anything below the
     (much larger) storage cap: all 28 sections in this fixture survive."""
     full = _pr3845_sections()
-    _, capped, _, _, _, _ = m._package_sections(full)
+    _, capped, _, _, _, _, _ = m._package_sections(full)
     assert len(capped) == len(full)
     assert sorted(capped) == sorted(full)
 
 
 def test_ordinary_changes_keep_part_of_the_budget():
     """A deletion-heavy PR must not hide every ordinary change."""
-    _, capped, deleted, _, _, _ = m._package_sections(_pr3845_sections())
+    _, capped, deleted, _, _, _, _ = m._package_sections(_pr3845_sections())
     ordinary = [hdr for hdr, _ in capped if hdr not in set(deleted)]
     assert ordinary, "all display slots went to deletions"
 
@@ -107,7 +107,7 @@ def test_reserve_caps_how_many_slots_deletions_can_take_at_the_storage_cap():
     cap = m.FULL_SECTIONS_MAX_PER_APP
     dels = [(f"/v1/Secret gone-{i:04d}", DEL_BODY) for i in range(cap + 20)]
     mods = [(f"/apps/Deployment app-{i:04d}", MOD_BODY) for i in range(20)]
-    _, capped, deleted, _, _, _ = m._package_sections(mods + dels)
+    _, capped, deleted, _, _, _, _ = m._package_sections(mods + dels)
     assert len(capped) == cap
     ordinary_shown = sum(1 for hdr, _ in capped if hdr not in set(deleted))
     assert ordinary_shown > 0, "ordinary changes were entirely pushed out by deletions"
@@ -117,7 +117,7 @@ def test_replicas_zeroed_gets_the_same_priority():
     """Same class of bug, same fix: a zeroing that sorts last stays visible."""
     mods = [(f"/apps/Deployment app-{i:02d}", MOD_BODY) for i in range(15)]
     zero = [("/apps/StatefulSet zzz-last", ZERO_BODY)]
-    _, capped, _, zeroed, _, _ = m._package_sections(mods + zero)
+    _, capped, _, zeroed, _, _, _ = m._package_sections(mods + zero)
     assert zeroed == ["/apps/StatefulSet zzz-last"]
     assert "/apps/StatefulSet zzz-last" in {hdr for hdr, _ in capped}
 
@@ -127,7 +127,7 @@ def test_replicas_zeroed_gets_the_same_priority():
 def test_no_risk_sections_means_untouched_order():
     """The common case must stay byte for byte identical to before."""
     plain = [(f"/apps/Deployment app-{i:02d}", MOD_BODY) for i in range(15)]
-    clean_diff, capped, deleted, zeroed, _, _ = m._package_sections(plain)
+    clean_diff, capped, deleted, zeroed, _, _, _ = m._package_sections(plain)
     assert deleted == [] and zeroed == []
     assert capped == plain
     assert clean_diff.startswith("===== /apps/Deployment app-00 =====")
@@ -149,7 +149,7 @@ def test_detection_still_runs_on_the_full_list():
     """Guard the PR-6773 lesson: detect before any cap, not after."""
     fillers = [(f"/apps/Deployment filler-{i}", MOD_BODY) for i in range(30)]
     full = fillers + [("/v1/Secret buried-last", DEL_BODY)]
-    _, _, deleted, _, _, _ = m._package_sections(full)
+    _, _, deleted, _, _, _, _ = m._package_sections(full)
     assert deleted == ["/v1/Secret buried-last"]
 
 

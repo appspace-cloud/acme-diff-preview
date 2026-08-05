@@ -106,7 +106,14 @@ def _oversized_comment(monkeypatch):
         for i in range(20)
     }
     return m.format_comment("deadbeefcafe1234", app_results,
-                            base_sha="0123456789abcdef")
+                            base_sha="0123456789abcdef",
+                            # readable_budget=0 = render everything, the way
+                            # the persisted full-diff artifact is built. The
+                            # comment path now folds ordinary bulk away long
+                            # before 245KB, so this is where a body that big
+                            # still comes from -- and upsert_comment must
+                            # still truncate it without losing the footer.
+                            readable_budget=0)
 
 
 def test_s2_truncated_comment_keeps_footer_tokens(monkeypatch):

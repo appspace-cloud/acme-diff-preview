@@ -2,7 +2,14 @@
 
 **Commit** `abc12345` → `main` | `acme-config-prod` | 📦 Large changeset (60 apps)
 
+### 🧭 Merge summary
+
+✅ **Routine** — nothing dangerous detected
+
+- ✅ 60 app(s) change, nothing risk-flagged
+
 ---
+
 
 #### Changeset overview
 

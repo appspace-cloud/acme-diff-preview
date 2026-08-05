@@ -2,6 +2,14 @@
 
 **Commit** `abc12345` → `main` | `acme-config-prod`
 
+### 🧭 Merge summary
+
+⚠️ **Review before merging** (1 item(s))
+
+- ⬇️ **Chart version downgrade** in pv-acme-a
+
+---
+
 # 🔻⚠️ CHART VERSION DOWNGRADE ⚠️🔻
 
 **This PR moves the chart to a LOWER version. Downgrades can break schema/data migrations that do not run backwards. Verify this is intentional before merging.**

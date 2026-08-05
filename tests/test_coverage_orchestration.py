@@ -67,7 +67,8 @@ def world(monkeypatch):
     monkeypatch.setattr(m, "get_pr_changed_files", lambda pr_id, repo=None: ([ANCILLARY], {}))
     monkeypatch.setattr(m, "find_existing_comment", lambda pr_id, repo=None: (None, "", ""))
     monkeypatch.setattr(m, "upsert_comment",
-                        lambda pr_id, body, existing_id=None, repo=None: sinks.upserts.append(body) or 123)
+                        lambda pr_id, body, existing_id=None, repo=None, **kw:
+                        sinks.upserts.append(body) or 123)
     monkeypatch.setattr(m, "post_build_status",
                         lambda pr_sha, state, description, pr_id=None, repo=None:
                         sinks.statuses.append((state, description)))

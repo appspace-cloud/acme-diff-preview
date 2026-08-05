@@ -26,7 +26,7 @@ def test_package_sections_stores_more_than_ten():
     DiffResult.sections. Now all 67 must survive (well under the memory
     cap)."""
     sections = _fake_sections(67)
-    _, stored, _, _, _, _ = m._package_sections(sections)
+    _, stored, _, _, _, _, _ = m._package_sections(sections)
     assert len(stored) == 67
 
 
@@ -35,7 +35,7 @@ def test_package_sections_respects_memory_cap():
     FULL_SECTIONS_MAX_PER_APP, stored sections are still capped."""
     cap = m.FULL_SECTIONS_MAX_PER_APP
     sections = _fake_sections(cap + 50)
-    _, stored, _, _, _, _ = m._package_sections(sections)
+    _, stored, _, _, _, _, _ = m._package_sections(sections)
     assert len(stored) == cap
 
 
@@ -53,7 +53,7 @@ def test_fingerprint_different_content_different_hash():
 
 def test_package_sections_returns_fingerprint():
     sections = _fake_sections(3)
-    _, _, _, _, fp, _ = m._package_sections(sections)
+    _, _, _, _, fp, _, _ = m._package_sections(sections)
     assert isinstance(fp, str) and len(fp) == 64  # sha256 hex digest
 
 
@@ -63,16 +63,16 @@ def test_package_sections_fingerprint_stable_across_two_apps_same_change():
     independent of section order."""
     app_a_sections = _fake_sections(67)
     app_b_sections = list(reversed(_fake_sections(67)))
-    _, _, _, _, fp_a, _ = m._package_sections(app_a_sections)
-    _, _, _, _, fp_b, _ = m._package_sections(app_b_sections)
+    _, _, _, _, fp_a, _, _ = m._package_sections(app_a_sections)
+    _, _, _, _, fp_b, _, _ = m._package_sections(app_b_sections)
     assert fp_a == fp_b
 
 
 def test_package_sections_fingerprint_differs_for_different_apps():
     app_a_sections = _fake_sections(67, prefix="svc")
     app_c_sections = _fake_sections(3, prefix="tiny")
-    _, _, _, _, fp_a, _ = m._package_sections(app_a_sections)
-    _, _, _, _, fp_c, _ = m._package_sections(app_c_sections)
+    _, _, _, _, fp_a, _, _ = m._package_sections(app_a_sections)
+    _, _, _, _, fp_c, _, _ = m._package_sections(app_c_sections)
     assert fp_a != fp_c
 
 

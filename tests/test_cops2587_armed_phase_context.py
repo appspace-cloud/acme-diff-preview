@@ -5,9 +5,15 @@ a Phase 1 PR (e.g. acme-config-prod #3860, the pv-ukhsa-a arm) should not
 need the runbook from memory to answer: what happens right now (nothing --
 the environment stays fully live and billing), what happens next (Phase 3,
 a later folder-removal PR, is what actually deletes), what must be checked
-before Phase 3 (the finalizer must be live on the hub -- the exact
-verification whose omission nearly orphaned pv-ukhsa-a), and what survives
-even a full cascade (the content backup bucket, per the runbook).
+before Phase 3 (nothing manual: the phase model guarantees the finalizer,
+and Phase 2's state is read from the environment's own config and stated
+outright), and what survives even a full cascade (the content backup
+bucket, per the runbook).
+
+2026-08-06: the panel is now a phase TABLE. The prose version rendered as
+an unreadable wall in Bitbucket -- the phase list had no blank line before
+it, so markdown inlined the bullets -- and it told the reviewer to run a
+kubectl finalizer check by hand. Same facts, scannable shape.
 
 Everything here is additive text inside the existing ARMED branch. Every
 COPS-2584 assertion must keep passing untouched.
@@ -61,13 +67,21 @@ def test_armed_says_the_environment_stays_fully_live_right_now(monkeypatch):
     assert "managed by argocd" in low or "still managed" in low
 
 
-def test_armed_includes_the_pre_phase3_finalizer_verification(monkeypatch):
-    """The pv-ukhsa-a near-miss: a folder removal merged without the
-    finalizer live orphans everything. The panel must carry the check."""
+def test_armed_states_phase2_from_config_instead_of_asking_for_a_check(monkeypatch):
+    """Superseded contract (was: the panel must print a kubectl finalizer
+    verification). The reviewer should not be sent to run commands: the
+    phase model guarantees the finalizer, and Phase 2's state is already
+    known from the environment's own configuration, so the panel states it
+    outright. Asked for directly by the operators reading these comments,
+    after seeing the rendered panel on acme-config-prod PR #3893."""
     out = _armed_output(monkeypatch)
-    assert "finalizers" in out
-    assert "kubectl" in out
-    assert "before" in out.lower() and "folder" in out.lower()
+    assert "kubectl" not in out, "do not send the reviewer to run commands"
+    assert "finalizers" not in out
+    assert "not armed" in out, "Phase 2 state must be stated, not checked"
+    # The purge-armed wording is pinned by
+    # test_armed_with_purge_still_carries_the_data_destruction_note; calling
+    # the helper twice here would hit the (path, sha) fetch cache and read
+    # back the first fixture.
 
 
 def test_armed_says_what_survives_a_full_cascade(monkeypatch):

@@ -168,7 +168,8 @@ def test_process_pr_threads_the_audit_appendix_through(monkeypatch):
     monkeypatch.setattr(m, "fix_stuck_inprogress", lambda *a, **k: None)
     monkeypatch.setattr(m, "_touch_progress", lambda: None)
     monkeypatch.setattr(m, "upsert_comment",
-                        lambda pr_id, body, existing_id=None, repo=None:
+                        lambda pr_id, body, existing_id=None, repo=None,
+                        artifact_url="":
                         sinks["upserts"].append(body) or 1)
     monkeypatch.setattr(m, "post_build_status", lambda *a, **k: None)
     monkeypatch.setattr(m, "_save_diff_ui_artifact",
@@ -201,7 +202,17 @@ def test_process_pr_threads_the_audit_appendix_through(monkeypatch):
     assert "everything that will be DELETED" in body
     assert "kind: Deployment" in body
     assert "topsecret-audit-value" not in body
-    assert body == sinks["upserts"][0]
+    # Superseded contract (was: artifact == comment). The artifact is now
+    # the COMPLETE record and the comment is the scannable summary that
+    # points at it: inlining hundreds of lines of rendered manifest is what
+    # made decommission comments unreadable (acme-config-prod PR #3894).
+    # The appendix must therefore be in the artifact and NOT in the comment.
+    comment = sinks["upserts"][0]
+    assert "kind: Deployment" not in comment, \
+        "the raw manifest dump must not be inlined in the comment"
+    assert "Full rendered output" in comment, "the comment must point at it"
+    assert "ENVIRONMENT DECOMMISSION" in comment, "the warning still shouts"
+    assert len(body) > len(comment)
 
 
 def test_phase_gate_fails_closed_when_refetch_degrades(monkeypatch):
