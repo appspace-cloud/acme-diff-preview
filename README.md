@@ -2,8 +2,8 @@
 
 ![CI](https://github.com/appspace-cloud/acme-diff-preview/actions/workflows/ci.yml/badge.svg)
 ![Release](https://github.com/appspace-cloud/acme-diff-preview/actions/workflows/release.yml/badge.svg)
-![Coverage](badges/coverage.svg)
-![Version](badges/version.svg)
+![Coverage](https://raw.githubusercontent.com/appspace-cloud/acme-diff-preview/badges/badges/coverage.svg)
+![Version](https://raw.githubusercontent.com/appspace-cloud/acme-diff-preview/badges/badges/version.svg)
 
 **Shows you what ArgoCD is about to change, before you merge.**
 

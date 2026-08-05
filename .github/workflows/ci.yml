@@ -69,46 +69,37 @@ jobs:
           git fetch --tags --quiet
           python3 scripts/generate_badges.py
 
-      - name: Commit updated badges (main only)
+      - name: Publish badges (main only)
         if: github.ref == 'refs/heads/main' && github.event_name == 'push'
-        # COPS-2580 made this non-fatal. It still reported a red error and
-        # burned three attempts on something that cannot work, so it read
-        # like a real failure in an otherwise-green run.
-        #
-        # The push is blocked by the "main-protection" repository ruleset,
-        # which requires status checks on every ref update. A bot push can
-        # never satisfy that: the checks run ON that push, so the commit
-        # would have to pass checks that only start existing once it lands.
-        # Rebasing and retrying cannot help -- it is a policy, not a race.
-        #
-        # Deliberately NOT fixed by adding the Actions bot to the ruleset's
-        # bypass list. That would let ANY workflow write to main, which is a
-        # real widening of who can change the default branch of a tool that
-        # gates production, traded for a cosmetic badge. Not worth it.
-        #
-        # So: try once, and if the ruleset rejects it, say so plainly as a
-        # notice and stop. Badges then refresh whenever someone runs
-        # scripts/generate_badges.py and commits the result in a normal PR,
-        # which goes through review like everything else.
+        # Badges never touch main. The main-protection ruleset requires
+        # status checks on every ref update, which a bot push can never
+        # satisfy (the checks would have to pass before they exist), and
+        # widening the ruleset's bypass list for a cosmetic badge was
+        # deliberately rejected: it would let any workflow write to the
+        # default branch of a tool that gates production. The SVGs live on
+        # a dedicated, unprotected 'badges' branch that holds nothing else;
+        # the README embeds them via raw URLs from that branch.
         continue-on-error: true
         run: |
-          if git diff --quiet -- badges/; then
-            echo "Badges unchanged, nothing to commit."
-            exit 0
+          git fetch origin badges 2>/dev/null || true
+          rm -rf .badges-wt
+          if git rev-parse -q --verify refs/remotes/origin/badges >/dev/null; then
+            git worktree add .badges-wt -B badges refs/remotes/origin/badges
+          else
+            git worktree add --orphan -b badges .badges-wt
           fi
-          git config user.name "github-actions[bot]"
-          git config user.email "github-actions[bot]@users.noreply.github.com"
+          mkdir -p .badges-wt/badges
+          cp badges/*.svg .badges-wt/badges/
+          cd .badges-wt
           git add badges/
-          git commit -m "[COPS-2498] chore: update badges [skip ci]"
-          if git push origin HEAD:main 2>push.err; then
-            echo "Badges updated on main."
+          if git rev-parse -q --verify HEAD >/dev/null && git diff --cached --quiet; then
+            echo "Badges unchanged, nothing to publish."
             exit 0
           fi
-          cat push.err
-          echo "::notice::Badge refresh skipped: the main-protection ruleset "\
-               "blocks bot pushes to main. Run scripts/generate_badges.py and "\
-               "commit badges/ in a normal PR to refresh them."
-          exit 0
+          git -c user.name="github-actions[bot]" \
+              -c user.email="github-actions[bot]@users.noreply.github.com" \
+              commit -q -m "chore: publish badges from main@${GITHUB_SHA:0:8}"
+          git push origin badges
 
   helm-lint:
     runs-on: ubuntu-latest
