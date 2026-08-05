@@ -599,7 +599,7 @@ def test_process_pr_confirmed_decommission_skips_normal_diff(world, monkeypatch)
     monkeypatch.setattr(m, "_detect_env_decommission_candidates", lambda *a, **k: cand)
     monkeypatch.setattr(m, "_evaluate_env_decommissions",
                         lambda *a, **k: (["# ENVIRONMENT DECOMMISSION",
-                                          "pv-orch-a is being deleted"], ["pv-orch-a"]))
+                                          "pv-orch-a is being deleted"], ["pv-orch-a"], []))
     monkeypatch.setattr(m, "_apps_to_skip_for_decommission",
                         lambda *a, **k: {"pv-orch-a-ms"})
     m.process_pr(_mk_pr(pr_id=601), PATH_MAP, base_sha=BASE_SHA)

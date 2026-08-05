@@ -195,3 +195,12 @@ def test_jfrog_hmac_accepts_exactly_the_correct_signature(body, secret):
         assert m._verify_jfrog_hmac(body, good) is True
         tampered = ("0" if good[0] != "0" else "1") + good[1:]
         assert m._verify_jfrog_hmac(body, tampered) is False
+
+
+def test_redact_idempotent_on_trailing_terminators():
+    # Deterministic pin of the hypothesis finding ('0\r\r'): content-bearing
+    # text with trailing terminators (any \r/\n mix) must reach a fixed
+    # point after one pass, not lose one terminator per pass forever.
+    for text in ("0\r\r", "x\n\n", "a\r\nb\r\n\r\n", "y\n\n\n"):
+        once = m._redact_sensitive(text)
+        assert m._redact_sensitive(once) == once, repr(text)
