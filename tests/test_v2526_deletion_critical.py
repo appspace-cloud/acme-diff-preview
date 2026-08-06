@@ -98,7 +98,7 @@ def test_package_sections_detects_before_the_cap(monkeypatch):
     16 sections here (15 fillers + the deletion) survive into `capped`."""
     fillers = [(f"/apps/Deployment filler-{i}", MOD_BODY) for i in range(15)]
     full = fillers + [SECTIONS[0]]
-    clean_diff, capped, deleted, zeroed, fingerprint, _, _ = m._package_sections(full)
+    clean_diff, capped, deleted, zeroed, fingerprint, _, _, _ = m._package_sections(full)
     assert len(capped) == len(full)
     assert deleted == ["/external-secrets.io/ExternalSecret card-deployment-key"], \
         "deletion beyond the section cap was lost — the PR-6773 bug"

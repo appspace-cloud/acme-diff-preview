@@ -54,6 +54,9 @@ and QA apps when CI publishes a new chart, so they pick it up past the OCI cache
 | 🖥️ VM infrastructure | **Always present**, in a fixed place, so "did this PR touch VMs?" is answerable without reading anything else: `🖥️🚨 VM INFRASTRUCTURE CHANGES` when something dangerous is found, `🖥️ (routine)` for harmless changes, and an explicit `no changes` line when the domain is untouched. Covers KCC linux-services (`ComputeInstance`, `ComputeDisk`, `ComputeAddress`, snapshot-policy attachments); instance-type and disk-type changes are always highlighted, since both mean destroy-and-recreate. |
 | ⬆️ Routine version bump | Several environments taking the same version-only change, folded into one line naming the transition and every environment it covers. Only ever applied to changes that are provably version-only. |
 | ✂️ N more changed app(s) omitted | The readability budget folded ordinary diff blocks away. Nothing risk-flagged is ever folded; the link goes to the full-diff page, which always holds everything. |
+| ⬆️ N of M changed resource(s) are the version transition | Inside ONE app, every resource whose only changed lines are version noise (image tags, chart labels, version env values, checksum annotations, deploy timestamps) folds behind that single line, which names the transition. Everything else in the same app stays inline, so a real change riding along with a bump cannot hide in it. Deletions, zeroed replicas and VM changes are never folded. |
+| ♻️ N more resource(s) change exactly the same lines | One representative hunk is shown once and the identical siblings are named instead of reprinted. A one-line annotation added to hundreds of resources reads as one hunk plus a count. |
+| ✂️ N more changed resource(s) omitted | Same readability budget, applied inside one app: ordinary resources past the budget are named instead of inlined. Nothing risk-flagged is ever omitted, and the full-diff page still holds every hunk. |
 
 The one rule the tool never breaks: **a failure is never reported as "no changes".**
 If a diff could not be computed, the status says so and the PR is not marked clean.
@@ -77,6 +80,18 @@ applies to, instead of a separate, arbitrarily-truncated copy per app.
 Deletions and replica zeroings get a reserved share of the display order, so
 the resources the shouty blocks name are the ones you actually see first.
 Details in [docs/internals.md](docs/internals.md#which-resources-make-it-into-the-comment-body).
+
+The same idea then runs INSIDE each app, because the most common change in
+`acme-config-prod` is a platform version bump to a single environment, and
+that renders as one app carrying hundreds of near-identical resource
+sections. Version-only sections fold behind one line, identical changes
+repeated across many resources are shown once with a count, and whatever is
+left is bounded by the readability budget. Needles (anything that is not
+provably version noise) are pushed to the front of the display order, so the
+one resource that also gained an annotation is visible instead of buried.
+The full-diff page behind the build-status link never folds, groups or
+omits anything: it stays the complete record for all three config repos
+(dev, stage and prod).
 
 **VM infrastructure changes.** GCP virtual machines (the KCC linux-services
 resources rendered from `appspace.infra.deployLinuxServicesK8s`) are the
