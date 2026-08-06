@@ -2079,8 +2079,9 @@ OUT_DECOMMISSIONED = "decommissioned"
 DiffResult = namedtuple("DiffResult",
                         ["text", "sections", "n_res", "has_diff", "error", "outcome", "reason",
                          "version_change", "deleted_resources", "replicas_zeroed",
-                         "fingerprint", "renamed_resources", "vm_changes"],
-                        defaults=[None, None, None, None, None, None])
+                         "fingerprint", "renamed_resources", "vm_changes",
+                         "version_fold"],
+                        defaults=[None, None, None, None, None, None, None])
 # vm_changes: structured facts about KCC linux-services (VM) resources this
 # diff touches, extracted by _detect_vm_changes on the FULL pre-cap section
 # list (same design as deleted_resources: safety facts never depend on
@@ -2093,6 +2094,10 @@ DiffResult = namedtuple("DiffResult",
 # format_comment can group them and show one full representative diff
 # instead of many arbitrary truncated duplicates. None on every other
 # outcome and on legacy/coerced results (_result()) — those never group.
+
+# version_fold: which of this app's sections are provably version-bump
+# noise (see _classify_version_fold), computed pre-cap like every other
+# safety fact. None on non-OUT_DIFF outcomes and legacy/coerced results.
 
 # version_change (v2.5.8): (main_rev, pr_rev) when the PR changes this app's
 # chart targetRevision, else None. Lets format_comment shout on downgrades.
@@ -5279,8 +5284,199 @@ def _fingerprint_sections(sections: list) -> str:
     return hashlib.sha256(blob.encode("utf-8", errors="replace")).hexdigest()
 
 
-def _package_sections(filtered_sections: list):
-    """Build (clean_diff, stored_sections, deleted, zeroed, fingerprint, renamed)
+# ── Version-transition fold ───────────────────────────────────────────
+# A platform version bump renders as dozens or hundreds of near-identical
+# sections (185 and 473 on two real acme-config-prod PRs) whose ONLY
+# changed lines are image tags, chart/version labels, checksum
+# annotations, version-carrying env values and deploy timestamps.
+# Inlining them all is what pushed single-environment bump comments to
+# the 245KB hard cap, and it buried the one real change a reviewer
+# needed to see (a brand-new KCC reconcile-interval annotation, found
+# live inside 473 sections of noise). The classifier below decides,
+# deterministically, which sections are provably that noise so the
+# comment can fold them behind one line. The safe failure direction is
+# always "keep the section inline": anything unpaired, unknown or
+# ambiguous makes the whole section a needle.
+_VERSION_FOLD_MIN = 3          # a fold line only pays for itself at 3+
+_FOLD_CHECKSUM_RE = re.compile(r"^checksum/[\w./-]+$")
+_FOLD_HEX_RE      = re.compile(r"^[0-9a-f]{6,64}$")
+_FOLD_ISO_TS_RE   = re.compile(
+    r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}(:\d{2})?(\.\d+)?(Z|[+-]\d{2}:?\d{2})$")
+# Keys whose value IS a version (or carries one as a -<version> suffix).
+# Deliberately narrow: a generic "version:" config key must NOT be here,
+# it can mean anything (schema versions, API versions, file formats).
+_FOLD_CHART_LABEL_KEYS = ("helm.sh/chart", "app.kubernetes.io/version",
+                          "appVersion", "targetRevision")
+_FOLD_TRAILING_VER_RE  = re.compile(r"^(.*?)-(\d[\w.+-]*)$")
+_FOLD_CLASS_ORDER = ("image tags", "chart labels", "version env values",
+                     "checksums", "deploy timestamps")
+
+
+def _fold_pairs(body: str):
+    """Pair every changed line of a unified-diff body by YAML key.
+
+    Returns a list of (key, old_value, new_value) or None when the body
+    cannot be fully paired: a pure addition or deletion, an unbalanced
+    key, or any changed line that is not a simple "key: value". Pairing
+    is positional per key (the i-th removed "value:" matches the i-th
+    added one); if a hunk reorders lines the values will not classify
+    and the section stays inline, which is the safe direction.
+    """
+    minus, plus = [], []
+    for raw in body.splitlines():
+        if raw.startswith(("---", "+++", "@@", "\\")):
+            continue
+        if raw[:1] == "-":
+            minus.append(raw[1:])
+        elif raw[:1] == "+":
+            plus.append(raw[1:])
+    if not minus or not plus:
+        return None
+
+    def _kv(sline):
+        t = sline.strip()
+        if t.startswith("- "):
+            t = t[2:]
+        if ":" not in t:
+            return None
+        k, v = t.split(":", 1)
+        return k.strip(), v.strip().strip('"').strip("'")
+
+    by_key_old, by_key_new = {}, {}
+    for src, sink in ((minus, by_key_old), (plus, by_key_new)):
+        for sline in src:
+            kv = _kv(sline)
+            if kv is None:
+                return None
+            sink.setdefault(kv[0], []).append(kv[1])
+    if set(by_key_old) != set(by_key_new):
+        return None
+    pairs = []
+    for k, olds in by_key_old.items():
+        news = by_key_new[k]
+        if len(olds) != len(news):
+            return None
+        pairs.extend((k, o, n) for o, n in zip(olds, news))
+    return pairs
+
+
+def _split_image(v: str):
+    """('repo', 'tag') for repo:tag image references, else (None, None)."""
+    if ":" not in v:
+        return None, None
+    repo, tag = v.rsplit(":", 1)
+    if not repo or not tag or "/" in tag:
+        return None, None
+    return repo, tag
+
+
+def _classify_fold_pair(key, old, new, candidates):
+    """One paired change -> (noise_class, version_pair) or (None, None).
+
+    candidates is the set of (old, new) version transitions observed on
+    unambiguous carriers; a bare env "value:" pair is only accepted when
+    it repeats one of those, so an unrelated config value can never fold.
+    """
+    if _FOLD_CHECKSUM_RE.match(key):
+        if (_FOLD_HEX_RE.match(old) and _FOLD_HEX_RE.match(new)
+                and old != new):
+            return "checksums", None
+        return None, None
+    kl = key.lower()
+    if kl == "image" or kl.endswith("image"):
+        ro, to = _split_image(old)
+        rn, tn = _split_image(new)
+        if ro and ro == rn and to != tn:
+            candidates.add((to, tn))
+            return "image tags", (to, tn)
+        return None, None
+    if key in _FOLD_CHART_LABEL_KEYS:
+        if key == "helm.sh/chart":
+            mo = _FOLD_TRAILING_VER_RE.match(old)
+            mn = _FOLD_TRAILING_VER_RE.match(new)
+            if (mo and mn and mo.group(1) == mn.group(1)
+                    and mo.group(2) != mn.group(2)):
+                pair = (mo.group(2), mn.group(2))
+                candidates.add(pair)
+                return "chart labels", pair
+            return None, None
+        if old != new:
+            candidates.add((old, new))
+            return "chart labels", (old, new)
+        return None, None
+    if key == "value":
+        if _FOLD_ISO_TS_RE.match(old) and _FOLD_ISO_TS_RE.match(new):
+            return "deploy timestamps", None
+        if (old, new) in candidates:
+            return "version env values", (old, new)
+        return None, None
+    return None, None
+
+
+def _classify_version_fold(sections, version_change=None,
+                           exempt=frozenset()):
+    """Which sections are provably version-bump noise, and which are not.
+
+    Two passes over the paired changes. The first collects the version
+    transitions this app is taking from unambiguous carriers (image
+    tags, chart labels, targetRevision, plus the app-level chart
+    version_change when known). The second accepts a section only when
+    EVERY changed line pairs up and classifies against that vocabulary.
+    Returns None when fewer than _VERSION_FOLD_MIN sections fold (a fold
+    line for one or two sections costs more attention than it saves),
+    else a dict with the fold facts for the comment renderer.
+    """
+    if not sections:
+        return None
+    candidates = set()
+    if (version_change and version_change[0] and version_change[1]
+            and version_change[0] != version_change[1]):
+        candidates.add((str(version_change[0]), str(version_change[1])))
+    paired = []
+    for hdr, body in sections:
+        pairs = None if hdr in exempt else _fold_pairs(body)
+        paired.append((hdr, pairs))
+        if pairs:
+            for key, old, new in pairs:
+                _classify_fold_pair(key, old, new, candidates)
+    foldable_headers, classes = [], set()
+    chart_votes, other_votes = {}, {}
+    for hdr, pairs in paired:
+        if not pairs:
+            continue
+        ok, sec_classes, sec_votes = True, set(), []
+        for key, old, new in pairs:
+            cls, pair = _classify_fold_pair(key, old, new, candidates)
+            if cls is None:
+                ok = False
+                break
+            sec_classes.add(cls)
+            if pair:
+                sec_votes.append((cls, pair))
+        if not ok:
+            continue
+        foldable_headers.append(hdr)
+        classes |= sec_classes
+        for cls, pair in sec_votes:
+            book = chart_votes if cls == "chart labels" else other_votes
+            book[pair] = book.get(pair, 0) + 1
+    if len(foldable_headers) < _VERSION_FOLD_MIN:
+        return None
+    votes = chart_votes or other_votes
+    label = None
+    if votes:
+        old, new = max(votes.items(), key=lambda kv: kv[1])[0]
+        label = f"{old} \u2192 {new}"
+    return {"n_foldable": len(foldable_headers),
+            "n_total": len(sections),
+            "label": label,
+            "headers": tuple(foldable_headers),
+            "classes": tuple(c for c in _FOLD_CLASS_ORDER if c in classes)}
+
+
+def _package_sections(filtered_sections: list, version_change=None):
+    """Build (clean_diff, stored_sections, deleted, zeroed, fingerprint,
+    renamed, vm_changes, version_fold)
     from the FULL filtered section list. Detection runs here — before the
     display and AI caps — so a deletion at position 111 of a mass diff can
     never be lost again (the PR-6773 bug). The fingerprint is computed on
@@ -5304,13 +5500,26 @@ def _package_sections(filtered_sections: list):
     # detecting a risk is only half the job (the PR-3845 lesson).
     vm_changes = _detect_vm_changes(filtered_sections)
     fingerprint = _fingerprint_sections(filtered_sections)
+    # Version-transition fold, computed here for the same reason deletions
+    # are: on the FULL pre-cap list, so what folds and what stays inline
+    # never depends on a display cap. Sections already claimed by a safety
+    # fact are exempt by construction.
+    exempt = (set(deleted or []) | set(zeroed or [])
+              | {f["header"] for f in vm_changes})
+    version_fold = _classify_version_fold(
+        filtered_sections, version_change=version_change, exempt=exempt)
+    needle_headers = []
+    if version_fold:
+        _fold_set = set(version_fold["headers"])
+        needle_headers = [h for h, _ in filtered_sections
+                          if h not in _fold_set and h not in exempt]
     # COPS-2567: detecting a deletion is only half the job. Give the risk
     # sections a reserved share of the display budget before the caps below
     # cut the list, otherwise the shouty block names resources the reviewer
     # cannot see anywhere in the comment.
     filtered_sections = _prioritise_risk_sections(
         filtered_sections, deleted, zeroed, RISK_SECTION_RESERVE,
-        extra=[f["header"] for f in vm_changes])
+        extra=[f["header"] for f in vm_changes] + needle_headers)
     display_secs = filtered_sections[:MAX_RESOURCES_FULL]
     truncated_parts = []
     for hdr, body in display_secs:
@@ -5318,7 +5527,7 @@ def _package_sections(filtered_sections: list):
         truncated_parts.append(f"===== {hdr} =====\n{body_t}")
     clean_diff = "\n".join(truncated_parts)
     return (clean_diff, filtered_sections[:FULL_SECTIONS_MAX_PER_APP],
-            deleted, zeroed, fingerprint, renamed, vm_changes)
+            deleted, zeroed, fingerprint, renamed, vm_changes, version_fold)
 
 
 def _diff_resources(main_res: dict, pr_res: dict) -> str:
@@ -6741,11 +6950,12 @@ def argocd_diff(app, pr_sha, main_sha, chart_revision=None, changed_paths=None, 
         # memory — but detect deletions/zeroings FIRST, on the full list
         # (v2.5.26: the PR-6773 lesson, see _package_sections).
         clean_diff, capped_sections, deleted_res, zeroed_res, fingerprint, \
-            renamed_res, vm_changes_res = _package_sections(filtered_sections)
+            renamed_res, vm_changes_res, version_fold = _package_sections(
+                filtered_sections, version_change=version_change)
         return DiffResult(clean_diff, capped_sections,
                           n_res, True, None, OUT_DIFF, "changes", version_change,
                           deleted_res, zeroed_res, fingerprint, renamed_res,
-                          vm_changes_res)
+                          vm_changes_res, version_fold)
     # Exhausted retries
     return _indeterminate(last_reason, last_detail or "unknown error")
 
@@ -7900,8 +8110,91 @@ def _result(value):
     return DiffResult("", [], 0, False, None, OUT_NO_DIFF, "clean")
 
 
+# Repeated-change rollup. Same census, second finding: on prod PR 3891
+# the 384 sections that are NOT version noise collapse into 13 distinct
+# changes, and two of them account for 364 sections (one KCC annotation
+# added to every resource). One representative hunk plus a count is the
+# whole review value; the other 363 copies are scroll.
+_REPEAT_GROUP_MIN = 3
+
+
+def _changed_lines_signature(body: str) -> str:
+    """Only the added/removed lines. Context is deliberately ignored: two
+    resources take "the same change" even when the surrounding manifest
+    differs, which is exactly the KCC-annotation case."""
+    return "\n".join(l for l in body.splitlines()
+                      if l[:1] in "+-" and not l.startswith(("---", "+++")))
+
+
+def _group_repeated_sections(sections: list, risk_headers=None):
+    """(representatives, duplicates_by_header).
+
+    Order of first occurrence is preserved, so the reordering that puts
+    risk sections and needles first still decides what a reviewer reads
+    first. Risk sections are never grouped: a deletion always gets its
+    own hunk, however many identical siblings it has.
+    """
+    risky = set(risk_headers or ())
+    groups, order = {}, []
+    for hdr, body in sections:
+        if hdr in risky:
+            order.append((hdr, body, None))
+            continue
+        sig = _changed_lines_signature(body)
+        if sig in groups:
+            groups[sig].append(hdr)
+            continue
+        groups[sig] = []
+        order.append((hdr, body, sig))
+    reps, dups = [], {}
+    for hdr, body, sig in order:
+        reps.append((hdr, body))
+        if sig is None:
+            continue
+        others = groups[sig]
+        if len(others) + 1 >= _REPEAT_GROUP_MIN:
+            dups[hdr] = others
+        else:
+            reps.extend((h, body) for h in others)
+    return reps, dups
+
+
+def _name_list(headers, room: int = 240):
+    """As many resource names as fit in a readable line, then "...".
+
+    Naming them matters: a reviewer scanning for one specific resource
+    needs to see whether it is in the group. Naming ALL of them defeats
+    the point of grouping in the first place.
+    """
+    names = []
+    for h in headers:
+        piece = f"`{h}`"
+        if room - len(piece) - 2 < 0:
+            break
+        names.append(piece)
+        room -= len(piece) + 2
+    if not names:
+        return ""
+    return ", ".join(names) + (", ..." if len(names) < len(headers) else "")
+
+
+def _full_hunks_link(artifact_url: str) -> str:
+    """One phrase for "the complete diff lives over there".
+
+    Every place the comment folds content away has to point somewhere,
+    and a reviewer must never have to guess whether the missing hunks
+    are lost or just elsewhere.
+    """
+    if artifact_url:
+        return f"[Full hunks in the full diff view]({artifact_url})"
+    return ("Full hunks are in the diff-preview full-diff view, linked "
+            "from the build status.")
+
+
 def _format_app_diff_block(app, sections, diff_text, show_diff=True, n_res=None,
-                           risk_headers=None):
+                           risk_headers=None, version_fold=None,
+                           artifact_url="", size_budget=None,
+                           group_repeats=False):
     """Return a list of markdown lines for one app's diff block.
 
     sections is DiffResult.sections — already truncated to display budget.
@@ -7922,19 +8215,65 @@ def _format_app_diff_block(app, sections, diff_text, show_diff=True, n_res=None,
     out = [f"\u26a0\ufe0f **`{app}`** \u2014 {n} resource(s) changed", ""]
     if not show_diff:
         return out
+    # Version-transition fold: the noise sections identified by
+    # _classify_version_fold collapse behind one line; only needles render
+    # inline. Never active on the full-diff page (caller passes None there).
+    folded = set()
+    if version_fold and version_fold.get("n_foldable"):
+        folded = set(version_fold.get("headers") or ())
+        _lbl = version_fold.get("label")
+        _are = (f"are the version transition `{_lbl}` only"
+                if _lbl else "are version-only updates")
+        # Two short paragraphs inside the quote, never one long line: a
+        # prose wall past ~350 chars wraps into something nobody reads
+        # (measured on the last 50 merged prod comments, COPS-2605).
+        out += [f"> \u2b06\ufe0f **{version_fold['n_foldable']} of {total} "
+                f"changed resource(s)** {_are}. {_full_hunks_link(artifact_url)}"]
+        _what = ", ".join(version_fold.get("classes") or ())
+        if _what:
+            out += [">", f"> Folded lines: {_what}."]
+        out += [""]
+    inline = [(h, b) for h, b in (sections or []) if h not in folded]
+    # Identical changes collapse to one hunk plus a count. Off on the
+    # full-diff page (the caller leaves group_repeats False there), which
+    # must stay the complete record.
+    dups = {}
+    if group_repeats:
+        inline, dups = _group_repeated_sections(inline, risk_headers)
     if sections:
         if total > shown:
             # COPS-2567: only claim a plain prefix when it still is one.
-            n_risk = sum(1 for hdr, _ in sections if hdr in (risk_headers or ()))
-            if n_risk:
-                note = (f"> \U0001f50d Showing {shown} of {total} changed "
-                        f"resources, the {n_risk} highest-risk one(s) first. "
-                        f"See ArgoCD for the full set.")
+            if folded:
+                # With the fold active "showing first N of M" would be
+                # false; say what the storage cap left out instead.
+                note = (f"> \U0001f50d {total - shown} more changed "
+                        f"resource(s) beyond the storage cap are only in "
+                        f"the full diff view.")
             else:
-                note = (f"> \U0001f50d Showing first {shown} of {total} changed "
-                        f"resources. See ArgoCD for the full set.")
+                n_risk = sum(1 for hdr, _ in sections
+                             if hdr in (risk_headers or ()))
+                if n_risk:
+                    note = (f"> \U0001f50d Showing {shown} of {total} changed "
+                            f"resources, the {n_risk} highest-risk one(s) "
+                            f"first. See ArgoCD for the full set.")
+                else:
+                    note = (f"> \U0001f50d Showing first {shown} of {total} "
+                            f"changed resources. See ArgoCD for the full set.")
             out += [note, ""]
-        for hdr, body in sections:
+        omitted = []
+        used = sum(len(_l.encode("utf-8")) + 1 for _l in out)
+        rendered_one = False
+        for hdr, body in inline:
+            if (size_budget is not None and rendered_one
+                    and hdr not in (risk_headers or ())
+                    and used > size_budget):
+                # Intra-app readable budget (see format_comment): ordinary
+                # sections past the budget fold into one pointer below.
+                # Risk sections are exempt, and the first section always
+                # renders so the block is never headline-only.
+                omitted.append(hdr)
+                omitted.extend(dups.get(hdr) or ())
+                continue
             # Redaction happens here, at display time, so the diff engine
             # still compares real values and detects Secret changes.
             # v2.5.8: sections bodies are NOT pre-truncated (only
@@ -7955,7 +8294,29 @@ def _format_app_diff_block(app, sections, diff_text, show_diff=True, n_res=None,
                              + "\n... (diff truncated for display \u2014 see "
                                "ArgoCD for the full resource diff)")
             body_disp = _fence_safe(body_disp)
-            out += [f"**`{_fence_safe(hdr)}`**", "", "```diff", body_disp, "```", ""]
+            chunk = [f"**`{_fence_safe(hdr)}`**", "", "```diff", body_disp,
+                     "```", ""]
+            _same = dups.get(hdr) or []
+            if _same:
+                chunk += [f"> \u267b\ufe0f **{len(_same)} more resource(s) "
+                          f"change exactly the same lines.**"]
+                _also = _name_list(_same)
+                if _also:
+                    chunk += [">", f"> Same change: {_also}"]
+                chunk += [""]
+            for _l in chunk:
+                used += len(_l.encode("utf-8")) + 1
+            out += chunk
+            rendered_one = True
+        if omitted:
+            out += [f"> \u2702\ufe0f **{len(omitted)} more changed "
+                    f"resource(s) omitted** here to keep the comment "
+                    f"scannable. None is a deletion, zeroed replica or "
+                    f"VM change. {_full_hunks_link(artifact_url)}"]
+            _names = _name_list(omitted)
+            if _names:
+                out += [">", f"> Omitted: {_names}"]
+            out += [""]
     elif diff_text:
         # v2.5.17: this fallback (sections not supplied -- reachable through
         # _result()'s legacy 3-tuple coercion, which rebuilds sections with
@@ -9174,6 +9535,19 @@ def format_comment(pr_sha, app_results, skipped_apps=None, base_sha="",
     # zeroed replicas, VM changes, downgrades) are exempt and render in
     # full wherever they sort — never silently fold a dangerous change.
     collapsed_apps = []
+    # Lazy running size: each line's byte size is counted exactly once no
+    # matter where it was appended, replacing the full recount per app
+    # that made this loop quadratic on exactly the PRs where the budget
+    # matters most (census: 473-section bump PRs).
+    _sz_state = [0, 0]          # [next line index to count, bytes so far]
+
+    def _body_size():
+        idx, total_b = _sz_state
+        while idx < len(lines):
+            total_b += len(lines[idx].encode("utf-8")) + 1
+            idx += 1
+        _sz_state[0], _sz_state[1] = idx, total_b
+        return total_b
 
     for app, r in sorted(results.items(), key=lambda kv: _app_sort_key(*kv)):
         if r.outcome == OUT_ERROR:
@@ -9250,8 +9624,7 @@ def format_comment(pr_sha, app_results, skipped_apps=None, base_sha="",
                           or getattr(rep_r, "vm_changes", None)
                           or (rep_r.version_change
                               and _is_version_downgrade(*rep_r.version_change)))
-            if budget and not _risky and sum(
-                    len(l.encode("utf-8")) + 1 for l in lines) > budget:
+            if budget and not _risky and _body_size() > budget:
                 collapsed_apps.extend(members)
                 continue
             if len(members) > 1:
@@ -9269,10 +9642,17 @@ def format_comment(pr_sha, app_results, skipped_apps=None, base_sha="",
             # Pass n_res so the header shows the REAL count (FIX B).
             # COPS-2567: pass the risk headers too, so the truncation note
             # tells the truth about how the shown sections were picked.
+            _fold = getattr(rep_r, "version_fold", None) if budget else None
+            _room = max(budget - _body_size(), 0) if budget else None
+            _risk_hdrs = (set(rep_r.deleted_resources or [])
+                          | set(rep_r.replicas_zeroed or [])
+                          | {f["header"]
+                             for f in (getattr(rep_r, "vm_changes", None) or [])})
             lines += _format_app_diff_block(
-                rep_app, rep_r.sections, rep_r.text, show_diff=True, n_res=rep_r.n_res,
-                risk_headers=set(rep_r.deleted_resources or [])
-                | set(rep_r.replicas_zeroed or []))
+                rep_app, rep_r.sections, rep_r.text, show_diff=True,
+                n_res=rep_r.n_res, risk_headers=_risk_hdrs,
+                version_fold=_fold, artifact_url=artifact_url,
+                size_budget=_room, group_repeats=bool(budget))
 
         else:
             lines += [f"\u2705 **`{app}`** \u2014 no manifest changes", ""]

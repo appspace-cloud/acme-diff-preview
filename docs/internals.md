@@ -8,6 +8,7 @@ here is required to use the tool; it is for people changing it or debugging it.
 - [Why an empty `microservices.definitions` is blocked](#why-an-empty-microservicesdefinitions-is-blocked)
 - [Handling mass version bumps](#handling-mass-version-bumps-hundreds-of-apps-in-one-pr)
 - [Which resources make it into the comment body](#which-resources-make-it-into-the-comment-body)
+- [What one app shows when it changes hundreds of resources](#what-one-app-shows-when-it-changes-hundreds-of-resources)
 - [Superseding an in-flight render](#superseding-an-in-flight-render)
 - [Secret-leak and comment-integrity hardening](#secret-leak-and-comment-integrity-hardening)
 - [Full-diff web UI](#full-diff-web-ui-atlantis-style)
@@ -125,6 +126,70 @@ The truncation note reflects this. It says `Showing first N of M` only while
 the slice really is a prefix, and names the risk-first ordering otherwise.
 With the storage cap this generous, real apps almost never truncate at all
 now; the note mostly exists for the pathological case.
+
+### What one app shows when it changes hundreds of resources
+
+The rules above pick which resources of a fleet are shown. They do nothing
+for the shape that turned out to be the most common one in
+`acme-config-prod`: a platform version bump applied to a SINGLE environment.
+A census of the last 100 prod PRs found that 80 of them touch exactly one
+environment, that the version bump is the dominant operation, and that 10
+percent of the comments sat exactly on the Bitbucket 245KB hard cap. PR 3884
+is one app with 185 resource sections and PR 3891 has 473 across 30 apps.
+The readability budget shipped in COPS-2605 could not help there, because it
+is checked once per app before rendering that app, so the first app always
+renders in full. With one app, the budget never engages at all.
+
+Worse than the size: PR 3891 added a brand new
+`cnrm.cloud.google.com/reconcile-interval-in-seconds` annotation to its KCC
+resources. It was in the comment, and no reviewer could ever have found it
+inside 473 near-identical hunks.
+
+Three layers now run inside each app, in this order.
+
+**1. Version-transition fold (`_classify_version_fold`).** The changed lines
+of a bump section come from a tight vocabulary: image tags, chart labels,
+checksum annotations, version-carrying env values and deploy timestamps.
+The classifier pairs every changed line of a section by YAML key, and folds
+the section only if EVERY pair classifies as one of those. A pure addition,
+a pure deletion, an unbalanced key or one unknown line makes the whole
+section a needle that stays inline. Env `value:` pairs are the ambiguous
+case, so they are only accepted when the same transition was already seen on
+an unambiguous carrier (an image tag, a chart label, `targetRevision`, or the
+app-level chart `version_change`). That is why a `MAX_WORKERS: 4 -> 16`
+change can never fold. Fewer than `_VERSION_FOLD_MIN` foldable sections
+means no fold at all, because one fold line costs more attention than the
+two hunks it would hide.
+
+Like every other safety fact, this is computed in `_package_sections` on the
+FULL pre-cap list, so what folds never depends on a display cap. Sections
+already claimed by a deletion, a zeroing or a VM fact are exempt by
+construction, and the needles join those facts in the
+`_prioritise_risk_sections` reservation, so the one interesting resource
+survives the storage cap instead of being dropped at position 300.
+
+**2. Repeat grouping (`_group_repeated_sections`).** One identical change
+applied to many resources (the annotation above, added to every KCC member)
+is one fact, not 12. Sections are keyed by the signature of their changed
+lines only, so context lines and resource names do not split a group. The
+first section of a group renders its hunk in full and the rest are named
+under a `same change` line. Risk sections are never grouped: a reviewer
+verifying a deletion needs to see that deletion, not a pointer to a sibling.
+
+**3. Intra-app readability budget.** Whatever survives the first two layers
+is still bounded. A running byte counter (`used`) grows as chunks are
+appended, and once it passes the room left in the budget the remaining
+ordinary sections are named in one `omitted` line instead of inlined. Risk
+sections are exempt from this cut, and the first section of an app always
+renders, so a block is never reduced to just its headline.
+
+Every one of the three points at the full-diff page, which is rendered with
+the budget disabled and grouping off, and therefore never folds, groups or
+omits anything. Folding in the comment is only ever safe because that page
+is the complete record.
+
+On the two worst PRs in the census, the comment goes from the 245KB hard cap
+to about 32KB, with the reconcile-interval needle visible in both.
 
 ### Grouping apps with an identical diff (COPS-2579)
 

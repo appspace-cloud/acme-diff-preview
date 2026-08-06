@@ -27,75 +27,9 @@
    strategy:
 ```
 
-**`/apps/Deployment svc-1`**
-
-```diff
---- 
-+++ 
-@@ -20,7 +20,6 @@
-     app.kubernetes.io/name: broadcast
- spec:
-   
--  replicas: 2
-   
-   strategy:
-```
-
-**`/apps/Deployment svc-2`**
-
-```diff
---- 
-+++ 
-@@ -20,7 +20,6 @@
-     app.kubernetes.io/name: broadcast
- spec:
-   
--  replicas: 2
-   
-   strategy:
-```
-
-**`/apps/Deployment svc-3`**
-
-```diff
---- 
-+++ 
-@@ -20,7 +20,6 @@
-     app.kubernetes.io/name: broadcast
- spec:
-   
--  replicas: 2
-   
-   strategy:
-```
-
-**`/apps/Deployment svc-4`**
-
-```diff
---- 
-+++ 
-@@ -20,7 +20,6 @@
-     app.kubernetes.io/name: broadcast
- spec:
-   
--  replicas: 2
-   
-   strategy:
-```
-
-**`/apps/Deployment svc-5`**
-
-```diff
---- 
-+++ 
-@@ -20,7 +20,6 @@
-     app.kubernetes.io/name: broadcast
- spec:
-   
--  replicas: 2
-   
-   strategy:
-```
+> ♻️ **5 more resource(s) change exactly the same lines.**
+>
+> Same change: `/apps/Deployment svc-1`, `/apps/Deployment svc-2`, `/apps/Deployment svc-3`, `/apps/Deployment svc-4`, `/apps/Deployment svc-5`
 
 ---
 **Status:** ⚠️ 6 resource(s) will change
