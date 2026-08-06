@@ -8728,6 +8728,26 @@ def _build_merge_summary(results, rollup_by_sig, vm_change_lines,
 
     if appspace_state_lines:
         txt = "\n".join(appspace_state_lines)
+        # Arming destruction is the highest-severity thing a config-only PR
+        # can do, and it is invisible in the manifest diff: the footer still
+        # reads "No manifest changes". Live proof, acme-config-dev PR #7024:
+        # the body shouted DECOMMISSION ARMED while this summary said
+        # "Routine - nothing dangerous detected". A verdict that contradicts
+        # the panel below it is worse than no verdict at all.
+        if "PURGE ARMED" in txt:
+            findings.append((_SEV_BLOCK,
+                             "\U0001f6a8 **Data purge ARMED** \u2014 the "
+                             "cascade will permanently destroy the BigQuery "
+                             "dataset and the user content bucket"))
+        elif "DECOMMISSION ARMED" in txt:
+            findings.append((_SEV_BLOCK,
+                             "\U0001f512 **Decommission ARMED** \u2014 this "
+                             "environment becomes eligible for cascade "
+                             "deletion when its folder is removed"))
+        elif "DISARMED" in txt.upper():
+            findings.append((_SEV_ROUTINE,
+                             "\U0001f513 decommission disarmed (safe "
+                             "direction)"))
         if "PAUSED" in txt.upper():
             findings.append((_SEV_REVIEW,
                              "\u23f8\ufe0f **ArgoCD auto-sync paused** for an "

@@ -708,3 +708,38 @@ def test_no_golden_comment_has_a_markdown_rendering_hazard():
                 problems.append("%s: %d-char prose wall \u2014 wraps into an "
                                 "unreadable block" % (name, len(line)))
     assert not problems, "rendering hazards:\n" + "\n".join(problems)
+
+
+def test_merge_summary_never_contradicts_an_armed_state_panel():
+    """acme-config-dev PR #7024, real output: the body shouted
+    "DECOMMISSION ARMED" while the summary said "Routine - nothing
+    dangerous detected" and the footer said "No manifest changes". Arming
+    destruction is config-only, so it never reaches the manifest diff --
+    the summary has to read the state panel."""
+    results = {"pv-qa-13-a-ms": _result(outcome=m.OUT_NO_DIFF)}
+    armed = m.format_comment(
+        PR_SHA, results, base_sha=BASE_SHA,
+        appspace_state_lines=["## \U0001f512\u26a0\ufe0f DECOMMISSION ARMED "
+                              "for `pv-qa-13-a` \u26a0\ufe0f\U0001f512", ""])
+    head = _merge_summary_of(armed)
+    assert "DO NOT MERGE" in head
+    assert "Decommission ARMED" in head
+    assert "nothing dangerous detected" not in head
+
+    purge = m.format_comment(
+        PR_SHA, results, base_sha=BASE_SHA,
+        appspace_state_lines=["## \U0001f6a8 PURGE ARMED for "
+                              "already-decommissioned `pv-x` \U0001f6a8", ""])
+    head_p = _merge_summary_of(purge)
+    assert "DO NOT MERGE" in head_p
+    assert "purge" in head_p.lower()
+
+
+def test_merge_summary_treats_disarming_as_safe():
+    results = {"pv-a-ms": _result(outcome=m.OUT_NO_DIFF)}
+    head = _merge_summary_of(m.format_comment(
+        PR_SHA, results, base_sha=BASE_SHA,
+        appspace_state_lines=["### \U0001f513 Decommission DISARMED for "
+                              "`pv-a`", ""]))
+    assert "DO NOT MERGE" not in head
+    assert "disarmed" in head.lower()
