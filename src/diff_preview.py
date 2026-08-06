@@ -264,6 +264,22 @@ DIFF_TIMEOUT       = _env_int("DIFF_TIMEOUT", 120)       # seconds per diff (OCI
 WARM_WORKERS       = _env_int("WARM_WORKERS", 4)         # parallel chart-cache warm-up pulls
 WARM_THRESHOLD     = _env_int("WARM_THRESHOLD", 8)       # only warm when a PR fans out to more apps than this
 MAX_COMMENT_BYTES  = 245_000 # Bitbucket ~256KB limit; leave headroom
+# Proactive readability budget, far below the Bitbucket hard limit.
+# Reality check on acme-config-prod (2026-08): 8 of the 14 most recent bot
+# comments sat EXACTLY at the 245KB truncation wall — one of them a routine
+# fleet-wide version bump (PR #3891) rendering 473 diff blocks. Meanwhile
+# every committed "readable" golden comment is under 4KB. Nobody reads
+# 150KB in a PR comment; the full-diff view exists for that. 30KB is ~8x
+# the largest small-PR comment today and a few screen-scrolls at most.
+# Critical panels (state flags, cause panel, decommission, VM changes,
+# downgrades, deletions, renames) always render in full; only ordinary
+# per-app diff blocks past this budget collapse into a pointer at the
+# full-diff view. Env-overridable like the other capacity knobs.
+COMMENT_READABLE_BYTES = _env_int("COMMENT_READABLE_BYTES", 30_000)
+# Overview-table row cap, applied only when the changeset is already past
+# the readability budget: a 774-row overview table (observed live on
+# acme-config-prod PR #3890) is pure scroll with no glance value.
+_OVERVIEW_TABLE_MAX_ROWS = 40
 JFROG_MAX_BODY_BYTES = _env_int("JFROG_MAX_BODY_BYTES", 65536)  # 64 KB — reject oversized bodies before HMAC
 
 # ── Full-diff web UI (Atlantis-style) ────────────────────────────
@@ -2063,8 +2079,12 @@ OUT_DECOMMISSIONED = "decommissioned"
 DiffResult = namedtuple("DiffResult",
                         ["text", "sections", "n_res", "has_diff", "error", "outcome", "reason",
                          "version_change", "deleted_resources", "replicas_zeroed",
-                         "fingerprint", "renamed_resources"],
-                        defaults=[None, None, None, None, None])
+                         "fingerprint", "renamed_resources", "vm_changes"],
+                        defaults=[None, None, None, None, None, None])
+# vm_changes: structured facts about KCC linux-services (VM) resources this
+# diff touches, extracted by _detect_vm_changes on the FULL pre-cap section
+# list (same design as deleted_resources: safety facts never depend on
+# display caps). None on non-OUT_DIFF outcomes and legacy/coerced results.
 # fingerprint (COPS-2579): stable hash of this app's FULL (pre-cap) section
 # list, set only on the OUT_DIFF success path. Two apps whose changes are
 # byte-for-byte identical (a shared ancestor-file edit rolled out the same
@@ -4256,10 +4276,14 @@ def _evaluate_new_envs(new_env_candidates: list, pr_sha: str,
             lines.append(f"- **Chart version:** `{sec['version']}`")
             lines.append(f"- **Resources:** {sec['n_res']} total — {kind_breakdown}")
             if sec["workloads"]:
-                shown = sec["workloads"][:40]
+                # 40 names is a 765-char wall of wrapped inline code in
+                # Bitbucket (measured on PR #3863 and #3864). The count is
+                # the number that matters; the full list is on the
+                # full-diff page.
+                shown = sec["workloads"][:12]
                 apps = ", ".join(f"`{w}`" for w in shown)
-                more = (f" *(+{len(sec['workloads'])-40} more)*"
-                        if len(sec["workloads"]) > 40 else "")
+                more = (f" *(+{len(sec['workloads'])-12} more)*"
+                        if len(sec["workloads"]) > 12 else "")
                 lines.append(
                     f"- **Applications ({len(sec['workloads'])}):** {apps}{more}")
         else:
@@ -5043,8 +5067,178 @@ def _detect_replicas_zeroed(sections: list) -> list:
     return zeroed
 
 
+# ── VM-domain (KCC linux-services) risk detection ────────────────────
+# The slowest thing on this platform to recover from is a botched virtual
+# machine change: unlike a Kubernetes rollout there is no quick rollback
+# for a wrong machine type, a shrunk disk, or a deletion-policy flip that
+# lets the next cascade actually destroy the VM. The reviewers who read
+# these comments daily asked for VM changes to be unmistakable. Detection
+# is deterministic and runs on the FULL pre-cap section list (the PR-6773
+# lesson: display caps must never hide a safety fact), exactly like the
+# deleted-resources detection above.
+
+_VM_KINDS = ("ComputeInstance", "ComputeDisk", "ComputeAddress",
+             "ComputeDiskResourcePolicyAttachment")
+_VM_DELETION_POLICY_KEY = "cnrm.cloud.google.com/deletion-policy"
+# Fields worth reporting per kind, taken from the templates in
+# acme-components helm-charts/supporting-services/templates/
+# kcc-linux-services/. `type` only counts as a disk type when the value is
+# disk-shaped (pd-*/hyperdisk-*), which keeps unrelated `type:` keys (e.g.
+# a network accessConfigs type) out of the report.
+_VM_TRACKED_FIELDS = {
+    "ComputeInstance": ("machineType", "zone", "desiredStatus",
+                        "deletionProtection", "size", "type",
+                        _VM_DELETION_POLICY_KEY),
+    "ComputeDisk": ("size", "type", "location", _VM_DELETION_POLICY_KEY),
+    "ComputeAddress": ("address", _VM_DELETION_POLICY_KEY),
+    "ComputeDiskResourcePolicyAttachment": ("resourceID", "zone"),
+}
+_VM_DISK_TYPE_RE = re.compile(r"^(pd-|hyperdisk-)")
+
+
+def _vm_unquote(v: str) -> str:
+    v = v.strip()
+    if len(v) >= 2 and v[0] == v[-1] and v[0] in "\"'":
+        return v[1:-1]
+    return v
+
+
+def _detect_vm_changes(sections: list) -> list:
+    """Structured facts for every VM-domain (KCC linux-services) section.
+
+    Returns a list of dicts:
+      {header, kind, name, fields: [(field, old, new)], created, deleted,
+       dangerous: [reason, ...], notes: [note, ...]}
+
+    The severity rules come straight from the rendering templates and their
+    runbook comments in acme-components:
+      - deletion-policy moving to `delete`, or deletionProtection turning
+        false, means the next cascade/prune can actually destroy the
+        resource in GCP (both are driven by allowDeletion) — dangerous.
+      - a machineType change requires parking the VM first (desiredStatus:
+        TERMINATED, wait for KCC, then back to RUNNING). A machineType
+        change with no TERMINATED transition or TERMINATED state anywhere
+        in the section is exactly the mistake the template comment warns
+        about — dangerous.
+      - zone and disk `type` are immutable in GCP: changing them means
+        destroy-and-recreate — dangerous.
+      - a disk size DECREASE is impossible in place (GCP only grows disks),
+        so it implies recreation and data loss — dangerous. Growth is the
+        routine case.
+      - a whole VM-domain resource disappearing from the render (an
+        `enabled` flag turning off, or the environment dropping the domain)
+        is dangerous; a snapshot-policy attachment disappearing silently
+        ends that disk's backup schedule.
+    Everything else in the domain (status transitions, brand-new resources,
+    an address re-pin) is reported as a routine/notable line — the panel
+    only shouts when shouting is deserved, or nobody trusts it.
+    """
+    facts = []
+    for header, body in sections or []:
+        kind = _section_kind(header)
+        if kind not in _VM_KINDS:
+            continue
+        tracked = _VM_TRACKED_FIELDS[kind]
+        minus_vals, plus_vals = {}, {}
+        minus_n = plus_n = context_n = 0
+        context_terminated = False
+        for line in body.splitlines():
+            if line.startswith("+++") or line.startswith("---"):
+                continue
+            sign = line[:1]
+            if sign == " ":
+                context_n += 1
+                if "desiredStatus:" in line and "TERMINATED" in line:
+                    context_terminated = True
+                continue
+            if sign not in ("+", "-"):
+                continue
+            if sign == "+":
+                plus_n += 1
+            else:
+                minus_n += 1
+            content = line[1:].strip()
+            if ":" not in content:
+                continue
+            key, _, val = content.partition(":")
+            key = key.strip()
+            if key not in tracked:
+                continue
+            val = _vm_unquote(val)
+            if key == "type" and not _VM_DISK_TYPE_RE.match(val):
+                continue
+            (plus_vals if sign == "+" else minus_vals).setdefault(
+                key, []).append(val)
+        deleted = bool(minus_n and not plus_n and not context_n)
+        created = bool(plus_n and not minus_n and not context_n)
+        fields, dangerous, notes = [], [], []
+        if not deleted and not created:
+            for key in tracked:
+                olds, news = minus_vals.get(key, []), plus_vals.get(key, [])
+                if not olds and not news:
+                    continue
+                old = olds[0] if olds else ""
+                new = news[0] if news else ""
+                if old == new:
+                    continue
+                fields.append((key, old, new))
+        byk = {k: (o, n) for (k, o, n) in fields}
+        if deleted:
+            if kind == "ComputeDiskResourcePolicyAttachment":
+                dangerous.append("snapshot-policy attachment removed — this "
+                                 "disk loses its backup schedule")
+            else:
+                dangerous.append(
+                    "%s removed from the render entirely (an enabled flag "
+                    "turned off, or the environment dropped the domain)"
+                    % kind)
+        elif created:
+            notes.append("new %s — appears in this environment for the "
+                         "first time" % kind)
+        else:
+            pol = byk.get(_VM_DELETION_POLICY_KEY)
+            if pol and pol[1] == "delete":
+                dangerous.append("deletion-policy moves to `delete` — the "
+                                 "next cascade can destroy this resource "
+                                 "in GCP")
+            prot = byk.get("deletionProtection")
+            if prot and prot[1].lower() == "false":
+                dangerous.append("deletionProtection turns OFF — GCP-side "
+                                 "delete protection is removed")
+            if "machineType" in byk:
+                ds_new = byk.get("desiredStatus", ("", ""))[1]
+                if ds_new != "TERMINATED" and not context_terminated:
+                    dangerous.append("machineType changes while the VM is "
+                                     "not parked TERMINATED — the runbook "
+                                     "requires stopping the VM first")
+            if "zone" in byk:
+                dangerous.append("zone is immutable — changing it means "
+                                 "destroy-and-recreate")
+            if "type" in byk:
+                dangerous.append("disk type is immutable — changing it "
+                                 "means destroy-and-recreate")
+            if "size" in byk:
+                o, n = byk["size"]
+                try:
+                    if int(float(n)) < int(float(o)):
+                        dangerous.append("disk size DECREASES — GCP cannot "
+                                         "shrink a disk in place; this "
+                                         "implies recreation and data loss")
+                except ValueError:
+                    # A size that is not plainly numeric (a templated value,
+                    # or one carrying a unit suffix) cannot be compared, so
+                    # the shrink check is skipped on purpose. The field is
+                    # still reported above as an ordinary changed field.
+                    continue
+        facts.append({"header": header, "kind": kind,
+                      "name": _section_name(header), "fields": fields,
+                      "created": created, "deleted": deleted,
+                      "dangerous": dangerous, "notes": notes})
+    return facts
+
+
 def _prioritise_risk_sections(sections: list, deleted: list, zeroed: list,
-                              reserve: int) -> list:
+                              reserve: int, extra: list = None) -> list:
     """Move risk sections to the front, up to `reserve` of them.
 
     COPS-2567. Sections arrive sorted by resource key, and the display caps
@@ -5058,7 +5252,7 @@ def _prioritise_risk_sections(sections: list, deleted: list, zeroed: list,
     `reserve` bounds the damage in the other direction: a PR with 200
     deletions must still show some ordinary changes.
     """
-    risky = set(deleted or []) | set(zeroed or [])
+    risky = set(deleted or []) | set(zeroed or []) | set(extra or [])
     if not risky:
         return sections            # common case: byte for byte as before
     head, tail = [], []
@@ -5103,13 +5297,20 @@ def _package_sections(filtered_sections: list):
     created = _detect_created_resources(filtered_sections)
     deleted, renamed = _split_renames_from_deletions(deleted, created)
     zeroed  = _detect_replicas_zeroed(filtered_sections)
+    # VM-domain facts, computed here for the same reason deletions are: the
+    # panel that reports them must never depend on what survived a display
+    # cap. The headers join the risk reservation below so the actual VM
+    # section is visible in the comment, not just named by the panel —
+    # detecting a risk is only half the job (the PR-3845 lesson).
+    vm_changes = _detect_vm_changes(filtered_sections)
     fingerprint = _fingerprint_sections(filtered_sections)
     # COPS-2567: detecting a deletion is only half the job. Give the risk
     # sections a reserved share of the display budget before the caps below
     # cut the list, otherwise the shouty block names resources the reviewer
     # cannot see anywhere in the comment.
     filtered_sections = _prioritise_risk_sections(
-        filtered_sections, deleted, zeroed, RISK_SECTION_RESERVE)
+        filtered_sections, deleted, zeroed, RISK_SECTION_RESERVE,
+        extra=[f["header"] for f in vm_changes])
     display_secs = filtered_sections[:MAX_RESOURCES_FULL]
     truncated_parts = []
     for hdr, body in display_secs:
@@ -5117,7 +5318,7 @@ def _package_sections(filtered_sections: list):
         truncated_parts.append(f"===== {hdr} =====\n{body_t}")
     clean_diff = "\n".join(truncated_parts)
     return (clean_diff, filtered_sections[:FULL_SECTIONS_MAX_PER_APP],
-            deleted, zeroed, fingerprint, renamed)
+            deleted, zeroed, fingerprint, renamed, vm_changes)
 
 
 def _diff_resources(main_res: dict, pr_res: dict) -> str:
@@ -6028,8 +6229,15 @@ def _evaluate_env_decommissions(candidates: list, pr_sha: str, main_sha: str,
                 "",
             ]
         if any_rendered and total:
-            kind_breakdown = ", ".join(
-                f"{n} {k}" for k, n in sorted(kind_counts.items(), key=lambda kv: (-kv[1], kv[0])))
+            # Top kinds only. The full breakdown was ~30 comma-separated
+            # entries wrapping over eight lines in Bitbucket (seen live on
+            # PR #3894) -- unreadable, and the exact tail never drove a
+            # decision. The complete inventory is in the appendix on the
+            # full-diff page.
+            _ranked = sorted(kind_counts.items(), key=lambda kv: (-kv[1], kv[0]))
+            kind_breakdown = ", ".join(f"{n} {k}" for k, n in _ranked[:8])
+            if len(_ranked) > 8:
+                kind_breakdown += (f", +{len(_ranked) - 8} more kind(s)")
             label = ("**Resources that will be removed:**" if cascade
                      else "**Resources that will be LEFT RUNNING (orphaned):**")
             lines.append(f"- {label} {total} total \u2014 {kind_breakdown}")
@@ -6532,11 +6740,12 @@ def argocd_diff(app, pr_sha, main_sha, chart_revision=None, changed_paths=None, 
         # Truncate to display budget NOW so we never hold the full YAML in
         # memory — but detect deletions/zeroings FIRST, on the full list
         # (v2.5.26: the PR-6773 lesson, see _package_sections).
-        clean_diff, capped_sections, deleted_res, zeroed_res, fingerprint, renamed_res = \
-            _package_sections(filtered_sections)
+        clean_diff, capped_sections, deleted_res, zeroed_res, fingerprint, \
+            renamed_res, vm_changes_res = _package_sections(filtered_sections)
         return DiffResult(clean_diff, capped_sections,
                           n_res, True, None, OUT_DIFF, "changes", version_change,
-                          deleted_res, zeroed_res, fingerprint, renamed_res)
+                          deleted_res, zeroed_res, fingerprint, renamed_res,
+                          vm_changes_res)
     # Exhausted retries
     return _indeterminate(last_reason, last_detail or "unknown error")
 
@@ -6722,8 +6931,13 @@ def find_existing_comment(pr_id, repo=None):
         pages += 1
     return None, "", ""
 
-def _truncate_comment(body: str) -> str:
+def _truncate_comment(body: str, artifact_url: str = "") -> str:
     """Cap a comment body at MAX_COMMENT_BYTES, PRESERVING the footer.
+
+    artifact_url, when known, makes the truncation note link straight to
+    the full-diff view instead of pointing the reviewer at "the pod logs" —
+    the exact wording that shipped on every truncated mass-PR comment and
+    helped nobody (observed live on acme-config-prod PR #3891 and others).
 
     v2.5.18 (FINDINGS_SCALE S2): the old truncation cut from the END, which
     destroyed the footer on every oversized comment — and mass PRs are
@@ -6746,9 +6960,10 @@ def _truncate_comment(body: str) -> str:
     encoded = body.encode("utf-8")
     if len(encoded) <= MAX_COMMENT_BYTES:
         return body
+    where = (f"see the [full diff]({artifact_url})" if artifact_url
+             else "see the pod logs or ArgoCD UI for the full diff")
     note = (f"\n\n*... diff content truncated ({len(encoded)//1024}KB exceeds "
-            f"the Bitbucket comment limit) - see the pod logs or ArgoCD UI "
-            f"for the full diff*\n")
+            f"the Bitbucket comment limit) - {where}*\n")
     footer_at = body.rfind("\n---\n**Status:**")
     if footer_at != -1:
         footer = body[footer_at:]
@@ -6794,11 +7009,14 @@ def _save_diff_ui_artifact(repo, pr_id, pr_sha, body, base_sha=None,
     except Exception as e:
         log(f"[diff-ui] artifact save failed (non-fatal): {e}", "WARNING")
 
-def upsert_comment(pr_id, body, existing_id=None, repo=None):
-    """Post or update PR comment. Truncates if over limit; posts fallback on error."""
+def upsert_comment(pr_id, body, existing_id=None, repo=None, artifact_url=""):
+    """Post or update PR comment. Truncates if over limit; posts fallback on error.
+
+    artifact_url is threaded into the truncation note so an oversized
+    comment links straight to the full-diff view (see _truncate_comment)."""
     orig_bytes = len(body.encode("utf-8"))
     if orig_bytes > MAX_COMMENT_BYTES:
-        body = _truncate_comment(body)
+        body = _truncate_comment(body, artifact_url=artifact_url)
         with _diff_stats_lock:
             _diff_stats["comments_truncated"] += 1
         log(f"[comment] truncated: {orig_bytes//1024}KB -> "
@@ -7853,7 +8071,114 @@ def _fmt_service_list(services: list, shown: int = 8) -> str:
     return f"{head}{more}"
 
 
-def _summarize_input_changes(changed_files, pr_sha, base_sha, repo=None) -> list:
+# ── Routine version-bump classification ─────────────────────────────
+# The 83.7% case at fleet scale: acme-config-prod PR #3891 bumped
+# appspace.version in 8 files and the comment rendered 473 near-identical
+# diff blocks before hitting the 245KB truncation wall. Fingerprint
+# grouping cannot collapse those — each environment's rendered diff
+# differs in names/labels, so every app formed its own group. This
+# classifier is the deterministic complement: it recognizes a diff whose
+# EVERY changed line is version-shaped, so format_comment can fold
+# equivalent-but-not-identical groups into one summary line per distinct
+# transition. Deliberately conservative, in the same spirit as
+# _is_rename_of: a false positive here HIDES a real change behind a
+# one-liner, which is strictly worse than the verbosity it fixes. Any risk
+# fact (deletion, zeroed replicas, rename, VM change, downgrade), any
+# non-version key, any one-sided add/remove of a key, and any unkeyed
+# changed line keeps the app fully enumerated.
+
+_ROUTINE_KEY_BASES = ("image", "tag", "targetrevision")
+_VERSIONISH_VAL_RE = re.compile(r"^v?\d[\w.+-]*$")
+
+
+def _routine_bump_key_ok(key: str, old: str, new: str) -> bool:
+    """True when one changed key is version-shaped enough to fold.
+
+    Grounded in the changed-line census of PR #3891's comment: the bump is
+    `image:` + `app.kubernetes.io/version:` pairs, env-var `value:` lines
+    carrying bare version strings, and checksum annotations (cascade
+    noise, ignored upstream). `value:` only qualifies when BOTH sides look
+    like a version string, so a feature-flag value can never fold silently.
+    """
+    base = key.rsplit("/", 1)[-1].rsplit(".", 1)[-1].lower()
+    if base in _ROUTINE_KEY_BASES or "version" in key.lower():
+        return True
+    if base == "value":
+        return bool(_VERSIONISH_VAL_RE.match(old)
+                    and _VERSIONISH_VAL_RE.match(new))
+    return False
+
+
+def _routine_bump_signature(r):
+    """(old_rev, new_rev, ((key, olds, news), ...)) for a routine bump, else None.
+
+    Two apps with the SAME signature take the same change even when their
+    rendered diffs are not byte-identical, so format_comment can fold
+    their fingerprint groups together. None means "not provably routine"
+    and the app renders in full — this fails open toward verbosity, never
+    toward hiding a change.
+    """
+    if r.outcome != OUT_DIFF or not r.sections:
+        return None
+    if (r.deleted_resources or r.replicas_zeroed or r.renamed_resources
+            or getattr(r, "vm_changes", None)):
+        return None
+    if r.version_change and _is_version_downgrade(*r.version_change):
+        return None
+    minus, plus = {}, {}
+    for _hdr, body in r.sections:
+        for line in body.splitlines():
+            if line.startswith("+++") or line.startswith("---"):
+                continue
+            sign = line[:1]
+            if sign not in ("+", "-"):
+                continue
+            content = line[1:].strip()
+            key, colon, val = content.partition(":")
+            key = key.strip()
+            if not colon or not key:
+                return None       # a structural/unkeyed line changed
+            val = _vm_unquote(val)
+            if key.startswith("checksum/"):
+                continue           # pure cascade noise on either side
+            (plus if sign == "+" else minus).setdefault(key, set()).add(val)
+    if set(minus) != set(plus):
+        return None                # one-sided add/remove of a key
+    items = []
+    for key in sorted(minus):
+        olds, news = minus[key], plus[key]
+        if olds == news:
+            continue               # reorder-only, not a change
+        for o in olds:
+            for n in news:
+                if not _routine_bump_key_ok(key, o, n):
+                    return None
+        items.append((key, "|".join(sorted(olds)), "|".join(sorted(news))))
+    if not items and not r.version_change:
+        return None
+    vc = r.version_change or ("", "")
+    return (vc[0] or "", vc[1] or "", tuple(items))
+
+
+def _routine_bump_label(sig) -> str:
+    """One human line naming the transition a rollup group shares."""
+    old_rev, new_rev, items = sig
+    if old_rev or new_rev:
+        label = f"chart `{old_rev}` \u2192 `{new_rev}`"
+        extra = len(items)
+    elif items:
+        key, olds, news = items[0]
+        label = f"`{key}`: `{olds}` \u2192 `{news}`"
+        extra = len(items) - 1
+    else:
+        return "version-only change"
+    if extra > 0:
+        label += f" (+{extra} more field(s))"
+    return label
+
+
+def _summarize_input_changes(changed_files, pr_sha, base_sha, repo=None,
+                             full=False) -> list:
     """Markdown block: key-level changes this PR makes to its value files.
 
     v2.6.2 (born from acme-config-dev PR #6848): the comment showed a chart
@@ -7867,8 +8192,12 @@ def _summarize_input_changes(changed_files, pr_sha, base_sha, repo=None) -> list
     blocks - skipped here. Values under password/secret/token-ish keys are
     never echoed. Output is capped; unparseable files are noted, never fatal.
     """
-    out, budget = [], _INPUT_CHANGES_MAX_LINES
-    for path in (changed_files or [])[:8]:
+    # full=True is the render behind the full-diff view: no file cap and no
+    # line budget, so the persisted page really does show every changed
+    # file key by key. The comment keeps the tight caps.
+    out, budget = [], (10 ** 9 if full else _INPUT_CHANGES_MAX_LINES)
+    for path in (list(changed_files or []) if full
+                 else (changed_files or [])[:8]):
         if not path.endswith((".yaml", ".yml")):
             continue
         new_txt, st_new = _bb_fetch_cached(path, pr_sha, repo=repo)
@@ -7890,7 +8219,11 @@ def _summarize_input_changes(changed_files, pr_sha, base_sha, repo=None) -> list
                          if old_flat[k] != new_flat[k])
         if not (removed or added or changed):
             continue
-        file_lines = [f"`{path}`:"]
+        # Blank line is load-bearing: without it Bitbucket renders the
+        # bullets below INLINE into this heading. Seen on 44 of the last
+        # 50 acme-config-prod comments, e.g. PR #3893 showing
+        # "customer.yaml: - added appspace.decommission = True" on one line.
+        file_lines = [f"`{path}`:", ""]
         file_lines += _rollup_by_service(
             removed,
             sig_fn=lambda k: _fmt_input_val(k, old_flat[k]),
@@ -8043,51 +8376,44 @@ def _summarize_appspace_state_changes(changed_files, pr_sha, base_sha, path_map,
         was_armed, is_armed = _decommission_armed_flat(old_flat), _decommission_armed_flat(new_flat)
         was_purge, is_purge = _purge_armed_flat(old_flat), _purge_armed_flat(new_flat)
         if not was_armed and is_armed:
-            purge_note = (
-                " **`appspace.decommissionPurgeData: true` is also set \u2014 the " +
-                "cascade will permanently destroy the BigQuery dataset and the " +
-                "user content bucket, not just the workloads.**"
-                if is_purge else "")
+            # Phase 2's state is known from the environment's own config, so
+            # the panel states it instead of asking the reviewer to go and
+            # check anything. Rendered as a table: the previous version was
+            # four dense prose paragraphs plus a kubectl command, and the
+            # phase list had no blank line before it, so markdown inlined
+            # the bullets into the paragraph (seen live on PR #3893).
+            purge_state = ("\U0001f6a8 **armed** \u2014 the cascade will "
+                           "permanently destroy this data"
+                           if is_purge else
+                           "\u2b1c not armed \u2014 data is abandoned, "
+                           "recoverable")
             lines += [
                 f"## \U0001f512\u26a0\ufe0f DECOMMISSION ARMED for `{env_name}` \u26a0\ufe0f\U0001f512",
                 "",
-                f"**`appspace.decommission: true` was added.** This PR deletes " +
-                f"nothing by itself, but {app_list} are now eligible for the " +
-                f"cascade-delete finalizer: once this environment's folder is " +
-                f"removed in a later PR, its resources will be deleted rather " +
-                f"than left running.{purge_note}",
+                f"**`appspace.decommission: true` was added. This PR deletes "
+                f"nothing by itself.** {app_list} become eligible for the "
+                f"cascade-delete finalizer, which only acts when this "
+                f"environment's folder is removed in a later PR.",
                 "",
-                f"**This is Phase 1 of the decommission runbook.** Until the " +
-                f"folder is removed, nothing changes for `{env_name}`: every " +
-                f"workload keeps running, disks stay held, costs keep accruing, " +
-                f"and the environment is still fully managed by ArgoCD. If that " +
-                f"is the point of this PR (arming ahead of a scheduled removal), " +
-                f"this is exactly the expected state.",
+                "| Phase | State | What it does |",
+                "|-------|-------|--------------|",
+                "| **Phase 1 \u2014 arm cascade** | \u2705 **this PR** | the "
+                "Applications become eligible for cascade deletion |",
+                f"| **Phase 2 \u2014 arm data purge** | {purge_state} | "
+                "`appspace.decommissionPurgeData` approves destroying the "
+                "BigQuery dataset and the user content bucket |",
+                "| **Phase 3 \u2014 remove folder** | \u2b1c pending | a later "
+                "PR deletes the Applications and every resource they manage, "
+                "Config Connector cloud resources included; that PR gets its "
+                "own full inventory panel |",
                 "",
-                f"What the remaining phases do:",
-                f"- **Phase 2 (optional):** `appspace.decommissionPurgeData: true` " +
-                f"approves destroying the BigQuery dataset and the user content " +
-                f"bucket. Without it the cascade abandons them, recoverable, in " +
-                f"GCP. The flag is inert unless Phase 1 is armed too.",
-                f"- **Phase 3:** a later PR removes this environment's folder. " +
-                f"That PR, and only that PR, triggers the actual deletion: the " +
-                f"Applications and every resource they manage, including the " +
-                f"Config Connector cloud resources. It gets its own panel with " +
-                f"the full rendered inventory of what is removed and what is " +
-                f"retained. Even a full cascade leaves the content backup bucket " +
-                f"and some namespace-level leftovers behind, per the runbook's " +
-                f"what-survives section.",
+                f"**Nothing changes for `{env_name}` until Phase 3:** every "
+                f"workload keeps running, disks stay held, costs keep accruing "
+                f"and the environment is still managed by ArgoCD.",
                 "",
-                f"**Before merging the Phase 3 folder removal, verify the " +
-                f"finalizer is actually live on the hub** \u2014 removing the " +
-                f"folder without it orphans every resource instead of deleting " +
-                f"them:",
-                f"```",
-                f"kubectl --context gcp-shared-devops-na1-a -n argocd " +
-                f"get application {sorted(app_names)[0]} " +
-                f"-o jsonpath='{{.metadata.finalizers}}'",
-                f"```",
-                f"Full procedure: see `acme-components` `documentation/`.",
+                f"Even a full cascade leaves the content backup bucket and "
+                f"some namespace-level leftovers behind. Full procedure: see "
+                f"`acme-components` `documentation/`.",
                 "",
             ]
         elif was_armed and not is_armed:
@@ -8118,6 +8444,338 @@ def _summarize_appspace_state_changes(changed_files, pr_sha, base_sha, path_map,
             ]
 
     return lines
+
+
+_VM_VALUES_PREFIX = "appspace.infra.deployLinuxServicesK8s."
+# Every values-level key path that provisions a virtual machine. The
+# corpus of the last 50 acme-config-prod PRs carries deployLinuxServicesK8s
+# (x17), the LEGACY non-KCC deployLinuxServices (x9) and deployWindows
+# (x5), all live at the same time. Detecting only the K8s one silently
+# missed PR #3844, which changed a Deloitte VM from n2d-custom-16-49152 to
+# n2-custom-12-49152 (a downsize) and whose comment said "No manifest
+# changes" -- exactly the failure this panel exists to prevent.
+_VM_VALUES_PREFIXES = (
+    "appspace.infra.deployLinuxServicesK8s.",
+    "appspace.infra.deployLinuxServices.",
+    "appspace.infra.deployWindows.",
+)
+_VM_DOMAIN_LABELS = {
+    "appspace.infra.deployLinuxServicesK8s.": "linux VM (KCC)",
+    "appspace.infra.deployLinuxServices.": "linux VM (legacy)",
+    "appspace.infra.deployWindows.": "Windows VM",
+}
+# Disk-size keys differ between the legacy and KCC value schemas.
+_VM_DISK_SIZE_KEYS = ("dataDiskSizeGb", "bootDiskSizeGb",
+                      "dataDiskSize", "bootDiskSize", "diskSize")
+_VM_DISK_TYPE_KEYS = ("dataDiskType", "bootDiskType", "diskType")
+_VM_ROLE_NAMES = ("defaults", "svc", "mongo", "rabbit")
+# Panel headers are constants because the merge summary recognises its own
+# panels by them. Danger uses "##", routine and clean use "###", so the
+# summary can tell severity apart without re-deriving any facts.
+_VM_PANEL_DANGER_HDR = ("## \U0001f5a5\ufe0f\U0001f6a8 VM INFRASTRUCTURE "
+                        "CHANGES \U0001f6a8")
+_VM_PANEL_ROUTINE_HDR = "### \U0001f5a5\ufe0f VM INFRASTRUCTURE CHANGES (routine)"
+_VM_PANEL_CLEAN_HDR = "### \U0001f5a5\ufe0f VM infrastructure \u2014 no changes"
+
+
+def _summarize_vm_changes(changed_files, pr_sha, base_sha, path_map,
+                          app_results, repo=None) -> list:
+    """Markdown panel for VM-domain (KCC linux-services) changes.
+
+    Two detection levels, both needed, both deterministic:
+
+    VALUES level: any changed key under the deployLinuxServicesK8s domain
+    in a value file this PR modifies on both sides. This is the only level
+    that can catch the change on a non-rendering environment — observed
+    live on acme-config-prod PR #3892, where adding
+    `defaults.allowDeletion: true` to an AZURE environment (the KCC
+    templates render only for GCP) produced a green "No manifest changes"
+    comment while literally arming VM deletion ahead of a decommission.
+    The same key change also shows as one plain bullet in the generic
+    cause panel; that panel stays complete on purpose, this one adds the
+    weight and the consequence.
+
+    RENDERED level: the structured facts _detect_vm_changes extracted per
+    app at diff time on the full pre-cap section list
+    (DiffResult.vm_changes), naming the exact resource and field,
+    old -> new.
+
+    Same never-break-the-comment contract and _bb_fetch_cached reuse as
+    _summarize_appspace_state_changes: re-reading a (path, sha) the input
+    panel already fetched is a cache hit, not a second Bitbucket call.
+    Files present on only one side are new-env/decommission territory with
+    their own panels. Returns [] when the PR does not touch the VM domain
+    at all — an always-on panel trains reviewers to skip it.
+    """
+    dangerous_lines, routine_lines = [], []
+    seen = set()
+    for f in (changed_files or [])[:12]:
+        clean = posixpath.normpath(f.lstrip("/"))
+        if clean in seen or not clean.endswith((".yaml", ".yml")):
+            continue
+        seen.add(clean)
+        new_txt, st_new = _bb_fetch_cached(clean, pr_sha, repo=repo)
+        old_txt, st_old = _bb_fetch_cached(clean, base_sha, repo=repo)
+        if st_new != BB_OK or st_old != BB_OK:
+            continue  # added/deleted file: new-env / decommission territory
+        try:
+            new_flat = _flatten_yaml(yaml.safe_load(new_txt) or {})
+            old_flat = _flatten_yaml(yaml.safe_load(old_txt) or {})
+        except yaml.YAMLError:
+            continue  # the input panel already flags unparseable files
+        keys = sorted(k for k in (set(old_flat) | set(new_flat))
+                      if k.startswith(_VM_VALUES_PREFIXES)
+                      and old_flat.get(k) != new_flat.get(k))
+        if not keys:
+            continue
+        env_name = posixpath.basename(posixpath.dirname(clean))
+        scope = (f"`{env_name}`" if path_map.get(clean) else
+                 f"ancestor `{clean}` (inherited by every environment "
+                 f"below it)")
+        for k in keys:
+            prefix = next(p for p in _VM_VALUES_PREFIXES if k.startswith(p))
+            domain = _VM_DOMAIN_LABELS[prefix]
+            rest = k[len(prefix):]
+            role = rest.split(".", 1)[0]
+            role_label = ("defaults (all roles)" if role == "defaults"
+                          else role if role in _VM_ROLE_NAMES else rest)
+            role_label = f"{domain} \u00b7 {role_label}"
+            old_v, new_v = old_flat.get(k), new_flat.get(k)
+            old_s = "" if old_v is None else str(old_v)
+            new_s = "" if new_v is None else str(new_v)
+            leaf = rest.rsplit(".", 1)[-1]
+            if old_v is not None and new_v is not None:
+                change = f"`{rest}`: `{old_s}` \u2192 `{new_s}`"
+            elif old_v is None:
+                change = f"**added** `{rest}` = `{new_s}`"
+            else:
+                change = f"**removed** `{rest}` (was `{old_s}`)"
+            danger, reason = False, ""
+            if leaf == "allowDeletion" and new_s.lower() == "true":
+                danger = True
+                reason = ("deletion-policy flips to `delete` and "
+                          "deletionProtection turns off for this role's VM, "
+                          "disk and address \u2014 the next cascade can "
+                          "destroy them in GCP")
+            elif leaf == "enabled" and new_s.lower() == "false":
+                danger = True
+                reason = ("the resources disappear from the render \u2014 a "
+                          "live VM stops being managed, or gets deleted if "
+                          "deletion is armed")
+            elif leaf == "machineType":
+                ds = (new_flat.get(prefix + role + ".desiredStatus")
+                      or new_flat.get(prefix + "defaults.desiredStatus"))
+                if str(ds) != "TERMINATED":
+                    danger = True
+                    reason = ("machineType changes while desiredStatus is "
+                              "not TERMINATED \u2014 the runbook requires "
+                              "stopping the VM first")
+            elif leaf == "zone":
+                danger = True
+                reason = "zone is immutable \u2014 destroy-and-recreate"
+            elif leaf in _VM_DISK_SIZE_KEYS:
+                try:
+                    if float(new_s) < float(old_s):
+                        danger = True
+                        reason = ("disk size DECREASES \u2014 GCP cannot "
+                                  "shrink a disk in place")
+                except (TypeError, ValueError):
+                    # Sizes that are not plainly numeric (templated values,
+                    # or values carrying a unit suffix) cannot be compared,
+                    # so the shrink check is skipped on purpose. The key
+                    # change itself is still reported as a routine line.
+                    pass
+            elif leaf in _VM_DISK_TYPE_KEYS:
+                danger = True
+                reason = "disk type is immutable \u2014 destroy-and-recreate"
+            mark = "\U0001f6a8 " if danger else ""
+            tail = f" \u2014 {reason}" if reason else ""
+            line = f"- {mark}{scope} \u00b7 **{role_label}**: {change}{tail}"
+            (dangerous_lines if danger else routine_lines).append(line)
+
+    for app, r in sorted((app_results or {}).items()):
+        for fact in (getattr(r, "vm_changes", None) or []):
+            env = _envs_from_apps([app])[0]
+            where = f"`{env}` \u00b7 `{fact['kind']} {fact['name']}`"
+            field_txt = ", ".join(
+                "`%s` `%s` \u2192 `%s`" % (k, o or "(absent)", n or "(removed)")
+                for k, o, n in fact["fields"])
+            if fact["dangerous"]:
+                dangerous_lines.append(
+                    "- \U0001f6a8 %s: %s \u2014 %s" % (
+                        where,
+                        field_txt or ("resource DELETED from the render"
+                                      if fact["deleted"] else
+                                      "resource-level change"),
+                        "; ".join(fact["dangerous"])))
+            elif fact["fields"] or fact["notes"]:
+                routine_lines.append(
+                    "- %s: %s" % (where,
+                                  field_txt or "; ".join(fact["notes"])))
+
+    if not dangerous_lines and not routine_lines:
+        # Always render the section, even empty. Operators asked for a
+        # fixed place to look: "did this PR touch VMs at all?" must be
+        # answerable without reading the rest. Audit of the last 40
+        # acme-config-prod PRs found "GCP unify guard: Windows/LinuxVM
+        # off" switching VMs off with no VM wording anywhere in the
+        # comment -- silence is indistinguishable from "not checked".
+        return [_VM_PANEL_CLEAN_HDR, "",
+                "No changes to VM infrastructure (KCC linux-services) in "
+                "this PR.", ""]
+    if dangerous_lines:
+        _warn = ("**This PR touches virtual machine infrastructure (KCC linux-services). A botched VM change is slow and painful to recover from \u2014 verify every line below before merging.**")
+        lines = [
+            _VM_PANEL_DANGER_HDR,
+            "",
+            _warn,
+            "",
+        ] + dangerous_lines
+        if routine_lines:
+            lines += ["", "Routine VM changes in the same PR:", ""] + routine_lines
+        return lines + [""]
+    return ([_VM_PANEL_ROUTINE_HDR, ""]
+            + routine_lines + [""])
+
+
+# ── Merge summary ────────────────────────────────────────────────────
+# The headline panel: one verdict plus one line per finding, so an
+# operator can answer "is this safe to merge?" from the first screen.
+# Built from the audit of the last 40 merged acme-config-prod PRs:
+#   * 20/40 were fleet version bumps and 10/40 were truncated at the
+#     245KB wall, so the routine case must compress to a single line;
+#   * six decommission-phase PRs (arm cascade, arm data purge, arm VM
+#     deletion) produced 489-571 byte comments with NO panel at all --
+#     the most destructive changes in the fleet were the quietest;
+#   * nine PRs fired RESOURCE(S) DELETED, several of them really folder
+#     moves and key renames, so deletions must say WHERE, not just that
+#     they happened.
+# Severity is the maximum over the findings: BLOCK > REVIEW > ROUTINE.
+_SEV_ROUTINE, _SEV_REVIEW, _SEV_BLOCK = 0, 1, 2
+_VERDICTS = {
+    _SEV_BLOCK: "\u26d4 **DO NOT MERGE** without checking the item(s) below",
+    _SEV_REVIEW: "\u26a0\ufe0f **Review before merging**",
+    _SEV_ROUTINE: "\u2705 **Routine** \u2014 nothing dangerous detected",
+}
+
+
+def _fmt_env_list(apps, shown=8) -> str:
+    """Environment names, the way operators say them (no -ms/-ss/-glb)."""
+    envs = sorted(set(_envs_from_apps(sorted(apps))))
+    return _fmt_service_list(envs, shown=shown)
+
+
+def _build_merge_summary(results, rollup_by_sig, vm_change_lines,
+                         decommission_lines, appspace_state_lines,
+                         new_env_lines, new_env_structural) -> list:
+    """The verdict block that opens every comment.
+
+    Reads the same deterministic facts the panels below use, so the
+    summary can never disagree with the detail. Text panels built
+    elsewhere are recognised by their own header constants rather than
+    re-derived, for the same reason.
+    """
+    findings = []          # (severity, line)
+    sev = _SEV_ROUTINE
+
+    if decommission_lines:
+        txt = "\n".join(decommission_lines)
+        purge = "PURGE" in txt.upper()
+        findings.append((_SEV_BLOCK,
+                         "\U0001f5d1\ufe0f **Environment decommission** \u2014 "
+                         + ("data purge is ARMED: buckets/datasets are "
+                            "destroyed, not abandoned"
+                            if purge else
+                            "resources are deleted; data is abandoned, "
+                            "not purged")))
+    if vm_change_lines:
+        hdr = vm_change_lines[0]
+        if hdr == _VM_PANEL_DANGER_HDR:
+            findings.append((_SEV_BLOCK,
+                             "\U0001f5a5\ufe0f **VM infrastructure change "
+                             "flagged dangerous** \u2014 see the VM section"))
+        elif hdr == _VM_PANEL_ROUTINE_HDR:
+            findings.append((_SEV_ROUTINE,
+                             "\U0001f5a5\ufe0f VM infrastructure changed "
+                             "(routine)"))
+
+    deleted_apps = sorted(a for a, r in results.items() if r.deleted_resources)
+    if deleted_apps:
+        n = sum(len(results[a].deleted_resources) for a in deleted_apps)
+        findings.append((_SEV_BLOCK,
+                         f"\u274c **{n} resource(s) deleted** in "
+                         f"{len(deleted_apps)} app(s): "
+                         f"{_fmt_env_list(deleted_apps)}"))
+    renamed_apps = sorted(a for a, r in results.items()
+                          if getattr(r, "renamed_resources", None))
+    if renamed_apps:
+        findings.append((_SEV_ROUTINE,
+                         "\u267b\ufe0f resources renamed/recreated (not a "
+                         f"deletion): {_fmt_env_list(renamed_apps)}"))
+
+    downgraded = sorted(a for a, r in results.items()
+                        if r.version_change
+                        and _is_version_downgrade(*r.version_change))
+    if downgraded:
+        findings.append((_SEV_REVIEW,
+                         "\u2b07\ufe0f **Chart version downgrade** in "
+                         f"{_fmt_env_list(downgraded)}"))
+    zeroed_apps = sorted(a for a, r in results.items() if r.replicas_zeroed)
+    if zeroed_apps:
+        findings.append((_SEV_REVIEW,
+                         "\U0001f9ca **Replicas scaled to zero** in "
+                         f"{_fmt_env_list(zeroed_apps)}"))
+
+    if appspace_state_lines:
+        txt = "\n".join(appspace_state_lines)
+        if "PAUSED" in txt.upper():
+            findings.append((_SEV_REVIEW,
+                             "\u23f8\ufe0f **ArgoCD auto-sync paused** for an "
+                             "environment \u2014 changes stop being applied"))
+        elif "RESUMED" in txt.upper():
+            findings.append((_SEV_REVIEW,
+                             "\u25b6\ufe0f **ArgoCD auto-sync resumed** \u2014 "
+                             "pending drift will be applied"))
+    if new_env_lines:
+        findings.append((_SEV_REVIEW if new_env_structural else _SEV_ROUTINE,
+                         "\U0001f195 **New environment** in this PR"
+                         + (" \u2014 its configuration did not validate"
+                            if new_env_structural else "")))
+
+    # The 50% case: fleets jumping from one version to another. Named the
+    # way operations talks about it -- environments and versions.
+    for _sig in sorted(rollup_by_sig or {}):
+        apps = [a for _rep, _mem, _r in rollup_by_sig[_sig] for a in _mem]
+        findings.append((_SEV_ROUTINE,
+                         f"\u2b06\ufe0f **{len(set(_envs_from_apps(apps)))} "
+                         f"environment(s) jumping** "
+                         f"{_routine_bump_label(_sig)}: "
+                         f"{_fmt_env_list(apps)}"))
+
+    changed = [a for a, r in results.items() if r.outcome == OUT_DIFF]
+    errored = [a for a, r in results.items() if r.outcome == OUT_ERROR]
+    unknown = [a for a, r in results.items() if r.outcome == OUT_INDETERMINATE]
+    if errored or unknown:
+        findings.append((_SEV_REVIEW,
+                         f"\u2754 **{len(errored) + len(unknown)} app(s) "
+                         f"could not be diffed** \u2014 the comment below "
+                         f"cannot prove they are safe"))
+    if not findings:
+        findings.append((
+            _SEV_ROUTINE,
+            (f"\u2705 {len(changed)} app(s) change, nothing risk-flagged"
+             if changed else
+             "\u2705 No manifest changes and no risky configuration change")))
+
+    sev = max(s for s, _ in findings)
+    n_check = sum(1 for s, _ in findings if s >= _SEV_REVIEW)
+    verdict = _VERDICTS[sev]
+    if sev >= _SEV_REVIEW:
+        verdict += f" ({n_check} item(s))"
+    order = {_SEV_BLOCK: 0, _SEV_REVIEW: 1, _SEV_ROUTINE: 2}
+    findings.sort(key=lambda f: order[f[0]])
+    return ["### \U0001f9ed Merge summary", "", verdict, ""] + \
+           [f"- {line}" for _s, line in findings] + [""]
 
 
 def _comment_header(pr_sha: str) -> str:
@@ -8182,7 +8840,9 @@ def _group_changed_apps_by_fingerprint(changed_apps: list) -> list:
 def format_comment(pr_sha, app_results, skipped_apps=None, base_sha="",
                     new_env_lines=None, new_env_structural=False, new_env_desc="",
                     decommission_lines=None, input_change_lines=None,
-                    appspace_state_lines=None, appendix_lines=None):
+                    appspace_state_lines=None, appendix_lines=None,
+                    vm_change_lines=None, artifact_url="",
+                    readable_budget=None):
     """Format the full PR comment. Never uses <details>/<summary> — Bitbucket
     does not render them. Large changesets get a compact summary table at the
     top (all apps, one row each) and, for the diff sections below, apps
@@ -8211,6 +8871,13 @@ def format_comment(pr_sha, app_results, skipped_apps=None, base_sha="",
     """
     skipped_apps  = skipped_apps or []
     results       = {app: _result(v) for app, v in app_results.items()}
+    # Readability budget for the BULK region only. None = use the module
+    # default; 0 (or any falsy value) = render everything. The persisted
+    # full-diff artifact is built with 0: the comment may fold bulk
+    # content away, but the view it links to must never be missing
+    # anything, or the link the comment offers is a dead end.
+    budget        = (COMMENT_READABLE_BYTES if readable_budget is None
+                     else readable_budget)
     any_change    = False
     any_error     = False
     any_unknown   = False
@@ -8236,6 +8903,29 @@ def format_comment(pr_sha, app_results, skipped_apps=None, base_sha="",
         for m in members:
             diff_group_for_app[m] = (rep_app, members, rep_r)
 
+    # Routine-bump rollup, layered ON TOP of the fingerprint grouping: the
+    # grouping collapses byte-identical diffs into one representative;
+    # this folds INPUT_ROLLUP_MIN_SERVICES or more equivalent-but-not-
+    # identical groups (per-environment names defeat the fingerprint — the
+    # PR #3891 shape: one appspace.version bump rendered as 473
+    # near-identical blocks) into ONE summary line per distinct
+    # transition. A single group, however many byte-identical members it
+    # has, keeps its full representative diff exactly as before. Risk
+    # always wins: any group whose diff is not provably version-only stays
+    # fully enumerated (_routine_bump_signature fails open).
+    rollup_by_sig, rolled_apps = {}, set()
+    _sig_buckets = {}
+    if budget:  # budget=0 renders everything: the artifact keeps every diff
+        for grp in diff_groups:
+            _sig = _routine_bump_signature(grp[2])
+            if _sig is not None:
+                _sig_buckets.setdefault(_sig, []).append(grp)
+    for _sig, _grps in _sig_buckets.items():
+        if len(_grps) >= INPUT_ROLLUP_MIN_SERVICES:
+            rollup_by_sig[_sig] = _grps
+            for _rep, _members, _r in _grps:
+                rolled_apps.update(_members)
+
     mode_label = "large" if is_large else "small"
     print(f"    [comment] mode={mode_label} | changed_apps={len(changed_apps)} | "
           f"diff_bytes={total_diff_bytes}")
@@ -8251,6 +8941,14 @@ def format_comment(pr_sha, app_results, skipped_apps=None, base_sha="",
         f"## \U0001f52d {STATUS_NAME}", "",
         f"{_comment_header(pr_sha)}{large_label}", "",
     ]
+
+    # ── Merge summary ────────────────────────────────────────────────
+    # The verdict, before any detail: an operator decides here whether
+    # this PR is safe to merge, and only then reads down for the why.
+    lines += _build_merge_summary(
+        results, rollup_by_sig, vm_change_lines, decommission_lines,
+        appspace_state_lines, new_env_lines, new_env_structural)
+    lines += ["---", ""]
 
     # ── Application state-flag warning (COPS-2584) ───────────────────
     # autosync pause/resume, decommission arm/disarm — shown before even the
@@ -8271,6 +8969,15 @@ def format_comment(pr_sha, app_results, skipped_apps=None, base_sha="",
     # downgrade warning.
     if decommission_lines:
         lines += decommission_lines
+
+    # ── VM infrastructure changes ─────────────────────────────────────
+    # Between the decommission warning (whole-environment destruction
+    # outranks a field change) and the downgrade shout: a botched VM
+    # change is the slowest thing on this platform to recover from, and
+    # the reviewers reading these comments daily asked for it to be
+    # impossible to miss.
+    if vm_change_lines:
+        lines += vm_change_lines
 
     # ── Chart downgrade warning (v2.5.8) ─────────────────────────────
     # A chart version going DOWN is legal but dangerous (schema regressions,
@@ -8386,21 +9093,51 @@ def format_comment(pr_sha, app_results, skipped_apps=None, base_sha="",
             for m in members:
                 group_label[m] = f"Group {idx}"
         no_change_count = 0
+        rows = []
         for app, r in sorted(results.items(), key=lambda kv: _app_sort_key(*kv)):
             if r.outcome == OUT_DIFF:
                 label = group_label.get(app, "\u2014")
-                lines.append(f"| `{app}` | \u26a0\ufe0f changed | {r.n_res} | {label} |")
+                rows.append(f"| `{app}` | \u26a0\ufe0f changed | {r.n_res} | {label} |")
             elif r.outcome == OUT_DECOMMISSIONED:
-                lines.append(f"| `{app}` | \U0001f5d1\ufe0f decommissioned | \u2014 | \u2014 |")
+                rows.append(f"| `{app}` | \U0001f5d1\ufe0f decommissioned | \u2014 | \u2014 |")
             elif r.outcome == OUT_INDETERMINATE:
-                lines.append(f"| `{app}` | \u2754 diff unavailable | \u2014 | \u2014 |")
+                rows.append(f"| `{app}` | \u2754 diff unavailable | \u2014 | \u2014 |")
             elif r.outcome == OUT_ERROR:
-                lines.append(f"| `{app}` | \u274c error | \u2014 | \u2014 |")
+                rows.append(f"| `{app}` | \u274c error | \u2014 | \u2014 |")
             else:
                 no_change_count += 1
+        # Row cap, applied only when the changeset is already past the
+        # readability budget: full per-environment transparency stays whole
+        # for anything a human might actually scan, but a 774-row table
+        # (observed live on acme-config-prod PR #3890) is pure scroll. The
+        # complete list always lives in the full-diff view.
+        if (budget and total_diff_bytes > budget
+                and len(rows) > _OVERVIEW_TABLE_MAX_ROWS):
+            hidden = len(rows) - _OVERVIEW_TABLE_MAX_ROWS
+            rows = rows[:_OVERVIEW_TABLE_MAX_ROWS]
+            rows.append(f"| *(+{hidden} more \u2014 see the full diff view)* "
+                        f"| | | |")
+        lines += rows
         if no_change_count:
             lines.append(f"| *(+{no_change_count} more)* | \u2705 no changes | \u2014 | \u2014 |")
         lines += [""]
+
+    # ── Routine version-bump rollups ──────────────────────────────────
+    # One line per distinct transition (see _routine_bump_signature). The
+    # folded apps stay in the overview table above and in every count;
+    # only their duplicate diff blocks disappear.
+    for _sig in sorted(rollup_by_sig):
+        _grps = rollup_by_sig[_sig]
+        _apps_all = sorted(a for _g, _mem, _r in _grps for a in _mem)
+        _where = (f" \u2014 full diffs in the [full diff view]({artifact_url})"
+                  if artifact_url else
+                  " \u2014 see ArgoCD or the diff-preview full-diff view")
+        lines += [
+            f"> \u2b06\ufe0f **Routine version bump** {_routine_bump_label(_sig)} "
+            f"\u2014 **{len(set(_envs_from_apps(_apps_all)))} environments**: "
+            f"{_fmt_env_list(_apps_all)}{_where}",
+            "",
+        ]
 
     # ── Per-app diff sections ─────────────────────────────────────────
     # COPS-2579: no more arbitrary top-N inline cutoff. Every distinct
@@ -8408,6 +9145,15 @@ def format_comment(pr_sha, app_results, skipped_apps=None, base_sha="",
     # apps are visited in sorted order (_app_sort_key) and any OUT_DIFF app
     # that is not its group's representative is skipped here -- it was
     # already accounted for when the representative rendered.
+    #
+    # Bulk-region readability budget: everything ABOVE this point (panels,
+    # table, rollups) always renders in full. From here on, an ordinary
+    # group's diff block only renders while the running body size is under
+    # COMMENT_READABLE_BYTES; the remainder collapses into one pointer at
+    # the full-diff view after the loop. Risk-flagged groups (deletions,
+    # zeroed replicas, VM changes, downgrades) are exempt and render in
+    # full wherever they sort — never silently fold a dangerous change.
+    collapsed_apps = []
 
     for app, r in sorted(results.items(), key=lambda kv: _app_sort_key(*kv)):
         if r.outcome == OUT_ERROR:
@@ -8475,6 +9221,19 @@ def format_comment(pr_sha, app_results, skipped_apps=None, base_sha="",
                 continue
             any_change = True
             total_changed += rep_r.n_res * len(members)
+            if app in rolled_apps:
+                # Folded into a routine-bump rollup line above: counted in
+                # every total and listed in the table, its duplicate diff
+                # block omitted.
+                continue
+            _risky = bool(rep_r.deleted_resources or rep_r.replicas_zeroed
+                          or getattr(rep_r, "vm_changes", None)
+                          or (rep_r.version_change
+                              and _is_version_downgrade(*rep_r.version_change)))
+            if budget and not _risky and sum(
+                    len(l.encode("utf-8")) + 1 for l in lines) > budget:
+                collapsed_apps.extend(members)
+                continue
             if len(members) > 1:
                 # COPS-2579: name every environment this exact change
                 # applies to, right above its one full diff, instead of
@@ -8497,6 +9256,23 @@ def format_comment(pr_sha, app_results, skipped_apps=None, base_sha="",
 
         else:
             lines += [f"\u2705 **`{app}`** \u2014 no manifest changes", ""]
+
+    # ── Readability-budget pointer ────────────────────────────────────
+    # One line accounting for every ordinary diff block the budget above
+    # folded away. Every collapsed app is still in the overview table and
+    # in the footer count; nothing risk-flagged can ever land here.
+    if collapsed_apps:
+        _link = (f"[full diff view]({artifact_url})" if artifact_url
+                 else "the diff-preview full-diff view (build-status link) "
+                      "or ArgoCD")
+        lines += [
+            f"> \u2702\ufe0f **{len(collapsed_apps)} more changed app(s) "
+            f"omitted here to keep this comment scannable.** Every omitted "
+            f"diff is ordinary (no deletions, downgrades, zeroed replicas "
+            f"or VM changes) \u2014 read them in full in the {_link}. "
+            f"Omitted: {_fmt_service_list(sorted(collapsed_apps), shown=10)}",
+            "",
+        ]
 
     # ── Skipped apps note ────────────────────────────────────────────
     if skipped_apps:
@@ -8523,7 +9299,27 @@ def format_comment(pr_sha, app_results, skipped_apps=None, base_sha="",
     # keeps the head of the body, so anything above (summaries, existing-app
     # diffs) survives at the appendix's expense — never the other way round.
     if appendix_lines:
-        lines += ["---"] + appendix_lines
+        # The audit appendix is the complete rendered manifest of everything
+        # being deleted or created -- hundreds of lines of raw nginx config
+        # and YAML. Dumping it into the comment is what made decommission
+        # PRs unreadable (seen live on PR #3894, where the comment scrolled
+        # through the whole nginx upstream block). It belongs on the
+        # full-diff page, which is rendered with budget=0 and keeps it in
+        # full; the comment gets a pointer instead.
+        if budget:
+            _n = sum(1 for l in appendix_lines if l.startswith("### "))
+            _link = (f"[full diff view]({artifact_url})" if artifact_url
+                     else "the diff-preview full-diff view (build-status link)")
+            lines += [
+                "---", "",
+                f"\U0001f4c4 **Full rendered output** ({_n or 1} section(s), "
+                f"complete redacted manifests of every affected resource) is "
+                f"kept out of this comment to keep it readable \u2014 read it "
+                f"in {_link}.",
+                "",
+            ]
+        else:
+            lines += ["---"] + appendix_lines
 
     # ── Footer ───────────────────────────────────────────────────────
     unknown_note = ""
@@ -8578,7 +9374,18 @@ def format_comment(pr_sha, app_results, skipped_apps=None, base_sha="",
         f"**Status:** {status}",
         f"*{_ts()} \u2014 {COMMENT_MARKER} [{_status_token}]" + (f" [base:{base_sha[:8]}]" if base_sha else "") + "*",
     ]
-    return "\n".join(lines)
+    # Collapse repeated horizontal rules. Panels are assembled
+    # independently and several of them own a trailing separator, so a PR
+    # that skips the panels in between would otherwise render "---" twice
+    # in a row, which markdown shows as an empty band.
+    deduped = []
+    for ln in lines:
+        if ln == "---":
+            prev = next((p for p in reversed(deduped) if p.strip()), None)
+            if prev == "---":
+                continue
+        deduped.append(ln)
+    return "\n".join(deduped)
 
 # ── Per-PR processing (isolated) ──────────────────────────────────────
 def process_pr(pr, path_map, base_sha="", repo=None):
@@ -9268,24 +10075,60 @@ def process_pr(pr, path_map, base_sha="", repo=None):
         except Exception as e:  # state-flag panel must never break the comment
             log(f"    [comment] appspace-state panel failed: {e}", "WARNING")
             appspace_state_lines = []
-        body = format_comment(pr_sha, app_results, skipped_apps, base_sha=base_sha,
-                               new_env_lines=new_env_lines or None,
-                               new_env_structural=bool(structural_envs
-                                                        or moves_missing_cohort),
-                               new_env_desc=new_env_desc,
-                               decommission_lines=decommission_lines or None,
-                               input_change_lines=input_change_lines or None,
-                               appspace_state_lines=appspace_state_lines or None,
-                               appendix_lines=((decom_full_lines or []) + (new_env_full_lines or [])) or None)
+        try:
+            vm_change_lines = _summarize_vm_changes(
+                changed, pr_sha, base_sha, path_map, app_results, repo=repo)
+        except Exception as e:  # VM panel must never break the comment
+            log(f"    [comment] vm-changes panel failed: {e}", "WARNING")
+            vm_change_lines = []
+        # Direct permalink into the full-diff view for this exact commit.
+        # Only built when the view is reachable from outside the cluster
+        # (base URL set), so the comment never links to something a
+        # reviewer cannot open. The artifact itself is saved below, before
+        # upsert, so the link never 404s once the comment is visible.
+        artifact_url = (diff_ui.ui_url(DIFF_UI_BASE_URL, repo or BB_REPO,
+                                       pr_id, pr_sha)
+                        if (DIFF_UI_ENABLED and DIFF_UI_BASE_URL) else "")
+        _comment_kwargs = dict(
+            skipped_apps=skipped_apps, base_sha=base_sha,
+            new_env_lines=new_env_lines or None,
+            new_env_structural=bool(structural_envs or moves_missing_cohort),
+            new_env_desc=new_env_desc,
+            decommission_lines=decommission_lines or None,
+            input_change_lines=input_change_lines or None,
+            appspace_state_lines=appspace_state_lines or None,
+            appendix_lines=((decom_full_lines or [])
+                            + (new_env_full_lines or [])) or None,
+            vm_change_lines=vm_change_lines or None)
+        body = format_comment(pr_sha, app_results,
+                              artifact_url=artifact_url, **_comment_kwargs)
         comment_kb = round(len(body.encode()) / 1024, 1)
-        # Full-diff UI: persist the full body BEFORE upsert (which truncates over
-        # MAX_COMMENT_BYTES) so the web UI serves the complete diff, with the
-        # same per-PR context (base commit, outcome breakdown, app count)
-        # already computed above for the log line.
-        _save_diff_ui_artifact(repo, pr_id, pr_sha, body, base_sha=base_sha,
+        # Full-diff UI: persist the COMPLETE body BEFORE upsert (which
+        # truncates over MAX_COMMENT_BYTES), with the same per-PR context
+        # (base commit, outcome breakdown, app count) already computed
+        # above for the log line. readable_budget=0 disables the comment's
+        # bulk folding (rollups, collapsed apps, table row cap) for this
+        # render only: the comment above may point at this view, so it has
+        # to actually hold everything the comment left out.
+        # The full-diff view must be complete: every changed file key by key
+        # (no 8-file cap, no line budget), every app's diff and the full
+        # rendered-output appendix (readable_budget=0 disables rollups,
+        # collapsing, the table row cap and the appendix pointer). The
+        # comment points here, so this page has to hold everything the
+        # comment left out -- always, not only when a flag happens to be on.
+        _full_kwargs = dict(_comment_kwargs)
+        try:
+            _full_kwargs["input_change_lines"] = _summarize_input_changes(
+                changed, pr_sha, base_sha, repo=repo, full=True) or None
+        except Exception as e:
+            log(f"    [comment] full input panel failed: {e}", "WARNING")
+        full_body = format_comment(pr_sha, app_results,
+                                   readable_budget=0, **_full_kwargs)
+        _save_diff_ui_artifact(repo, pr_id, pr_sha, full_body, base_sha=base_sha,
                                outcome_counts=dict(outcome_counts),
                                app_count=len(app_results))
-        upsert_comment(pr_id, body, existing_id, repo=repo)
+        upsert_comment(pr_id, body, existing_id, repo=repo,
+                       artifact_url=artifact_url)
         action = "updated" if existing_id else "posted"
         print(f"    Comment {action} on PR #{pr_id} ({comment_kb}KB)")
 

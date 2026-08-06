@@ -2,7 +2,14 @@
 
 **Commit** `abc12345` → `main` | `acme-config-prod`
 
+### 🧭 Merge summary
+
+⚠️ **Review before merging** (1 item(s))
+
+- 🆕 **New environment** in this PR — its configuration did not validate
+
 ---
+
 
 ✅ **`pv-acme-a-ms`** — no manifest changes
 

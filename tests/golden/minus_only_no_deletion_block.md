@@ -2,7 +2,14 @@
 
 **Commit** `abc12345` → `main` | `acme-config-prod`
 
+### 🧭 Merge summary
+
+✅ **Routine** — nothing dangerous detected
+
+- ✅ 1 app(s) change, nothing risk-flagged
+
 ---
+
 
 ⚠️ **`pv-acme-a-ms`** — 6 resource(s) changed
 

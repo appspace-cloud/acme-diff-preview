@@ -139,9 +139,13 @@ def test_evaluate_new_envs_appendix_empty_when_render_fails(monkeypatch):
 # ── format_comment: appendix placement ──────────────────────────────────────
 
 def test_format_comment_places_appendix_after_new_env_and_before_footer():
+    # readable_budget=0 = the full-diff render. The comment itself now
+    # replaces the appendix with a one-line pointer: dumping hundreds of
+    # lines of rendered manifest inline is what made decommission comments
+    # unreadable (acme-config-prod PR #3894). Placement still matters here.
     body = m.format_comment(
         "c" * 12, {}, new_env_lines=["NEWENV_SENTINEL"],
-        appendix_lines=["APPENDIX_SENTINEL"])
+        appendix_lines=["APPENDIX_SENTINEL"], readable_budget=0)
     i_env = body.index("NEWENV_SENTINEL")
     i_app = body.index("APPENDIX_SENTINEL")
     i_foot = body.index("**Status:**")
@@ -151,7 +155,7 @@ def test_format_comment_places_appendix_after_new_env_and_before_footer():
 def test_truncation_keeps_footer_with_giant_appendix():
     giant = ["```yaml"] + [f"kind: ConfigMap  # line {i}" for i in range(20000)] + ["```"]
     body = m.format_comment("c" * 12, {}, new_env_lines=["NEWENV_SENTINEL"],
-                            appendix_lines=giant)
+                            appendix_lines=giant, readable_budget=0)
     assert len(body.encode()) > m.MAX_COMMENT_BYTES
     cut = m._truncate_comment(body)
     assert len(cut.encode()) <= m.MAX_COMMENT_BYTES

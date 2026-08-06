@@ -2,7 +2,14 @@
 
 **Commit** `abc12345` → `main` | `acme-config-prod`
 
+### 🧭 Merge summary
+
+⚠️ **Review before merging** (1 item(s))
+
+- ❔ **1 app(s) could not be diffed** — the comment below cannot prove they are safe
+
 ---
+
 
 ❌ **`pv-glencore-c-ms`** — ⚙️ **SCHEMA VALIDATION FAILED — this environment's values violate the chart's schema**
 > at '/appspace/microservices/definitions/svc-00': got null, want object

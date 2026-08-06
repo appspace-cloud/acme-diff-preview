@@ -44,7 +44,13 @@ def _make_shared_change_body(n_apps=200, n_resources=67):
             None, None, None, fp)
         for i in range(n_apps)
     }
-    return m.format_comment("a" * 40, results, base_sha="b" * 40)
+    # readable_budget=0 is exactly how process_pr renders the body it
+    # persists: the comment may fold bulk content away to stay scannable,
+    # but the artifact this test inspects is the view the comment LINKS to,
+    # so it is built complete. A collapsed artifact would make that link a
+    # dead end -- which is the regression this assertion now also guards.
+    return m.format_comment("a" * 40, results, base_sha="b" * 40,
+                            readable_budget=0)
 
 
 def test_diff_ui_artifact_contains_the_full_diff_for_every_app(monkeypatch):

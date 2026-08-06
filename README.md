@@ -44,12 +44,16 @@ and QA apps when CI publishes a new chart, so they pick it up past the OCI cache
 | ✅ no manifest changes | Rendered output is byte-identical. Safe. |
 | ⚠️ N resource(s) will change | Normal diff. Review it. |
 | ❔ diff unavailable | **Not** the same as "no changes". Something failed and the app was NOT evaluated. |
+| 🧭 Merge summary | **Always present, always first.** One verdict — ⛔ do not merge / ⚠️ review / ✅ routine — followed by one line per finding: decommissions, deletions, dangerous VM changes, downgrades, zeroed replicas, auto-sync toggles, new environments and the environments jumping version. It is built from the same deterministic facts as the panels below, so it can never disagree with the detail. |
 | 🗑️ RESOURCE(S) DELETED | Resources disappear from the rendered output entirely, with **no replacement in this PR**. Sensitive kinds are always listed in full and never truncated away. |
 | 🔄 resource(s) RENAMED | Deleted and recreated under a new name in the same PR, so nothing is lost. Typically a name carrying a content hash, or a resource moving to a new identity. These are deliberately kept **out** of the deletion count. |
-| 🗑️ ENVIRONMENT DECOMMISSION | A whole environment is being removed. Read the block: by default its workloads are **orphaned, not deleted**. When the deletion is properly phased (cascade armed beforehand per `acme-components` `documentation/delete.md`), a **📄 Full rendered output — everything that will be DELETED** appendix follows with the complete, redacted manifests the cascade removes — inline up to the comment limit, untruncated on the full-diff page for audit. |
-| 🆕 New Environment(s) Detected | A brand-new environment is added. The provisioning summary (chart version, resource counts, applications) comes first; a **📄 Full rendered output** appendix with the complete, redacted manifest follows — the comment inlines as much as fits under Bitbucket's size limit, and the untruncated output is kept on the full-diff page behind the build status link. |
+| 🗑️ ENVIRONMENT DECOMMISSION | A whole environment is being removed. Read the block: by default its workloads are **orphaned, not deleted**. When the deletion is properly phased (cascade armed beforehand per `acme-components` `documentation/delete.md`), the complete redacted manifests the cascade removes are kept on the **full-diff page** for audit; the comment links to them instead of inlining hundreds of lines of rendered YAML. |
+| 🆕 New Environment(s) Detected | A brand-new environment is added. The provisioning summary (chart version, resource counts, applications) comes first; the complete redacted manifest is kept on the **full-diff page** behind the build-status link; the comment links to it rather than inlining it. |
 | ⏸️/▶️ Auto-sync PAUSED/RESUMED | `appspace.autosync` was toggled. Shown even when it is the ONLY change — no rendered manifest is touched, so the resource diff has nothing to say. |
 | 🔒 DECOMMISSION ARMED / 🔓 DISARMED | `appspace.decommission` (and `decommissionPurgeData`) was toggled on a LIVE environment. Different from the block above: nothing is deleted yet, this is the flag that decides what happens the day the folder actually goes. |
+| 🖥️ VM infrastructure | **Always present**, in a fixed place, so "did this PR touch VMs?" is answerable without reading anything else: `🖥️🚨 VM INFRASTRUCTURE CHANGES` when something dangerous is found, `🖥️ (routine)` for harmless changes, and an explicit `no changes` line when the domain is untouched. Covers KCC linux-services (`ComputeInstance`, `ComputeDisk`, `ComputeAddress`, snapshot-policy attachments); instance-type and disk-type changes are always highlighted, since both mean destroy-and-recreate. |
+| ⬆️ Routine version bump | Several environments taking the same version-only change, folded into one line naming the transition and every environment it covers. Only ever applied to changes that are provably version-only. |
+| ✂️ N more changed app(s) omitted | The readability budget folded ordinary diff blocks away. Nothing risk-flagged is ever folded; the link goes to the full-diff page, which always holds everything. |
 
 The one rule the tool never breaks: **a failure is never reported as "no changes".**
 If a diff could not be computed, the status says so and the PR is not marked clean.
@@ -73,6 +77,37 @@ applies to, instead of a separate, arbitrarily-truncated copy per app.
 Deletions and replica zeroings get a reserved share of the display order, so
 the resources the shouty blocks name are the ones you actually see first.
 Details in [docs/internals.md](docs/internals.md#which-resources-make-it-into-the-comment-body).
+
+**VM infrastructure changes.** GCP virtual machines (the KCC linux-services
+resources rendered from `appspace.infra.deployLinuxServicesK8s`) are the
+slowest thing on the platform to recover from when a change goes wrong, so
+they get a dedicated panel right after the decommission warning, ranked by
+severity. Flagged as dangerous: a deletion-policy moving to `delete` or
+`deletionProtection` turning off (the next cascade can then really destroy
+the VM in GCP), a `machineType` change without parking the VM
+(`desiredStatus: TERMINATED`) first, a zone or disk-type change (both
+immutable — destroy and recreate), a disk **shrink**, and a VM or
+snapshot-policy attachment disappearing from the render. Disk growth, status
+transitions and brand-new resources are reported quietly as routine.
+
+Detection runs at **two levels**, because either one alone misses real cases:
+the rendered manifests, and the value files themselves. The values level is
+what catches a VM change on an environment where the templates do not render
+at all — arming `allowDeletion` on an Azure environment produces no manifest
+diff whatsoever, and used to show up as a plain green "no manifest changes".
+
+**Scannability budget.** A comment that scrolls for 200KB is not read. Beyond
+`COMMENT_READABLE_BYTES` of bulk diff content, ordinary per-app diff blocks
+collapse into a single line pointing at the full-diff page, the overview
+table caps its rows, and environments taking the same **provably version-only**
+change fold into one `⬆️ Routine version bump` line naming the transition
+and every environment it covers. Three invariants hold regardless of size:
+every panel above the diffs always renders in full, anything risk-flagged
+(deletions, downgrades, zeroed replicas, VM changes) is never folded, and the
+full-diff page linked from the comment is always rendered with folding
+disabled, so it holds everything the comment left out.
+
+**The full-diff page is the complete record.** It is rendered separately from the comment with every budget disabled: no rollups, no collapsed apps, no table row cap, and the configuration panel uncapped so every changed file is listed key by key, file by file. The comment is the summary; this page is the evidence.
 
 ## How the diff works
 
@@ -136,6 +171,7 @@ full-diff web UI.
 | `HELM_CACHE_MAX_CHARTS` | — | `60` | Max pulled chart versions kept on disk |
 | `AI_MAX_APPS` | — | `40` | Max changed apps included in the AI summary prompt |
 | `FULL_SECTIONS_MAX_PER_APP` | — | `400` | Max changed resources stored per app for the comment, the diff-group fingerprint and the full-diff web UI page (memory-bounded, not an arbitrary display cutoff) |
+| `COMMENT_READABLE_BYTES` | — | `30000` | Readability budget for the **bulk** region of a comment. Past it, ordinary diff blocks fold into a pointer at the full-diff page and the overview table caps its rows. Panels and risk-flagged apps are never affected, and the full-diff page itself is always rendered with folding off. `0` disables folding entirely |
 | `DIFF_OCI_SELFCHECK_INTERVAL` | — | `900` | Seconds between periodic OCI self-checks (`helm show chart` against a known-good ref). First check ~60s after start; `0` disables. Result in `/diff-preview/stats` as `oci_selfcheck` |
 | `DIFF_OCI_SELFCHECK_REF` | — | *(last successful pull)* | Optional fixed reference `registry/chart:version` for the self-check |
 | `DIFF_OCI_FAIL_ERROR_THRESHOLD` | — | `3` | Consecutive systemic chart-pull failures after which failures log at ERROR instead of WARNING |

@@ -2,7 +2,14 @@
 
 **Commit** `abc12345` → `main` | `acme-config-prod`
 
+### 🧭 Merge summary
+
+✅ **Routine** — nothing dangerous detected
+
+- ✅ No manifest changes and no risky configuration change
+
 ---
+
 
 ✅ **`pv-acme-a-glb`** — no manifest changes
 

@@ -2,6 +2,14 @@
 
 **Commit** `abc12345` → `main` | `acme-config-prod`
 
+### 🧭 Merge summary
+
+⛔ **DO NOT MERGE** without checking the item(s) below (1 item(s))
+
+- ❌ **1 resource(s) deleted** in 1 app(s): pv-acme-a
+
+---
+
 ## 🗑️⚠️ 1 RESOURCE(S) DELETED ⚠️
 
 **This PR removes the following resources entirely. Verify each deletion is intentional — 🔐-flagged kinds can revoke access or destroy credentials/data.**
