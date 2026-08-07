@@ -5093,6 +5093,12 @@ _VM_DELETION_POLICY_KEY = "cnrm.cloud.google.com/deletion-policy"
 _VM_TRACKED_FIELDS = {
     "ComputeInstance": ("machineType", "zone", "desiredStatus",
                         "deletionProtection", "size", "type",
+                        # deviceName lives inside attachedDisk[], but the
+                        # body is parsed line by line, so the nesting does
+                        # not matter here. Tracked because a mismatch makes
+                        # KCC rename the attachment by detaching and
+                        # reattaching a live disk (COPS-2592).
+                        "deviceName",
                         _VM_DELETION_POLICY_KEY),
     "ComputeDisk": ("size", "type", "location", _VM_DELETION_POLICY_KEY),
     "ComputeAddress": ("address", _VM_DELETION_POLICY_KEY),
@@ -5145,6 +5151,7 @@ def _detect_vm_changes(sections: list) -> list:
             continue
         tracked = _VM_TRACKED_FIELDS[kind]
         minus_vals, plus_vals = {}, {}
+        untracked_keys = set()
         minus_n = plus_n = context_n = 0
         context_terminated = False
         for line in body.splitlines():
@@ -5168,6 +5175,18 @@ def _detect_vm_changes(sections: list) -> list:
             key, _, val = content.partition(":")
             key = key.strip()
             if key not in tracked:
+                # COPS-2618: a closed tracked-field list means anything
+                # outside it was dropped in silence, so a section that
+                # genuinely changed could still leave the panel with
+                # nothing to say and the caller would render
+                # "VM infrastructure - no changes". That is what happened
+                # on acme-config-prod #3923, where three objects each
+                # gained five taxonomy labels and the panel denied it.
+                # Remembering the untracked keys keeps the panel honest by
+                # construction, for fields nobody has thought of yet as
+                # much as for labels.
+                if key and not key.startswith("-") and " " not in key:
+                    untracked_keys.add(key)
                 continue
             val = _vm_unquote(val)
             if key == "type" and not _VM_DISK_TYPE_RE.match(val):
@@ -5216,6 +5235,25 @@ def _detect_vm_changes(sections: list) -> list:
                     dangerous.append("machineType changes while the VM is "
                                      "not parked TERMINATED — the runbook "
                                      "requires stopping the VM first")
+            if "deviceName" in byk:
+                o, n = byk["deviceName"]
+                if o and n:
+                    dangerous.append(
+                        "attachedDisk `deviceName` changes `%s` → `%s` — KCC "
+                        "renames an attachment by DETACHING and reattaching "
+                        "the disk; on a RUNNING VM that happens under a "
+                        "mounted filesystem" % (o, n))
+                else:
+                    # Pin added or removed. The chart omits deviceName when
+                    # adopting, so the attachment name simply stops being
+                    # managed; nothing is detached. Visible, not alarming —
+                    # flagging it would block every adoption PR, which is
+                    # what COPS-2608 just stopped doing.
+                    notes.append(
+                        "attachedDisk `deviceName` %s (`%s`) — the attachment "
+                        "name stops or starts being managed; no disk "
+                        "operation follows from this alone"
+                        % ("removed" if o else "added", o or n))
             if "zone" in byk:
                 dangerous.append("zone is immutable — changing it means "
                                  "destroy-and-recreate")
@@ -5235,6 +5273,18 @@ def _detect_vm_changes(sections: list) -> list:
                     # the shrink check is skipped on purpose. The field is
                     # still reported above as an ordinary changed field.
                     continue
+        # COPS-2618: a change the tracked list cannot describe is still a
+        # change. Naming the keys keeps the line actionable -- a reviewer can
+        # tell a taxonomy-label rollout from something worth opening the diff
+        # for -- and guarantees the caller never renders "no changes" over a
+        # section that visibly moved.
+        if untracked_keys and not deleted and not created:
+            shown = sorted(untracked_keys)
+            notes.append(
+                "other field(s) changed, not individually tracked by this "
+                "panel: %s%s" % (", ".join("`%s`" % k for k in shown[:8]),
+                                 "" if len(shown) <= 8
+                                 else " and %d more" % (len(shown) - 8)))
         facts.append({"header": header, "kind": kind,
                       "name": _section_name(header), "fields": fields,
                       "created": created, "deleted": deleted,
