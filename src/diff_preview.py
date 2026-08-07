@@ -6288,12 +6288,16 @@ def _decommission_fully_phased(identity_file: str, main_sha: str) -> bool:
     acme-components documentation/delete.md (checked against the current
     default branch, automation-dev/2603.2.0):
 
-      phase 2 first — `appspace.decommission: true` live at base, so the
+      phase 2 — `appspace.decommission: true` live at base, so the
         cascade actually runs when the folder goes;
       phase 1 as applicable — when the identity file itself declares
         `appspace.infra.deployLinuxServicesK8s`, the VM deletion must be
         armed too (`defaults.allowDeletion: true`), or the real VM, disk
         and IP survive the cascade under the KCC/ASO abandon policy.
+
+    This numbering is the canonical one and is what the rendered phase
+    table uses (_decommission_phase_table). Phase 3 is the folder removal
+    this function is judging.
 
     VMs declared only at cohort level are invisible here on purpose: this
     reads the same single file the cascade decision reads, and fails
@@ -6354,6 +6358,19 @@ def _evaluate_env_decommissions(candidates: list, pr_sha: str, main_sha: str,
         # the full deleted manifests are collected for the audit appendix.
         cascade = _decommission_cascades(c["identity_file"], main_sha)
         purges_data = _decommission_purges_data(c["identity_file"], main_sha)
+        # COPS-2616: the phase table needs the VM-arming state too. Same
+        # single base-side file the cascade decision reads, and fails CLOSED
+        # the same way, so an unreadable identity file renders Phase 1 as
+        # pending rather than silently claiming it is done.
+        vm_armed, declares_vms = False, False
+        _vm_content, _vm_status = _bb_fetch_cached(c["identity_file"], main_sha)
+        if _vm_status == BB_OK and _vm_content:
+            try:
+                _vm_flat = _flatten_yaml(yaml.safe_load(_vm_content) or {})
+                vm_armed = _vm_deletion_armed_flat(_vm_flat)
+                declares_vms = _declares_vms_flat(_vm_flat)
+            except Exception:
+                pass
         collect_full = (with_full_output and cascade
                         and _decommission_fully_phased(c["identity_file"], main_sha))
         app_deleted_docs: dict = {}
@@ -6400,6 +6417,18 @@ def _evaluate_env_decommissions(candidates: list, pr_sha: str, main_sha: str,
             f"**`{c['env_name']}` is being deleted by this PR "
             f"(was running chart version `{', '.join(versions) or 'unknown'}`). "
             f"This is a destructive, hard-to-reverse change — verify this is intentional.**",
+            "",
+        ] + _decommission_phase_table(
+            # Position before volume: the reviewer sees where this PR sits in
+            # the sequence before scrolling the inventory. A Phase 2 row that
+            # is not done is also why the orphaning warning below fires
+            # (COPS-2616).
+            vm_state=(_PH_DONE if vm_armed else None),
+            cascade_state=(_PH_DONE if cascade else None),
+            removal_state=_PH_THIS_PR,
+            declares_vms=declares_vms,
+            purge=purges_data,
+        ) + [
             "",
         ]
         if not cascade:
@@ -8650,6 +8679,89 @@ def _purge_armed_flat(flat: dict) -> bool:
             and str(flat.get("appspace.decommissionPurgeData", "")).lower() == "true")
 
 
+def _vm_deletion_armed_flat(flat: dict) -> bool:
+    """Phase 1 state: the real VM, disk and IP are only deleted by the
+    cascade when allowDeletion is armed. Same key _decommission_fully_phased
+    reads, applied to an already flattened dict."""
+    val = flat.get("appspace.infra.deployLinuxServicesK8s.defaults.allowDeletion")
+    return str(val).strip().lower() == "true"
+
+
+def _declares_vms_flat(flat: dict) -> bool:
+    """Whether the environment declares linux service VMs at all. Same test
+    _decommission_fully_phased applies, and the reason delete.md says to skip
+    Phase 1 when there are none."""
+    return any(k.startswith("appspace.infra.deployLinuxServicesK8s")
+               for k in flat)
+
+
+# Phase numbering is canonical per acme-components documentation/delete.md
+# and the _decommission_fully_phased docstring, which agree: arming the VM
+# deletion is Phase 1, arming the cascade (optionally purging data) is
+# Phase 2, removing the folder is Phase 3. The rendered panel used to call
+# arming the cascade "Phase 1", contradicting both, and a reviewer reading
+# the comment and the runbook side by side got two different models
+# (COPS-2616).
+_PH_DONE = "\u2705 **done**"
+_PH_THIS_PR = "\u2705 **this PR**"
+_PH_PENDING = "\u2b1c pending"
+_PH_NA = "\u2014 not applicable"
+
+
+def _decommission_phase_table(vm_state, cascade_state, removal_state,
+                              declares_vms: bool, purge: bool = False) -> list:
+    """The one phase table, rendered identically by all three decommission
+    panels. Each *_state is one of the _PH_* constants, or None to fall back
+    to pending.
+
+    Callers pass the states they already have in scope; nothing is fetched
+    here. Phase 1 is always rendered so the model stays complete, but reads
+    "not applicable" when the environment declares no VMs -- delete.md says
+    to skip the step, not to hide that the step exists, and a table that
+    silently started at Phase 2 would just make the reader wonder what they
+    were missing.
+    """
+    purge_note = (" \u2014 with `decommissionPurgeData` armed the cascade will "
+                  "**permanently destroy** the BigQuery dataset and the user "
+                  "content bucket, not just abandon them"
+                  if purge else
+                  " \u2014 `decommissionPurgeData` is not armed, so the "
+                  "BigQuery dataset and the content bucket are abandoned and "
+                  "stay recoverable")
+    # The pointer to the inventory only makes sense while Phase 3 is still
+    # ahead of the reviewer; on the removal PR itself they are already
+    # looking at that inventory.
+    removal_note = ("deletes the Applications and every resource they manage, "
+                    "Config Connector cloud resources included \u2014 the "
+                    "destructive step, and this PR is it"
+                    if removal_state == _PH_THIS_PR else
+                    "a later PR deletes the Applications and every resource "
+                    "they manage, Config Connector cloud resources included; "
+                    "that PR gets its own full inventory panel")
+    rows = ["| Phase | State | What it does |",
+            "|-------|-------|--------------|"]
+    if declares_vms:
+        vm_note = ("`deployLinuxServicesK8s.defaults.allowDeletion` lets the "
+                   "cascade delete the real VM, its data disk and its reserved "
+                   "IP; without it they survive under the abandon policy")
+        rows.append(
+            f"| **Phase 1 \u2014 arm VM deletion** | {vm_state or _PH_PENDING} | "
+            f"{vm_note} |")
+    else:
+        rows.append(
+            f"| **Phase 1 \u2014 arm VM deletion** | {_PH_NA} | this environment "
+            "declares no `deployLinuxServicesK8s` VMs, so there is nothing to "
+            "arm |")
+    rows.append(
+        f"| **Phase 2 \u2014 arm cascade** | {cascade_state or _PH_PENDING} | "
+        "`appspace.decommission` makes the Applications eligible for the "
+        f"cascade-delete finalizer{purge_note} |")
+    rows.append(
+        f"| **Phase 3 \u2014 remove folder** | {removal_state or _PH_PENDING} | "
+        f"{removal_note} |")
+    return rows
+
+
 def _summarize_appspace_state_changes(changed_files, pr_sha, base_sha, path_map, repo=None) -> list:
     """Markdown block calling out changes to Application-level state flags
     read from a LIVE environment's own customer.yaml/config.yaml:
@@ -8737,17 +8849,11 @@ def _summarize_appspace_state_changes(changed_files, pr_sha, base_sha, path_map,
         was_armed, is_armed = _decommission_armed_flat(old_flat), _decommission_armed_flat(new_flat)
         was_purge, is_purge = _purge_armed_flat(old_flat), _purge_armed_flat(new_flat)
         if not was_armed and is_armed:
-            # Phase 2's state is known from the environment's own config, so
-            # the panel states it instead of asking the reviewer to go and
-            # check anything. Rendered as a table: the previous version was
-            # four dense prose paragraphs plus a kubectl command, and the
-            # phase list had no blank line before it, so markdown inlined
-            # the bullets into the paragraph (seen live on PR #3893).
-            purge_state = ("\U0001f6a8 **armed** \u2014 the cascade will "
-                           "permanently destroy this data"
-                           if is_purge else
-                           "\u2b1c not armed \u2014 data is abandoned, "
-                           "recoverable")
+            # The phase table is shared with the arm-purge and folder-removal
+            # panels (_decommission_phase_table), so a reviewer sees the same
+            # three rows on every PR of the sequence with only the marks
+            # moving. Numbering follows delete.md, not the old panel-local
+            # numbering (COPS-2616).
             lines += [
                 f"## \U0001f512\u26a0\ufe0f DECOMMISSION ARMED for `{env_name}` \u26a0\ufe0f\U0001f512",
                 "",
@@ -8756,17 +8862,13 @@ def _summarize_appspace_state_changes(changed_files, pr_sha, base_sha, path_map,
                 f"cascade-delete finalizer, which only acts when this "
                 f"environment's folder is removed in a later PR.",
                 "",
-                "| Phase | State | What it does |",
-                "|-------|-------|--------------|",
-                "| **Phase 1 \u2014 arm cascade** | \u2705 **this PR** | the "
-                "Applications become eligible for cascade deletion |",
-                f"| **Phase 2 \u2014 arm data purge** | {purge_state} | "
-                "`appspace.decommissionPurgeData` approves destroying the "
-                "BigQuery dataset and the user content bucket |",
-                "| **Phase 3 \u2014 remove folder** | \u2b1c pending | a later "
-                "PR deletes the Applications and every resource they manage, "
-                "Config Connector cloud resources included; that PR gets its "
-                "own full inventory panel |",
+            ] + _decommission_phase_table(
+                vm_state=(_PH_DONE if _vm_deletion_armed_flat(new_flat) else None),
+                cascade_state=_PH_THIS_PR,
+                removal_state=None,
+                declares_vms=_declares_vms_flat(new_flat),
+                purge=is_purge,
+            ) + [
                 "",
                 f"**Nothing changes for `{env_name}` until Phase 3:** every "
                 f"workload keeps running, disks stay held, costs keep accruing "
@@ -8794,6 +8896,17 @@ def _summarize_appspace_state_changes(changed_files, pr_sha, base_sha, path_map,
                 f"environment already armed for decommission.** {app_list} will " +
                 f"now permanently destroy the BigQuery dataset and the user " +
                 f"content bucket when the cascade runs, not just abandon them.",
+                "",
+            ] + _decommission_phase_table(
+                # The cascade is already armed at base -- that is this
+                # branch's own condition -- so Phase 2 reads done, and this
+                # PR is the purge qualifier on it.
+                vm_state=(_PH_DONE if _vm_deletion_armed_flat(new_flat) else None),
+                cascade_state=_PH_THIS_PR,
+                removal_state=None,
+                declares_vms=_declares_vms_flat(new_flat),
+                purge=True,
+            ) + [
                 "",
             ]
         elif is_armed and was_purge and not is_purge:
