@@ -124,6 +124,24 @@ disabled, so it holds everything the comment left out.
 
 **The full-diff page is the complete record.** It is rendered separately from the comment with every budget disabled: no rollups, no collapsed apps, no table row cap, and the configuration panel uncapped so every changed file is listed key by key, file by file. The comment is the summary; this page is the evidence.
 
+**Every comment links to it, unconditionally.** The pointer renders twice, in
+two fixed places: under the commit header, and again immediately above the
+`Status:` line, because on a long comment the header has scrolled away. Until
+now every link to the page was conditional (a truncation note, a per-app
+"full hunks" pointer, a rollup line), so a comment where nothing was truncated
+and nothing was folded had no way to reach the page at all.
+
+If the page could not be written for a run, the comment says so in that same
+place and keeps the hunks inline, rather than offering a link that 404s. That
+fallback is checked, not assumed: the save reports whether it succeeded and the
+comment is re-rendered before it is posted.
+
+**Two render profiles.** `COMMENT` and `FULL` are what separate the two
+surfaces: how much folding, grouping, and capping each one does. They are
+values (`RenderProfile`) rather than a magic integer threaded through the
+renderer, so a surface's behaviour can be read in one place. The older
+`readable_budget=` argument still works and maps onto a profile.
+
 ## How the diff works
 
 ArgoCD is used **only** for discovery: at startup, and every 5 minutes, one

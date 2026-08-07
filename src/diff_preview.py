@@ -59,7 +59,9 @@ import leader  # Lease-based leader election (same-dir module, stdlib only)
 import io as _io
 import http.client as _http_client
 import socketserver
+import dataclasses
 from collections import Counter, namedtuple
+from dataclasses import dataclass
 from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
 import concurrent.futures
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -485,6 +487,19 @@ _diff_stats:      dict          = {
     # is the real remaining headroom.
     "max_affected_apps_seen": 0,
     "ai_prompt_capped": 0,         # AI prompts capped at AI_MAX_APPS
+    # COPS-2609 (phase B): the shape of the comment we post. Phases C-E are
+    # verified against these numbers, so they have to exist before those
+    # phases move anything. comment_bytes is the last comment rendered;
+    # comment_max_bytes is the high-water mark, which is the one that can
+    # answer phase E's "no comment ever reaches MAX_COMMENT_BYTES": a
+    # last-value gauge only ever describes whichever PR rendered last.
+    "comment_bytes": 0,            # size of the most recent comment body
+    "comment_max_bytes": 0,        # largest comment body rendered so far
+    "comment_fences": 0,           # diff fences in the most recent comment
+    # Comments posted with the hunks inlined because the full-diff page was
+    # not available. Harmless today; from phase E on, every one of these is
+    # a reviewer reading a comment that lost its backing page.
+    "comment_fallback_inline": 0,
     "diff_retries": 0,             # per-diff transient retries performed
     "futures_cancelled": 0,        # subtask futures cancelled on abnormal exit
     # v2.5.20 (E1): HTTP connection-pool observability. reuses vs fresh
@@ -7273,6 +7288,31 @@ def _truncate_comment(body: str, artifact_url: str = "") -> str:
     return out
 
 
+def _record_comment_stats(body, profile, fallback_inline=False):
+    """Record the size and shape of a comment body we are about to post.
+
+    Phases C-E of COPS-2607 are all verified against these numbers: C proves
+    the page holds everything, E proves the comment stopped carrying YAML and
+    never approaches MAX_COMMENT_BYTES. Neither claim can be checked against
+    production without a number that was already being collected before the
+    change, so this lands in phase B with nothing to show yet.
+
+    Returns (bytes, fences) so the caller can log them without recomputing.
+    """
+    n_bytes = len(body.encode("utf-8"))
+    n_fences = body.count("```diff")
+    with _diff_stats_lock:
+        _diff_stats["comment_bytes"] = n_bytes
+        if n_bytes > _diff_stats.get("comment_max_bytes", 0):
+            _diff_stats["comment_max_bytes"] = n_bytes
+        _diff_stats["comment_fences"] = n_fences
+        if fallback_inline:
+            _diff_stats["comment_fallback_inline"] += 1
+    log(f"[comment] profile={profile.name} bytes={n_bytes} "
+        f"fences={n_fences} fallback_inline={bool(fallback_inline)}")
+    return n_bytes, n_fences
+
+
 def _save_diff_ui_artifact(repo, pr_id, pr_sha, body, base_sha=None,
                            outcome_counts=None, app_count=None):
     """Full-diff UI: persist the FULL comment body (pre-truncation) for the web
@@ -7284,9 +7324,15 @@ def _save_diff_ui_artifact(repo, pr_id, pr_sha, body, base_sha=None,
     base_sha/outcome_counts/app_count are the same per-PR context already
     computed for the log line and the comment header, threaded through so
     the page shows real PR context (base commit, per-outcome breakdown, app
-    count) instead of only the raw diff text."""
+    count) instead of only the raw diff text.
+
+    Returns True only when the page really was written. The comment offers a
+    link to that page before it exists, so a swallowed failure used to mean
+    a comment pointing at a 404 with nobody able to tell (COPS-2609). A
+    disabled UI returns False for the same reason: not an error, but still
+    no page, and the caller has to take the same branch."""
     if not DIFF_UI_ENABLED:
-        return
+        return False
     try:
         diff_ui.save_artifact(
             DIFF_UI_DIR, repo or BB_REPO, pr_id, pr_sha, body,
@@ -7295,8 +7341,10 @@ def _save_diff_ui_artifact(repo, pr_id, pr_sha, body, base_sha=None,
             max_artifacts=DIFF_UI_MAX_ARTIFACTS,
             base_sha=base_sha, outcome_counts=outcome_counts,
             app_count=app_count, bucket=DIFF_UI_GCS_BUCKET)
+        return True
     except Exception as e:
         log(f"[diff-ui] artifact save failed (non-fatal): {e}", "WARNING")
+        return False
 
 def upsert_comment(pr_id, body, existing_id=None, repo=None, artifact_url=""):
     """Post or update PR comment. Truncates if over limit; posts fallback on error.
@@ -7454,6 +7502,110 @@ AI_MAX_BODY_CHARS        = 1500
 # truncation note kicks in, while still bounding worst-case memory for a
 # run with MAX_APPS_PER_RUN concurrent apps (the COPS-2543 OOM lesson).
 FULL_SECTIONS_MAX_PER_APP = _env_int("FULL_SECTIONS_MAX_PER_APP", 400)
+
+
+# ── Render profiles (COPS-2609, phase B of COPS-2607) ────────────────────
+# This service renders two surfaces with one function: the PR comment and
+# the full-diff page behind the ACME Diff Preview build status. Until now
+# the only thing separating them was `readable_budget`, and that integer's
+# truthiness had quietly accumulated four more jobs: whether byte-identical
+# apps are grouped, whether version-transition noise folds, whether the
+# overview table is row-capped, and whether the appendix collapses into a
+# pointer. A call site could not read any of that, and the later phases of
+# COPS-2607 need to say things the integer cannot express at all -- no body
+# cap, no fences, no input panel.
+#
+# So the difference between the two surfaces becomes a value. The point is
+# that phases C, D and E change a profile rather than the renderer.
+@dataclass(frozen=True)
+class RenderProfile:
+    """How much of the truth a given surface shows.
+
+    Frozen on purpose: these are module-level constants shared across every
+    PR and every worker thread. A render able to mutate one would leak the
+    change into unrelated PRs, and the symptom (a comment that folds
+    differently depending on what was rendered before it) is close to
+    impossible to reproduce. Use replace() for a variant.
+    """
+    name: str
+    # Bulk-region readability budget in bytes. 0 renders everything.
+    # None means "COMMENT_READABLE_BYTES, read at render time" -- see
+    # resolved(). Do NOT bake the constant in as a default here: it is an
+    # _env_int, so a snapshot taken at import silently ignores both the env
+    # var and any runtime override, and the symptom is a comment that stops
+    # honouring its own configured budget.
+    readable_budget: int = None
+    # Render the YAML hunks inline. Phase E turns this off for the comment,
+    # which is only safe once the page provably holds everything (phase C).
+    inline_diffs: bool = True
+    # Render the "why this changed" input panel. Phase E moves it to the page.
+    input_panel: bool = True
+    # Collapse byte-identical apps into one representative (COPS-2579).
+    group_repeats: bool = True
+    # Fold version-transition noise so needles stay visible (COPS-2606).
+    version_fold: bool = True
+    # Evidence lines to show per app when inline_diffs is off. Inert until
+    # phase E gives it a renderer; kept here so E does not reshape this
+    # object as well as use it.
+    inline_evidence_lines: int = 0
+    # Hard cap per resource body. Phase C lifts it on the page only.
+    # None = DISPLAY_BODY_MAX_CHARS at render time (see readable_budget).
+    body_max_chars: int = None
+    # Sections kept per app. Applied when the diff is computed, not when it
+    # is rendered, so phase C has to lift it there; carried here so the
+    # value a surface wants is stated in one place.
+    # None = FULL_SECTIONS_MAX_PER_APP at render time.
+    section_cap: int = None
+
+    def replace(self, **kw):
+        return dataclasses.replace(self, **kw)
+
+    def resolved(self):
+        """Fill in every field that means "the module constant, right now".
+
+        Called once per render. Idempotent, so a caller that hands in an
+        already-resolved profile gets it back unchanged.
+        """
+        return dataclasses.replace(
+            self,
+            readable_budget=(COMMENT_READABLE_BYTES
+                             if self.readable_budget is None
+                             else self.readable_budget),
+            body_max_chars=(DISPLAY_BODY_MAX_CHARS
+                            if self.body_max_chars is None
+                            else self.body_max_chars),
+            section_cap=(FULL_SECTIONS_MAX_PER_APP
+                         if self.section_cap is None
+                         else self.section_cap))
+
+    @classmethod
+    def from_readable_budget(cls, readable_budget):
+        """Map the deprecated keyword onto a profile.
+
+        None is the comment with the module default. 0 is the page: it is
+        how process_pr and eleven existing tests ask for the complete
+        render. Any other number is still the comment, just tighter -- the
+        fold tests drive it with 8000/6000/2500 and must keep grouping and
+        folding, which is exactly what the old `if budget:` did.
+        """
+        if readable_budget is None:
+            return COMMENT_PROFILE
+        if not readable_budget:
+            return FULL_PROFILE
+        return COMMENT_PROFILE.replace(readable_budget=readable_budget)
+
+
+COMMENT_PROFILE = RenderProfile(name="COMMENT")
+FULL_PROFILE = RenderProfile(
+    name="FULL",
+    readable_budget=0,
+    group_repeats=False,
+    version_fold=False,
+    # The two caps below stay live (None) rather than being pinned here, so
+    # this phase is behaviour-neutral: the page renders today byte-for-byte
+    # what it rendered yesterday. Phase C is where they become explicit and
+    # effectively unlimited on this surface.
+)
 # v2.5.18 (FINDINGS_SCALE S1): cap how many APPS go into the prompt. The two
 # caps above bound each app's contribution but not the number of apps, so a
 # mass version bump built an unbounded prompt: measured 4.3MB (~1.08M tokens)
@@ -8273,7 +8425,7 @@ def _full_hunks_link(artifact_url: str) -> str:
 def _format_app_diff_block(app, sections, diff_text, show_diff=True, n_res=None,
                            risk_headers=None, version_fold=None,
                            artifact_url="", size_budget=None,
-                           group_repeats=False):
+                           group_repeats=False, profile=None):
     """Return a list of markdown lines for one app's diff block.
 
     sections is DiffResult.sections — already truncated to display budget.
@@ -8288,12 +8440,21 @@ def _format_app_diff_block(app, sections, diff_text, show_diff=True, n_res=None,
     so the truncation note must not keep saying "first".
     Bitbucket does NOT render HTML <details>/<summary>, so we never use them.
     """
+    profile = (profile or COMMENT_PROFILE).resolved()
     shown = len(sections) if sections else 0
     total = n_res if n_res is not None else shown
     n = total if total else 1
     out = [f"\u26a0\ufe0f **`{app}`** \u2014 {n} resource(s) changed", ""]
     if not show_diff:
         return out
+    # profile.inline_diffs (COPS-2609): the mechanism phase E flips. Both
+    # profiles keep it on today, so this branch is inert -- it exists so E
+    # is a profile change rather than another surgery on this function.
+    # What it must never do is drop the app: the header above still names
+    # it and states how many resources changed, and the pointer says where
+    # the hunks are. That is a relocation, not a loss.
+    if not profile.inline_diffs:
+        return out + [_full_hunks_link(artifact_url), ""]
     # Version-transition fold: the noise sections identified by
     # _classify_version_fold collapse behind one line; only needles render
     # inline. Never active on the full-diff page (caller passes None there).
@@ -8368,8 +8529,11 @@ def _format_app_diff_block(app, sections, diff_text, show_diff=True, n_res=None,
             # a CRLF<->LF-only change would otherwise collapse to "no visible
             # change". Convert first, then redact, then neutralize fences.
             body_disp = _redact_for_display(hdr, _show_cr(body)).rstrip()
-            if len(body_disp) > DISPLAY_BODY_MAX_CHARS:
-                body_disp = (body_disp[:DISPLAY_BODY_MAX_CHARS].rstrip()
+            # profile.body_max_chars (COPS-2609): same number as before on
+            # both surfaces. Phase C lifts it on the page only, which is the
+            # whole point of the cap living on the profile now.
+            if len(body_disp) > profile.body_max_chars:
+                body_disp = (body_disp[:profile.body_max_chars].rstrip()
                              + "\n... (diff truncated for display \u2014 see "
                                "ArgoCD for the full resource diff)")
             body_disp = _fence_safe(body_disp)
@@ -9589,7 +9753,7 @@ def format_comment(pr_sha, app_results, skipped_apps=None, base_sha="",
                     decommission_lines=None, input_change_lines=None,
                     appspace_state_lines=None, appendix_lines=None,
                     vm_change_lines=None, artifact_url="",
-                    readable_budget=None):
+                    readable_budget=None, profile=None):
     """Format the full PR comment. Never uses <details>/<summary> — Bitbucket
     does not render them. Large changesets get a compact summary table at the
     top (all apps, one row each) and, for the diff sections below, apps
@@ -9618,13 +9782,23 @@ def format_comment(pr_sha, app_results, skipped_apps=None, base_sha="",
     """
     skipped_apps  = skipped_apps or []
     results       = {app: _result(v) for app, v in app_results.items()}
-    # Readability budget for the BULK region only. None = use the module
-    # default; 0 (or any falsy value) = render everything. The persisted
-    # full-diff artifact is built with 0: the comment may fold bulk
-    # content away, but the view it links to must never be missing
-    # anything, or the link the comment offers is a dead end.
-    budget        = (COMMENT_READABLE_BYTES if readable_budget is None
-                     else readable_budget)
+    # Which surface is being rendered (COPS-2609). `readable_budget` is the
+    # deprecated way to ask and still works everywhere; it maps onto a
+    # profile rather than being interpreted twice. Refusing both together is
+    # deliberate: phases C-E move call sites over one at a time, and during
+    # that window a silent winner would let a caller believe it set a budget
+    # it did not set.
+    if profile is not None and readable_budget is not None:
+        raise TypeError("format_comment(): pass profile= or readable_budget=, "
+                        "not both")
+    profile = (profile or RenderProfile.from_readable_budget(
+        readable_budget)).resolved()
+    # Readability budget for the BULK region only. 0 = render everything.
+    # The persisted full-diff artifact is built with the FULL profile: the
+    # comment may fold bulk content away, but the view it links to must
+    # never be missing anything, or the link the comment offers is a dead
+    # end.
+    budget        = profile.readable_budget
     any_change    = False
     any_error     = False
     any_unknown   = False
@@ -9684,10 +9858,35 @@ def format_comment(pr_sha, app_results, skipped_apps=None, base_sha="",
 
     # ── Header ──────────────────────────────────────────────────────
     large_label = f" | \U0001f4e6 Large changeset ({len(changed_apps)} apps)" if is_large else ""
+    # COPS-2609: the pointer to the full rendered output, rendered in two
+    # fixed places so a reader learns where to look. Every other link to
+    # that page is conditional -- a truncation note, a per-app "full hunks"
+    # pointer, a rollup line -- so a comment where nothing was truncated and
+    # nothing was folded had no way to reach it at all. Measured on
+    # acme-config-prod #3899: zero occurrences in the body.
+    #
+    # When the page could not be produced the comment says so rather than
+    # degrading quietly: a reviewer cannot otherwise tell an unavailable
+    # page from one nobody linked, and the later phases remove inline YAML
+    # on the promise that this link is always here.
+    _full_view = (
+        f"\U0001f50e **Full rendered diff (every hunk):** {artifact_url}"
+        if artifact_url else
+        "\u26a0\ufe0f The full-diff page could not be produced for this run, "
+        "so every hunk is inlined below.")
     lines = [
         f"## \U0001f52d {STATUS_NAME}", "",
         f"{_comment_header(pr_sha)}{large_label}", "",
+        _full_view, "",
     ]
+    # The bulk-region budget is measured with _body_size(), which counts
+    # every line including the header. Left alone, this fixed pointer would
+    # eat a few hundred bytes of readable budget and silently push a diff
+    # section out of the comment -- a behaviour change disguised as a link.
+    # Give those bytes back, so the bulk region gets exactly the room it had
+    # before (COPS-2609: this phase is behaviour-neutral apart from the link).
+    if budget:
+        budget += len(_full_view.encode("utf-8")) + 2
 
     # ── Merge summary ────────────────────────────────────────────────
     # The verdict, before any detail: an operator decides here whether
@@ -9708,7 +9907,10 @@ def format_comment(pr_sha, app_results, skipped_apps=None, base_sha="",
     # ── Input root-cause panel (v2.6.2) ──────────────────────────────
     # WHAT the PR edits at the values level, before any symptom below —
     # a reviewer reads cause first (PR #6848).
-    if input_change_lines:
+    # profile.input_panel: phase E moves this panel to the page, where a
+    # reviewer has room for it. Off here means it is not rendered at all on
+    # this surface, never that it stopped being computed.
+    if input_change_lines and profile.input_panel:
         lines += input_change_lines
 
     # ── Environment decommission warning (v2.5.10) ───────────────────
@@ -10008,7 +10210,8 @@ def format_comment(pr_sha, app_results, skipped_apps=None, base_sha="",
             # Pass n_res so the header shows the REAL count (FIX B).
             # COPS-2567: pass the risk headers too, so the truncation note
             # tells the truth about how the shown sections were picked.
-            _fold = getattr(rep_r, "version_fold", None) if budget else None
+            _fold = (getattr(rep_r, "version_fold", None)
+                     if profile.version_fold else None)
             _room = max(budget - _body_size(), 0) if budget else None
             _risk_hdrs = (set(rep_r.deleted_resources or [])
                           | set(rep_r.replicas_zeroed or [])
@@ -10018,7 +10221,8 @@ def format_comment(pr_sha, app_results, skipped_apps=None, base_sha="",
                 rep_app, rep_r.sections, rep_r.text, show_diff=True,
                 n_res=rep_r.n_res, risk_headers=_risk_hdrs,
                 version_fold=_fold, artifact_url=artifact_url,
-                size_budget=_room, group_repeats=bool(budget))
+                size_budget=_room, group_repeats=profile.group_repeats,
+                profile=profile)
 
         else:
             lines += [f"\u2705 **`{app}`** \u2014 no manifest changes", ""]
@@ -10136,6 +10340,13 @@ def format_comment(pr_sha, app_results, skipped_apps=None, base_sha="",
         _status_token = "clean"
 
     lines += [
+        # Above the separator, never between it and the Status line:
+        # _truncate_comment locates the footer with rfind("\n---\n**Status:**")
+        # and splitting that sequence loses the [clean]/[base:] tokens, which
+        # the poll loop parses for SHA dedup. Caught by
+        # test_s2_truncated_comment_keeps_footer_tokens (COPS-2609).
+        _full_view,
+        "",
         "---",
         f"**Status:** {status}",
         f"*{_ts()} \u2014 {COMMENT_MARKER} [{_status_token}]" + (f" [base:{base_sha[:8]}]" if base_sha else "") + "*",
@@ -10889,10 +11100,30 @@ def process_pr(pr, path_map, base_sha="", repo=None):
         except Exception as e:
             log(f"    [comment] full input panel failed: {e}", "WARNING")
         full_body = format_comment(pr_sha, app_results,
-                                   readable_budget=0, **_full_kwargs)
-        _save_diff_ui_artifact(repo, pr_id, pr_sha, full_body, base_sha=base_sha,
-                               outcome_counts=dict(outcome_counts),
-                               app_count=len(app_results))
+                                   profile=FULL_PROFILE, **_full_kwargs)
+        saved = _save_diff_ui_artifact(
+            repo, pr_id, pr_sha, full_body, base_sha=base_sha,
+            outcome_counts=dict(outcome_counts),
+            app_count=len(app_results))
+        # COPS-2609: the comment above already offers a link to that page.
+        # If the save did not happen -- disk full, bad key, UI switched off
+        # mid-run -- posting it as-is sends every reviewer of this PR to a
+        # 404 with no way to tell that from a page nobody linked. Re-render
+        # without the URL: the comment then says the page could not be
+        # produced and keeps the hunks inline. Cheap (a pure function over
+        # results already in memory) and it only runs on the failure path.
+        # This is the fallback phases C-E lean on, so it has to be real
+        # before the comment stops carrying YAML.
+        fallback_inline = bool(artifact_url) and not saved
+        if fallback_inline:
+            log(f"PR #{pr_id}: full-diff page unavailable, re-rendering the "
+                f"comment with hunks inline", "WARNING")
+            artifact_url = ""
+            body = format_comment(pr_sha, app_results, artifact_url="",
+                                  **_comment_kwargs)
+            comment_kb = round(len(body.encode()) / 1024, 1)
+        _record_comment_stats(body, COMMENT_PROFILE,
+                              fallback_inline=fallback_inline)
         upsert_comment(pr_id, body, existing_id, repo=repo,
                        artifact_url=artifact_url)
         action = "updated" if existing_id else "posted"

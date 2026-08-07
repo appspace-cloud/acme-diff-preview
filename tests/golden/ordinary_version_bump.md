@@ -2,6 +2,8 @@
 
 **Commit** `abc12345` → `main` | `acme-config-prod`
 
+⚠️ The full-diff page could not be produced for this run, so every hunk is inlined below.
+
 ### 🧭 Merge summary
 
 ✅ **Routine** — nothing dangerous detected
@@ -27,6 +29,8 @@
 ```
 
 ✅ **`pv-acme-a-ss`** — no manifest changes
+
+⚠️ The full-diff page could not be produced for this run, so every hunk is inlined below.
 
 ---
 **Status:** ⚠️ 1 resource(s) will change

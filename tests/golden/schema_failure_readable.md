@@ -2,6 +2,8 @@
 
 **Commit** `abc12345` → `main` | `acme-config-prod`
 
+⚠️ The full-diff page could not be produced for this run, so every hunk is inlined below.
+
 ### 🧭 Merge summary
 
 ⚠️ **Review before merging** (1 item(s))
@@ -27,6 +29,8 @@
 > **Fix:** write an explicit empty map to keep the entry with pure chart defaults, for example `myservice: {}`.
 > ⚠️ Do **not** delete the key instead: the chart renders one microservice per entry under `microservices.definitions`, so removing it deletes that microservice from the environment.
 > **Fix:** correct each value listed above in this environment's `customer.yaml` (or the `config.yaml` of its cohort or ring if every environment needs the fix).
+
+⚠️ The full-diff page could not be produced for this run, so every hunk is inlined below.
 
 ---
 **Status:** ❔ Diff incomplete — 1 app(s) could not be evaluated (NOT confirmed unchanged)

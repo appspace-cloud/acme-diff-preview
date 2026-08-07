@@ -2,6 +2,8 @@
 
 **Commit** `abc12345` → `main` | `acme-config-prod`
 
+🔎 **Full rendered diff (every hunk):** https://diffs.appspace.example/diff/acme-config-prod/42/abc12345
+
 ### 🧭 Merge summary
 
 ✅ **Routine** — nothing dangerous detected
@@ -33,6 +35,8 @@
 -        image: registry.example/mongo:2603.1.9
 +        image: registry.example/mongo:2603.1.10
 ```
+
+🔎 **Full rendered diff (every hunk):** https://diffs.appspace.example/diff/acme-config-prod/42/abc12345
 
 ---
 **Status:** ⚠️ 7 resource(s) will change

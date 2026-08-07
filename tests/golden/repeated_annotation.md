@@ -2,6 +2,8 @@
 
 **Commit** `abc12345` → `main` | `acme-config-prod`
 
+🔎 **Full rendered diff (every hunk):** https://diffs.appspace.example/diff/acme-config-prod/42/abc12345
+
 ### 🧭 Merge summary
 
 ✅ **Routine** — nothing dangerous detected
@@ -29,6 +31,8 @@
 > ♻️ **11 more resource(s) change exactly the same lines.**
 >
 > Same change: `/iam.cnrm.cloud.google.com/IAMPolicyMember member-001`, `/iam.cnrm.cloud.google.com/IAMPolicyMember member-002`, `/iam.cnrm.cloud.google.com/IAMPolicyMember member-003`, `/iam.cnrm.cloud.google.com/IAMPolicyMember member-004`, ...
+
+🔎 **Full rendered diff (every hunk):** https://diffs.appspace.example/diff/acme-config-prod/42/abc12345
 
 ---
 **Status:** ⚠️ 12 resource(s) will change

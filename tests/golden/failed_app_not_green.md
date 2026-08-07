@@ -2,6 +2,8 @@
 
 **Commit** `abc12345` → `main` | `acme-config-prod`
 
+⚠️ The full-diff page could not be produced for this run, so every hunk is inlined below.
+
 ### 🧭 Merge summary
 
 ⚠️ **Review before merging** (1 item(s))
@@ -14,6 +16,8 @@
 ❔ **`pv-acme-a-ss`** — diff unavailable (could not pull the OCI chart (registry login or network))
 
 ✅ **`pv-acme-a-ms`** — no manifest changes
+
+⚠️ The full-diff page could not be produced for this run, so every hunk is inlined below.
 
 ---
 **Status:** ❔ Diff incomplete — 1 app(s) could not be evaluated (NOT confirmed unchanged)

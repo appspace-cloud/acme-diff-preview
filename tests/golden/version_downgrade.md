@@ -2,6 +2,8 @@
 
 **Commit** `abc12345` → `main` | `acme-config-prod`
 
+⚠️ The full-diff page could not be produced for this run, so every hunk is inlined below.
+
 ### 🧭 Merge summary
 
 ⚠️ **Review before merging** (1 item(s))
@@ -32,6 +34,8 @@
 +        image: appspace-ms:2603.1.0
          ports:
 ```
+
+⚠️ The full-diff page could not be produced for this run, so every hunk is inlined below.
 
 ---
 **Status:** ⚠️ 1 resource(s) will change | 🔻 CHART DOWNGRADE — verify intentional

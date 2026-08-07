@@ -2,6 +2,8 @@
 
 **Commit** `abc12345` → `main` | `acme-config-prod` | 📦 Large changeset (6 apps)
 
+🔎 **Full rendered diff (every hunk):** https://diffs.appspace.example/diff/acme-config-prod/42/abc12345
+
 ### 🧭 Merge summary
 
 ✅ **Routine** — nothing dangerous detected
@@ -122,6 +124,8 @@
 ```
 
 > ✂️ **3 more changed app(s) omitted here to keep this comment scannable.** Every omitted diff is ordinary (no deletions, downgrades, zeroed replicas or VM changes) — read them in full in the [full diff view](https://diffs.appspace.example/diff/acme-config-prod/42/abc12345). Omitted: pv-env-3-ms, pv-env-4-ms, pv-env-5-ms
+
+🔎 **Full rendered diff (every hunk):** https://diffs.appspace.example/diff/acme-config-prod/42/abc12345
 
 ---
 **Status:** ⚠️ 6 resource(s) will change
