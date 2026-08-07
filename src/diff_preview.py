@@ -8943,6 +8943,172 @@ _VM_DISK_SIZE_KEYS = ("dataDiskSizeGb", "bootDiskSizeGb",
                       "dataDiskSize", "bootDiskSize", "diskSize")
 _VM_DISK_TYPE_KEYS = ("dataDiskType", "bootDiskType", "diskType")
 _VM_ROLE_NAMES = ("defaults", "svc", "mongo", "rabbit")
+
+_LEGACY_PREFIX = "appspace.infra.deployLinuxServices."
+_KCC_PREFIX = "appspace.infra.deployLinuxServicesK8s."
+
+
+def _norm_machine_type(v) -> str:
+    """Compare machine types the way an operator reads them: trimmed,
+    unquoted, case-insensitive. `n2d-highmem-2` and ` "N2D-Highmem-2" `
+    are the same machine, and a PR that only re-quotes a value is not a
+    resize."""
+    return str(v or "").strip().strip("'\"").strip().lower()
+
+
+def _kcc_enabled_roles(flat: dict) -> list:
+    """Roles explicitly enabled under the KCC key. `defaults` is config, not
+    a role, so it never appears here."""
+    return sorted({
+        k[len(_KCC_PREFIX):].split(".", 1)[0]
+        for k, v in flat.items()
+        if k.startswith(_KCC_PREFIX)
+        and k.endswith(".enabled")
+        and str(v).strip().lower() == "true"
+        and k[len(_KCC_PREFIX):].split(".", 1)[0] in _VM_ROLE_NAMES
+        and k[len(_KCC_PREFIX):].split(".", 1)[0] != "defaults"
+    })
+
+
+def _kcc_role_value(flat: dict, role: str, leaf: str):
+    """A role's value for a leaf, falling back to `defaults` the way the
+    chart does."""
+    v = flat.get(f"{_KCC_PREFIX}{role}.{leaf}")
+    return flat.get(f"{_KCC_PREFIX}defaults.{leaf}") if v is None else v
+
+
+def _detect_kcc_adoption(old_flat: dict, new_flat: dict) -> dict:
+    """Classify a values-level change as a Terraform -> KCC ownership
+    transfer, in which the existing GCP VM is adopted by name and nothing
+    is created or resized (COPS-2608).
+
+    Returns a dict when the file is an ownership move, otherwise None:
+
+      {"kind": "adoption", "roles": [...]}  the VM changes owner and is
+          adopted by name; gets the card;
+      {"kind": "cleanup"}                    KCC was already live at base
+          and this PR only drops the dead legacy block; routine, no card.
+
+    Both suppress the machineType danger, because in neither case is a
+    machine being resized. Only the first renders a card.
+
+    Deliberately conservative: anything it cannot prove is an ownership
+    move is left to the existing danger rules, because a false "this is
+    safe" is far worse than a false alarm.
+
+    Not an ownership move, on purpose:
+      - `createNewBootDisk` true on an enabled role: that builds a new VM;
+      - machine types that genuinely differ: a resize wearing adoption's
+        coat;
+      - legacy keys removed with no KCC role enabled at all: that is a VM
+        being switched off, which is exactly what the danger rules exist
+        for.
+
+    When the legacy `machineType` is absent the comparison is treated as
+    satisfied: the old Terraform module defaulted that value, so a
+    customer.yaml that relied on the default has no old value, and nothing
+    that does not exist can be changing. The rendered level stays the
+    authority in that case.
+    """
+    legacy_removed = any(
+        k.startswith(_LEGACY_PREFIX) and k in old_flat and k not in new_flat
+        for k in set(old_flat) - set(new_flat))
+    if not legacy_removed:
+        return None
+
+    roles = _kcc_enabled_roles(new_flat)
+    if not roles:
+        return None
+
+    # KCC already live at base with the same roles: this PR only drops the
+    # dead legacy block. Nothing is adopted, nothing is resized.
+    if _kcc_enabled_roles(old_flat) == roles:
+        return {"kind": "cleanup"}
+
+    legacy_mt = None
+    for k, v in old_flat.items():
+        if k.startswith(_LEGACY_PREFIX) and k.rsplit(".", 1)[-1] == "machineType":
+            legacy_mt = v
+            break
+
+    facts = []
+    for role in roles:
+        if str(_kcc_role_value(new_flat, role, "createNewBootDisk")
+               ).strip().lower() != "false":
+            return None  # greenfield, or unspecified: not provably adoption
+        mt = _kcc_role_value(new_flat, role, "machineType")
+        if (legacy_mt is not None
+                and _norm_machine_type(mt) != _norm_machine_type(legacy_mt)):
+            return None  # the values really differ: it is a resize
+        facts.append({
+            "role": role,
+            "instance": _kcc_role_value(new_flat, role, "instanceName"),
+            "machineType": mt,
+            "dataDiskSizeGb": _kcc_role_value(new_flat, role, "dataDiskSizeGb"),
+            "manageMetadata": _kcc_role_value(new_flat, role, "manageMetadata"),
+        })
+    return {"kind": "adoption", "roles": facts}
+
+
+def _kcc_move_disk_shrink(old_flat: dict, new_flat: dict, roles: list) -> str:
+    """Danger reason when a disk shrinks *across* the Terraform -> KCC key
+    move, or "" when it does not.
+
+    The ordinary shrink rule compares old and new of the same key, so it is
+    blind here: the old size lives on `deployLinuxServices.dataDiskSizeGb`
+    and the new one on `deployLinuxServicesK8s.<role>.dataDiskSizeGb`. Two
+    different keys are never compared, so a 256 -> 128 shrink slipped
+    through the whole panel. Classifying the move is what makes the
+    comparison possible, so the check belongs here (COPS-2608).
+    """
+    for leaf in _VM_DISK_SIZE_KEYS:
+        old_v = old_flat.get(_LEGACY_PREFIX + leaf)
+        if old_v is None:
+            continue
+        for role in roles:
+            new_v = _kcc_role_value(new_flat, role, leaf)
+            if new_v is None:
+                continue
+            try:
+                if float(str(new_v)) < float(str(old_v)):
+                    return (f"`{leaf}` DECREASES across the Terraform \u2192 KCC "
+                            f"move for role `{role}` (`{old_v}` \u2192 `{new_v}`) "
+                            f"\u2014 GCP cannot shrink a disk in place")
+            except (TypeError, ValueError):
+                continue
+    return ""
+
+
+def _kcc_adoption_card(env_name: str, info: dict) -> list:
+    """One card per adopted environment, replacing the nine
+    "appears for the first time" bullets. Those are true of the Argo CD
+    objects and misleading about GCP, where the VM already exists and is
+    adopted by resourceID."""
+    lines = [
+        f"**\U0001f5a5\ufe0f VM INFRASTRUCTURE \u2014 ADOPTION \u2014 `{env_name}`**",
+        "",
+        "Terraform `deployLinuxServices` \u2192 KCC `deployLinuxServicesK8s`. "
+        "The existing GCP VM is adopted by name (`createNewBootDisk: false`). "
+        "**No VM is created or resized by this PR.**",
+        "",
+    ]
+    for f in info["roles"]:
+        inst = f["instance"] or f"(chart default for role `{f['role']}`)"
+        lines.append(f"- **{f['role']}** \u2014 instance `{inst}`, machineType "
+                     f"`{f['machineType']}` (unchanged)"
+                     + (f", data disk {f['dataDiskSizeGb']}Gi"
+                        if f["dataDiskSizeGb"] else "")
+                     + f", manageMetadata={f['manageMetadata']}")
+    lines += [
+        "",
+        "The Compute objects are new **in Argo CD**; the GCP resources "
+        "already exist and are adopted by `resourceID`. After merge: "
+        "`lastStartTimestamp` unchanged, all `Compute*` UpToDate, then the "
+        "`terraform state rm` follow-up.",
+        "",
+    ]
+    return lines
+
 # Panel headers are constants because the merge summary recognises its own
 # panels by them. Danger uses "##", routine and clean use "###", so the
 # summary can tell severity apart without re-deriving any facts.
@@ -8982,6 +9148,7 @@ def _summarize_vm_changes(changed_files, pr_sha, base_sha, path_map,
     at all — an always-on panel trains reviewers to skip it.
     """
     dangerous_lines, routine_lines = [], []
+    adoption_cards = []
     seen = set()
     for f in (changed_files or [])[:12]:
         clean = posixpath.normpath(f.lstrip("/"))
@@ -9003,6 +9170,29 @@ def _summarize_vm_changes(changed_files, pr_sha, base_sha, path_map,
         if not keys:
             continue
         env_name = posixpath.basename(posixpath.dirname(clean))
+        # COPS-2608: classify the whole file before scoring individual keys.
+        # A Terraform -> KCC ownership transfer moves the same machineType
+        # from one key tree to the other; scoring the removal and the
+        # addition independently reads as two resizes and blocks a PR that
+        # resizes nothing. Only the machineType reason is suppressed: every
+        # other danger rule still applies to the same file, so arming
+        # deletion or shrinking a disk in the same PR still blocks.
+        adoption = _detect_kcc_adoption(old_flat, new_flat)
+        if adoption and adoption.get("kind") == "adoption":
+            shrink = _kcc_move_disk_shrink(
+                old_flat, new_flat, [f["role"] for f in adoption["roles"]])
+            if shrink:
+                # A shrink across the move is real data loss and the plain
+                # shrink rule cannot see it (different keys either side).
+                # Report it and stop treating the file as a safe adoption,
+                # so nothing else gets suppressed either.
+                dangerous_lines.append(
+                    f"- \U0001f6a8 `{env_name}` \u00b7 **linux VM (KCC \u2190 legacy)**: "
+                    f"{shrink}")
+                adoption = None
+        if (adoption and adoption.get("kind") == "adoption"
+                and path_map.get(clean)):
+            adoption_cards.extend(_kcc_adoption_card(env_name, adoption))
         scope = (f"`{env_name}`" if path_map.get(clean) else
                  f"ancestor `{clean}` (inherited by every environment "
                  f"below it)")
@@ -9039,7 +9229,13 @@ def _summarize_vm_changes(changed_files, pr_sha, base_sha, path_map,
             elif leaf == "machineType":
                 ds = (new_flat.get(prefix + role + ".desiredStatus")
                       or new_flat.get(prefix + "defaults.desiredStatus"))
-                if str(ds) != "TERMINATED":
+                # Suppressed only for a classified adoption, and only on the
+                # linux key trees it applies to: the value is not changing,
+                # it is moving key. Windows and any unclassified file keep
+                # the original rule untouched.
+                adopted_move = (adoption is not None
+                                and prefix in (_LEGACY_PREFIX, _KCC_PREFIX))
+                if str(ds) != "TERMINATED" and not adopted_move:
                     danger = True
                     reason = ("machineType changes while desiredStatus is "
                               "not TERMINATED \u2014 the runbook requires "
@@ -9105,10 +9301,17 @@ def _summarize_vm_changes(changed_files, pr_sha, base_sha, path_map,
             _warn,
             "",
         ] + dangerous_lines
+        # Even when something else in the PR is dangerous, an adoption that
+        # was classified still gets its card: the reviewer needs to know the
+        # VM is being adopted rather than created while judging the real
+        # danger above it.
+        if adoption_cards:
+            lines += [""] + adoption_cards
         if routine_lines:
             lines += ["", "Routine VM changes in the same PR:", ""] + routine_lines
         return lines + [""]
     return ([_VM_PANEL_ROUTINE_HDR, ""]
+            + (adoption_cards + [""] if adoption_cards else [])
             + routine_lines + [""])
 
 
