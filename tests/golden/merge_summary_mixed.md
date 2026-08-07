@@ -2,6 +2,8 @@
 
 **Commit** `abc12345` → `main` | `acme-config-prod` | 📦 Large changeset (6 apps)
 
+🔎 **Full rendered diff (every hunk):** https://diffs.appspace.example/diff/acme-config-prod/42/abc12345
+
 ### 🧭 Merge summary
 
 ⛔ **DO NOT MERGE** without checking the item(s) below (2 item(s))
@@ -69,6 +71,8 @@
 -  name: gone
 -spec: {}
 ```
+
+🔎 **Full rendered diff (every hunk):** https://diffs.appspace.example/diff/acme-config-prod/42/abc12345
 
 ---
 **Status:** ⚠️ 6 resource(s) will change

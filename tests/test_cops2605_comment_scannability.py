@@ -342,14 +342,35 @@ def test_readable_budget_collapses_bulk_keeps_risk_and_links_artifact():
     assert body.count("| \u26a0\ufe0f changed |") <= m._OVERVIEW_TABLE_MAX_ROWS
 
 
-def test_artifact_url_changes_nothing_when_under_budget():
+def test_artifact_url_only_adds_the_full_view_lines():
+    """COPS-2609 deliberately changed this contract.
+
+    Under COPS-2605 the artifact URL was used only by the truncation note,
+    so passing it changed nothing on a comment that fitted the budget --
+    which is precisely why a comment where nothing was truncated had no way
+    to reach the full-diff page at all. The URL is now rendered in two fixed
+    places on every comment.
+
+    What must still hold is the original spirit: the URL perturbs nothing
+    *else*. Stripping the two full-view lines gives back the body rendered
+    without a URL, modulo the unavailable-page notice that replaces them.
+    """
     results = {"pv-acme-a-ms": _result(ORDINARY,
                                        [("/apps/Deployment b", ORDINARY)],
                                        1, True, outcome=m.OUT_DIFF)}
     a = m.format_comment(PR_SHA, results, base_sha=BASE_SHA)
     b = m.format_comment(PR_SHA, results, base_sha=BASE_SHA,
                          artifact_url=ART_URL)
-    assert a == b
+    assert ART_URL in b, "the full-diff page must be reachable from the body"
+    assert ART_URL not in a
+
+    def _strip_full_view(body):
+        return [l for l in body.splitlines()
+                if "Full rendered diff" not in l
+                and "full-diff page could not be produced" not in l]
+
+    assert _strip_full_view(a) == _strip_full_view(b), \
+        "the artifact URL must not perturb anything but its own two lines"
 
 
 def test_truncate_comment_links_artifact():

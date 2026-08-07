@@ -2,6 +2,8 @@
 
 **Commit** `abc12345` → `main` | `acme-config-prod`
 
+⚠️ The full-diff page could not be produced for this run, so every hunk is inlined below.
+
 ### 🧭 Merge summary
 
 ⛔ **DO NOT MERGE** without checking the item(s) below (1 item(s))
@@ -46,6 +48,8 @@
    
    strategy:
 ```
+
+⚠️ The full-diff page could not be produced for this run, so every hunk is inlined below.
 
 ---
 **Status:** ⚠️ 2 resource(s) will change

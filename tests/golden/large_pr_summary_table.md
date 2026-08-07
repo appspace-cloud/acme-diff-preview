@@ -2,6 +2,8 @@
 
 **Commit** `abc12345` → `main` | `acme-config-prod` | 📦 Large changeset (60 apps)
 
+⚠️ The full-diff page could not be produced for this run, so every hunk is inlined below.
+
 ### 🧭 Merge summary
 
 ✅ **Routine** — nothing dangerous detected
@@ -94,6 +96,8 @@
 +        image: appspace-ms:2603.1.0
          ports:
 ```
+
+⚠️ The full-diff page could not be produced for this run, so every hunk is inlined below.
 
 ---
 **Status:** ⚠️ 240 resource(s) will change

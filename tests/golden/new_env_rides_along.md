@@ -2,6 +2,8 @@
 
 **Commit** `abc12345` → `main` | `acme-config-prod`
 
+⚠️ The full-diff page could not be produced for this run, so every hunk is inlined below.
+
 ### 🧭 Merge summary
 
 ⚠️ **Review before merging** (1 item(s))
@@ -18,6 +20,8 @@
 ### 🆕 New environment: `pv-brandnew-a`
 
 > Could not be validated: cohort config.yaml missing
+
+⚠️ The full-diff page could not be produced for this run, so every hunk is inlined below.
 
 ---
 **Status:** ❌ 1 new environment
