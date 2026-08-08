@@ -585,6 +585,19 @@ _pr_chart_targets: dict = {}     # pr_id -> {(chart, version), ...} builds each 
 # by the PR workers, whereas this dict is written from HTTP handler threads.
 _pr_superseded: dict       = {}   # (repo, pr_id) -> newest sha seen from a webhook
 _pr_supersede_aborts: dict = {}   # (repo, pr_id) -> consecutive aborts, livelock guard
+# COPS-2617: the same idea for the DESTINATION branch. When main advances
+# because a different PR merged, every open PR's snapshot is stale -- but
+# that was only noticed AFTER a render finished, by comparing the [base:]
+# token in the already-published comment, which costs a full re-render
+# instead of an early abort. Measured on acme-config-prod: four merges in
+# ~8 minutes produced 6 passes across two large PRs, of which 4 rendered
+# against a base_sha already superseded, and #3922's comment (564 apps,
+# ~4 min/pass) was rewritten 3 times purely from unrelated merges.
+#
+# Keyed by (repo, base_branch) rather than per PR: one merge invalidates
+# every open PR against that branch, and a burst of merges must cost one
+# extra pass in total, not one per merge. Most recent sha wins.
+_base_superseded: dict     = {}   # (repo, base_branch) -> newest base sha
 _supersede_lock            = threading.Lock()
 # A PR pushed to faster than it can render would abort forever and never
 # publish anything. After this many consecutive aborts, let the run finish.
@@ -641,6 +654,47 @@ def _arm_supersede(sk, pr_sha: str):
     with _supersede_lock:
         pending = _pr_superseded.pop(sk, None)
     if pending and not _sha_eq(pending, pr_sha):
+        return pending
+    return None
+
+
+def _record_base_hint(repo: str, base_branch: str, sha: str) -> None:
+    """Note that `repo`'s `base_branch` has advanced to `sha` (COPS-2617).
+
+    Last writer wins on purpose: a burst of merges is one piece of news
+    ("the base moved, and here is where to"), not N. That is what turns the
+    measured four-merges-four-recomputes into four-merges-one-recompute.
+    """
+    if not SUPERSEDE_ABORT_ENABLED:
+        return
+    try:
+        with _supersede_lock:
+            _base_superseded[(repo, base_branch)] = sha
+    except Exception:  # pragma: no cover - see _record_supersede_hint
+        pass
+
+
+def _base_superseded_by(repo: str, base_branch: str, base_sha: str, sk=None):
+    """Peek at whether the destination branch moved since `base_sha`.
+
+    Peek, not pop, and deliberately unlike _arm_supersede: the hint is
+    shared by every open PR against that branch, so the first PR to read it
+    must not consume it out from under the others.
+
+    sk (repo, pr_id), when given, applies the SAME livelock guard as the
+    PR's-own-commit path. A busy merge train advances the base continuously,
+    and without this a large PR would abort forever and never publish
+    anything -- which is worse than publishing slightly stale, because a
+    reviewer gets nothing at all.
+    """
+    if not SUPERSEDE_ABORT_ENABLED:
+        return None
+    with _supersede_lock:
+        pending = _base_superseded.get((repo, base_branch))
+        aborts = _pr_supersede_aborts.get(sk, 0) if sk else 0
+    if aborts >= SUPERSEDE_MAX_CONSECUTIVE_ABORTS:
+        return None
+    if pending and not _sha_eq(pending, base_sha):
         return pending
     return None
 
@@ -1145,6 +1199,10 @@ def _verify_bb_hmac(body: bytes, header: str) -> bool:
 # source.commit.hash is simply the current tip. Recording hints from those
 # adds nothing and couples this to unrelated activity.
 _SUPERSEDE_EVENTS = ("pullrequest:created", "pullrequest:updated")
+# COPS-2617: a MERGE is what advances the destination branch. A push to a
+# PR's own branch must never be read as "main moved", or every other open PR
+# would abort on every unrelated push.
+_BASE_SUPERSEDE_EVENTS = ("pullrequest:fulfilled",)
 
 
 def _maybe_record_supersede_hint(event_key: str, body: bytes) -> None:
@@ -1162,7 +1220,8 @@ def _maybe_record_supersede_hint(event_key: str, body: bytes) -> None:
     try:
         if not SUPERSEDE_ABORT_ENABLED or not BB_WEBHOOK_SECRET:
             return
-        if event_key not in _SUPERSEDE_EVENTS:
+        if event_key not in _SUPERSEDE_EVENTS \
+                and event_key not in _BASE_SUPERSEDE_EVENTS:
             return
         payload = json.loads(body.decode("utf-8"))
         if not isinstance(payload, dict):
@@ -1185,6 +1244,16 @@ def _maybe_record_supersede_hint(event_key: str, body: bytes) -> None:
             return
         workspace, _, slug = full_name.partition("/")
         if workspace != BB_WORKSPACE or slug not in REPOS:
+            return
+        if event_key in _BASE_SUPERSEDE_EVENTS:
+            # COPS-2617: a merge. The destination branch now points at the
+            # merge commit, which invalidates every open PR against it.
+            dest = pr.get("destination") or {}
+            branch = ((dest.get("branch") or {}).get("name"))
+            new_base = ((pr.get("merge_commit") or {}).get("hash"))
+            if isinstance(branch, str) and branch and \
+                    isinstance(new_base, str) and new_base:
+                _record_base_hint(slug, branch, new_base)
             return
         _record_supersede_hint(slug, pr_id, sha)
     except Exception:
@@ -10022,8 +10091,16 @@ def format_comment(pr_sha, app_results, skipped_apps=None, base_sha="",
     ai_summary = generate_ai_summary(app_results)
     if ai_summary:
         print(f"    [comment] AI summary included ({len(ai_summary)} chars)")
+    elif not any(_result(v).outcome == OUT_DIFF for v in app_results.values()):
+        # Nothing changed, so there was nothing to summarise. Routine.
+        print("    [comment] AI summary absent (no changes to summarise)")
     else:
-        print("    [comment] AI summary absent (call failed or no changes)")
+        # COPS-2617 secondary finding: this and the line above used to share
+        # one INFO message, so a Vertex call failing on every PR looked
+        # exactly like a quiet day. Changes exist and the summary is missing,
+        # which means the call failed -- say so, and at a level that shows up.
+        log("[comment] AI summary absent despite changed apps: the Vertex "
+            "call failed or returned nothing", "WARNING")
 
     # ── Header ──────────────────────────────────────────────────────
     large_label = f" | \U0001f4e6 Large changeset ({len(changed_apps)} apps)" if is_large else ""
@@ -10614,6 +10691,27 @@ def process_pr(pr, path_map, base_sha="", repo=None):
             f"(consecutive={_n})", pr=pr_id, event="superseded",
             old_sha=pr_sha[:12], new_sha=_armed_newer[:12], stage="entry")
         return  # _seen NOT set → the newer sha is rendered on the next pass
+
+    # COPS-2617: the same check for the DESTINATION branch. A merge on main
+    # invalidates this snapshot exactly as a push to the PR's own branch
+    # does, and it used to be noticed only AFTER a full render, by comparing
+    # the [base:] token on the already-published comment. Measured on
+    # acme-config-prod: 4 of 6 passes across two large PRs rendered against
+    # an already-dead base, and a 564-app comment was rewritten 3 times in
+    # 8 minutes from unrelated merges.
+    #
+    # Peek, never pop: this hint is shared by every open PR against the
+    # branch, so the first PR to read it must not consume it. It clears
+    # naturally when a render finally starts from the new base.
+    _newer_base = _base_superseded_by(repo, dest, base_sha, sk=sk)
+    if _newer_base:
+        _n = _note_supersede_abort(sk)
+        log(f"PR #{pr_id}: base branch advanced before render started "
+            f"({(base_sha or '')[:8]} -> {_newer_base[:8]}), skipping "
+            f"(consecutive={_n})", pr=pr_id, event="base_superseded",
+            old_sha=(base_sha or "")[:12], new_sha=_newer_base[:12],
+            stage="entry")
+        return  # _seen NOT set → rendered against the new base next pass
 
     # A chart republish (JFrog webhook) can force this PR to recompute once,
     # bypassing both dedups below. Consume-once: if the recompute then fails,
