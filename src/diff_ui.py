@@ -510,6 +510,132 @@ def _render_index(outline):
     return "".join(parts)
 
 
+# ── Prose rendering (COPS-2625, phase H) ────────────────────────────────
+# Phases C and D made the page complete and navigable; it still printed its
+# own prose as markup, so the surface that exists to be READ was the harder
+# of the two to read. These transforms fix that under four rules:
+#
+#   1. Outside fences only. Inside a fence, alignment and the leading +/-
+#      carry meaning, so those rows are produced exactly as before.
+#   2. Escape FIRST, transform the already-escaped string. Nothing below
+#      ever sees raw PR-controlled text, so no transform can open an
+#      injection hole; the whitelist decides only what gets *decoration*.
+#   3. Anything not recognised renders exactly as it did before. Seven
+#      hashes is not a heading and a values line with pipes is not a table.
+#      An unrenderable line is a cosmetic miss; a swallowed line is lost
+#      information, and this page exists so nothing is lost.
+#   4. One row per source line, tables excepted (they collapse to one).
+_MD_HEAD_RE = re.compile(r"^(#{1,6}) (.*)$")
+_MD_RULE_RE = re.compile(r"^-{3,}\s*$")
+_MD_LI_RE = re.compile(r"^([ \t]*)- (.*)$")
+_MD_TROW_RE = re.compile(r"^\s*\|.*\|\s*$")
+_MD_TSEP_RE = re.compile(r"^\s*\|(?:\s*:?-{2,}:?\s*\|)+\s*$")
+_MD_CODE_RE = re.compile(r"`([^`\n]+)`")
+_MD_BOLD_RE = re.compile(r"\*\*(\S(?:[^*]*\S)?)\*\*")
+# http/https only, and the closing paren must follow the url immediately.
+# javascript:, data: and vbscript: are not rejected by a blocklist here --
+# they simply never match, which is the only version of this that stays
+# correct when someone invents a new scheme.
+_MD_LINK_RE = re.compile(r"\[([^\]\n]*)\]\((https?://[^)\s]+)\)")
+
+# The body repeats what the page chrome already states above the diff.
+_MD_HDR_TITLE_RE = re.compile(r"^#{1,6} .*ACME Diff Preview\s*$")
+_MD_HDR_COMMIT_RE = re.compile(r"^\*\*Commit\*\* ")
+
+
+def _render_inline(esc):
+    """Inline markup on an ALREADY-ESCAPED line.
+
+    Code spans and links are lifted out into placeholders before bold runs,
+    so markup inside a code span stays literal (a resource path containing
+    asterisks is a path, not an emphasis) and bold can never rewrite the
+    inside of an href. Placeholders are restored highest-index first,
+    because a link's replacement may itself contain a code placeholder.
+
+    NUL is the placeholder delimiter and cannot survive html.escape from
+    any real body; if one is present anyway the line is returned untouched,
+    per rule 3.
+    """
+    if "\x00" in esc:
+        return esc
+    toks = []
+
+    def _hold(fragment):
+        toks.append(fragment)
+        return "\x00%d\x00" % (len(toks) - 1)
+
+    out = _MD_CODE_RE.sub(
+        lambda m: _hold("<code>%s</code>" % m.group(1)), esc)
+    out = _MD_LINK_RE.sub(
+        lambda m: _hold('<a href="%s" rel="noopener noreferrer">%s</a>'
+                        % (m.group(2),
+                           _MD_BOLD_RE.sub(r"<strong>\1</strong>",
+                                           m.group(1)))), out)
+    out = _MD_BOLD_RE.sub(r"<strong>\1</strong>", out)
+    for i in range(len(toks) - 1, -1, -1):
+        out = out.replace("\x00%d\x00" % i, toks[i])
+    return out
+
+
+def _md_cells(line):
+    s = line.strip()
+    if s.startswith("|"):
+        s = s[1:]
+    if s.endswith("|"):
+        s = s[:-1]
+    return [c.strip() for c in s.split("|")]
+
+
+def _md_table(lines):
+    """A pipe table as a real table. lines[1] is the separator row."""
+    parts = ['<table class="mdt"><thead><tr>']
+    parts += ["<th>%s</th>" % _render_inline(html.escape(c))
+              for c in _md_cells(lines[0])]
+    parts.append("</tr></thead><tbody>")
+    for ln in lines[2:]:
+        parts.append("<tr>")
+        parts += ["<td>%s</td>" % _render_inline(html.escape(c))
+                  for c in _md_cells(ln)]
+        parts.append("</tr>")
+    parts.append("</tbody></table>")
+    return "".join(parts)
+
+
+def _md_prose(line, esc):
+    """(row class, cell html) for one prose line. esc is html.escape(line);
+    every capture below is re-escaped from the raw line, which is the same
+    string because escaping is per character."""
+    if _MD_RULE_RE.match(line):
+        return "mdrule", ""
+    m = _MD_HEAD_RE.match(line)
+    if m:
+        return ("mdh mdh%d" % len(m.group(1)),
+                _render_inline(html.escape(m.group(2))))
+    m = _MD_LI_RE.match(line)
+    if m:
+        return "mdli", "%s&bull; %s" % (m.group(1),
+                                        _render_inline(html.escape(m.group(2))))
+    return "", _render_inline(esc)
+
+
+def _page_header_span(lines):
+    """How many leading lines the PAGE may drop because its chrome already
+    states them: the generated title and the commit/base line. Returns 0
+    unless the whole expected shape is present, so an unfamiliar body keeps
+    every one of its rows."""
+    if not lines or not _MD_HDR_TITLE_RE.match(lines[0]):
+        return 0
+    i = 1
+    while i < len(lines) and not lines[i].strip():
+        i += 1
+    if i >= len(lines) or not _MD_HDR_COMMIT_RE.match(lines[i]):
+        return 0
+    i += 1
+    while i < len(lines) and not lines[i].strip():
+        i += 1
+    return i
+
+
 def _diff_row(cls, old_no, new_no, marker, esc_text, row_id=""):
     """One table row: two line-number gutters, a +/- marker cell, and the
     escaped code cell. esc_text is ALREADY html-escaped by the caller.
@@ -525,7 +651,7 @@ def _diff_row(cls, old_no, new_no, marker, esc_text, row_id=""):
             f'<td class="code">{esc_text}</td></tr>')
 
 
-def _render_body_rows(body, outline=None):
+def _render_body_rows(body, outline=None, drop_header=False):
     """Render the comment body as diff table rows. Same information as the
     raw text (the /raw endpoint stays byte-exact), just readable: inside
     ```diff fences, +/-/@@ lines get GitHub-palette colors and old/new line
@@ -541,6 +667,13 @@ def _render_body_rows(body, outline=None):
     happens to look like a header is diff content, not structure. Anchors
     are strictly additive -- with outline=None the output is byte-identical
     to before, and one row is still emitted per source line either way.
+
+    drop_header (COPS-2625) lets the PAGE skip the generated title and
+    commit line, which its own chrome already states above the diff. It
+    defaults to off, so the only caller that opts in is render_html and no
+    other surface changes. The skipped lines are still walked for pending
+    anchor matches, so dropping them can never shift an anchor onto the
+    wrong row.
     """
     rows = []
     fence = None      # None | "diff" | "code"
@@ -552,7 +685,20 @@ def _render_body_rows(body, outline=None):
             for res in app["resources"]:
                 pending.append((res["name"], res["id"]))
     pending.reverse()   # pop() from the end walks document order
-    for line in str(body).split("\n"):
+
+    def _take_anchor(text):
+        if pending and ("`%s`" % pending[-1][0]) in text:
+            return pending.pop()[1]
+        return ""
+
+    lines = str(body).split("\n")
+    start = _page_header_span(lines) if drop_header else 0
+    for skipped in lines[:start]:
+        _take_anchor(skipped)
+    i = start
+    while i < len(lines):
+        line = lines[i]
+        i += 1
         esc = html.escape(line)
         m = _FENCE_RE.match(line)
         if m:
@@ -578,14 +724,40 @@ def _render_body_rows(body, outline=None):
                 new_no += 1
         elif fence == "code":
             rows.append(_diff_row("ctx", None, None, "", esc))
-        elif line.startswith("# ") or line.startswith("## ") \
-                or line.startswith("### "):
-            rows.append(_diff_row("mdh", None, None, "", esc))
-        else:
+        elif (_MD_TROW_RE.match(line) and i < len(lines)
+                and _MD_TSEP_RE.match(lines[i])):
+            # A pipe row is only a table when the separator row follows it.
+            # Without that check a values line containing pipes would be
+            # swallowed into a table, which is rule 3 the wrong way round.
+            j = i + 1
+            while j < len(lines) and _MD_TROW_RE.match(lines[j]):
+                j += 1
+            block = lines[i - 1:j]
+            # Every source line still gets its chance at a pending anchor,
+            # exactly as when each was its own row; the first match lands on
+            # the collapsed row. This is the one place rule 4 (one row per
+            # source line) is deliberately broken, so consumption order is
+            # kept identical on purpose.
             row_id = ""
-            if pending and ("`%s`" % pending[-1][0]) in line:
-                row_id = pending.pop()[1]
-            rows.append(_diff_row("", None, None, "", esc, row_id=row_id))
+            for src in block:
+                got = _take_anchor(src)
+                if got and not row_id:
+                    row_id = got
+            rows.append(_diff_row("mdt", None, None, "",
+                                  _md_table(block), row_id=row_id))
+            i = j
+        else:
+            # Anchor placement is frozen at the pre-2625 predicate on
+            # purpose: headings of level 1 to 3 never took a pending match
+            # and still do not, even though levels 4 to 6 now render as
+            # headings too. No anchor may move, so the widened heading rule
+            # is for rendering only.
+            row_id = ""
+            if not (line.startswith("# ") or line.startswith("## ")
+                    or line.startswith("### ")):
+                row_id = _take_anchor(line)
+            cls, cell = _md_prose(line, esc)
+            rows.append(_diff_row(cls, None, None, "", cell, row_id=row_id))
     return rows
 
 
@@ -637,7 +809,8 @@ def render_html(artifact, requested_sha=None):
 
     outline = build_outline(artifact.get("body", ""))
     index_html = _render_index(outline)
-    rows = _render_body_rows(artifact.get("body", ""), outline=outline)
+    rows = _render_body_rows(artifact.get("body", ""), outline=outline,
+                             drop_header=True)
     visible = "".join(rows[:MAX_VISIBLE_LINES])
     overflow = rows[MAX_VISIBLE_LINES:]
     if overflow:
@@ -754,6 +927,30 @@ tr.del td.mk {{ color: var(--del-mk); }}
 tr.hunk td {{ background: var(--hunk-bg); color: var(--hunk-fg); }}
 tr.fence td.code {{ color: var(--muted); opacity: .55; }}
 tr.mdh td.code {{ font-weight: 700; }}
+/* COPS-2625: prose is rendered, not printed. The code cell stays
+   white-space: pre everywhere except the collapsed table row, where the
+   table does its own layout. */
+tr.mdh1 td.code {{ font-size: 20px; line-height: 30px; }}
+tr.mdh2 td.code {{ font-size: 17px; line-height: 26px; }}
+tr.mdh3 td.code {{ font-size: 15px; line-height: 24px; }}
+tr.mdh4 td.code, tr.mdh5 td.code, tr.mdh6 td.code {{ font-size: 13px; }}
+tr.mdh td.code, tr.mdli td.code {{
+             font-family: -apple-system, BlinkMacSystemFont, "Segoe UI",
+                          Helvetica, Arial, sans-serif; }}
+tr.mdrule td.code {{ padding: 0; }}
+tr.mdrule td.code::after {{ content: ""; display: block;
+             border-top: 1px solid var(--border); margin: 6px 0; }}
+td.code strong {{ font-weight: 700; }}
+td.code code {{ background: var(--panel); border: 1px solid var(--border);
+             border-radius: 4px; padding: 0 4px; font-size: 11.5px; }}
+td.code a {{ color: var(--link); }}
+tr.mdt td.code {{ white-space: normal; padding: 6px 8px; }}
+table.mdt {{ border-collapse: collapse; margin: 4px 0;
+             font-family: -apple-system, BlinkMacSystemFont, "Segoe UI",
+                          Helvetica, Arial, sans-serif; font-size: 12px; }}
+table.mdt th, table.mdt td {{ border: 1px solid var(--border);
+             padding: 4px 8px; text-align: left; vertical-align: top; }}
+table.mdt th {{ background: var(--panel); font-weight: 600; }}
 .show-all {{ width: 100%; border: none; background: var(--panel);
             color: var(--link); font: inherit; font-size: 12px;
             padding: 8px; cursor: pointer; }}
