@@ -555,6 +555,130 @@ _diff_stats:      dict          = {
 }
 _diff_stats_lock: threading.Lock = threading.Lock()
 
+
+# ── Prometheus exposition (COPS-2627) ───────────────────────────────────
+# The COPS-2607 phases added counters as evidence that the two-surface
+# split holds, and nothing watched any of them. The ticket said to check
+# what was already wired before adding a scrape path: nothing was. This
+# Datadog org takes no Kubernetes container logs and the cluster has no
+# Datadog agent; it ships logs to Cloud Logging via fluentbit-gke and runs
+# Google Managed Prometheus. This endpoint is what either platform can
+# read, so the choice of alerting backend stays open.
+#
+# The registry is EXPLICIT. A stats key only becomes a metric when someone
+# declares its name, type and help here, because a metric is a contract
+# with whatever alerts on it and a key that appears by accident is a
+# contract nobody agreed to.
+#
+# Type matters more than it looks. The counters are per pod and reset on
+# every restart, so a "current value" monitor reads healthy after each
+# deploy. Declaring a monotonic series as `counter` is what lets increase()
+# and rate() span a reset correctly. A value that can fall on its own -- a
+# high-water mark, or a consecutive-failure count that zeroes on the next
+# success -- must NOT be a counter, or the drop is read as a restart and
+# silently swallowed.
+_PROM_PREFIX = "acme_diff_preview"
+_PROM_REGISTRY = (
+    # (stats key, metric suffix, type, help)
+    ("comment_fallback_inline", "comment_fallback_inline_total", "counter",
+     "Comments posted with hunks inlined because the full-diff page was "
+     "unavailable. Every one is a reviewer reading a comment that lost its "
+     "backing page."),
+    ("section_cap_trims", "section_cap_trims_total", "counter",
+     "Times FULL_SECTIONS_MAX_PER_APP trimmed an app's section list. Every "
+     "increment is content missing from BOTH surfaces; should stay 0."),
+    ("diff_retries", "diff_retries_total", "counter",
+     "Per-diff transient retries performed."),
+    ("futures_cancelled", "futures_cancelled_total", "counter",
+     "Subtask futures cancelled on abnormal exit."),
+    ("ai_prompt_capped", "ai_prompt_capped_total", "counter",
+     "AI prompts capped at AI_MAX_APPS."),
+    ("http_pool_reuses", "http_pool_reuses_total", "counter",
+     "Requests served on an existing pooled connection."),
+    ("http_pool_fresh_conns", "http_pool_fresh_conns_total", "counter",
+     "New HTTPS connections opened."),
+    ("http_pool_fallbacks", "http_pool_fallbacks_total", "counter",
+     "Requests re-routed to plain urlopen."),
+    # Gauges: each of these can legitimately go down.
+    ("comment_max_bytes", "comment_max_bytes", "gauge",
+     "Largest comment body rendered since start. Phase E's claim is that "
+     "this stops approaching the limit; if it climbs back, the summary is "
+     "regressing."),
+    ("comment_bytes", "comment_bytes", "gauge",
+     "Size of the most recent comment body."),
+    ("comment_fences", "comment_fences", "gauge",
+     "Diff fences in the most recent comment. Phase E moved these to the "
+     "page, so this is expected to be 0."),
+    ("oci_consecutive_pull_failures", "oci_consecutive_pull_failures",
+     "gauge",
+     "Consecutive systemic chart-pull failures since the last success. A "
+     "pod can be Ready with every pull failing."),
+    ("last_iteration_s", "last_iteration_seconds", "gauge",
+     "Seconds taken by the most recent poll iteration."),
+    ("is_leader", "is_leader", "gauge",
+     "1 on the replica that owns the poll loop, 0 on standby."),
+)
+
+
+def _prom_escape(v):
+    """Backslash first: escaping the quote first would then double the
+    backslash it just introduced."""
+    return str(v).replace("\\", "\\\\").replace('"', '\\"')
+
+
+def _prom_number(v):
+    if isinstance(v, bool):
+        return 1.0 if v else 0.0
+    if isinstance(v, (int, float)):
+        return float(v)
+    return None      # strings, None, timestamps: skipped, never guessed
+
+
+def render_prometheus(stats, extra_labels=None):
+    """Prometheus text exposition for the stats dict.
+
+    Values that are not numbers are skipped rather than emitted: a single
+    malformed line makes a scraper reject the whole payload, so one string
+    would cost every other metric on the page.
+    """
+    labels = dict(extra_labels or {})
+    lset = ""
+    if labels:
+        lset = "{%s}" % ",".join('%s="%s"' % (k, _prom_escape(v))
+                                 for k, v in sorted(labels.items()))
+    out = []
+
+    def emit(name, kind, help_text, value, label_set=lset):
+        out.append("# HELP %s %s" % (name, help_text))
+        out.append("# TYPE %s %s" % (name, kind))
+        out.append("%s%s %g" % (name, label_set, value))
+
+    # The version is not a number; it travels as a label. It is also what
+    # tells a monitor whether a counter reset was a deploy or a crash.
+    vlabels = dict(labels)
+    vlabels["version"] = APP_VERSION
+    emit("%s_build_info" % _PROM_PREFIX, "gauge",
+         "Running version, always 1.", 1,
+         "{%s}" % ",".join('%s="%s"' % (k, _prom_escape(v))
+                           for k, v in sorted(vlabels.items())))
+
+    for key, suffix, kind, help_text in _PROM_REGISTRY:
+        if key not in stats:
+            continue
+        n = _prom_number(stats[key])
+        if n is None:
+            continue
+        emit("%s_%s" % (_PROM_PREFIX, suffix), kind, help_text, n)
+
+    # COPS-2577 learned this on the stats payload: a high-water mark is
+    # meaningless without the cap it is approaching, and a threshold
+    # hardcoded in a monitor drifts the day the cap moves.
+    if "comment_max_bytes" in stats:
+        emit("%s_comment_max_bytes_limit" % _PROM_PREFIX, "gauge",
+             "MAX_COMMENT_BYTES, the cap comment_max_bytes approaches.",
+             float(MAX_COMMENT_BYTES))
+    return "\n".join(out) + "\n"
+
 # Comment-ID cache: avoids re-paginating ALL comments on every iteration to
 # find ours (bughunt N5). Our comment is updated in place, so its position
 # among a PR's comments never moves; on a heavily-discussed PR the old
@@ -895,6 +1019,22 @@ class _HealthHandler(BaseHTTPRequestHandler):
             self.send_header("Content-Length", str(len(data)))
             self.end_headers()
             self.wfile.write(data)
+
+        elif self.path == "/metrics":
+            # COPS-2627: the same counters as /diff-preview/stats, in the
+            # format a scraper reads. Google Managed Prometheus is already
+            # running in this cluster; a Datadog OpenMetrics check reads
+            # the identical payload, so this does not commit us to either.
+            with _diff_stats_lock:
+                snapshot = dict(_diff_stats)
+            snapshot["is_leader"] = _should_run_iteration(_leader)
+            body = render_prometheus(snapshot).encode("utf-8")
+            self.send_response(200)
+            self.send_header("Content-Type",
+                             "text/plain; version=0.0.4; charset=utf-8")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
 
         elif self.path == "/diff-preview/stats":
             # JSON counters for diff operations — useful for dashboards and alerts

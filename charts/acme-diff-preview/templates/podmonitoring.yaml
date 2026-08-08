@@ -1,0 +1,36 @@
+{{- /*
+COPS-2627: let Google Managed Prometheus scrape /metrics.
+
+The ticket asked for monitors on the COPS-2607 counters and said to check
+what was already wired first. Nothing was: this Datadog org receives no
+Kubernetes container logs and the cluster runs no Datadog agent. What it
+does run is GMP (gmp-system/collector) and fluentbit-gke to Cloud Logging.
+So this is the path that already exists.
+
+PodMonitoring, not a Service-level scrape, on purpose. The counters are PER
+POD, and both replicas serve HTTP while only one owns the poll loop, so a
+Service-level scrape would hit whichever replica the Service happened to
+pick and report one pod's numbers as the whole deployment's. Per-pod series
+are also what make a counter reset attributable to a restart.
+
+Off by default: a scrape creates billable Cloud Monitoring series, which
+should be a deliberate decision rather than a side effect of a bump.
+*/}}
+{{- if .Values.podMonitoring.enabled }}
+apiVersion: monitoring.googleapis.com/v1
+kind: PodMonitoring
+metadata:
+  name: {{ include "acme-diff-preview.fullname" . }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "acme-diff-preview.labels" . | nindent 4 }}
+spec:
+  selector:
+    matchLabels:
+      {{- include "acme-diff-preview.selectorLabels" . | nindent 6 }}
+  endpoints:
+    - port: {{ .Values.podMonitoring.port }}
+      path: /metrics
+      interval: {{ .Values.podMonitoring.interval }}
+      timeout: {{ .Values.podMonitoring.timeout }}
+{{- end }}
