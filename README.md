@@ -131,7 +131,25 @@ Two caps remain, and neither is silent:
 - **Visible rows** default to 20,000. Everything past that is still in the HTML, behind a `show full output` button, and `/raw` is always byte-exact. The ceiling is a browser-survival number, not a policy: #3887 is 786,150 lines and renders to 113MB of HTML, so laying out every row on first paint is a hung tab rather than completeness.
 - **Stored sections** are bounded by `FULL_SECTIONS_MAX_PER_APP` (5,000) for memory safety, because the full list is retained per app across a whole run. What it drops is missing from *both* surfaces, so hitting it increments `section_cap_trims`, logs a warning, and the page states the shortfall rather than claiming to be complete.
 
-**Rolling back the uncapping.** `FULL_PAGE_UNCAPPED=false` restores the old capped page. Once the comment has stopped carrying inline YAML, set `COMMENT_INLINE_DIFFS=true` **first**, then flip this. The other order leaves the comment without YAML *and* the page truncating, which means the information is simply gone. A rollback switch whose safe order is not written down is a trap.
+**Rolling back the uncapping.** `FULL_PAGE_UNCAPPED=false` restores the old capped page. Since 2.35.0 the comment no longer carries inline YAML, so set `COMMENT_INLINE_DIFFS=true` **first**, then flip this. The other order leaves the comment without YAML *and* the page truncating, which means the information is simply gone. A rollback switch whose safe order is not written down is a trap.
+
+### Two surfaces, one contract
+
+Since 2.35.0 the service renders two different things from one function, and the split is deliberate:
+
+| | PR comment | Full-diff page |
+|---|---|---|
+| Purpose | the **decision** | the **evidence** |
+| YAML hunks | no | always |
+| Config-changes panel | no | yes |
+| AI analysis | no | yes |
+| Clean applications | one count | named, one per line |
+| Verdicts, deletions, VM facts, downgrades, decommissions | **all of them, with names** | all of them |
+| Retention | as long as Bitbucket keeps the comment | 365 days from the PR's last diff run |
+
+The rule that makes this safe: **the comment only drops the YAML when there is a page to hold it.** If the artifact could not be written, the comment renders the hunks inline and says why, so a failed save can never produce a comment with no evidence anywhere.
+
+The second rule is subtler and cost three bugs to get right: what moves is *evidence*, never *conclusions*. The comment still tells you that six of seven resources are a version bump only, which the seventh is, which resources are being deleted, and what every guard decided. Only the proof moved.
 
 **Retention.** The local artifact directory is a cache, not the record: `_prune` only walks it, and a pruned entry costs one re-download. The durable copy is the GCS bucket, and its object lifecycle is what actually decides how long a page opens. That lifecycle lives in `acme-infrastructure` (`shared/infrastructure/acme-diff-preview-artifacts`). Because the artifact is rewritten on every commit, the age clock runs from the PR's last diff run, not from when it was opened. A page that is gone says so explicitly instead of 404-ing into a dead end.
 
@@ -230,6 +248,9 @@ full-diff web UI.
 | `DIFF_UI_DIR` | `diffUi.dir` | `/tmp/acme-diff-ui` | Artifact directory (bounded, pruned oldest-first) |
 | `DIFF_UI_MAX_ARTIFACTS` | `diffUi.maxArtifacts` | `500` | Max artifacts in the **local cache** before pruning oldest-first. Not a retention policy: `DIFF_UI_GCS_BUCKET` is the durable copy and its bucket lifecycle sets how long a page really lives |
 | `DIFF_UI_MAX_BYTES` | `diffUi.maxBytes` | `419430400` (400MiB) | Byte budget for the same local cache, enforced alongside the count. The directory is an emptyDir whose `sizeLimit` the kubelet enforces by **evicting the pod**, and artifacts range from ~2KB to tens of MB, so a count alone is measured in the wrong unit. A pruned entry costs one GCS re-download |
+| `COMMENT_INLINE_DIFFS` | — | `false` | Render the YAML hunks inside the PR comment. `false` (the default since 2.35.0) makes the comment a **decision summary**: verdicts, names and counts stay, the evidence lives on the full-diff page. `true` restores the pre-2.35.0 comment in one variable, and is also the **first** step of a phase C rollback — see below |
+| `COMMENT_INPUT_PANEL` | — | `false` | Render the `Config changes in this PR` panel in the comment. Off by default; the page always keeps it |
+| `COMMENT_INLINE_EVIDENCE_LINES` | — | `0` | With inline diffs off, still show this many lines of evidence for **risk-flagged** applications only (deletions, zeroed replicas, VM facts), so a reviewer never leaves the comment to see *why* something is dangerous — only to see the rest. `0` means the comment ships with no fenced block at all |
 | `FULL_PAGE_UNCAPPED` | — | `true` | The full-diff page never cuts a resource body. `false` restores the pre-2.33.0 page (bodies cut at 6,000 chars with a marker). **Rollback order matters, see below** |
 | — | `diffUi.ingress.enabled` | `false` | Externally reachable, IAP-gated Service + BackendConfig for the UI ([details](docs/internals.md#full-diff-web-ui-atlantis-style)) |
 
