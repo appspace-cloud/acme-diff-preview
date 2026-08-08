@@ -7,6 +7,7 @@ here is required to use the tool; it is for people changing it or debugging it.
 
 - [Why an empty `microservices.definitions` is blocked](#why-an-empty-microservicesdefinitions-is-blocked)
 - [Handling mass version bumps](#handling-mass-version-bumps-hundreds-of-apps-in-one-pr)
+- [The two surfaces: comment and page](#the-two-surfaces-comment-and-page)
 - [Which resources make it into the comment body](#which-resources-make-it-into-the-comment-body)
 - [What one app shows when it changes hundreds of resources](#what-one-app-shows-when-it-changes-hundreds-of-resources)
 - [Superseding an in-flight render](#superseding-an-in-flight-render)
@@ -90,14 +91,105 @@ start of each iteration so a long-lived pod cannot fill node ephemeral storage.
 > correct; a requeue-based design would raise throughput but is a larger
 > change. Revisit only if blip-storms during mass bumps become common.
 
+### The two surfaces: comment and page
+
+Since 2.35.0 (COPS-2612) one function, `format_comment`, renders two different
+artifacts, and which one it is rendering is carried by a `RenderProfile`
+rather than inferred. `COMMENT_PROFILE` is the PR comment; `FULL_PROFILE` is
+the full-diff page.
+
+The split is not "short version / long version". It is **decision** versus
+**evidence**:
+
+| | `COMMENT_PROFILE` | `FULL_PROFILE` |
+| --- | --- | --- |
+| YAML hunks | no | always |
+| Config-changes panel | no | yes |
+| AI analysis | no | yes |
+| Clean applications | one count | named, one per line |
+| Byte-identical sections grouped | yes | no |
+| Version-transition noise folded | yes | no |
+| Per-resource body cap | 6,000 chars | none |
+| Verdicts, deletions, VM facts, downgrades | **all, with names** | all |
+
+#### The switches, and why they resolve at render time
+
+`COMMENT_INLINE_DIFFS` (default `false`), `COMMENT_INPUT_PANEL` (`false`),
+`COMMENT_INLINE_EVIDENCE_LINES` (`0`) and `FULL_PAGE_UNCAPPED` (`true`) are
+read inside `RenderProfile.resolved()`, once per render, never snapshotted as
+dataclass defaults at import.
+
+This is not a style choice. `COMMENT_INLINE_DIFFS=true` is the one-variable
+rollback to the pre-2.35.0 comment, and an import-time snapshot would make it
+decorative: flipping it on a running pod would change nothing. The same trap
+was hit twice during the COPS-2607 phases before the rule was written down.
+
+`FULL_PROFILE` **pins** those three rather than resolving them. The page is
+the complete record, so a comment-shape switch must not be able to empty it —
+otherwise the rollback switch would delete the very thing it exists to fall
+back on.
+
+#### The rule that makes removing YAML safe
+
+`format_comment` forces `inline_diffs` and `input_panel` back on when
+`artifact_url` is empty. No URL means the artifact save failed or the UI is
+off, so there is no page to hold the evidence, and the comment keeps it and
+says why. Without that, a failed save would produce a comment with no
+evidence anywhere.
+
+The clearest proof it works is accidental: the four `test_cops2565` goldens
+render without a URL, take this path, and still match the pre-2.35.0 comment
+byte for byte.
+
+#### Evidence moves, conclusions do not
+
+The subtler rule, and the one that cost four bugs during COPS-2612. A diff
+block contains both proof and conclusions, and only the proof belongs on the
+page. The comment still states:
+
+* how many of an app's resources are a version transition only, and **which
+  one is not** (`Changed for another reason: ...`);
+* every deletion, zeroed replica, downgrade, decommission and VM fact, by
+  name;
+* the real resource count per app, never `len(sections)`.
+
+When adding anything to a diff block, the question to ask is which of the two
+it is. If a reader would use it to decide, it stays in the comment.
+
+#### `is_complete_record`
+
+A `RenderProfile` field, not a check on `profile.name`. It means "this surface
+IS the record, not a pointer to one", and it drives two behaviours: the page
+renders no pointer to itself (with no URL to hand, that pointer degraded into
+the page announcing that the page could not be produced — live for two
+versions), and when the storage cap trims an app the page owns the shortfall
+instead of directing the reader elsewhere.
+
+It is a behaviour field precisely so a profile derived with `replace()` under
+another name keeps behaving like the page.
+
+#### Rollback order
+
+`COMMENT_INLINE_DIFFS=true` **first**, then `FULL_PAGE_UNCAPPED=false`. The
+other order leaves the comment without YAML *and* the page truncating, so the
+information is gone. A rollback switch whose safe order is not written down is
+a trap.
+
+---
+
 ### Which resources make it into the comment body
 
 An app can change hundreds of resources. Sections are stored up to
-`FULL_SECTIONS_MAX_PER_APP` (400, memory-bounded, not an arbitrary display
-cutoff), which covers every real app seen so far with plenty of headroom. The
-counts in the headline and in the `N resource(s) changed` line are always the
-real totals; the cap only bites in the rare case a single app really does
-exceed it.
+`FULL_SECTIONS_MAX_PER_APP` (5,000 since COPS-2610, memory-bounded, not an
+arbitrary display cutoff). The counts in the headline and in the
+`N resource(s) changed` line are always the real totals.
+
+The cap is applied at **storage** time, so what it drops is missing from both
+surfaces. At its old value of 400 it did that silently, while the comment's
+own note claimed the remainder was "only in the full diff view" — exactly
+where it was not. Hitting it now increments `section_cap_trims`, logs a
+warning, and makes the page state the shortfall rather than claim to be
+complete. That counter should stay at zero; if it moves, raise the cap.
 
 Two rules decide what is shown, in order:
 
@@ -233,6 +325,40 @@ without any extra work.
 
 ### Superseding an in-flight render
 
+Two cases, one mechanism. A render is worth aborting when the snapshot it
+started from is already dead — whether that is because the PR's **own** branch
+moved (COPS-2575) or because the **destination** branch moved under it
+(COPS-2617).
+
+#### The destination-branch case
+
+A merge on `main` invalidates every open PR against it. Before COPS-2617 that
+was only noticed *after* a render finished, by comparing the `[base:]` token
+on the already-published comment — a full re-render rather than an abort.
+Measured on acme-config-prod, four merges in ~8 minutes: 6 passes across two
+large PRs, **4 of them against a base commit that was already dead**, and a
+564-app comment rewritten 3 times purely from unrelated merges.
+
+Three properties of the destination hint, each deliberate:
+
+* **Keyed by `(repo, base_branch)`, not per PR.** One merge invalidates every
+  open PR against that branch, and a burst has to cost one extra pass in
+  total, not one per merge. Last writer wins.
+* **Peek, never pop** — the one place it differs from `_arm_supersede`. That
+  hint belongs to a single PR, so consuming it is right. This one is shared,
+  so the first PR to read it must not consume it for the others. It clears
+  naturally once a render starts from the new base.
+* **Only `pullrequest:fulfilled` arms it.** A push to a PR's own branch must
+  never read as "main moved", or every other open PR would abort on every
+  unrelated push.
+
+Both cases share `_supersede_lock`, `_sha_eq` normalisation, and the
+`SUPERSEDE_MAX_CONSECUTIVE_ABORTS` livelock guard — without that ceiling a
+merge train would starve a large PR out of ever publishing anything, which is
+worse than publishing slightly stale.
+
+#### The PR's-own-branch case
+
 Two pushes landing on the same PR inside one render window used to mean the
 first render ran to completion against a commit that was already dead,
 published that diff into the shared PR comment, and only then did the real
@@ -345,6 +471,72 @@ below), the service persists the COMPLETE, untruncated comment body for the
 PR (already redacted, the exact text the comment would carry), together with
 the same at-a-glance context the comment header shows (base commit, apps
 evaluated, per-outcome breakdown), and serves it on the health port.
+
+#### Completeness, and the two caps that remain (COPS-2610)
+
+The page never cuts a resource body. Before that was enforced it was quietly
+failing its own promise: one stored production artifact carried **981**
+occurrences of `... (diff truncated for display)`. The 6,000-char body cap is
+a *comment* protection — one giant ConfigMap rewrite would push the comment
+past `MAX_COMMENT_BYTES`, whose blunt global cut would chop off the footer and
+the status token the poll loop parses. On the page it was only a lie.
+
+Two caps survive, neither silent:
+
+* **Visible rows**, default 20,000. Everything past that is still in the HTML
+  behind a `show full output` button, and `/raw` is byte-exact. This is a
+  browser-survival number, not a policy: the largest real artifact is 786,150
+  lines and 113MB of HTML, so laying out every row on first paint is a hung
+  tab rather than completeness.
+* **Stored sections**, `FULL_SECTIONS_MAX_PER_APP` — see above; it counts and
+  logs when it bites.
+
+#### Retention lives in the bucket, not in the prune
+
+`_prune` only walks the local artifact directory, which is a **cache**. The
+durable copy is the GCS bucket, and its object lifecycle is what decides how
+long a page opens: 365 days, set in `acme-infrastructure`
+(`shared/infrastructure/acme-diff-preview-artifacts`). Raising
+`DIFF_UI_MAX_ARTIFACTS` would not extend retention by a day.
+
+Because the artifact is rewritten on every commit, the age clock runs from the
+PR's last diff run. The local cache also has a byte budget
+(`DIFF_UI_MAX_BYTES`, 400MiB) because the directory is an emptyDir whose
+`sizeLimit` the kubelet enforces by **evicting the pod**, and a count is the
+wrong unit for files spanning 2KB to tens of MB.
+
+#### Navigation and anchors (COPS-2611 / COPS-2622)
+
+An index lists every application with its resource count, collapsed per
+application via `<details>` so 345 of them are a list rather than a wall, with
+a client-side filter that narrows the index and never the body.
+
+Structure is parsed from the markers `format_comment` already emits, not from
+a change to the stored artifact, so older artifacts stay readable and `/raw`
+is untouched. The parser is defensive by construction: anything unrecognised
+falls through and renders exactly as before, and one row is emitted per source
+line either way. A page that lost a line to gain an index would undo the work
+above.
+
+**`diff_ui.app_anchor` is the single owner of the per-application anchor
+shape**, and the PR comment imports it to build its deep links. Two copies of
+that logic would drift on the first change and every deep link would 404 *in
+silence*. It is deliberately order-independent, unlike the de-duplicated ids
+inside `build_outline`: the comment cannot know the page's application order,
+so a position-dependent id could not be reproduced. That moves
+collision-freedom onto the input, which holds because fleet application names
+are already `[a-z0-9-]`; `build_outline` keeps its numeric suffix as backstop.
+
+Anchors are scoped per application because resource names repeat across
+environments constantly, and an index entry pointing into the collapsed
+overflow reveals it before jumping — otherwise clicking it would do nothing on
+exactly the large pages that need the index most.
+
+Every value on the page is PR-controlled, so all of it is escaped, anchor ids
+are **sanitised** rather than escaped (they land in `id=` and `href="#..."`
+where escaping still leaves a quote to break out of), the filter only toggles
+a class and never writes body-derived strings back into the DOM, and the page
+ships zero external assets.
 
 Before COPS-2579 this claim was only partly true: the persisted body was the
 SAME body posted as the comment, and that body was itself capped per app
