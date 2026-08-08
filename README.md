@@ -135,6 +135,10 @@ Two caps remain, and neither is silent:
 
 **Retention.** The local artifact directory is a cache, not the record: `_prune` only walks it, and a pruned entry costs one re-download. The durable copy is the GCS bucket, and its object lifecycle is what actually decides how long a page opens. That lifecycle lives in `acme-infrastructure` (`shared/infrastructure/acme-diff-preview-artifacts`). Because the artifact is rewritten on every commit, the age clock runs from the PR's last diff run, not from when it was opened. A page that is gone says so explicitly instead of 404-ing into a dead end.
 
+**The page is navigable.** An index at the top lists every application with its resource count, collapsed per application so 345 of them are a list rather than a wall, with a filter box that narrows the index as you type. Every application and every resource has a stable anchor, so a link to one resource can be pasted into a ticket: `.../diff/acme-config-prod/3899/<sha>#app-pv-bos-b-ms--compute-cnrm-cloud-google-com-computeinstance-pv-bos-svc-a`. Anchors are scoped by application because resource names repeat across environments, and an entry pointing into the collapsed overflow reveals it before jumping.
+
+The index is derived from the markers the comment renderer already emits, not from a change to the stored artifact, so older artifacts stay readable and `/raw` is untouched. Anything the parser does not recognise still renders exactly as before: the page never loses a line to gain an index. The page still ships zero external assets, and every value on it, including anchor ids and index labels, is escaped or sanitised, because all of it is PR-controlled content.
+
 **Every comment links to it, unconditionally.** The pointer renders twice, in
 two fixed places: under the commit header, and again immediately above the
 `Status:` line, because on a long comment the header has scrolled away. Until
