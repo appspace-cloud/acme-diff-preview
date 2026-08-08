@@ -10149,12 +10149,17 @@ def format_comment(pr_sha, app_results, skipped_apps=None, base_sha="",
         # be the one case where the header position mattered.
         lines += [_full_view, ""]
     # The bulk-region budget is measured with _body_size(), which counts
-    # every line including the header. Left alone, this fixed pointer would
-    # eat a few hundred bytes of readable budget and silently push a diff
-    # section out of the comment -- a behaviour change disguised as a link.
-    # Give those bytes back, so the bulk region gets exactly the room it had
-    # before (COPS-2609: this phase is behaviour-neutral apart from the link).
-    if budget and _full_view:
+    # every line including the header. COPS-2609 added this compensation
+    # because the pointer then rendered INSIDE the measured region and would
+    # otherwise have eaten readable budget, silently folding a diff section
+    # away -- a behaviour change disguised as a link.
+    #
+    # COPS-2622 removed the header copy, so the surviving pointer is appended
+    # after the loop and never consumes budget. The compensation has to go
+    # with it, or the bulk region quietly gains ~85 bytes it did not pay for.
+    # It still applies in the no-page case above, which is the only branch
+    # that still renders a line here.
+    if budget and _full_view and not artifact_url:
         budget += len(_full_view.encode("utf-8")) + 2
 
     # ── Merge summary ────────────────────────────────────────────────
