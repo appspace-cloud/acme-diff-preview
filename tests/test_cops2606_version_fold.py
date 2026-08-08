@@ -31,6 +31,13 @@ import diff_preview as m
 GOLDEN_DIR = os.path.join(os.path.dirname(__file__), "golden")
 FIXED_TS = "2026-01-01 00:00 UTC"
 PR_SHA = "abc12345def67890abc12345def67890abc12345"
+
+# COPS-2612: the comment stopped inlining hunks by default. Cases
+# below that assert the INLINE shape (fence counts, hunk contents,
+# the intra-app budget, the repeat rollup) exercise a path that is
+# still live -- always on the page, and in the comment on rollback --
+# so they name the surface instead of relying on the default.
+INLINE = m.COMMENT_PROFILE.replace(inline_diffs=True)
 BASE_SHA = "0000111122223333444455556666777788889999"
 URL = "https://diffs.appspace.example/diff/acme-config-prod/42/abc12345"
 
@@ -198,18 +205,34 @@ class TestPackaging:
 # ── The comment ──────────────────────────────────────────────────────────
 
 class TestComment:
-    def test_fold_line_and_needle_inline(self):
+    def test_fold_line_states_the_conclusion_and_names_the_needle(self):
+        """COPS-2612 split this in two. The comment keeps every CONCLUSION
+        the fold produces -- how many resources are version-only, which
+        transition, which line classes, and which resource changed for
+        another reason -- and stops carrying the hunk that proves it. The
+        proof moved to the page; the sentence a reviewer decides on did
+        not."""
         secs = [_bump_section(i) for i in range(6)] + [_needle_section()]
         body = m.format_comment(PR_SHA, {"pv-acme-a-ms": _mk_result(secs)},
                                 base_sha=BASE_SHA, artifact_url=URL)
         assert "**6 of 7 changed resource(s)**" in body
         assert "2603.1.9 \u2192 2603.1.10" in body
         assert "image tags" in body
+        assert "Changed for another reason" in body, \
+            "the reader must learn WHICH resource is not version-only"
+        assert "svc-003" not in body
+        assert body.count("```diff") == 0
+        assert "7 resource(s) changed" in body
+        assert "[base:" in body
+
+    def test_the_needle_hunk_renders_on_the_inline_surface(self):
+        secs = [_bump_section(i) for i in range(6)] + [_needle_section()]
+        body = m.format_comment(PR_SHA, {"pv-acme-a-ms": _mk_result(secs)},
+                                base_sha=BASE_SHA, artifact_url=URL,
+                                profile=INLINE)
         assert "reconcile-interval-in-seconds" in body
         assert "svc-003" not in body
         assert body.count("```diff") == 1
-        assert "7 resource(s) changed" in body
-        assert "[base:" in body
 
     def test_full_page_never_folds(self):
         secs = [_bump_section(i) for i in range(6)] + [_needle_section()]
@@ -224,7 +247,7 @@ class TestComment:
         secs = [_varied_section(i) for i in range(40)]
         body = m.format_comment(PR_SHA, {"pv-big-a-ms": _mk_result(secs)},
                                 base_sha=BASE_SHA, artifact_url=URL,
-                                readable_budget=8000)
+                                profile=INLINE.replace(readable_budget=8000))
         assert "cfg-000" in body
         assert "cfg-039" not in body
         assert "more changed resource(s) omitted" in body
@@ -237,7 +260,7 @@ class TestComment:
                 "name: gone", f"name: gone-{k}")))
         body = m.format_comment(PR_SHA, {"pv-big-a-ms": _mk_result(secs)},
                                 base_sha=BASE_SHA, artifact_url=URL,
-                                readable_budget=6000)
+                                profile=INLINE.replace(readable_budget=6000))
         for k in range(6):
             assert f"gone-{k}" in body
 
@@ -246,7 +269,10 @@ class TestComment:
         body = m.format_comment(PR_SHA, {"pv-acme-a-ms": _mk_result(secs)},
                                 base_sha=BASE_SHA, artifact_url=URL)
         assert "changed resource(s)** are" not in body
-        assert body.count("```diff") == 2
+        inline = m.format_comment(PR_SHA, {"pv-acme-a-ms": _mk_result(secs)},
+                                  base_sha=BASE_SHA, artifact_url=URL,
+                                  profile=INLINE)
+        assert inline.count("```diff") == 2
 
 
 # ── Goldens: freeze what the reviewer reads ──────────────────────────────
@@ -268,7 +294,7 @@ class TestGoldens:
         secs = [_varied_section(i) for i in range(12)]
         body = m.format_comment(PR_SHA, {"pv-big-a-ms": _mk_result(secs)},
                                 base_sha=BASE_SHA, artifact_url=URL,
-                                readable_budget=2500)
+                                profile=INLINE.replace(readable_budget=2500))
         _assert_golden("intra_app_budget", body)
 
 
@@ -287,11 +313,23 @@ def _annotation_section(i):
 
 
 class TestRepeatRollup:
+    """COPS-2612 scopes this class to the INLINE surface.
+
+    Unlike the version fold, whose summary line states WHY resources
+    changed and therefore stays in the comment, collapsing byte-identical
+    sections is a display optimisation for hunks: its whole job is to stop
+    printing the same hunk 364 times. With the hunks on the page, it has
+    nothing to optimise in the comment, and "4 more resource(s) change
+    exactly the same lines" has no antecedent when no representative is
+    shown. The mechanism is still what the comment renders on rollback, so
+    it keeps being tested here against an explicit inline profile.
+    """
     def test_identical_change_renders_once(self):
         secs = [_annotation_section(i) for i in range(6)]
         secs.append(_varied_section(0))
         body = m.format_comment(PR_SHA, {"pv-acme-a-glb": _mk_result(secs)},
-                                base_sha=BASE_SHA, artifact_url=URL)
+                                base_sha=BASE_SHA, artifact_url=URL,
+                                profile=INLINE)
         assert body.count("```diff") == 2
         assert "5 more resource(s)" in body
         assert "member-000" in body      # the representative hunk
@@ -301,7 +339,8 @@ class TestRepeatRollup:
     def test_below_minimum_all_render(self):
         secs = [_annotation_section(i) for i in range(2)]
         body = m.format_comment(PR_SHA, {"pv-acme-a-glb": _mk_result(secs)},
-                                base_sha=BASE_SHA, artifact_url=URL)
+                                base_sha=BASE_SHA, artifact_url=URL,
+                                profile=INLINE)
         assert body.count("```diff") == 2
         assert "more resource(s)" not in body
 
@@ -310,7 +349,8 @@ class TestRepeatRollup:
                  TRUE_DELETION.replace("name: gone", f"name: gone-{k}"))
                 for k in range(4)]
         body = m.format_comment(PR_SHA, {"pv-acme-a-glb": _mk_result(secs)},
-                                base_sha=BASE_SHA, artifact_url=URL)
+                                base_sha=BASE_SHA, artifact_url=URL,
+                                profile=INLINE)
         assert body.count("```diff") == 4
         for k in range(4):
             assert f"gone-{k}" in body
@@ -327,7 +367,8 @@ class TestRepeatRollup:
         secs = ([_bump_section(i) for i in range(4)]
                 + [_annotation_section(i) for i in range(5)])
         body = m.format_comment(PR_SHA, {"pv-acme-a-glb": _mk_result(secs)},
-                                base_sha=BASE_SHA, artifact_url=URL)
+                                base_sha=BASE_SHA, artifact_url=URL,
+                                profile=INLINE)
         assert "changed resource(s)** are the version transition" in body
         assert "4 more resource(s)" in body
         assert body.count("```diff") == 1
@@ -335,5 +376,6 @@ class TestRepeatRollup:
     def test_golden_repeated_annotation(self):
         secs = [_annotation_section(i) for i in range(12)]
         body = m.format_comment(PR_SHA, {"pv-acme-a-glb": _mk_result(secs)},
-                                base_sha=BASE_SHA, artifact_url=URL)
+                                base_sha=BASE_SHA, artifact_url=URL,
+                                profile=INLINE)
         _assert_golden("repeated_annotation", body)

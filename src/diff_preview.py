@@ -317,6 +317,23 @@ DIFF_UI_MAX_BYTES     = _env_int("DIFF_UI_MAX_BYTES", 400 * 1024 * 1024)
 # COMMENT_INLINE_DIFFS=true FIRST, then flip this. The other order leaves
 # the comment without YAML while the page truncates -- information is gone.
 FULL_PAGE_UNCAPPED    = os.environ.get("FULL_PAGE_UNCAPPED", "true").strip().lower() in ("1", "true", "yes")
+# ── Phase E switches (COPS-2612) ─────────────────────────────────────────
+# The comment becomes a decision summary: verdicts, names and counts stay,
+# the YAML evidence moves to the full-diff page. Safe only because phase C
+# proved the page holds everything and retains it, and phase D made it
+# navigable. Measured on the 36-PR corpus: median comment 9,874 bytes, of
+# which 70-93% is YAML that the same reader can now open in one click.
+#
+# COMMENT_INLINE_DIFFS=true is the one-variable rollback to the old shape,
+# and it is also the FIRST step when rolling back phase C -- see README.
+# These are read at render time through RenderProfile.resolved(), never
+# snapshotted at import, or the rollback would not work on a running pod.
+COMMENT_INLINE_DIFFS  = os.environ.get("COMMENT_INLINE_DIFFS", "false").strip().lower() in ("1", "true", "yes")
+COMMENT_INPUT_PANEL   = os.environ.get("COMMENT_INPUT_PANEL", "false").strip().lower() in ("1", "true", "yes")
+# Narrow escape hatch: with inline diffs off, still show this many lines of
+# evidence for BLOCK-severity findings only. 0 (default) means the comment
+# ships with no fenced block at all.
+COMMENT_INLINE_EVIDENCE_LINES = _env_int("COMMENT_INLINE_EVIDENCE_LINES", 0)
 # Durable artifact store: name of a GCS bucket. Empty keeps the old
 # behavior (local dir only, artifacts die with the pod). When set, saves
 # are mirrored to the bucket and local read misses fall back to it, so
@@ -7572,19 +7589,27 @@ class RenderProfile:
     # var and any runtime override, and the symptom is a comment that stops
     # honouring its own configured budget.
     readable_budget: int = None
-    # Render the YAML hunks inline. Phase E turns this off for the comment,
-    # which is only safe once the page provably holds everything (phase C).
-    inline_diffs: bool = True
-    # Render the "why this changed" input panel. Phase E moves it to the page.
-    input_panel: bool = True
+    # Render the YAML hunks inline. Phase E (COPS-2612) turns this off for
+    # the comment, which is only safe because phase C proved the page holds
+    # everything and phase D made it navigable.
+    # None = COMMENT_INLINE_DIFFS at render time. Never bake the env value
+    # in as a default here, for the reason spelled out under
+    # readable_budget: an import-time snapshot makes the switch decorative,
+    # and this one is the phase E rollback.
+    inline_diffs: bool = None
+    # Render the "why this changed" input panel. Phase E moves it to the
+    # page. None = COMMENT_INPUT_PANEL at render time.
+    input_panel: bool = None
     # Collapse byte-identical apps into one representative (COPS-2579).
     group_repeats: bool = True
     # Fold version-transition noise so needles stay visible (COPS-2606).
     version_fold: bool = True
-    # Evidence lines to show per app when inline_diffs is off. Inert until
-    # phase E gives it a renderer; kept here so E does not reshape this
-    # object as well as use it.
-    inline_evidence_lines: int = 0
+    # Evidence lines to show per app when inline_diffs is off. Phase E
+    # renders these for BLOCK-severity apps only, so a reviewer never has
+    # to leave the comment to see WHY something is dangerous, only to see
+    # the rest. None = COMMENT_INLINE_EVIDENCE_LINES at render time; 0 (the
+    # default) means the comment ships with no fences at all.
+    inline_evidence_lines: int = None
     # This surface IS the complete record, not a summary pointing at one
     # (COPS-2611). Two consequences, both about not lying to the reader:
     # it never renders a pointer to the full-diff page (it would be a link
@@ -7631,6 +7656,15 @@ class RenderProfile:
             readable_budget=(COMMENT_READABLE_BYTES
                              if self.readable_budget is None
                              else self.readable_budget),
+            inline_diffs=(COMMENT_INLINE_DIFFS
+                          if self.inline_diffs is None
+                          else self.inline_diffs),
+            input_panel=(COMMENT_INPUT_PANEL
+                         if self.input_panel is None
+                         else self.input_panel),
+            inline_evidence_lines=(COMMENT_INLINE_EVIDENCE_LINES
+                                   if self.inline_evidence_lines is None
+                                   else self.inline_evidence_lines),
             body_max_chars=body_cap,
             section_cap=(FULL_SECTIONS_MAX_PER_APP
                          if self.section_cap is None
@@ -7660,6 +7694,14 @@ FULL_PROFILE = RenderProfile(
     group_repeats=False,
     version_fold=False,
     is_complete_record=True,
+    # Pinned True, never resolved from the env: the page is the complete
+    # record, so the phase E switches must not be able to empty it. Flipping
+    # COMMENT_INLINE_DIFFS is a comment-shape decision; if it could also
+    # reach the page, the rollback switch would delete the very thing it
+    # exists to fall back on.
+    inline_diffs=True,
+    input_panel=True,
+    inline_evidence_lines=0,
     # COPS-2610 (phase C): the page never cuts a resource body. Measured
     # before the change: acme-config-prod #3887's stored artifact carried
     # 981 "diff truncated for display" markers, 981 places where the
@@ -8518,12 +8560,15 @@ def _format_app_diff_block(app, sections, diff_text, show_diff=True, n_res=None,
     # What it must never do is drop the app: the header above still names
     # it and states how many resources changed, and the pointer says where
     # the hunks are. That is a relocation, not a loss.
-    if not profile.inline_diffs:
-        return out + [_full_hunks_link(artifact_url), ""]
-    # Version-transition fold: the noise sections identified by
-    # _classify_version_fold collapse behind one line; only needles render
-    # inline. Never active on the full-diff page (caller passes None there).
+    # Version-transition fold. Computed BEFORE the inline_diffs gate below,
+    # because its summary line is a CONCLUSION, not evidence: "6 of 7
+    # changed resources are the version transition 2602 -> 2603 only" is
+    # exactly the sentence a reviewer needs to decide, and it contains no
+    # YAML. Phase E moves the hunks to the page; dropping this line with
+    # them would break umbrella rule 2 (never lose information) while
+    # claiming to only relocate it.
     folded = set()
+    _fold_lines = []
     if version_fold and version_fold.get("n_foldable"):
         folded = set(version_fold.get("headers") or ())
         _lbl = version_fold.get("label")
@@ -8532,12 +8577,50 @@ def _format_app_diff_block(app, sections, diff_text, show_diff=True, n_res=None,
         # Two short paragraphs inside the quote, never one long line: a
         # prose wall past ~350 chars wraps into something nobody reads
         # (measured on the last 50 merged prod comments, COPS-2605).
-        out += [f"> \u2b06\ufe0f **{version_fold['n_foldable']} of {total} "
-                f"changed resource(s)** {_are}. {_full_hunks_link(artifact_url)}"]
+        # The link is appended here only when the hunks stay inline. With
+        # phase E the block emits its own pointer immediately below, and
+        # the same URL twice in adjacent lines reads like a rendering bug.
+        _fold_link = (f" {_full_hunks_link(artifact_url)}"
+                      if profile.inline_diffs else "")
+        _fold_lines += [f"> \u2b06\ufe0f **{version_fold['n_foldable']} of "
+                        f"{total} changed resource(s)** {_are}.{_fold_link}"]
         _what = ", ".join(version_fold.get("classes") or ())
         if _what:
-            out += [">", f"> Folded lines: {_what}."]
-        out += [""]
+            _fold_lines += [">", f"> Folded lines: {_what}."]
+        # Name the needles. The fold line says "6 of 7 are version-only",
+        # which leaves the reader knowing one resource changed for another
+        # reason and not which one. With the hunks inline that was answered
+        # by reading on; with phase E moving them to the page it would not
+        # be answered at all, so the names come up into the comment. Names
+        # are not evidence, and umbrella rule 2 is about information, not
+        # about bytes.
+        _needles = [h for h, _ in (sections or []) if h not in folded]
+        if _needles and not profile.inline_diffs:
+            _shown = ", ".join(f"`{_section_name(h)}`" for h in _needles[:5])
+            _extra = (f" *(+{len(_needles) - 5} more)*"
+                      if len(_needles) > 5 else "")
+            _fold_lines += [">", f"> Changed for another reason: "
+                                 f"{_shown}{_extra}"]
+        _fold_lines += [""]
+    if not profile.inline_diffs:
+        # COPS-2612: the block keeps its header (the app and its REAL
+        # resource count) and points at the page. Narrow exception: with
+        # COMMENT_INLINE_EVIDENCE_LINES > 0, a risk-flagged app still shows
+        # that many lines from its offending resources, so a reviewer never
+        # has to leave the comment to see WHY something is dangerous -- only
+        # to see the rest. Routine apps stay fence-free.
+        out += _fold_lines
+        _n = profile.inline_evidence_lines
+        if _n and risk_headers:
+            for hdr, body in (sections or []):
+                if hdr not in risk_headers:
+                    continue
+                _ev = _redact_for_display(hdr, _show_cr(body)).rstrip()
+                _ev = "\n".join(_ev.split("\n")[:_n])
+                out += [f"**`{_fence_safe(hdr)}`**", "", "```diff",
+                        _fence_safe(_ev), "```", ""]
+        return out + [_full_hunks_link(artifact_url), ""]
+    out += _fold_lines
     inline = [(h, b) for h, b in (sections or []) if h not in folded]
     # Identical changes collapse to one hunk plus a count. Off on the
     # full-diff page (the caller leaves group_repeats False there), which
@@ -9871,6 +9954,14 @@ def format_comment(pr_sha, app_results, skipped_apps=None, base_sha="",
                         "not both")
     profile = (profile or RenderProfile.from_readable_budget(
         readable_budget)).resolved()
+    # NON-NEGOTIABLE (COPS-2612): dropping the YAML from the comment is only
+    # ever safe when the page exists to hold it. No artifact_url means the
+    # save failed or the UI is off, so the comment falls back to inlining
+    # and the phase B notice says why. Without this, a failed artifact save
+    # would silently produce a comment with no evidence anywhere -- the one
+    # outcome the whole umbrella is built to prevent.
+    if not profile.is_complete_record and not artifact_url:
+        profile = profile.replace(inline_diffs=True, input_panel=True)
     # Readability budget for the BULK region only. 0 = render everything.
     # The persisted full-diff artifact is built with the FULL profile: the
     # comment may fold bulk content away, but the view it links to must
@@ -10090,7 +10181,16 @@ def format_comment(pr_sha, app_results, skipped_apps=None, base_sha="",
             lines.append(f"- *(+{n_ren - 10} more)*")
         lines.append("")
 
-    if ai_summary:
+    # AI Analysis: page only from COPS-2612 on. Decision recorded in the
+    # ticket, as it required. It is model output that partly restates the
+    # deterministic merge summary directly above it, and in a comment whose
+    # whole purpose is now "the verdict, fast" the deterministic narrative
+    # is the one that belongs. It stays in full on the page, where length
+    # costs nothing. _sanitize_ai_summary is untouched and still runs on
+    # that path: it is the prompt-injection sink for model output built
+    # from PR-controlled manifests, and moving surfaces is no reason to
+    # relax it.
+    if ai_summary and profile.is_complete_record:
         lines += [
             "---",
             "### \U0001f916 AI Analysis",
@@ -10185,6 +10285,9 @@ def format_comment(pr_sha, app_results, skipped_apps=None, base_sha="",
     # zeroed replicas, VM changes, downgrades) are exempt and render in
     # full wherever they sort — never silently fold a dangerous change.
     collapsed_apps = []
+    # Apps evaluated and found clean. Named one per line on the page, folded
+    # into a single count in the comment (COPS-2612).
+    clean_apps = []
     # Lazy running size: each line's byte size is counted exactly once no
     # matter where it was appended, replacing the full recount per app
     # that made this loop quadratic on exactly the PRs where the budget
@@ -10307,7 +10410,27 @@ def format_comment(pr_sha, app_results, skipped_apps=None, base_sha="",
                 profile=profile)
 
         else:
-            lines += [f"\u2705 **`{app}`** \u2014 no manifest changes", ""]
+            # COPS-2612: on a fleet PR this emitted one green line per clean
+            # app -- hundreds of lines saying nothing happened, between the
+            # reader and the few lines that matter. Collapsed to a single
+            # count in the comment; the page keeps naming every one, because
+            # "which environments were evaluated and found clean" is a real
+            # question and the page is where the complete record lives.
+            #
+            # Keyed on inline_diffs, not on is_complete_record, because the
+            # real condition is "is this surface carrying the detail right
+            # now". That is true on the page, and it is also true in the
+            # no-page fallback above -- where collapsing would leave these
+            # names in NO surface at all.
+            if profile.inline_diffs:
+                lines += [f"\u2705 **`{app}`** \u2014 no manifest changes", ""]
+            else:
+                clean_apps.append(app)
+
+    # ── Clean-app roll-up (COPS-2612) ─────────────────────────────────
+    if clean_apps:
+        lines += [f"\u2705 **{len(clean_apps)} application(s) unchanged** "
+                  f"\u2014 evaluated, nothing to apply.", ""]
 
     # ── Readability-budget pointer ────────────────────────────────────
     # One line accounting for every ordinary diff block the budget above

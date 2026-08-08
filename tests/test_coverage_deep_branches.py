@@ -832,9 +832,17 @@ def test_format_comment_error_plus_structural_combined_status(monkeypatch):
 
 
 def test_format_comment_includes_ai_summary_when_available(monkeypatch):
+    # COPS-2612 moved the AI Analysis block to the full-diff page only. It is
+    # model output that partly restates the deterministic merge summary, and
+    # the comment is now a decision summary where the deterministic narrative
+    # is the one that belongs. It is still generated and still rendered, on
+    # the page, so this test follows it there rather than being deleted.
     monkeypatch.setattr(m, "generate_ai_summary",
                         lambda *a, **k: "**1 app(s) updated**\n- synthetic AI line")
     results = {"chg": _dr(m.OUT_DIFF, n=1,
                           text="===== /v1/ConfigMap ns/x =====\n+ a\n")}
     body = m.format_comment("a" * 40, results, base_sha="b" * 40)
-    assert "synthetic AI line" in body
+    assert "synthetic AI line" not in body
+    page = m.format_comment("a" * 40, results, base_sha="b" * 40,
+                            profile=m.FULL_PROFILE)
+    assert "synthetic AI line" in page

@@ -34,6 +34,14 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
 
 import diff_preview as m
 
+# COPS-2612: these cases exercise the INLINE diff-block rendering
+# path. The comment stopped using it by default when phase E flipped
+# COMMENT_INLINE_DIFFS, but it is still what the full-diff page renders
+# always and what the comment renders on rollback, so the behaviour
+# below (redaction, body caps, fence safety) must keep being tested.
+_INLINE = m.COMMENT_PROFILE.replace(inline_diffs=True)
+
+
 
 def test_fallback_whole_masks_secret_with_unlisted_key_name():
     """A Secret data key that _SENSITIVE_KEYS does not name (tls.crt) must
@@ -45,7 +53,7 @@ def test_fallback_whole_masks_secret_with_unlisted_key_name():
         "   tls.crt: |-\n"
         "     LEAKEDCERTBYTESaaaaaaaaaaaaaaaa\n"
     )
-    out = "\n".join(m._format_app_diff_block("my-app", [], raw, show_diff=True, n_res=1))
+    out = "\n".join(m._format_app_diff_block("my-app", [], raw, show_diff=True, n_res=1, profile=_INLINE))
     assert "LEAKEDCERTBYTES" not in out
     assert "tls.crt:" in out  # key kept so the reviewer sees what changed
 
@@ -60,7 +68,7 @@ def test_fallback_masks_configmap_block_scalar_sensitive_key():
         "   apiToken: |\n"
         "     tok-LEAKEDTOKEN-abcdef\n"
     )
-    out = "\n".join(m._format_app_diff_block("my-app", [], raw, show_diff=True, n_res=1))
+    out = "\n".join(m._format_app_diff_block("my-app", [], raw, show_diff=True, n_res=1, profile=_INLINE))
     assert "tok-LEAKEDTOKEN-abcdef" not in out
 
 
@@ -78,7 +86,7 @@ def test_fallback_multiple_sections_each_redacted_independently():
         " - name: db_password\n"
         "   value: LEAKEDENVVALUEbbbbbbbbbbbbbbbb\n"
     )
-    out = "\n".join(m._format_app_diff_block("my-app", [], raw, show_diff=True, n_res=2))
+    out = "\n".join(m._format_app_diff_block("my-app", [], raw, show_diff=True, n_res=2, profile=_INLINE))
     assert "LEAKEDCERTAaaaaaaaaaaaaaaaaaaaa" not in out
     assert "LEAKEDENVVALUEbbbbbbbbbbbbbbbb" not in out
 
@@ -87,5 +95,5 @@ def test_fallback_still_handles_truly_headerless_text():
     """No '===== hdr =====' markers at all (arbitrary legacy diff text):
     still falls through to the flat redaction pass, unchanged behavior."""
     out = "\n".join(m._format_app_diff_block(
-        "legacy-app", [], "--- a\n+++ b\n-old\n+new\n", show_diff=True, n_res=1))
+        "legacy-app", [], "--- a\n+++ b\n-old\n+new\n", show_diff=True, n_res=1, profile=_INLINE))
     assert "```diff" in out and "-old" in out and "+new" in out

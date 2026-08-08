@@ -36,6 +36,14 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
 
 import diff_preview as m
 
+# COPS-2612: these cases exercise the INLINE diff-block rendering
+# path. The comment stopped using it by default when phase E flipped
+# COMMENT_INLINE_DIFFS, but it is still what the full-diff page renders
+# always and what the comment renders on rollback, so the behaviour
+# below (redaction, body caps, fence safety) must keep being tested.
+_INLINE = m.COMMENT_PROFILE.replace(inline_diffs=True)
+
+
 DEL_BODY = ("--- \n+++ \n@@ -1,6 +0,0 @@\n"
             "-apiVersion: autoscaling/v2\n-kind: HorizontalPodAutoscaler\n"
             "-metadata:\n-  name: userstory\n-spec:\n-  minReplicas: 5\n")
@@ -159,7 +167,7 @@ def test_truncation_note_says_risk_first_when_it_reorders():
     sections = [("/v1/Secret gone", DEL_BODY), ("/apps/Deployment app", MOD_BODY)]
     out = "\n".join(m._format_app_diff_block(
         "pv-dkv-a-ms", sections, "", n_res=38,
-        risk_headers={"/v1/Secret gone"}))
+        risk_headers={"/v1/Secret gone"}, profile=_INLINE))
     assert "Showing first" not in out, "wording still claims a plain prefix"
     assert "2 of 38" in out
 
@@ -167,5 +175,5 @@ def test_truncation_note_says_risk_first_when_it_reorders():
 def test_truncation_note_is_unchanged_without_risk_sections():
     sections = [("/apps/Deployment app", MOD_BODY)]
     out = "\n".join(m._format_app_diff_block(
-        "pv-dkv-a-ms", sections, "", n_res=38))
+        "pv-dkv-a-ms", sections, "", n_res=38, profile=_INLINE))
     assert "Showing first 1 of 38 changed resources" in out

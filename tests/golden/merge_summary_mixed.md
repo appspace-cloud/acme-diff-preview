@@ -43,34 +43,11 @@
 
 ⚠️ **`pv-vm-a-ss`** — 1 resource(s) changed
 
-**`/compute.cnrm.cloud.google.com/ComputeInstance pv-acme-a/pv-acme-svc-a`**
-
-```diff
---- 
-+++ 
-@@ -40,9 +40,9 @@
-   resourceID: "pv-acme-svc-a"
-   zone: "us-central1-a"
--  machineType: "n2d-standard-4"
-+  machineType: "n2d-standard-8"
-   canIpForward: false
-   desiredStatus: "RUNNING"
-```
+[Full hunks in the full diff view](https://diffs.appspace.example/diff/acme-config-prod/42/abc12345)
 
 ⚠️ **`pv-zzz-risky-ms`** — 1 resource(s) changed
 
-**`/v1/Service gone`**
-
-```diff
---- 
-+++ 
-@@ -1,5 +0,0 @@
--apiVersion: v1
--kind: Service
--metadata:
--  name: gone
--spec: {}
-```
+[Full hunks in the full diff view](https://diffs.appspace.example/diff/acme-config-prod/42/abc12345)
 
 🔎 **Full rendered diff (every hunk):** https://diffs.appspace.example/diff/acme-config-prod/42/abc12345
 

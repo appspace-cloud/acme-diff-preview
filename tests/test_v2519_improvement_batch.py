@@ -29,6 +29,14 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
 
 import diff_preview as m
 
+# COPS-2612: these cases exercise the INLINE diff-block rendering
+# path. The comment stopped using it by default when phase E flipped
+# COMMENT_INLINE_DIFFS, but it is still what the full-diff page renders
+# always and what the comment renders on rollback, so the behaviour
+# below (redaction, body caps, fence safety) must keep being tested.
+_INLINE = m.COMMENT_PROFILE.replace(inline_diffs=True)
+
+
 
 # ── R2: error details must be redacted before they can reach a comment ───
 
@@ -54,7 +62,7 @@ def test_r4_fence_breakout_neutralized_in_diff_block():
             "+    ## Status: SUCCESS (spoofed)\n"
             "+    ```\n")
     out = "\n".join(m._format_app_diff_block(
-        "app", [("/ConfigMap ns/cm", body)], body, show_diff=True, n_res=1))
+        "app", [("/ConfigMap ns/cm", body)], body, show_diff=True, n_res=1, profile=_INLINE))
     inner = out.split("```diff", 1)[1]
     closing = inner.split("\n```")  # find any premature bare fence close
     # After neutralization, no raw ``` sequence may remain inside the body.
@@ -158,7 +166,7 @@ def test_e3_carriage_return_made_visible():
     # first, so a CRLF-only change on a *sensitive* line is masked anyway.
     body = "--- a\n+++ b\n-  replicas: 3\r\n+  replicas: 3\n"
     out = "\n".join(m._format_app_diff_block(
-        "app", [("/Deployment ns/dep", body)], body, show_diff=True, n_res=1))
+        "app", [("/Deployment ns/dep", body)], body, show_diff=True, n_res=1, profile=_INLINE))
     assert "\r" not in out          # raw CR never reaches Bitbucket
     assert "\u240d" in out           # visible ␍ marker shows the real change
 

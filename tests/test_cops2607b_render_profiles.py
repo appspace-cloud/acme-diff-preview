@@ -173,11 +173,21 @@ def test_a_derived_profile_leaves_the_original_alone():
 # --- 4. the switches phases C-E will flip are wired ---------------------
 
 def test_inline_diffs_off_removes_the_fences():
-    """Phase E flips this. It is inert today, and that is the point: E must
-    be a profile change, not another surgery on format_comment."""
+    """Phase E flips this.
+
+    COPS-2612 added a precondition this test now has to state: dropping the
+    YAML is only safe when the page exists to hold it, so format_comment
+    forces inline_diffs back on when there is no artifact_url. The switch
+    alone is no longer sufficient, and that is deliberate -- a failed
+    artifact save must never produce a comment with no evidence anywhere.
+    """
     off = m.COMMENT_PROFILE.replace(inline_diffs=False)
-    assert "```diff" in _render()
-    assert "```diff" not in _render(profile=off)
+    on = m.COMMENT_PROFILE.replace(inline_diffs=True)
+    url = "https://argocd.appspace.com/diff/acme-config-dev/1/abc123"
+    assert "```diff" in _render(profile=on, artifact_url=url)
+    assert "```diff" not in _render(profile=off, artifact_url=url)
+    assert "```diff" in _render(profile=off, artifact_url=""), \
+        "no page means the comment keeps the YAML"
 
 
 def test_inline_diffs_off_still_names_every_app():
@@ -190,9 +200,13 @@ def test_inline_diffs_off_still_names_every_app():
 
 
 def test_input_panel_off_removes_the_panel():
+    # Same COPS-2612 precondition as the fences above: with no page to hold
+    # it, the panel stays in the comment.
     lines = ["### \U0001f9ea Why this changed", "", "- a cause line", ""]
-    on = _render(input_change_lines=lines)
-    off = _render(input_change_lines=lines,
+    url = "https://argocd.appspace.com/diff/acme-config-dev/1/abc123"
+    on = _render(input_change_lines=lines, artifact_url=url,
+                 profile=m.COMMENT_PROFILE.replace(input_panel=True))
+    off = _render(input_change_lines=lines, artifact_url=url,
                   profile=m.COMMENT_PROFILE.replace(input_panel=False))
     assert "a cause line" in on
     assert "a cause line" not in off
