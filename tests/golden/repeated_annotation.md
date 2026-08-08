@@ -2,8 +2,6 @@
 
 **Commit** `abc12345` → `main` | `acme-config-prod`
 
-🔎 **Full rendered diff (every hunk):** https://diffs.appspace.example/diff/acme-config-prod/42/abc12345
-
 ### 🧭 Merge summary
 
 ✅ **Routine** — nothing dangerous detected

@@ -2,8 +2,6 @@
 
 **Commit** `abc12345` → `main` | `acme-config-prod` | 📦 Large changeset (6 apps)
 
-🔎 **Full rendered diff (every hunk):** https://diffs.appspace.example/diff/acme-config-prod/42/abc12345
-
 ### 🧭 Merge summary
 
 ✅ **Routine** — nothing dangerous detected
@@ -26,27 +24,27 @@
 
 ⚠️ **`pv-env-0-ms`** — 1 resource(s) changed
 
-[Full hunks in the full diff view](https://diffs.appspace.example/diff/acme-config-prod/42/abc12345)
+[Full hunks for `pv-env-0-ms`](https://diffs.appspace.example/diff/acme-config-prod/42/abc12345#app-pv-env-0-ms)
 
 ⚠️ **`pv-env-1-ms`** — 1 resource(s) changed
 
-[Full hunks in the full diff view](https://diffs.appspace.example/diff/acme-config-prod/42/abc12345)
+[Full hunks for `pv-env-1-ms`](https://diffs.appspace.example/diff/acme-config-prod/42/abc12345#app-pv-env-1-ms)
 
 ⚠️ **`pv-env-2-ms`** — 1 resource(s) changed
 
-[Full hunks in the full diff view](https://diffs.appspace.example/diff/acme-config-prod/42/abc12345)
+[Full hunks for `pv-env-2-ms`](https://diffs.appspace.example/diff/acme-config-prod/42/abc12345#app-pv-env-2-ms)
 
 ⚠️ **`pv-env-3-ms`** — 1 resource(s) changed
 
-[Full hunks in the full diff view](https://diffs.appspace.example/diff/acme-config-prod/42/abc12345)
+[Full hunks for `pv-env-3-ms`](https://diffs.appspace.example/diff/acme-config-prod/42/abc12345#app-pv-env-3-ms)
 
 ⚠️ **`pv-env-4-ms`** — 1 resource(s) changed
 
-[Full hunks in the full diff view](https://diffs.appspace.example/diff/acme-config-prod/42/abc12345)
+[Full hunks for `pv-env-4-ms`](https://diffs.appspace.example/diff/acme-config-prod/42/abc12345#app-pv-env-4-ms)
 
 ⚠️ **`pv-env-5-ms`** — 1 resource(s) changed
 
-[Full hunks in the full diff view](https://diffs.appspace.example/diff/acme-config-prod/42/abc12345)
+[Full hunks for `pv-env-5-ms`](https://diffs.appspace.example/diff/acme-config-prod/42/abc12345#app-pv-env-5-ms)
 
 🔎 **Full rendered diff (every hunk):** https://diffs.appspace.example/diff/acme-config-prod/42/abc12345
 

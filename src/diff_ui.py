@@ -425,6 +425,26 @@ def _slug(text, fallback="x"):
     return (s or fallback)[:80]
 
 
+def app_anchor(name):
+    """The anchor id for an application block. THE single owner of that shape.
+
+    COPS-2622: the PR comment deep-links to individual applications on this
+    page. If the comment computed the id itself, the two would drift on the
+    first change here and every deep link would 404 *silently* -- worse than
+    the repetition it replaced. So the comment imports this.
+
+    Deliberately order-independent, unlike the de-duplicated ids inside
+    build_outline: the comment cannot know the page's application order (it
+    renders its own apps in a different order after rollups and budget
+    collapse), so an id that depended on position could not be reproduced.
+    That makes collision-freedom a property of the input instead, which is
+    safe here because application names are already `[a-z0-9-]` in the fleet
+    and _slug is the identity on them. build_outline keeps its numeric
+    suffix as the backstop for anything that ever is not.
+    """
+    return "app-" + _slug(name)
+
+
 def build_outline(body):
     """Structure of the page: [{id, name, count, resources: [{id, name}]}].
 
@@ -447,7 +467,7 @@ def build_outline(body):
     for line in str(body).split("\n"):
         m = _APP_RE.match(line)
         if m:
-            current = {"id": _unique("app-" + _slug(m.group(1))),
+            current = {"id": _unique(app_anchor(m.group(1))),
                        "name": m.group(1), "count": int(m.group(2)),
                        "resources": []}
             outline.append(current)

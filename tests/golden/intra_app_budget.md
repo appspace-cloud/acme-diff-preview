@@ -2,8 +2,6 @@
 
 **Commit** `abc12345` → `main` | `acme-config-prod`
 
-🔎 **Full rendered diff (every hunk):** https://diffs.appspace.example/diff/acme-config-prod/42/abc12345
-
 ### 🧭 Merge summary
 
 ✅ **Routine** — nothing dangerous detected
@@ -170,7 +168,7 @@
    pad-004-19: value
 ```
 
-> ✂️ **7 more changed resource(s) omitted** here to keep the comment scannable. None is a deletion, zeroed replica or VM change. [Full hunks in the full diff view](https://diffs.appspace.example/diff/acme-config-prod/42/abc12345)
+> ✂️ **7 more changed resource(s) omitted** here to keep the comment scannable. None is a deletion, zeroed replica or VM change. [Full hunks for `pv-big-a-ms`](https://diffs.appspace.example/diff/acme-config-prod/42/abc12345#app-pv-big-a-ms)
 >
 > Omitted: `/v1/ConfigMap cfg-005`, `/v1/ConfigMap cfg-006`, `/v1/ConfigMap cfg-007`, `/v1/ConfigMap cfg-008`, `/v1/ConfigMap cfg-009`, `/v1/ConfigMap cfg-010`, `/v1/ConfigMap cfg-011`
 
