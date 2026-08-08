@@ -122,7 +122,18 @@ every panel above the diffs always renders in full, anything risk-flagged
 full-diff page linked from the comment is always rendered with folding
 disabled, so it holds everything the comment left out.
 
-**The full-diff page is the complete record.** It is rendered separately from the comment with every budget disabled: no rollups, no collapsed apps, no table row cap, and the configuration panel uncapped so every changed file is listed key by key, file by file. The comment is the summary; this page is the evidence.
+**The full-diff page is the complete record.** It is rendered separately from the comment with every budget disabled: no rollups, no collapsed apps, no table row cap, no per-resource body cap, and the configuration panel uncapped so every changed file is listed key by key, file by file. The comment is the summary; this page is the evidence.
+
+Before this was enforced the page was quietly failing that promise: one production artifact (`acme-config-prod` #3887) carried 981 occurrences of `... (diff truncated for display)`, 981 places where the complete record told the reader to look somewhere else. The 6,000-character body cap is a comment protection, since one giant ConfigMap rewrite would otherwise push the comment past Bitbucket's limit and the blunt global cut would chop off the footer. On the page that same cap was only a lie.
+
+Two caps remain, and neither is silent:
+
+- **Visible rows** default to 20,000. Everything past that is still in the HTML, behind a `show full output` button, and `/raw` is always byte-exact. The ceiling is a browser-survival number, not a policy: #3887 is 786,150 lines and renders to 113MB of HTML, so laying out every row on first paint is a hung tab rather than completeness.
+- **Stored sections** are bounded by `FULL_SECTIONS_MAX_PER_APP` (5,000) for memory safety, because the full list is retained per app across a whole run. What it drops is missing from *both* surfaces, so hitting it increments `section_cap_trims`, logs a warning, and the page states the shortfall rather than claiming to be complete.
+
+**Rolling back the uncapping.** `FULL_PAGE_UNCAPPED=false` restores the old capped page. Once the comment has stopped carrying inline YAML, set `COMMENT_INLINE_DIFFS=true` **first**, then flip this. The other order leaves the comment without YAML *and* the page truncating, which means the information is simply gone. A rollback switch whose safe order is not written down is a trap.
+
+**Retention.** The local artifact directory is a cache, not the record: `_prune` only walks it, and a pruned entry costs one re-download. The durable copy is the GCS bucket, and its object lifecycle is what actually decides how long a page opens. That lifecycle lives in `acme-infrastructure` (`shared/infrastructure/acme-diff-preview-artifacts`). Because the artifact is rewritten on every commit, the age clock runs from the PR's last diff run, not from when it was opened. A page that is gone says so explicitly instead of 404-ing into a dead end.
 
 **Every comment links to it, unconditionally.** The pointer renders twice, in
 two fixed places: under the commit header, and again immediately above the
@@ -203,7 +214,7 @@ full-diff web UI.
 | `BB_RATELIMIT_MAX_PAUSE` | — | `60` | Cap on the shared pause, so a broken `Retry-After` cannot stall a PR |
 | `HELM_CACHE_MAX_CHARTS` | — | `60` | Max pulled chart versions kept on disk |
 | `AI_MAX_APPS` | — | `40` | Max changed apps included in the AI summary prompt |
-| `FULL_SECTIONS_MAX_PER_APP` | — | `400` | Max changed resources stored per app for the comment, the diff-group fingerprint and the full-diff web UI page (memory-bounded, not an arbitrary display cutoff) |
+| `FULL_SECTIONS_MAX_PER_APP` | — | `5000` | Max changed resources **stored** per app, shared by the comment, the diff-group fingerprint and the full-diff page. A memory bound, not a display cutoff: what it drops is gone from both surfaces, so hitting it increments `section_cap_trims`, logs a warning, and makes the page state the shortfall instead of claiming completeness |
 | `COMMENT_READABLE_BYTES` | — | `30000` | Readability budget for the **bulk** region of a comment. Past it, ordinary diff blocks fold into a pointer at the full-diff page and the overview table caps its rows. Panels and risk-flagged apps are never affected, and the full-diff page itself is always rendered with folding off. `0` disables folding entirely |
 | `DIFF_OCI_SELFCHECK_INTERVAL` | — | `900` | Seconds between periodic OCI self-checks (`helm show chart` against a known-good ref). First check ~60s after start; `0` disables. Result in `/diff-preview/stats` as `oci_selfcheck` |
 | `DIFF_OCI_SELFCHECK_REF` | — | *(last successful pull)* | Optional fixed reference `registry/chart:version` for the self-check |
@@ -213,7 +224,9 @@ full-diff web UI.
 | `DIFF_UI_ENABLED` | `diffUi.enabled` | `true` | Full-diff web UI ([details](docs/internals.md#full-diff-web-ui-atlantis-style)). Persists artifacts + serves `/diff/*` in-cluster; safe by default since no ingress path exposes it externally |
 | `DIFF_UI_BASE_URL` | `diffUi.baseUrl` | *(empty)* | External base URL the build status deep-links to. Empty = status keeps linking to the comment |
 | `DIFF_UI_DIR` | `diffUi.dir` | `/tmp/acme-diff-ui` | Artifact directory (bounded, pruned oldest-first) |
-| `DIFF_UI_MAX_ARTIFACTS` | `diffUi.maxArtifacts` | `500` | Max stored artifacts before pruning |
+| `DIFF_UI_MAX_ARTIFACTS` | `diffUi.maxArtifacts` | `500` | Max artifacts in the **local cache** before pruning oldest-first. Not a retention policy: `DIFF_UI_GCS_BUCKET` is the durable copy and its bucket lifecycle sets how long a page really lives |
+| `DIFF_UI_MAX_BYTES` | `diffUi.maxBytes` | `419430400` (400MiB) | Byte budget for the same local cache, enforced alongside the count. The directory is an emptyDir whose `sizeLimit` the kubelet enforces by **evicting the pod**, and artifacts range from ~2KB to tens of MB, so a count alone is measured in the wrong unit. A pruned entry costs one GCS re-download |
+| `FULL_PAGE_UNCAPPED` | — | `true` | The full-diff page never cuts a resource body. `false` restores the pre-2.33.0 page (bodies cut at 6,000 chars with a marker). **Rollback order matters, see below** |
 | — | `diffUi.ingress.enabled` | `false` | Externally reachable, IAP-gated Service + BackendConfig for the UI ([details](docs/internals.md#full-diff-web-ui-atlantis-style)) |
 
 

@@ -166,9 +166,17 @@ def test_respond_bad_path_is_400(tmp_path):
 
 
 def test_respond_missing_artifact_is_404(tmp_path):
-    code, _, body = diff_ui.respond("/diff/repo-x/1/abcdef1",
-                                    str(tmp_path), enabled=True)
-    assert code == 404 and b"not found" in body
+    # COPS-2610: still a 404, but no longer two words of text/plain. Once
+    # the comment stops carrying YAML (phase E), a missing page is a
+    # reviewer discovering the only record of a merged PR is gone, so the
+    # response has to say what happened and where else to look.
+    code, ctype, body = diff_ui.respond("/diff/repo-x/1/abcdef1",
+                                        str(tmp_path), enabled=True)
+    assert code == 404
+    assert ctype.startswith("text/html")
+    text = body.decode()
+    assert "no longer retained" in text
+    assert "repo-x" in text and "#1" in text
 
 
 def test_respond_html_escapes_content(tmp_path):

@@ -195,7 +195,7 @@ def _gcs_download(bucket, name):
 
 def save_artifact(base_dir, repo, pr_id, sha, body, pr_url="",
                   max_artifacts=500, base_sha="", outcome_counts=None,
-                  app_count=None, bucket=""):
+                  app_count=None, bucket="", max_bytes=None):
     """Persist the full (already redacted) diff body. Atomic; then prune.
 
     base_sha/outcome_counts/app_count are optional PR-level context (the diff
@@ -234,22 +234,43 @@ def save_artifact(base_dir, repo, pr_id, sha, body, pr_url="",
     finally:
         if os.path.exists(tmp):  # pragma: no cover - only on a failed replace
             os.remove(tmp)
-    _prune(base_dir, max_artifacts)
+    _prune(base_dir, max_artifacts, max_bytes)
     if bucket:
         _gcs_upload(bucket, os.path.basename(path),
                     payload.encode("utf-8"))
     return path
 
 
-def _prune(base_dir, max_artifacts):
-    """Remove oldest artifacts (by mtime) beyond max_artifacts. Best-effort."""
+def _prune(base_dir, max_artifacts, max_bytes=None):
+    """Remove oldest artifacts (by mtime) beyond the caps. Best-effort.
+
+    Two caps because they bound different failure modes. The count cap is
+    the historical one. The BYTE cap (COPS-2610) is the one that matches
+    how the directory actually fails: it lives on a 1Gi emptyDir and the
+    kubelet EVICTS the whole pod past the sizeLimit -- and artifact sizes
+    span three orders of magnitude (median ~181KB, observed worst 26.7MB
+    before uncapping), so a count is measured in the wrong unit. Local
+    pruning is cheap to be aggressive about: GCS is the durable copy and a
+    pruned entry costs exactly one re-download on the next view.
+    """
     try:
         entries = [os.path.join(base_dir, n) for n in os.listdir(base_dir)
                    if n.endswith(".json")]
         entries.sort(key=lambda p: os.path.getmtime(p))
+        sizes = {p: os.path.getsize(p) for p in entries}
     except OSError:  # pragma: no cover - directory vanished mid-run
         return
-    for path in entries[:max(0, len(entries) - max_artifacts)]:
+    total = sum(sizes.values())
+    over_count = max(0, len(entries) - max_artifacts)
+    doomed = entries[:over_count]
+    total -= sum(sizes[p] for p in doomed)
+    if max_bytes:
+        for path in entries[over_count:]:
+            if total <= max_bytes:
+                break
+            doomed.append(path)
+            total -= sizes[path]
+    for path in doomed:
         try:
             os.remove(path)
         except OSError:
@@ -360,7 +381,14 @@ _HUNK_RE = re.compile(r"^@@ -(\d+)(?:,\d+)? \+(\d+)(?:,\d+)? @@")
 # dropped, /raw stays byte-exact) but hidden behind a "show full output"
 # button so first paint and scrolling stay snappy. Module-level so tests and
 # operators can tune it.
-MAX_VISIBLE_LINES = 1500
+#
+# 20,000 (COPS-2610): the old 1,500 opened routine multi-app PRs mostly
+# folded. The ceiling is a measured browser-survival number, not a policy:
+# acme-config-prod #3887 is 786,150 lines and renders to 113MB of HTML in
+# 1.14s server-side -- ALL of it ships either way, so this constant only
+# decides how many <tr> the browser must lay out on first paint. "Show
+# everything by default" at that size is a hung tab, not completeness.
+MAX_VISIBLE_LINES = 20000
 
 
 def _diff_row(cls, old_no, new_no, marker, esc_text):
@@ -422,14 +450,21 @@ def _render_body_rows(body):
     return rows
 
 
-def render_html(artifact):
+def render_html(artifact, requested_sha=None):
     """Server-rendered Azure DevOps-style diff page. No external assets; the
     only script is a tiny theme switcher and a show-all toggle. EVERY dynamic
     value is escaped: the body is PR-controlled content, so the same
     comment-injection hardening the Bitbucket comment gets applies here.
     Colors follow the GitHub diff palette (more legible than Monaco's own),
     with Azure DevOps blue chrome. Light / Auto / Dark via a segmented
-    control, persisted in localStorage; Auto follows prefers-color-scheme."""
+    control, persisted in localStorage; Auto follows prefers-color-scheme.
+
+    requested_sha (COPS-2610): the sha in the URL, when the caller knows it.
+    The artifact is keyed by (repo, pr) on purpose -- one live page per PR,
+    exactly like the one comment -- so opening the build status of an OLDER
+    commit serves the CURRENT tip. Deliberate and documented, but it must
+    never be silent: a reviewer reading commit A's page as commit B's is
+    reading evidence for the wrong change."""
     repo = html.escape(str(artifact.get("repo", "")))
     pr_id = html.escape(str(artifact.get("pr_id", "")))
     sha = html.escape(str(artifact.get("sha", "")))
@@ -445,6 +480,21 @@ def render_html(artifact):
     summary = _format_outcome_summary(artifact.get("app_count"),
                                       artifact.get("outcome_counts") or {})
     summary_html = f'<div class="summary">{summary}</div>' if summary else ""
+    # Sha-mismatch banner. Case-normalised compare; a short-vs-long form of
+    # the SAME sha is not a mismatch (both are validated hex, so prefix
+    # compare on the shorter one is exact).
+    mismatch_html = ""
+    if requested_sha:
+        req = str(requested_sha).lower()
+        stored = str(artifact.get("sha", "")).lower()
+        n = min(len(req), len(stored))
+        if n and req[:n] != stored[:n]:
+            mismatch_html = (
+                f'<div class="notice">Showing the current tip '
+                f'<code>{html.escape(stored[:12])}</code> of this PR '
+                f'&mdash; you requested <code>{html.escape(req[:12])}</code>. '
+                f'One page is kept per pull request and every new commit '
+                f'replaces it, exactly like the PR comment.</div>')
 
     rows = _render_body_rows(artifact.get("body", ""))
     visible = "".join(rows[:MAX_VISIBLE_LINES])
@@ -567,6 +617,9 @@ tr.mdh td.code {{ font-weight: 700; }}
             color: var(--link); font: inherit; font-size: 12px;
             padding: 8px; cursor: pointer; }}
 .show-all:hover {{ text-decoration: underline; }}
+.notice {{ background: var(--hunk-bg); color: var(--hunk-fg);
+          border: 1px solid var(--border); border-radius: 4px;
+          padding: 8px 10px; margin: .6rem 0; font-size: 13px; }}
 footer {{ color: var(--muted); font-size: 12px; margin-top: 1rem; }}
 </style>
 </head>
@@ -584,7 +637,7 @@ footer {{ color: var(--muted); font-size: 12px; margin-top: 1rem; }}
 <h1>{repo} <span class="pr">{pr_link}</span></h1>
 <div class="meta">commit <code>{sha}</code>{base_bit}
  &middot; generated {created} &middot; <a href="{raw_href}">raw</a></div>
-{summary_html}
+{mismatch_html}{summary_html}
 <div class="diffwrap">
 <table class="diff"><tbody>{visible}</tbody>{rest_html}</table>
 </div>
@@ -634,7 +687,27 @@ def respond(path, base_dir, enabled, bucket=""):
     repo, pr_id, sha, raw = parsed
     artifact = load_artifact(base_dir, repo, pr_id, sha, bucket=bucket)
     if artifact is None:
-        return 404, text, b"not found"
+        # COPS-2610: a pruned or never-generated page must explain itself.
+        # Once the comment stops carrying YAML (phase E), this moment is a
+        # reviewer discovering that the only record of a merged PR is gone;
+        # two words of text/plain are not an acceptable way to say that.
+        # Everything interpolated is validated (repo/pr/sha regexes in
+        # parse_request_path) and escaped anyway.
+        gone = (
+            "<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\">"
+            "<title>diff no longer retained</title></head><body "
+            "style=\"font-family:system-ui;max-width:44rem;margin:3rem auto\">"
+            f"<h1>No diff page for {html.escape(str(repo))} PR "
+            f"#{html.escape(str(pr_id))}</h1>"
+            "<p>The diff for this pull request is <strong>no longer "
+            "retained</strong>, or was never generated (the PR may predate "
+            "the diff-preview service, or the run may have been skipped)."
+            "</p><p>Artifacts are kept for a fixed retention window after "
+            "the PR's last diff run. For older history, the PR's file diff "
+            "in Bitbucket and the rendered state in ArgoCD remain "
+            "available.</p></body></html>")
+        return 404, "text/html; charset=utf-8", gone.encode("utf-8")
     if raw:
         return 200, text, str(artifact.get("body", "")).encode("utf-8")
-    return 200, "text/html; charset=utf-8", render_html(artifact).encode("utf-8")
+    return (200, "text/html; charset=utf-8",
+            render_html(artifact, requested_sha=sha).encode("utf-8"))

@@ -169,6 +169,13 @@ spec:
             - name: DIFF_UI_MAX_ARTIFACTS
               value: {{ .maxArtifacts | quote }}
             {{- end }}
+            {{- if .maxBytes }}
+            # Byte budget for the local artifact cache. The count cap is in
+            # the wrong unit: the cache is an emptyDir whose sizeLimit the
+            # kubelet enforces by evicting the pod (see values.yaml).
+            - name: DIFF_UI_MAX_BYTES
+              value: {{ .maxBytes | quote }}
+            {{- end }}
             {{- if .gcsBucket }}
             # Durable artifact store: saves are mirrored to this bucket and
             # local read misses fall back to it (see values.yaml).
