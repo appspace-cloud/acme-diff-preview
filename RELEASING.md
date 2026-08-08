@@ -73,6 +73,23 @@ They can be the same bump or different — keep them in sync with what changed.
 6. Update `acme-infrastructure` config with the new chart version and image tag,
    open a PR, and let Atlantis apply it.
 
+**Step 5 comes before step 6, and the reason is not tidiness.** Merging to
+`main` does not build the image; only the tag push does. If infra is applied
+first, the kubelet tries to pull a tag that does not exist yet, and the
+Artifact Registry proxy **caches that 404**. From then on the pull keeps
+failing for the negative-cache TTL even after the image lands in JFrog, so the
+deploy is blocked for a while by a stale answer rather than by a missing image.
+The service stays up throughout (`atomic = false`, `cleanup_on_fail = false`
+leave the old pods running), and the Helm release is left `failed` until the
+next apply, but the rollout stalls.
+
+If it happens anyway: confirm the image really is in JFrog (the `docker.yml`
+run log ends with `image.name: docker-dev.repo.appspace.com/...`), then poll the
+proxy manifest as described below until it answers `200` and re-run the apply.
+Do not force anything, and do not push the image manually: that would collide
+with the tag build (see below). Always test with a known-good tag as a control,
+otherwise a broken check looks exactly like a missing image.
+
 ## Where the image actually lives: JFrog, then GKE pulls it through a proxy
 
 `docker.yml` pushes the image to **JFrog** (`docker-dev.repo.appspace.com`)
