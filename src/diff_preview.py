@@ -7585,6 +7585,16 @@ class RenderProfile:
     # phase E gives it a renderer; kept here so E does not reshape this
     # object as well as use it.
     inline_evidence_lines: int = 0
+    # This surface IS the complete record, not a summary pointing at one
+    # (COPS-2611). Two consequences, both about not lying to the reader:
+    # it never renders a pointer to the full-diff page (it would be a link
+    # to itself, and with no URL to hand it degrades to "the page could not
+    # be produced" -- which the page then said about itself, live on 2.32.0
+    # and 2.33.0), and when the storage cap trims an app it owns the
+    # shortfall instead of directing the reader elsewhere.
+    # A behaviour field rather than a check on name: a profile derived with
+    # replace() under another name must keep behaving like the page.
+    is_complete_record: bool = False
     # Hard cap per resource body. 0 = never cut (COPS-2610, the FULL page);
     # the sentinel is resolved through the FULL_PAGE_UNCAPPED hatch below.
     # None = DISPLAY_BODY_MAX_CHARS at render time (see readable_budget).
@@ -7649,6 +7659,7 @@ FULL_PROFILE = RenderProfile(
     readable_budget=0,
     group_repeats=False,
     version_fold=False,
+    is_complete_record=True,
     # COPS-2610 (phase C): the page never cuts a resource body. Measured
     # before the change: acme-config-prod #3887's stored artifact carried
     # 981 "diff truncated for display" markers, 981 places where the
@@ -8541,7 +8552,7 @@ def _format_app_diff_block(app, sections, diff_text, show_diff=True, n_res=None,
             # app -- the remainder is gone from both surfaces, so on the
             # FULL page (the self-described complete record) the note must
             # own the shortfall instead of pointing at itself.
-            if not profile.inline_diffs or profile.name == "FULL":
+            if not profile.inline_diffs or profile.is_complete_record:
                 note = (f"> \u26a0\ufe0f **Storage cap reached: showing "
                         f"{shown} of {total} changed resources.** The "
                         f"remainder was not retained "
@@ -9936,7 +9947,10 @@ def format_comment(pr_sha, app_results, skipped_apps=None, base_sha="",
     # degrading quietly: a reviewer cannot otherwise tell an unavailable
     # page from one nobody linked, and the later phases remove inline YAML
     # on the promise that this link is always here.
-    _full_view = (
+    # This page IS the full rendered output, so it renders no pointer at
+    # all: a link to itself is noise, and with no URL to hand the fallback
+    # branch made the page announce that the page could not be produced.
+    _full_view = None if profile.is_complete_record else (
         f"\U0001f50e **Full rendered diff (every hunk):** {artifact_url}"
         if artifact_url else
         "\u26a0\ufe0f The full-diff page could not be produced for this run, "
@@ -9944,15 +9958,16 @@ def format_comment(pr_sha, app_results, skipped_apps=None, base_sha="",
     lines = [
         f"## \U0001f52d {STATUS_NAME}", "",
         f"{_comment_header(pr_sha)}{large_label}", "",
-        _full_view, "",
     ]
+    if _full_view:
+        lines += [_full_view, ""]
     # The bulk-region budget is measured with _body_size(), which counts
     # every line including the header. Left alone, this fixed pointer would
     # eat a few hundred bytes of readable budget and silently push a diff
     # section out of the comment -- a behaviour change disguised as a link.
     # Give those bytes back, so the bulk region gets exactly the room it had
     # before (COPS-2609: this phase is behaviour-neutral apart from the link).
-    if budget:
+    if budget and _full_view:
         budget += len(_full_view.encode("utf-8")) + 2
 
     # ── Merge summary ────────────────────────────────────────────────
@@ -10406,14 +10421,17 @@ def format_comment(pr_sha, app_results, skipped_apps=None, base_sha="",
     else:
         _status_token = "clean"
 
-    lines += [
+    lines += ([
         # Above the separator, never between it and the Status line:
         # _truncate_comment locates the footer with rfind("\n---\n**Status:**")
         # and splitting that sequence loses the [clean]/[base:] tokens, which
         # the poll loop parses for SHA dedup. Caught by
         # test_s2_truncated_comment_keeps_footer_tokens (COPS-2609).
+        # Absent on the complete-record surface, which does not point at
+        # itself (COPS-2611).
         _full_view,
         "",
+    ] if _full_view else []) + [
         "---",
         f"**Status:** {status}",
         f"*{_ts()} \u2014 {COMMENT_MARKER} [{_status_token}]" + (f" [base:{base_sha[:8]}]" if base_sha else "") + "*",

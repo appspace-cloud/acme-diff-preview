@@ -271,3 +271,54 @@ def test_an_anchor_inside_the_collapsed_overflow_is_still_reachable():
     assert f'id="{target}"' in page
     assert "hashchange" in page
     assert "revealTarget" in page
+
+
+# --- 10. the page must not talk about itself in the third person --------
+
+def test_the_page_never_claims_it_could_not_be_produced():
+    """Found by opening a real page in a browser, not by a test.
+
+    The phase B pointer renders in two fixed places, and when there is no
+    artifact URL it degrades to "the full-diff page could not be produced
+    for this run". `process_pr` passes artifact_url to the COMMENT render
+    but not to the FULL one, so the page rendered that fallback about
+    itself: a reviewer reading the page was told the page does not exist.
+
+    Live on 2.32.0 and 2.33.0 before this fix.
+    """
+    import diff_preview as dp
+    results = {"pv-x-a-ss": dp.DiffResult(
+        "+ a: 1\n", [("/apps/Deployment web", "+ a: 1\n")], 1, True, None,
+        dp.OUT_DIFF, "diff")}
+    page = dp.format_comment("a" * 40, results, profile=dp.FULL_PROFILE)
+    assert "could not be produced" not in page
+    assert "Full rendered diff (every hunk)" not in page, \
+        "the page must not link to itself either"
+
+
+def test_the_comment_still_carries_the_pointer_and_the_fallback():
+    """The same change must not quietly remove what phase B added."""
+    import diff_preview as dp
+    results = {"pv-x-a-ss": dp.DiffResult(
+        "+ a: 1\n", [("/apps/Deployment web", "+ a: 1\n")], 1, True, None,
+        dp.OUT_DIFF, "diff")}
+    url = "https://argocd.appspace.com/diff/acme-config-dev/1/abc123"
+    with_url = dp.format_comment("a" * 40, results, artifact_url=url)
+    assert with_url.count(url) >= 2, "still twice, in both fixed places"
+    without = dp.format_comment("a" * 40, results, artifact_url="")
+    assert without.count("could not be produced") == 2
+
+
+def test_the_surface_knows_it_is_the_complete_record_by_behaviour():
+    """Not by name. A profile derived with replace() under another name
+    must keep behaving like the page, or a future phase gets a page that
+    silently links to itself again."""
+    import diff_preview as dp
+    assert dp.FULL_PROFILE.is_complete_record is True
+    assert dp.COMMENT_PROFILE.is_complete_record is False
+    renamed = dp.FULL_PROFILE.replace(name="FULL-VARIANT")
+    results = {"pv-x-a-ss": dp.DiffResult(
+        "+ a: 1\n", [("/apps/Deployment web", "+ a: 1\n")], 1, True, None,
+        dp.OUT_DIFF, "diff")}
+    assert "could not be produced" not in dp.format_comment(
+        "a" * 40, results, profile=renamed)
