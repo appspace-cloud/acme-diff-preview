@@ -15,9 +15,11 @@
 
 ⚠️ **`pv-hp-a-ms`** — 8 resource(s) changed
 
-> ⬆️ **8 of 8 changed resource(s)** are the version transition `2603.1.9 → 2603.1.10` only. [Full hunks in the full diff view](https://diffs.appspace.example/diff/acme-config-prod/42/abc12345)
+> ⬆️ **8 of 8 changed resource(s)** are the version transition `2603.1.9 → 2603.1.10` only.
 >
 > Folded lines: image tags, chart labels, version env values, checksums, deploy timestamps.
+
+[Full hunks in the full diff view](https://diffs.appspace.example/diff/acme-config-prod/42/abc12345)
 
 🔎 **Full rendered diff (every hunk):** https://diffs.appspace.example/diff/acme-config-prod/42/abc12345
 

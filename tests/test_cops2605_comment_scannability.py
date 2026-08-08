@@ -336,7 +336,21 @@ def test_readable_budget_collapses_bulk_keeps_risk_and_links_artifact():
     assert ART_URL in body
     assert "[clean] [base:00001111]" in body
     tail = body.split("pv-zzz-risky-ms")[-1]
-    assert "```diff" in tail and "/v1/Service gone" in tail, \
+    # COPS-2612: the guarantee was "a risk-flagged app is never folded away
+    # by the budget", and it holds unchanged -- but what proves it is no
+    # longer a fence. The deleted resource is still NAMED in the comment
+    # (that is the guard firing); its hunk is on the page. Split so the
+    # test says which half is which, because collapsing the two is how a
+    # real regression would slip through as a golden update.
+    assert "/v1/Service gone" in body, \
+        "a deletion must still be named in the comment"
+    assert "```diff" not in tail, "the hunk itself moved to the page"
+    inline = m.format_comment(PR_SHA, results, base_sha=BASE_SHA,
+                              artifact_url=ART_URL,
+                              profile=m.COMMENT_PROFILE.replace(
+                                  inline_diffs=True))
+    itail = inline.split("pv-zzz-risky-ms")[-1]
+    assert "```diff" in itail and "/v1/Service gone" in itail, \
         "a risk-flagged app must keep its full diff even past the budget"
     assert "41 resource(s) will change" in body
     assert body.count("| \u26a0\ufe0f changed |") <= m._OVERVIEW_TABLE_MAX_ROWS
@@ -364,13 +378,25 @@ def test_artifact_url_only_adds_the_full_view_lines():
     assert ART_URL in b, "the full-diff page must be reachable from the body"
     assert ART_URL not in a
 
-    def _strip_full_view(body):
-        return [l for l in body.splitlines()
-                if "Full rendered diff" not in l
-                and "full-diff page could not be produced" not in l]
+    # COPS-2612 changed this contract again, and deliberately. The URL is no
+    # longer decoration on an otherwise fixed body: it is the precondition
+    # for moving the YAML off the comment. Without it there is no page to
+    # move to, so the comment keeps the hunks and says why. The two bodies
+    # are therefore SUPPOSED to differ by more than two lines now.
+    #
+    # What still holds, and is what this test now pins, is the invariant
+    # underneath: the page-less body is the strictly larger one, and every
+    # app named in one is named in the other. Losing a URL may cost brevity;
+    # it may never cost information.
+    def _apps(body):
+        return {l for l in body.splitlines() if "resource(s) changed" in l}
 
-    assert _strip_full_view(a) == _strip_full_view(b), \
-        "the artifact URL must not perturb anything but its own two lines"
+    assert _apps(a) == _apps(b), \
+        "the same apps must be named whether or not a page exists"
+    assert "```diff" in a, "no page means the comment keeps the evidence"
+    assert "```diff" not in b, "a page means the evidence lives there"
+    assert len(a) > len(b), \
+        "the fallback body is the larger one; that is the whole point"
 
 
 def test_truncate_comment_links_artifact():

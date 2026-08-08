@@ -8577,9 +8577,13 @@ def _format_app_diff_block(app, sections, diff_text, show_diff=True, n_res=None,
         # Two short paragraphs inside the quote, never one long line: a
         # prose wall past ~350 chars wraps into something nobody reads
         # (measured on the last 50 merged prod comments, COPS-2605).
+        # The link is appended here only when the hunks stay inline. With
+        # phase E the block emits its own pointer immediately below, and
+        # the same URL twice in adjacent lines reads like a rendering bug.
+        _fold_link = (f" {_full_hunks_link(artifact_url)}"
+                      if profile.inline_diffs else "")
         _fold_lines += [f"> \u2b06\ufe0f **{version_fold['n_foldable']} of "
-                        f"{total} changed resource(s)** {_are}. "
-                        f"{_full_hunks_link(artifact_url)}"]
+                        f"{total} changed resource(s)** {_are}.{_fold_link}"]
         _what = ", ".join(version_fold.get("classes") or ())
         if _what:
             _fold_lines += [">", f"> Folded lines: {_what}."]
@@ -10412,7 +10416,13 @@ def format_comment(pr_sha, app_results, skipped_apps=None, base_sha="",
             # count in the comment; the page keeps naming every one, because
             # "which environments were evaluated and found clean" is a real
             # question and the page is where the complete record lives.
-            if profile.is_complete_record:
+            #
+            # Keyed on inline_diffs, not on is_complete_record, because the
+            # real condition is "is this surface carrying the detail right
+            # now". That is true on the page, and it is also true in the
+            # no-page fallback above -- where collapsing would leave these
+            # names in NO surface at all.
+            if profile.inline_diffs:
                 lines += [f"\u2705 **`{app}`** \u2014 no manifest changes", ""]
             else:
                 clean_apps.append(app)
