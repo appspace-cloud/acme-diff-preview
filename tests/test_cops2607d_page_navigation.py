@@ -146,15 +146,25 @@ def test_a_hostile_name_is_escaped_in_body_index_and_anchor():
     `onerror=alert(2)` contains nothing html.escape touches, so it survives
     as inert text inside an escaped cell and that is correct. What must
     never survive is an unescaped tag or a quote that closes an attribute.
+
+    Asserted by COUNTING the page's own markup rather than by stripping it
+    first. An earlier version of this test did
+    `re.sub(r"<script.*?</script>", "", page)` before checking, which
+    CodeQL flagged (py/bad-tag-filter) and which is worse than weak: the
+    page's own script is the LAST thing on the page, so a body-injected
+    `<script` would have matched from the injection all the way to the
+    page's own closing tag, deleting the evidence and passing the test. A
+    security test that hides its own failure is worse than no test.
+
+    The counts below are exact for this page: one script of its own, no
+    <img> at all, and no bare <b> (its <body> and <button> do not match).
     """
     page = _render(_body(_app(HOSTILE_APP, [HOSTILE_RES])))
-    # The page ships exactly one script of its own (theme switcher + index
-    # filter). Anything beyond that count came from the body.
-    assert page.lower().count("<script") == 1, "an extra <script> appeared"
-    outside = re.sub(r"(?is)<script.*?</script>", "", page)
-    for live in ("<script", "<img", "<b>"):
-        assert live not in outside.lower(), \
-            f"unescaped markup survived: {live}"
+    low = page.lower()
+    assert low.count("<script") == 1, "a second <script> came from the body"
+    assert low.count("</script") == 1
+    assert "<img" not in low, "unescaped <img> survived"
+    assert "<b>" not in low, "unescaped <b> survived"
     assert "&lt;script&gt;" in page, "the payload must survive as inert text"
     # nothing hostile survived into an id=, href= or data-k= attribute
     for pat in (r'id="([^"]*)"', r'href="#([^"]*)"', r'data-k="([^"]*)"'):
