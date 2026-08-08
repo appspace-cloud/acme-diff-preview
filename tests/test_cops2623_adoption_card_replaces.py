@@ -50,11 +50,12 @@ FIRST_TIME = "appears in this environment for the first time"
 
 
 def _adoption(env="pv-hsbc-c"):
-    """The shape _detect_kcc_adoption returns for a real adoption."""
+    """The shape _detect_kcc_adoption returns for a real adoption. Key
+    names taken from _kcc_adoption_card, not invented."""
     return {"kind": "adoption",
-            "roles": [{"role": "svc", "instance_name": f"{env[:-2]}-svc-a",
-                       "machine_type": "n2d-highmem-2",
-                       "data_disk_gb": 128, "manage_metadata": False}]}
+            "roles": [{"role": "svc", "instance": f"{env[:-2]}-svc-a",
+                       "machineType": "n2d-highmem-2",
+                       "dataDiskSizeGb": 128, "manageMetadata": False}]}
 
 
 # --- 1. the card replaces, it does not accompany --------------------------

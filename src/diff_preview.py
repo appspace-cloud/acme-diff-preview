@@ -9560,6 +9560,14 @@ def _kcc_adoption_card(env_name: str, info: dict) -> list:
         "already exist and are adopted by `resourceID`. After merge: "
         "`lastStartTimestamp` unchanged, all `Compute*` UpToDate, then the "
         "`terraform state rm` follow-up.",
+        # COPS-2623: state the absence, not just the presences. deviceName is
+        # the single most dangerous field in this migration -- COPS-2592
+        # shipped an incident where rendering it detached a live disk -- and
+        # an adoption reviewer is specifically looking for reassurance that
+        # it is not being set. Silence reads the same as "nobody checked".
+        "",
+        "`attachedDisk.deviceName` is **not rendered**, so KCC leaves the "
+        "live attachment name alone.",
         "",
     ]
     return lines
@@ -9604,6 +9612,11 @@ def _summarize_vm_changes(changed_files, pr_sha, base_sha, path_map,
     """
     dangerous_lines, routine_lines = [], []
     adoption_cards = []
+    # COPS-2623: which environments the card speaks for. Routine lines from
+    # those are the ones the card replaces; every other environment in the
+    # same PR keeps all of its lines, so this has to be per environment and
+    # not a single flag.
+    adopted_envs = set()
     seen = set()
     for f in (changed_files or [])[:12]:
         clean = posixpath.normpath(f.lstrip("/"))
@@ -9648,6 +9661,7 @@ def _summarize_vm_changes(changed_files, pr_sha, base_sha, path_map,
         if (adoption and adoption.get("kind") == "adoption"
                 and path_map.get(clean)):
             adoption_cards.extend(_kcc_adoption_card(env_name, adoption))
+            adopted_envs.add(env_name)
         scope = (f"`{env_name}`" if path_map.get(clean) else
                  f"ancestor `{clean}` (inherited by every environment "
                  f"below it)")
@@ -9716,7 +9730,14 @@ def _summarize_vm_changes(changed_files, pr_sha, base_sha, path_map,
             mark = "\U0001f6a8 " if danger else ""
             tail = f" \u2014 {reason}" if reason else ""
             line = f"- {mark}{scope} \u00b7 **{role_label}**: {change}{tail}"
-            (dangerous_lines if danger else routine_lines).append(line)
+            if danger:
+                dangerous_lines.append(line)
+            else:
+                # Tagged with the environment only when this really is one:
+                # an ancestor file is inherited by many, so it can never be
+                # suppressed by one environment's adoption card.
+                routine_lines.append(
+                    (env_name if path_map.get(clean) else None, line))
 
     for app, r in sorted((app_results or {}).items()):
         for fact in (getattr(r, "vm_changes", None) or []):
@@ -9735,10 +9756,72 @@ def _summarize_vm_changes(changed_files, pr_sha, base_sha, path_map,
                         "; ".join(fact["dangerous"])))
             elif fact["fields"] or fact["notes"]:
                 routine_lines.append(
-                    "- %s: %s" % (where,
-                                  field_txt or "; ".join(fact["notes"])))
+                    (env, "- %s: %s" % (where,
+                                        field_txt or "; ".join(fact["notes"]))))
 
-    if not dangerous_lines and not routine_lines:
+    return _vm_panel_lines(adoption_cards, adopted_envs,
+                           routine_lines, dangerous_lines)
+
+
+# Rendered-manifest bullets that differ only by resource name. Six snapshot
+# policy attachments (daily/hourly/weekly x boot/data) are one fact -- the
+# existing schedule comes under KCC management -- and reading them as six
+# findings is how a reviewer learns to skim the panel (COPS-2623).
+_VM_REPEAT_RE = re.compile(
+    r"^- (?P<scope>`[^`]+`) \u00b7 `(?P<kind>\w+) [^`]+`: (?P<note>.+)$")
+_VM_REPEAT_MIN = 3
+
+
+def _collapse_repeated_vm_lines(routine):
+    """Collapse same-scope, same-kind, same-note bullets into one count.
+
+    Applies to every environment, adopted or not: where the individual
+    resource names carry no information beyond the kind, printing them is
+    noise. The names stay on the full-diff page, which is the complete
+    record.
+
+    Defensive like every other parser here: anything that does not match
+    the shape passes through untouched and in order.
+    """
+    out, groups = [], {}
+    for env, line in routine:
+        mt = _VM_REPEAT_RE.match(line)
+        if not mt:
+            out.append((env, line))
+            continue
+        key = (env, mt.group("scope"), mt.group("kind"), mt.group("note"))
+        if key not in groups:
+            groups[key] = [len(out), 0]
+            out.append((env, line))
+        groups[key][1] += 1
+    for (env, scope, kind, note), (idx, count) in groups.items():
+        if count >= _VM_REPEAT_MIN:
+            out[idx] = (env, f"- {scope} \u00b7 {count} \u00d7 `{kind}`: {note}")
+    return out
+
+
+def _vm_panel_lines(adoption_cards, adopted_envs, routine, dangerous):
+    """Assemble the VM panel from its parts.
+
+    Extracted from _summarize_vm_changes so the suppression decision has
+    one testable place; that function needs a Bitbucket fetch to reach it.
+
+    `routine` is a list of (environment, line). It carries the environment
+    because of COPS-2623: an environment classified as a KCC adoption gets
+    a card that, by its own docstring, REPLACES those lines -- they restate
+    what the card says in prose and describe the ArgoCD objects as new when
+    nothing in GCP is. Measured at 59-60% of a single-environment adoption
+    comment. Every OTHER environment in the same PR keeps all of its lines,
+    which is why a flat list of strings was not enough.
+
+    `dangerous` is never filtered, for any environment. Suppressing
+    evidence is the point; suppressing a verdict would be a different and
+    far worse change, so the two lists stay separate all the way here.
+    """
+    routine = [(e, l) for e, l in routine if e not in adopted_envs]
+    routine = _collapse_repeated_vm_lines(routine)
+    routine_lines = [l for _, l in routine]
+    if not dangerous and not routine_lines and not adoption_cards:
         # Always render the section, even empty. Operators asked for a
         # fixed place to look: "did this PR touch VMs at all?" must be
         # answerable without reading the rest. Audit of the last 40
@@ -9748,25 +9831,25 @@ def _summarize_vm_changes(changed_files, pr_sha, base_sha, path_map,
         return [_VM_PANEL_CLEAN_HDR, "",
                 "No changes to VM infrastructure (KCC linux-services) in "
                 "this PR.", ""]
-    if dangerous_lines:
+    if dangerous:
         _warn = ("**This PR touches virtual machine infrastructure (KCC linux-services). A botched VM change is slow and painful to recover from \u2014 verify every line below before merging.**")
         lines = [
             _VM_PANEL_DANGER_HDR,
             "",
             _warn,
             "",
-        ] + dangerous_lines
+        ] + list(dangerous)
         # Even when something else in the PR is dangerous, an adoption that
         # was classified still gets its card: the reviewer needs to know the
         # VM is being adopted rather than created while judging the real
         # danger above it.
         if adoption_cards:
-            lines += [""] + adoption_cards
+            lines += [""] + list(adoption_cards)
         if routine_lines:
             lines += ["", "Routine VM changes in the same PR:", ""] + routine_lines
         return lines + [""]
     return ([_VM_PANEL_ROUTINE_HDR, ""]
-            + (adoption_cards + [""] if adoption_cards else [])
+            + (list(adoption_cards) + [""] if adoption_cards else [])
             + routine_lines + [""])
 
 
