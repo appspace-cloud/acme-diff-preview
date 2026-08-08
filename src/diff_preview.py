@@ -8560,6 +8560,44 @@ def _format_app_diff_block(app, sections, diff_text, show_diff=True, n_res=None,
     # What it must never do is drop the app: the header above still names
     # it and states how many resources changed, and the pointer says where
     # the hunks are. That is a relocation, not a loss.
+    # Version-transition fold. Computed BEFORE the inline_diffs gate below,
+    # because its summary line is a CONCLUSION, not evidence: "6 of 7
+    # changed resources are the version transition 2602 -> 2603 only" is
+    # exactly the sentence a reviewer needs to decide, and it contains no
+    # YAML. Phase E moves the hunks to the page; dropping this line with
+    # them would break umbrella rule 2 (never lose information) while
+    # claiming to only relocate it.
+    folded = set()
+    _fold_lines = []
+    if version_fold and version_fold.get("n_foldable"):
+        folded = set(version_fold.get("headers") or ())
+        _lbl = version_fold.get("label")
+        _are = (f"are the version transition `{_lbl}` only"
+                if _lbl else "are version-only updates")
+        # Two short paragraphs inside the quote, never one long line: a
+        # prose wall past ~350 chars wraps into something nobody reads
+        # (measured on the last 50 merged prod comments, COPS-2605).
+        _fold_lines += [f"> \u2b06\ufe0f **{version_fold['n_foldable']} of "
+                        f"{total} changed resource(s)** {_are}. "
+                        f"{_full_hunks_link(artifact_url)}"]
+        _what = ", ".join(version_fold.get("classes") or ())
+        if _what:
+            _fold_lines += [">", f"> Folded lines: {_what}."]
+        # Name the needles. The fold line says "6 of 7 are version-only",
+        # which leaves the reader knowing one resource changed for another
+        # reason and not which one. With the hunks inline that was answered
+        # by reading on; with phase E moving them to the page it would not
+        # be answered at all, so the names come up into the comment. Names
+        # are not evidence, and umbrella rule 2 is about information, not
+        # about bytes.
+        _needles = [h for h, _ in (sections or []) if h not in folded]
+        if _needles and not profile.inline_diffs:
+            _shown = ", ".join(f"`{_section_name(h)}`" for h in _needles[:5])
+            _extra = (f" *(+{len(_needles) - 5} more)*"
+                      if len(_needles) > 5 else "")
+            _fold_lines += [">", f"> Changed for another reason: "
+                                 f"{_shown}{_extra}"]
+        _fold_lines += [""]
     if not profile.inline_diffs:
         # COPS-2612: the block keeps its header (the app and its REAL
         # resource count) and points at the page. Narrow exception: with
@@ -8567,6 +8605,7 @@ def _format_app_diff_block(app, sections, diff_text, show_diff=True, n_res=None,
         # that many lines from its offending resources, so a reviewer never
         # has to leave the comment to see WHY something is dangerous -- only
         # to see the rest. Routine apps stay fence-free.
+        out += _fold_lines
         _n = profile.inline_evidence_lines
         if _n and risk_headers:
             for hdr, body in (sections or []):
@@ -8577,24 +8616,7 @@ def _format_app_diff_block(app, sections, diff_text, show_diff=True, n_res=None,
                 out += [f"**`{_fence_safe(hdr)}`**", "", "```diff",
                         _fence_safe(_ev), "```", ""]
         return out + [_full_hunks_link(artifact_url), ""]
-    # Version-transition fold: the noise sections identified by
-    # _classify_version_fold collapse behind one line; only needles render
-    # inline. Never active on the full-diff page (caller passes None there).
-    folded = set()
-    if version_fold and version_fold.get("n_foldable"):
-        folded = set(version_fold.get("headers") or ())
-        _lbl = version_fold.get("label")
-        _are = (f"are the version transition `{_lbl}` only"
-                if _lbl else "are version-only updates")
-        # Two short paragraphs inside the quote, never one long line: a
-        # prose wall past ~350 chars wraps into something nobody reads
-        # (measured on the last 50 merged prod comments, COPS-2605).
-        out += [f"> \u2b06\ufe0f **{version_fold['n_foldable']} of {total} "
-                f"changed resource(s)** {_are}. {_full_hunks_link(artifact_url)}"]
-        _what = ", ".join(version_fold.get("classes") or ())
-        if _what:
-            out += [">", f"> Folded lines: {_what}."]
-        out += [""]
+    out += _fold_lines
     inline = [(h, b) for h, b in (sections or []) if h not in folded]
     # Identical changes collapse to one hunk plus a count. Off on the
     # full-diff page (the caller leaves group_repeats False there), which

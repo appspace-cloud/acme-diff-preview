@@ -14,6 +14,14 @@ os.environ.setdefault("BB_TOKEN", "t")
 os.environ.setdefault("ARGOCD_PASS", "t")
 import diff_preview as m
 
+# COPS-2612: these cases exercise the INLINE diff-block rendering
+# path. The comment stopped using it by default when phase E flipped
+# COMMENT_INLINE_DIFFS, but it is still what the full-diff page renders
+# always and what the comment renders on rollback, so the behaviour
+# below (redaction, body caps, fence safety) must keep being tested.
+_INLINE = m.COMMENT_PROFILE.replace(inline_diffs=True)
+
+
 
 # ── _sha_eq ──────────────────────────────────────────────────────────────────
 
@@ -306,7 +314,7 @@ def test_cascade_retention_skips_bare_lines_then_matches_policy():
 # ── _format_app_diff_block: header-only mode ────────────────────────────────
 
 def test_format_app_diff_block_without_diff_body():
-    out = m._format_app_diff_block("appx", [], "", show_diff=False, n_res=3)
+    out = m._format_app_diff_block("appx", [], "", show_diff=False, n_res=3, profile=_INLINE)
     assert out[0].startswith("\u26a0\ufe0f") and len(out) == 2
 
 

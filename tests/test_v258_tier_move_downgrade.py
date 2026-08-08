@@ -20,6 +20,14 @@ os.environ.setdefault("BB_TOKEN", "t")
 os.environ.setdefault("ARGOCD_PASS", "t")
 import diff_preview as m
 
+# COPS-2612: these cases exercise the INLINE diff-block rendering
+# path. The comment stopped using it by default when phase E flipped
+# COMMENT_INLINE_DIFFS, but it is still what the full-diff page renders
+# always and what the comment renders on rollback, so the behaviour
+# below (redaction, body caps, fence safety) must keep being tested.
+_INLINE = m.COMMENT_PROFILE.replace(inline_diffs=True)
+
+
 
 OLD_DIR = "gcp/qa/private-cloud/ap1/custom/pv-qa-13-a"
 NEW_DIR = "gcp/qa/private-cloud/ap1/monthly/pv-qa-13-a"
@@ -179,14 +187,14 @@ def test_footer_status_mentions_downgrade():
 def test_format_app_diff_block_caps_giant_body_with_marker():
     giant = "\n".join(f"+line {i}" for i in range(4000))   # ~40k chars
     out = "\n".join(m._format_app_diff_block(
-        "app-x", [("apps/Deployment big", giant)], giant, n_res=1))
+        "app-x", [("apps/Deployment big", giant)], giant, n_res=1, profile=_INLINE))
     assert len(out) < 15_000
     assert "truncated" in out.lower()
 
 
 def test_format_app_diff_block_small_body_untouched():
     out = "\n".join(m._format_app_diff_block(
-        "app-x", [("apps/Deployment small", "+one line")], "+one line", n_res=1))
+        "app-x", [("apps/Deployment small", "+one line")], "+one line", n_res=1, profile=_INLINE))
     assert "+one line" in out
     assert "truncated" not in out.lower()
 

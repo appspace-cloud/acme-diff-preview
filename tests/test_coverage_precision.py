@@ -24,6 +24,13 @@ os.environ.setdefault("BB_TOKEN", "t")
 os.environ.setdefault("ARGOCD_PASS", "t")
 import diff_preview as m  # noqa: E402
 
+# COPS-2612: these cases exercise the INLINE diff-block rendering
+# path. The comment stopped using it by default when phase E flipped
+# COMMENT_INLINE_DIFFS, but it is still what the full-diff page renders
+# always and what the comment renders on rollback, so the behaviour
+# below (redaction, body caps, fence safety) must keep being tested.
+_INLINE = m.COMMENT_PROFILE.replace(inline_diffs=True)
+
 from test_coverage_orchestration import world, _mk_pr, PATH_MAP, BASE_SHA  # noqa: E402,F401
 from test_coverage_helm_layer import (  # noqa: E402
     _mk_fake_helm, _calls, helm_world, diff_world, _values_by_sha, APP, REG, CHART)
@@ -228,6 +235,8 @@ def test_run_one_diff_rename_loop_skips_a_file_that_fetched_fresh(diff_world, mo
 # ── discover_path_app_map: an app without a manifest-generate-paths annotation ──
 
 from test_coverage_http_and_webhooks import _mk_fake_argocd, clean_discovery  # noqa: E402,F401
+
+
 
 APPS_NO_ANNOTATION = [
     {
@@ -465,7 +474,7 @@ def test_get_pr_changed_files_page_limit_hit_logs_warning(monkeypatch):
 # ── _format_app_diff_block: the legacy raw diff_text path (no sections) ──
 
 def test_format_app_diff_block_legacy_diff_text_without_sections():
-    out = m._format_app_diff_block("legacy-app", [], "--- a\n+++ b\n-old\n+new\n", show_diff=True, n_res=1)
+    out = m._format_app_diff_block("legacy-app", [], "--- a\n+++ b\n-old\n+new\n", show_diff=True, n_res=1, profile=_INLINE)
     joined = "\n".join(out)
     assert "```diff" in joined and "-old" in joined and "+new" in joined
 

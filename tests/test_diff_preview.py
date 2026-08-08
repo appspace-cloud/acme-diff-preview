@@ -5,6 +5,8 @@ import os
 import sys
 import time
 
+
+
 SRC = os.path.join(os.path.dirname(__file__), "..", "src", "diff_preview.py")
 
 
@@ -1204,7 +1206,7 @@ def test_format_app_diff_block_applies_redaction():
     """The Bitbucket comment path itself must go through redaction."""
     mod = _import_module()
     sections = [("/v1/Secret pv-x/mongo-express", "+  site-cookie-secret: c2VjcmV0\n")]
-    out = "\n".join(mod._format_app_diff_block("pv-x-a-ss", sections, ""))
+    out = "\n".join(mod._format_app_diff_block("pv-x-a-ss", sections, "", profile=mod.COMMENT_PROFILE.replace(inline_diffs=True)))
     assert "c2VjcmV0" not in out and "[REDACTED]" in out
 
 

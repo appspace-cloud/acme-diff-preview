@@ -27,6 +27,8 @@ import importlib
 import os
 import sys
 
+
+
 SRC = os.path.join(os.path.dirname(__file__), "..", "src")
 
 
@@ -99,7 +101,7 @@ def test_format_app_diff_block_reports_real_count():
     sections = [(f"/apps/Deployment svc{i}", f"--- \n+++ \n+change{i}")
                 for i in range(3)]
     lines = mod._format_app_diff_block("pv-x-a-ms", sections, "", show_diff=True,
-                                       n_res=42)
+                                       n_res=42, profile=mod.COMMENT_PROFILE.replace(inline_diffs=True))
     header = lines[0]
     assert "42" in header, f"header must show real count 42, got: {header!r}"
     joined = "\n".join(lines)
@@ -112,7 +114,7 @@ def test_format_app_diff_block_no_note_when_not_truncated():
     mod = _import_module()
     sections = [("/apps/Deployment svc0", "--- \n+++ \n+x")]
     lines = mod._format_app_diff_block("pv-x-a-ms", sections, "", show_diff=True,
-                                       n_res=1)
+                                       n_res=1, profile=mod.COMMENT_PROFILE.replace(inline_diffs=True))
     joined = "\n".join(lines).lower()
     assert "1 resource(s) changed" in "\n".join(lines)
     assert "showing" not in joined, "no truncation note when nothing truncated"
