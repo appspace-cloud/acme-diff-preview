@@ -137,3 +137,4 @@ def test_every_app_is_still_named_with_its_real_count():
     for n in names:
         assert n in out
     assert out.count("resource(s) changed") == len(names)
+
