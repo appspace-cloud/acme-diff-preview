@@ -303,6 +303,20 @@ DIFF_UI_ENABLED       = os.environ.get("DIFF_UI_ENABLED", "true").strip().lower(
 DIFF_UI_DIR           = os.environ.get("DIFF_UI_DIR", "/tmp/acme-diff-ui")
 DIFF_UI_BASE_URL      = os.environ.get("DIFF_UI_BASE_URL", "").rstrip("/")
 DIFF_UI_MAX_ARTIFACTS = _env_int("DIFF_UI_MAX_ARTIFACTS", 500)
+# Byte budget for the local artifact cache (COPS-2610). The count cap above
+# is measured in the wrong unit for how this directory actually fails: it is
+# a 1Gi emptyDir whose sizeLimit the kubelet enforces by EVICTING the pod,
+# and artifact sizes span three orders of magnitude (median ~181KB, observed
+# worst 26.7MB before the page was uncapped). 400MiB leaves the rest of the
+# emptyDir to everything else that writes under /tmp. Cheap to be strict:
+# GCS is the durable copy, a pruned entry costs one re-download.
+DIFF_UI_MAX_BYTES     = _env_int("DIFF_UI_MAX_BYTES", 400 * 1024 * 1024)
+# Escape hatch for the uncapped full-diff page (COPS-2610): false restores
+# the pre-2.33.0 page (bodies cut at DISPLAY_BODY_MAX_CHARS with a marker).
+# ROLLBACK ORDER, once phase E (COPS-2612) is live: set
+# COMMENT_INLINE_DIFFS=true FIRST, then flip this. The other order leaves
+# the comment without YAML while the page truncates -- information is gone.
+FULL_PAGE_UNCAPPED    = os.environ.get("FULL_PAGE_UNCAPPED", "true").strip().lower() in ("1", "true", "yes")
 # Durable artifact store: name of a GCS bucket. Empty keeps the old
 # behavior (local dir only, artifacts die with the pod). When set, saves
 # are mirrored to the bucket and local read misses fall back to it, so
@@ -500,6 +514,11 @@ _diff_stats:      dict          = {
     # not available. Harmless today; from phase E on, every one of these is
     # a reviewer reading a comment that lost its backing page.
     "comment_fallback_inline": 0,
+    # Times the storage cap trimmed an app's section list (COPS-2610). Every
+    # increment is content missing from BOTH surfaces; after phase E, from
+    # everywhere. Should stay 0 -- if it moves, raise
+    # FULL_SECTIONS_MAX_PER_APP.
+    "section_cap_trims": 0,
     "diff_retries": 0,             # per-diff transient retries performed
     "futures_cancelled": 0,        # subtask futures cancelled on abnormal exit
     # v2.5.20 (E1): HTTP connection-pool observability. reuses vs fresh
@@ -5591,7 +5610,19 @@ def _package_sections(filtered_sections: list, version_change=None):
         body_t = body[:MAX_DIFF_CHARS] + "\n... (truncated)" if len(body) > MAX_DIFF_CHARS else body
         truncated_parts.append(f"===== {hdr} =====\n{body_t}")
     clean_diff = "\n".join(truncated_parts)
-    return (clean_diff, filtered_sections[:FULL_SECTIONS_MAX_PER_APP],
+    stored_sections = filtered_sections[:FULL_SECTIONS_MAX_PER_APP]
+    if len(stored_sections) < len(filtered_sections):
+        # COPS-2610: the storage cap is memory safety and may never again
+        # be silent. What it drops here is gone from BOTH surfaces -- after
+        # phase E that is information that ceased to exist -- so it counts
+        # itself and logs, and the FULL page names the shortfall.
+        with _diff_stats_lock:
+            _diff_stats["section_cap_trims"] += 1
+        log(f"[sections] storage cap hit: kept {len(stored_sections)} of "
+            f"{len(filtered_sections)} sections "
+            f"(FULL_SECTIONS_MAX_PER_APP={FULL_SECTIONS_MAX_PER_APP})",
+            "WARNING")
+    return (clean_diff, stored_sections,
             deleted, zeroed, fingerprint, renamed, vm_changes, version_fold)
 
 
@@ -7339,6 +7370,7 @@ def _save_diff_ui_artifact(repo, pr_id, pr_sha, body, base_sha=None,
             pr_url=(f"https://bitbucket.org/{BB_WORKSPACE}/"
                     f"{repo or BB_REPO}/pull-requests/{pr_id}"),
             max_artifacts=DIFF_UI_MAX_ARTIFACTS,
+            max_bytes=DIFF_UI_MAX_BYTES,
             base_sha=base_sha, outcome_counts=outcome_counts,
             app_count=app_count, bucket=DIFF_UI_GCS_BUCKET)
         return True
@@ -7495,13 +7527,18 @@ AI_MAX_BODY_CHARS        = 1500
 # `sections[:AI_MAX_SECTIONS_PER_APP]`) that got reused as the STORAGE cap
 # too, so any resource past #10 was discarded before the comment or the
 # diff-UI page could ever show it (measured: 60 of 16616 sections shown on
-# acme-config-prod PR #3837). Sections are now stored up to this much more
-# generous, memory-bounded limit instead. Chosen from history: the largest
-# real per-app resource count seen to date is ~111 (COPS PR #6773 note),
-# so this leaves several times that much headroom before the rare
-# truncation note kicks in, while still bounding worst-case memory for a
-# run with MAX_APPS_PER_RUN concurrent apps (the COPS-2543 OOM lesson).
-FULL_SECTIONS_MAX_PER_APP = _env_int("FULL_SECTIONS_MAX_PER_APP", 400)
+# acme-config-prod PR #3837).
+# COPS-2610 raised the bound again, 400 to 5,000. This is MEMORY safety,
+# not display policy: the full list already exists in memory when
+# _package_sections runs (every safety fact and the fingerprint are
+# computed on it pre-cap), so the cap only bounds what is RETAINED in
+# DiffResult across the whole run's app_results (the COPS-2543 OOM
+# lesson). At 400 it silently amputated the artifact of any app past it --
+# and the comment's note then claimed the remainder was "only in the full
+# diff view", which was exactly where it was not. If an app ever exceeds
+# 5,000, the trim is counted (section_cap_trims) and the FULL page says so
+# instead of pretending completeness.
+FULL_SECTIONS_MAX_PER_APP = _env_int("FULL_SECTIONS_MAX_PER_APP", 5000)
 
 
 # ── Render profiles (COPS-2609, phase B of COPS-2607) ────────────────────
@@ -7548,7 +7585,8 @@ class RenderProfile:
     # phase E gives it a renderer; kept here so E does not reshape this
     # object as well as use it.
     inline_evidence_lines: int = 0
-    # Hard cap per resource body. Phase C lifts it on the page only.
+    # Hard cap per resource body. 0 = never cut (COPS-2610, the FULL page);
+    # the sentinel is resolved through the FULL_PAGE_UNCAPPED hatch below.
     # None = DISPLAY_BODY_MAX_CHARS at render time (see readable_budget).
     body_max_chars: int = None
     # Sections kept per app. Applied when the diff is computed, not when it
@@ -7565,15 +7603,25 @@ class RenderProfile:
 
         Called once per render. Idempotent, so a caller that hands in an
         already-resolved profile gets it back unchanged.
+
+        body_max_chars: None means the module default; 0 means "never cut"
+        and passes through the FULL_PAGE_UNCAPPED escape hatch, so flipping
+        that env var back restores the pre-2.33.0 capped page without
+        touching a profile (COPS-2610). Checked at render time for the same
+        reason the constants are: an import-time snapshot would make the
+        hatch decorative.
         """
+        body_cap = self.body_max_chars
+        if body_cap is None:
+            body_cap = DISPLAY_BODY_MAX_CHARS
+        elif body_cap == 0 and not FULL_PAGE_UNCAPPED:
+            body_cap = DISPLAY_BODY_MAX_CHARS
         return dataclasses.replace(
             self,
             readable_budget=(COMMENT_READABLE_BYTES
                              if self.readable_budget is None
                              else self.readable_budget),
-            body_max_chars=(DISPLAY_BODY_MAX_CHARS
-                            if self.body_max_chars is None
-                            else self.body_max_chars),
+            body_max_chars=body_cap,
             section_cap=(FULL_SECTIONS_MAX_PER_APP
                          if self.section_cap is None
                          else self.section_cap))
@@ -7601,10 +7649,16 @@ FULL_PROFILE = RenderProfile(
     readable_budget=0,
     group_repeats=False,
     version_fold=False,
-    # The two caps below stay live (None) rather than being pinned here, so
-    # this phase is behaviour-neutral: the page renders today byte-for-byte
-    # what it rendered yesterday. Phase C is where they become explicit and
-    # effectively unlimited on this surface.
+    # COPS-2610 (phase C): the page never cuts a resource body. Measured
+    # before the change: acme-config-prod #3887's stored artifact carried
+    # 981 "diff truncated for display" markers, 981 places where the
+    # complete record told the reader to go somewhere else. 0 resolves
+    # through the FULL_PAGE_UNCAPPED hatch, see resolved().
+    body_max_chars=0,
+    # section_cap stays live (None -> FULL_SECTIONS_MAX_PER_APP): the trim
+    # happens at STORAGE time in _package_sections, shared by both
+    # surfaces, and is a memory bound, not display policy. Raised to 5,000
+    # and made loud in the same change.
 )
 # v2.5.18 (FINDINGS_SCALE S1): cap how many APPS go into the prompt. The two
 # caps above bound each app's contribution but not the number of apps, so a
@@ -8483,7 +8537,17 @@ def _format_app_diff_block(app, sections, diff_text, show_diff=True, n_res=None,
     if sections:
         if total > shown:
             # COPS-2567: only claim a plain prefix when it still is one.
-            if folded:
+            # COPS-2610: total > shown means the STORAGE cap trimmed this
+            # app -- the remainder is gone from both surfaces, so on the
+            # FULL page (the self-described complete record) the note must
+            # own the shortfall instead of pointing at itself.
+            if not profile.inline_diffs or profile.name == "FULL":
+                note = (f"> \u26a0\ufe0f **Storage cap reached: showing "
+                        f"{shown} of {total} changed resources.** The "
+                        f"remainder was not retained "
+                        f"(FULL_SECTIONS_MAX_PER_APP). See ArgoCD for the "
+                        f"live state.")
+            elif folded:
                 # With the fold active "showing first N of M" would be
                 # false; say what the storage cap left out instead.
                 note = (f"> \U0001f50d {total - shown} more changed "
@@ -8529,10 +8593,13 @@ def _format_app_diff_block(app, sections, diff_text, show_diff=True, n_res=None,
             # a CRLF<->LF-only change would otherwise collapse to "no visible
             # change". Convert first, then redact, then neutralize fences.
             body_disp = _redact_for_display(hdr, _show_cr(body)).rstrip()
-            # profile.body_max_chars (COPS-2609): same number as before on
-            # both surfaces. Phase C lifts it on the page only, which is the
-            # whole point of the cap living on the profile now.
-            if len(body_disp) > profile.body_max_chars:
+            # profile.body_max_chars (COPS-2609/2610): a COMMENT protection
+            # (one giant ConfigMap rewrite must not push the comment past
+            # MAX_COMMENT_BYTES and chop the status token off). 0 = never
+            # cut: the FULL page is the complete record and a cut there is
+            # a lie, not a protection.
+            if profile.body_max_chars and \
+                    len(body_disp) > profile.body_max_chars:
                 body_disp = (body_disp[:profile.body_max_chars].rstrip()
                              + "\n... (diff truncated for display \u2014 see "
                                "ArgoCD for the full resource diff)")
