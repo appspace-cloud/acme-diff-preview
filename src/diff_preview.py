@@ -8585,14 +8585,25 @@ def _name_list(headers, room: int = 240):
     return ", ".join(names) + (", ..." if len(names) < len(headers) else "")
 
 
-def _full_hunks_link(artifact_url: str) -> str:
+def _full_hunks_link(artifact_url: str, app: str = "") -> str:
     """One phrase for "the complete diff lives over there".
 
     Every place the comment folds content away has to point somewhere,
     and a reviewer must never have to guess whether the missing hunks
     are lost or just elsewhere.
+
+    app (COPS-2622): deep-link straight to that application's section on
+    the page instead of to the top of it. Before this, every per-app
+    pointer carried the identical bare URL -- 8 copies on a 6-app comment,
+    ~42 on a fleet bump -- which on a comment phase E had just shrunk to a
+    decision summary was most of what remained. The anchor shape comes
+    from diff_ui.app_anchor and is NOT rebuilt here: two copies of that
+    logic would drift and every deep link would 404 in silence.
     """
     if artifact_url:
+        if app:
+            return (f"[Full hunks for `{app}`]"
+                    f"({artifact_url}#{diff_ui.app_anchor(app)})")
         return f"[Full hunks in the full diff view]({artifact_url})"
     return ("Full hunks are in the diff-preview full-diff view, linked "
             "from the build status.")
@@ -8649,7 +8660,7 @@ def _format_app_diff_block(app, sections, diff_text, show_diff=True, n_res=None,
         # The link is appended here only when the hunks stay inline. With
         # phase E the block emits its own pointer immediately below, and
         # the same URL twice in adjacent lines reads like a rendering bug.
-        _fold_link = (f" {_full_hunks_link(artifact_url)}"
+        _fold_link = (f" {_full_hunks_link(artifact_url, app=app)}"
                       if profile.inline_diffs else "")
         _fold_lines += [f"> \u2b06\ufe0f **{version_fold['n_foldable']} of "
                         f"{total} changed resource(s)** {_are}.{_fold_link}"]
@@ -8688,7 +8699,7 @@ def _format_app_diff_block(app, sections, diff_text, show_diff=True, n_res=None,
                 _ev = "\n".join(_ev.split("\n")[:_n])
                 out += [f"**`{_fence_safe(hdr)}`**", "", "```diff",
                         _fence_safe(_ev), "```", ""]
-        return out + [_full_hunks_link(artifact_url), ""]
+        return out + [_full_hunks_link(artifact_url, app=app), ""]
     out += _fold_lines
     inline = [(h, b) for h, b in (sections or []) if h not in folded]
     # Identical changes collapse to one hunk plus a count. Off on the
@@ -8785,7 +8796,7 @@ def _format_app_diff_block(app, sections, diff_text, show_diff=True, n_res=None,
             out += [f"> \u2702\ufe0f **{len(omitted)} more changed "
                     f"resource(s) omitted** here to keep the comment "
                     f"scannable. None is a deletion, zeroed replica or "
-                    f"VM change. {_full_hunks_link(artifact_url)}"]
+                    f"VM change. {_full_hunks_link(artifact_url, app=app)}"]
             _names = _name_list(omitted)
             if _names:
                 out += [">", f"> Omitted: {_names}"]
@@ -10127,7 +10138,15 @@ def format_comment(pr_sha, app_results, skipped_apps=None, base_sha="",
         f"## \U0001f52d {STATUS_NAME}", "",
         f"{_comment_header(pr_sha)}{large_label}", "",
     ]
-    if _full_view:
+    # COPS-2622: the header copy is gone. COPS-2609 rendered this pointer
+    # twice because "on a long comment the header has scrolled away" -- and
+    # phase E is the change that made the comment short, so that reason
+    # expired. The surviving copy is the one above the Status line, because
+    # it is the last thing read and every app now carries its own deep link.
+    if _full_view and not artifact_url:
+        # The no-page notice still belongs at the top: it changes how the
+        # whole comment should be read, so burying it at the bottom would
+        # be the one case where the header position mattered.
         lines += [_full_view, ""]
     # The bulk-region budget is measured with _body_size(), which counts
     # every line including the header. Left alone, this fixed pointer would

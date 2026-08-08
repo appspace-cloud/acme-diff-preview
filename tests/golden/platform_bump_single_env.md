@@ -2,8 +2,6 @@
 
 **Commit** `abc12345` → `main` | `acme-config-prod`
 
-🔎 **Full rendered diff (every hunk):** https://diffs.appspace.example/diff/acme-config-prod/42/abc12345
-
 ### 🧭 Merge summary
 
 ✅ **Routine** — nothing dangerous detected
@@ -19,7 +17,7 @@
 >
 > Folded lines: image tags, chart labels, version env values, checksums, deploy timestamps.
 
-[Full hunks in the full diff view](https://diffs.appspace.example/diff/acme-config-prod/42/abc12345)
+[Full hunks for `pv-hp-a-ms`](https://diffs.appspace.example/diff/acme-config-prod/42/abc12345#app-pv-hp-a-ms)
 
 🔎 **Full rendered diff (every hunk):** https://diffs.appspace.example/diff/acme-config-prod/42/abc12345
 

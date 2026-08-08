@@ -63,19 +63,20 @@ def test_changed_comment_links_to_the_page():
     assert URL in out
 
 
-def test_link_appears_twice_in_fixed_places():
-    """Once in the header region, once again near the status line: on a long
-    comment the header has scrolled away, and a reviewer should not have to
-    scroll back up to find where the full output lives."""
-    out = _body(_changed_result())
-    assert out.count(URL) >= 2, \
-        "the link must render in both fixed places, not just once"
+def test_the_page_link_renders_exactly_once():
+    """COPS-2609 rendered this pointer twice, in the header region and again
+    near the status line, reasoning that on a long comment the header has
+    scrolled away.
 
-
-def test_first_link_is_near_the_header():
+    COPS-2612 is the change that made the comment short, so that reason
+    expired, and COPS-2622 measured the cost of keeping it: with every app
+    also carrying a pointer, a 6-app comment held 8 copies of one URL and a
+    fleet bump would have held ~42. One page-level link now, plus one deep
+    link per application, which is a link per destination rather than the
+    same destination repeated.
+    """
     out = _body(_changed_result())
-    head = out[:out.index("###")] if "###" in out else out[:600]
-    assert URL in head, "the first link belongs in the header region"
+    assert out.count("Full rendered diff (every hunk)") == 1
 
 
 def test_second_link_is_near_the_status_line():

@@ -2,8 +2,6 @@
 
 **Commit** `abc12345` → `main` | `acme-config-prod` | 📦 Large changeset (6 apps)
 
-🔎 **Full rendered diff (every hunk):** https://diffs.appspace.example/diff/acme-config-prod/42/abc12345
-
 ### 🧭 Merge summary
 
 ⛔ **DO NOT MERGE** without checking the item(s) below (2 item(s))
@@ -43,11 +41,11 @@
 
 ⚠️ **`pv-vm-a-ss`** — 1 resource(s) changed
 
-[Full hunks in the full diff view](https://diffs.appspace.example/diff/acme-config-prod/42/abc12345)
+[Full hunks for `pv-vm-a-ss`](https://diffs.appspace.example/diff/acme-config-prod/42/abc12345#app-pv-vm-a-ss)
 
 ⚠️ **`pv-zzz-risky-ms`** — 1 resource(s) changed
 
-[Full hunks in the full diff view](https://diffs.appspace.example/diff/acme-config-prod/42/abc12345)
+[Full hunks for `pv-zzz-risky-ms`](https://diffs.appspace.example/diff/acme-config-prod/42/abc12345#app-pv-zzz-risky-ms)
 
 🔎 **Full rendered diff (every hunk):** https://diffs.appspace.example/diff/acme-config-prod/42/abc12345
 
