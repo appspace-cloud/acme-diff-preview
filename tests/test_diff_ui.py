@@ -296,10 +296,20 @@ def test_render_html_escapes_inside_colored_lines():
     assert "+ &lt;b&gt;bold&lt;/b&gt;" in out
 
 
-def test_render_html_markdown_headers_highlighted():
+def test_render_html_markdown_headers_are_rendered_not_printed():
+    """COPS-2625 reverses what this test used to assert.
+
+    It pinned the pre-2625 contract: the mdh class added weight and the
+    hash prefix stayed on screen, so every section title on the page read
+    '## Title'. That was the defect phase H exists to fix, so the assertion
+    now runs the other way -- the class carries the level and the markup is
+    gone. What has NOT changed is checked here too: an ordinary line is
+    still class-less and still present."""
     out = diff_ui.render_html(_art("## Title\nplain text\n### `sub`\n"))
-    assert '<tr class="row mdh">' in out
-    assert "## Title" in out and "### `sub`" in out
+    assert '<tr class="row mdh mdh2">' in out
+    assert '<tr class="row mdh mdh3">' in out
+    assert ">Title<" in out and "## Title" not in out
+    assert "<code>sub</code>" in out and "### `sub`" not in out
     assert '<tr class="row">' in out and "plain text" in out
 
 
