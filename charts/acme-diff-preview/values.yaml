@@ -42,7 +42,7 @@ image:
   # Kept in sync with Chart.yaml appVersion (RELEASING.md). This default had
   # drifted since v2.7.0; it never bit us because acme-infrastructure pins the
   # tag explicitly, but anyone installing the chart as-is got a stale image.
-  tag: "2.39.0"
+  tag: "2.40.0"
   pullPolicy: IfNotPresent
 
 # Log verbosity for the diff-preview service. Set to DEBUG to emit the full
@@ -271,3 +271,28 @@ hardRefresh:
       # not fit in 256Mi, which silently OOM-killed every run from 2026-07-27
       # (the job died right after auth with no output). COPS-2543.
       memory: 1Gi
+
+# COPS-2626: post-deploy smoke check.
+#
+# Renders a real stored artifact through the deployed image after the
+# release settles and asserts properties of the result, rather than
+# asserting that markup is present. Off by default because it needs an
+# artifact that actually exists in the store: whoever enables it must name
+# one that will not be evicted (DIFF_UI_MAX_ARTIFACTS), so a merged PR
+# whose artifact is kept in GCS is the right choice.
+#
+# A failure does NOT roll the release back. It fails the hook loudly and
+# keeps the Job so the output can be read.
+smoke:
+  enabled: false
+  repo: ""
+  pr: ""
+  sha: ""
+  backoffLimit: 0
+  ttlSecondsAfterFinished: 3600
+  resources:
+    requests:
+      cpu: 50m
+      memory: 96Mi
+    limits:
+      memory: 192Mi
