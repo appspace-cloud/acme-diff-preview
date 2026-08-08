@@ -391,20 +391,121 @@ _HUNK_RE = re.compile(r"^@@ -(\d+)(?:,\d+)? \+(\d+)(?:,\d+)? @@")
 MAX_VISIBLE_LINES = 20000
 
 
-def _diff_row(cls, old_no, new_no, marker, esc_text):
+# ── Page structure (COPS-2611, phase D) ─────────────────────────────────
+# The stored body is markdown, and this module renders it line by line. To
+# navigate it we need a structural model, which is derived from the markers
+# format_comment already emits rather than by changing the artifact format:
+# older artifacts stay readable, and /raw stays byte-exact.
+#
+#   app       "⚠️ **`pv-alpha-a-ms`** — 139 resource(s) changed"
+#   resource  "**`/apps/Deployment apigateway`**"
+#
+# Sizes this has to survive, from real artifacts: 345 apps / 19,869
+# resources (prod #3887), 774 apps / 11,086 resources (#3890).
+#
+# Defensive by construction: anything that does not match falls through and
+# renders exactly as before. A parser that swallowed an unrecognised line
+# would trade a navigable page for an incomplete one, which is the opposite
+# of what phases C and D are for.
+_APP_RE = re.compile(
+    r"^.{0,4}\s*\*\*`([^`]+)`\*\*\s+\u2014\s+(\d+)\s+resource\(s\) changed\s*$")
+_RES_RE = re.compile(r"^\*\*`([^`]+)`\*\*\s*$")
+_UNSAFE_ID_RE = re.compile(r"[^a-z0-9]+")
+
+
+def _slug(text, fallback="x"):
+    """A URL-safe anchor fragment.
+
+    Sanitised to [a-z0-9-] rather than escaped, because this value lands in
+    an id= and an href="#..." attribute: escaping would still leave a quote
+    to break out of. Names are PR-controlled, so the safe set is the whole
+    defence here.
+    """
+    s = _UNSAFE_ID_RE.sub("-", str(text).lower()).strip("-")
+    return (s or fallback)[:80]
+
+
+def build_outline(body):
+    """Structure of the page: [{id, name, count, resources: [{id, name}]}].
+
+    Anchors are scoped by application, because resource names repeat across
+    environments constantly (`/Service web` exists in every app) and an
+    unscoped anchor would send a deep link to whichever one rendered first.
+    Collisions after sanitising get a numeric suffix, so two hostile names
+    that sanitise identically still get one anchor each.
+    """
+    outline, used = [], set()
+
+    def _unique(base):
+        cand, n = base, 2
+        while cand in used:
+            cand, n = f"{base}-{n}", n + 1
+        used.add(cand)
+        return cand
+
+    current = None
+    for line in str(body).split("\n"):
+        m = _APP_RE.match(line)
+        if m:
+            current = {"id": _unique("app-" + _slug(m.group(1))),
+                       "name": m.group(1), "count": int(m.group(2)),
+                       "resources": []}
+            outline.append(current)
+            continue
+        m = _RES_RE.match(line)
+        if m and current is not None:
+            current["resources"].append(
+                {"id": _unique(current["id"] + "--" + _slug(m.group(1))),
+                 "name": m.group(1)})
+    return outline
+
+
+def _render_index(outline):
+    """Table of contents. Server-rendered, collapsed per app via <details>
+    so 345 applications are a list rather than a wall, and so expanding
+    costs no JavaScript. Every label is escaped; every id is sanitised."""
+    if not outline:
+        return ""
+    n_res = sum(len(a["resources"]) for a in outline)
+    parts = [
+        '<details class="toc" open><summary>Index: '
+        f'{len(outline)} application(s), {n_res} resource(s)</summary>',
+        '<input class="tocfilter" type="text" autocomplete="off" '
+        'placeholder="Filter applications and resources" '
+        'aria-label="Filter the index">',
+        '<ul class="toclist">']
+    for app in outline:
+        label = html.escape(app["name"])
+        parts.append(
+            f'<li class="tocapp" data-k="{label.lower()}">'
+            f'<details><summary><a href="#{app["id"]}">{label}</a> '
+            f'<span class="tocn">{app["count"]}</span></summary><ul>')
+        for res in app["resources"]:
+            rlabel = html.escape(res["name"])
+            parts.append(
+                f'<li class="tocres" data-k="{rlabel.lower()}">'
+                f'<a href="#{res["id"]}">{rlabel}</a></li>')
+        parts.append("</ul></details></li>")
+    parts.append("</ul></details>")
+    return "".join(parts)
+
+
+def _diff_row(cls, old_no, new_no, marker, esc_text, row_id=""):
     """One table row: two line-number gutters, a +/- marker cell, and the
-    escaped code cell. esc_text is ALREADY html-escaped by the caller."""
+    escaped code cell. esc_text is ALREADY html-escaped by the caller.
+    row_id is an anchor target, already sanitised by _slug (COPS-2611)."""
     o = str(old_no) if old_no is not None else ""
     n = str(new_no) if new_no is not None else ""
     row_cls = f"row {cls}" if cls else "row"
-    return (f'<tr class="{row_cls}">'
+    anchor = f' id="{row_id}"' if row_id else ""
+    return (f'<tr class="{row_cls}"{anchor}>'
             f'<td class="ln-old">{o}</td>'
             f'<td class="ln-new">{n}</td>'
             f'<td class="mk">{marker}</td>'
             f'<td class="code">{esc_text}</td></tr>')
 
 
-def _render_body_rows(body):
+def _render_body_rows(body, outline=None):
     """Render the comment body as diff table rows. Same information as the
     raw text (the /raw endpoint stays byte-exact), just readable: inside
     ```diff fences, +/-/@@ lines get GitHub-palette colors and old/new line
@@ -412,10 +513,25 @@ def _render_body_rows(body):
     "- item" is never painted as a deletion); markdown headers outside fences
     get weight; fence markers are dimmed. Every line goes through html.escape
     BEFORE being placed in a cell, so highlighting can never open an
-    injection hole. Returns a list of row strings (one per source line)."""
+    injection hole. Returns a list of row strings (one per source line).
+
+    outline (COPS-2611) pins anchor ids onto the app and resource header
+    rows so the index can link into the body. It is consumed in document
+    order and only OUTSIDE fences: a line inside a ```diff block that
+    happens to look like a header is diff content, not structure. Anchors
+    are strictly additive -- with outline=None the output is byte-identical
+    to before, and one row is still emitted per source line either way.
+    """
     rows = []
     fence = None      # None | "diff" | "code"
     old_no = new_no = 0
+    pending = []
+    if outline:
+        for app in outline:
+            pending.append((app["name"], app["id"]))
+            for res in app["resources"]:
+                pending.append((res["name"], res["id"]))
+    pending.reverse()   # pop() from the end walks document order
     for line in str(body).split("\n"):
         esc = html.escape(line)
         m = _FENCE_RE.match(line)
@@ -446,7 +562,10 @@ def _render_body_rows(body):
                 or line.startswith("### "):
             rows.append(_diff_row("mdh", None, None, "", esc))
         else:
-            rows.append(_diff_row("", None, None, "", esc))
+            row_id = ""
+            if pending and ("`%s`" % pending[-1][0]) in line:
+                row_id = pending.pop()[1]
+            rows.append(_diff_row("", None, None, "", esc, row_id=row_id))
     return rows
 
 
@@ -496,7 +615,9 @@ def render_html(artifact, requested_sha=None):
                 f'One page is kept per pull request and every new commit '
                 f'replaces it, exactly like the PR comment.</div>')
 
-    rows = _render_body_rows(artifact.get("body", ""))
+    outline = build_outline(artifact.get("body", ""))
+    index_html = _render_index(outline)
+    rows = _render_body_rows(artifact.get("body", ""), outline=outline)
     visible = "".join(rows[:MAX_VISIBLE_LINES])
     overflow = rows[MAX_VISIBLE_LINES:]
     if overflow:
@@ -620,6 +741,24 @@ tr.mdh td.code {{ font-weight: 700; }}
 .notice {{ background: var(--hunk-bg); color: var(--hunk-fg);
           border: 1px solid var(--border); border-radius: 4px;
           padding: 8px 10px; margin: .6rem 0; font-size: 13px; }}
+.toc {{ border: 1px solid var(--border); border-radius: 4px;
+       background: var(--panel); padding: 8px 10px; margin: .6rem 0;
+       font-size: 13px; }}
+.toc > summary {{ cursor: pointer; font-weight: 600; }}
+.tocfilter {{ width: 100%; box-sizing: border-box; margin: 8px 0;
+             padding: 6px 8px; font: inherit; font-size: 13px;
+             color: inherit; background: var(--bg);
+             border: 1px solid var(--border); border-radius: 4px; }}
+.toclist {{ list-style: none; margin: 0; padding: 0;
+           max-height: 22rem; overflow-y: auto; }}
+.toclist ul {{ list-style: none; margin: 0 0 0 1rem; padding: 0; }}
+.tocapp > details > summary {{ cursor: pointer; padding: 2px 0; }}
+.tocres {{ padding: 1px 0; }}
+.tocres a, .tocapp a {{ color: var(--link); text-decoration: none; }}
+.tocres a:hover, .tocapp a:hover {{ text-decoration: underline; }}
+.tocn {{ color: var(--muted); font-size: 12px; }}
+.tochide {{ display: none; }}
+tr:target td {{ background: var(--hunk-bg); }}
 footer {{ color: var(--muted); font-size: 12px; margin-top: 1rem; }}
 </style>
 </head>
@@ -638,6 +777,7 @@ footer {{ color: var(--muted); font-size: 12px; margin-top: 1rem; }}
 <div class="meta">commit <code>{sha}</code>{base_bit}
  &middot; generated {created} &middot; <a href="{raw_href}">raw</a></div>
 {mismatch_html}{summary_html}
+{index_html}
 <div class="diffwrap">
 <table class="diff"><tbody>{visible}</tbody>{rest_html}</table>
 </div>
@@ -665,6 +805,56 @@ footer {{ color: var(--muted); font-size: 12px; margin-top: 1rem; }}
       apply(t);
     }});
   }}
+  // Index filter (COPS-2611). Narrows the INDEX, never the body: the body
+  // is the evidence and must not silently hide rows. Reads a pre-escaped
+  // data-k attribute and only toggles a class, so no body-derived string
+  // is ever written back into the DOM. Debounced because a large page has
+  // ~20k index nodes (measured: prod #3887 has 19,869 resources).
+  var box=document.querySelector(".tocfilter");
+  if(box){{
+    var apps=document.querySelectorAll(".tocapp");
+    var timer=null;
+    function run(){{
+      var q=box.value.toLowerCase().trim();
+      for(var i=0;i<apps.length;i++){{
+        var app=apps[i];
+        var appHit=!q||app.getAttribute("data-k").indexOf(q)>=0;
+        var kids=app.querySelectorAll(".tocres");
+        var any=false;
+        for(var j=0;j<kids.length;j++){{
+          var hit=appHit||kids[j].getAttribute("data-k").indexOf(q)>=0;
+          kids[j].classList.toggle("tochide",!hit);
+          if(hit){{any=true;}}
+        }}
+        app.classList.toggle("tochide",!(appHit||any));
+        var det=app.querySelector("details");
+        if(det&&q){{det.open=true;}}
+      }}
+    }}
+    box.addEventListener("input",function(){{
+      if(timer){{clearTimeout(timer);}}
+      timer=setTimeout(run,120);
+    }});
+  }}
+  // An index entry can point at a row inside the collapsed overflow (the
+  // page shows MAX_VISIBLE_LINES rows outright). Without this, clicking
+  // such an entry does nothing at all -- and it is exactly the large pages
+  // that need the index most. Reveal the overflow, then jump.
+  function revealTarget(){{
+    var h=location.hash;
+    if(!h||h.length<2){{return;}}
+    var el=document.getElementById(h.slice(1));
+    if(!el){{return;}}
+    var rest=document.querySelector(".rest");
+    if(rest&&rest.hidden&&rest.contains(el)){{
+      rest.hidden=false;
+      var b=document.querySelector(".show-all-row");
+      if(b){{b.remove();}}
+      el.scrollIntoView();
+    }}
+  }}
+  window.addEventListener("hashchange",revealTarget);
+  revealTarget();
 }})();
 </script>
 </body>
