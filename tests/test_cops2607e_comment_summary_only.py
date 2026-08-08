@@ -52,17 +52,19 @@ def test_the_comment_has_no_fenced_diff_blocks():
     assert out.count(FENCE) == 0
 
 
+PANEL = ["### \U0001f4dd Config changes in this PR", "",
+         "`a.yaml`:", "- `k`: `1` -> `2`", ""]
+
+
 def test_the_comment_has_no_config_changes_panel():
-    out = _comment({"pv-a-a-ms": _changed()},
-                   input_change_lines=["`a.yaml`:", "- `k`: `1` -> `2`"])
+    out = _comment({"pv-a-a-ms": _changed()}, input_change_lines=PANEL)
     assert "Config changes in this PR" not in out
 
 
 # 3: the page keeps both ---------------------------------------------------
 
 def test_the_page_keeps_fences_and_the_config_panel():
-    out = _page({"pv-a-a-ms": _changed()},
-                input_change_lines=["`a.yaml`:", "- `k`: `1` -> `2`"])
+    out = _page({"pv-a-a-ms": _changed()}, input_change_lines=PANEL)
     assert (FENCE + "diff") in out
     assert "Config changes in this PR" in out
 
@@ -109,7 +111,12 @@ def test_inline_diffs_true_restores_the_old_comment(monkeypatch):
 
 def test_evidence_lines_show_for_a_risk_app_only(monkeypatch):
     monkeypatch.setattr(m, "COMMENT_INLINE_EVIDENCE_LINES", 8)
-    risky = {"pv-a-a-ms": _changed(deleted=["/apps/Deployment doomed-svc"])}
+    # the deleted resource must BE one of the sections, or there is no
+    # evidence body to excerpt
+    risky = {"pv-a-a-ms": m.DiffResult(
+        "- gone\n", [("/apps/Deployment doomed-svc", "- gone: yes\n")], 1,
+        True, None, m.OUT_DIFF, "diff",
+        deleted_resources=["/apps/Deployment doomed-svc"])}
     routine = {"pv-b-b-ms": _changed(name="pv-b-b-ms")}
     assert (FENCE + "diff") in _comment(risky)
     assert (FENCE + "diff") not in _comment(routine)
@@ -126,13 +133,18 @@ def test_page_unavailable_forces_inline_and_says_so():
 
 # 10: the AI summary lives on the page only ---------------------------------
 
-def test_ai_summary_is_absent_from_the_comment_and_kept_on_the_page():
-    """Decision (recorded in the PR and the ticket): page only. It is model
-    output that partly restates the deterministic merge summary; the
-    comment's narrative stays deterministic. _sanitize_ai_summary keeps
-    running unchanged on the page path."""
+def test_ai_summary_is_absent_from_the_comment_and_kept_on_the_page(
+        monkeypatch):
+    """Decision (recorded in the ticket, as it required): page only. It is
+    model output that partly restates the deterministic merge summary; in a
+    comment whose whole purpose is now "the verdict, fast", the
+    deterministic narrative is the one that belongs. _sanitize_ai_summary
+    keeps running unchanged on the page path."""
+    monkeypatch.setattr(m, "generate_ai_summary",
+                        lambda _r: "AI says something changed somewhere")
     results = {"pv-a-a-ms": _changed()}
-    out = _comment(results, ai_summary="AI: something changed somewhere")
-    assert "AI" not in out or "AI Analysis" not in out
-    page = _page(results, ai_summary="AI: something changed somewhere")
+    assert "AI Analysis" not in _comment(results)
+    assert "something changed somewhere" not in _comment(results)
+    page = _page(results)
+    assert "AI Analysis" in page
     assert "something changed somewhere" in page
