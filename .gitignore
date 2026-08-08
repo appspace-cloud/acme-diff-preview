@@ -13,3 +13,10 @@ mutants/
 
 # generated locally by scripts/generate_badges.py; published to the 'badges' branch by CI
 badges/
+
+# Local task/prompt drafts kept beside the repo while working on it. Ignored
+# rather than deleted because they are working notes with real content, and
+# ignored rather than left untracked because a `git add -A` already swept a
+# pair of them into a release commit once (undone by PR #86). Untracked is
+# not a safeguard; this is.
+PROMPT_FOR_*.md
