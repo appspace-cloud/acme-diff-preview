@@ -1,0 +1,71 @@
+{{- /*
+COPS-2626: post-deploy smoke check.
+
+Runs AFTER the release settles (post-install/post-upgrade hook, weight 5
+so it lands after everything else) and renders a real stored artifact
+through the deployed image, then asserts properties of the result. Unit
+tests already pass on every one of these paths; two bugs still reached
+production because they asserted presence, not meaning.
+
+Deliberately NOT a rollback trigger. The hook policy keeps the failed Job
+so the output can be read, and hook-failed does not undo the release: a
+false alarm blocking a good deploy is worse than a short delay in noticing
+a real problem. helm upgrade will report the failure loudly, which is the
+point.
+
+Disabled by default. It needs an artifact that exists in the store, so
+whoever enables it also has to say which one.
+*/}}
+{{- if .Values.smoke.enabled }}
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: {{ include "acme-diff-preview.fullname" . }}-smoke
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "acme-diff-preview.labels" . | nindent 4 }}
+  annotations:
+    "helm.sh/hook": post-install,post-upgrade
+    "helm.sh/hook-weight": "5"
+    "helm.sh/hook-delete-policy": before-hook-creation
+spec:
+  backoffLimit: {{ .Values.smoke.backoffLimit }}
+  ttlSecondsAfterFinished: {{ .Values.smoke.ttlSecondsAfterFinished }}
+  template:
+    metadata:
+      labels:
+        {{- include "acme-diff-preview.selectorLabels" . | nindent 8 }}
+        app.kubernetes.io/component: smoke
+    spec:
+      restartPolicy: Never
+      serviceAccountName: {{ include "acme-diff-preview.fullname" . }}
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 1000
+      containers:
+        - name: smoke
+          image: "{{ .Values.image.repository }}:{{ .Values.image.tag | default .Chart.AppVersion }}"
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+          command:
+            - python3
+            # The Dockerfile is COPY src/ /app/, so modules land directly in
+            # /app and NOT in /app/src. Getting this wrong fails the hook on
+            # the first deploy with a file-not-found, which looks like a
+            # smoke failure and is not one.
+            - /app/smoke.py
+            - --url
+            - "http://{{ include "acme-diff-preview.fullname" . }}:{{ .Values.service.port }}"
+            - --repo
+            - "{{ .Values.smoke.repo }}"
+            - --pr
+            - "{{ .Values.smoke.pr }}"
+            - --sha
+            - "{{ .Values.smoke.sha }}"
+          resources:
+            {{- toYaml .Values.smoke.resources | nindent 12 }}
+{{- end }}
