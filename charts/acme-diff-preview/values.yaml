@@ -42,7 +42,7 @@ image:
   # Kept in sync with Chart.yaml appVersion (RELEASING.md). This default had
   # drifted since v2.7.0; it never bit us because acme-infrastructure pins the
   # tag explicitly, but anyone installing the chart as-is got a stale image.
-  tag: "2.40.0"
+  tag: "2.41.0"
   pullPolicy: IfNotPresent
 
 # Log verbosity for the diff-preview service. Set to DEBUG to emit the full
@@ -296,3 +296,21 @@ smoke:
       memory: 96Mi
     limits:
       memory: 192Mi
+
+# COPS-2627: Google Managed Prometheus scrape of /metrics.
+#
+# GMP already runs in this cluster (gmp-system/collector). Datadog does not:
+# that org receives no Kubernetes container logs and there is no agent here.
+# The /metrics payload is plain Prometheus exposition, so a Datadog
+# OpenMetrics check would read the same bytes if that ever changes.
+#
+# Off by default because a scrape creates billable Cloud Monitoring series.
+# The alert policies themselves live in acme-infrastructure, not here.
+podMonitoring:
+  enabled: false
+  # The container port is named `health` in deployment.yaml, not `http`.
+  # A name that does not exist makes GMP match nothing and scrape nothing,
+  # quietly: the PodMonitoring object is accepted and simply never fires.
+  port: health
+  interval: 60s
+  timeout: 10s
