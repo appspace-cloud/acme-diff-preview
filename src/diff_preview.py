@@ -10212,6 +10212,137 @@ def _group_changed_apps_by_fingerprint(changed_apps: list) -> list:
     return groups
 
 
+def _is_risky_result(r) -> bool:
+    """Facts that mean an app must never be folded into a group summary.
+
+    Named once and used everywhere (COPS-2629). The same expression was
+    inline in format_comment's budget check; two copies of a safety
+    predicate drift, and the copy that drifts is the one that stops
+    protecting anything.
+    """
+    return bool(r.deleted_resources or r.replicas_zeroed
+                or getattr(r, "vm_changes", None)
+                or (r.version_change
+                    and _is_version_downgrade(*r.version_change)))
+
+
+def _shape_signature(r) -> tuple:
+    """What makes two changes the SAME SHAPE (COPS-2629).
+
+    The exact set of changed resource headers, plus the real resource
+    count. Deliberately NOT the count alone: nine resources and nine
+    resources are one change only if they are the same nine, and grouping
+    on the count would let a genuinely different change hide inside a line
+    that claims to describe it.
+
+    Values are excluded on purpose, which is what makes this useful. On
+    acme-config-prod PR #4026, 22 `-glb` applications changed the same 9
+    resources with per-customer names inside, so fingerprint grouping
+    (COPS-2579) saw 22 distinct diffs and rendered 44 lines. The shape is
+    identical even though no two diffs are; the values live on the page.
+    Sections are (header, body) pairs, read the same way
+    _format_app_diff_block reads them. A dict lookup here would have been a
+    second, private idea of what a section is, and it raised on every real
+    diff the moment the full suite ran.
+    """
+    hdrs = []
+    for sec in (r.sections or []):
+        try:
+            hdrs.append(sec[0])
+        except (TypeError, KeyError, IndexError):
+            # Unknown section shape. Return None rather than a shared
+            # placeholder: a placeholder would make every unreadable app
+            # match every other one and group changes that were never
+            # compared. Callers treat None as "never group".
+            return None
+    return (r.n_res, tuple(hdrs))
+
+
+def _group_changed_apps_by_shape(changed_apps: list, skip=()) -> dict:
+    """app -> (representative_app, members) for same-shape changes.
+
+    Takes the same (app, DiffResult) pair list as
+    _group_changed_apps_by_fingerprint, so the two grouping passes read
+    from one structure rather than two views that can disagree.
+
+    Risky apps are excluded outright rather than grouped and annotated: a
+    deletion block exists so that someone reads it for that environment,
+    and folding it into "and 21 others" is the outcome this whole service
+    is built to prevent.
+
+    Apps in `skip` are left alone. Those are already handled by the
+    byte-identical grouping (COPS-2579), which names its own members; two
+    mechanisms claiming the same app would render it twice or not at all.
+    """
+    buckets = {}
+    for app, r in changed_apps:
+        if app in skip or _is_risky_result(r):
+            continue
+        sig = _shape_signature(r)
+        if sig is None:
+            continue
+        buckets.setdefault(sig, []).append(app)
+    out = {}
+    for members in buckets.values():
+        # INPUT_ROLLUP_MIN_SERVICES, not 2. COPS-2605 already settled this
+        # for the routine-bump rollup: below three, collapsing costs a
+        # reader their per-app detail without saving them anything, because
+        # a two-app comment was never the problem. Reusing that constant
+        # rather than inventing a second threshold keeps the two rollups
+        # from disagreeing about when a comment is "big".
+        if len(members) < INPUT_ROLLUP_MIN_SERVICES:
+            continue
+        members.sort()
+        for app in members:
+            out[app] = (members[0], members)
+    return out
+
+
+def _failure_signature(r) -> tuple:
+    """What makes two failures THE SAME problem (COPS-2629).
+
+    Measured on acme-config-prod PR #4026: 22 environments failed with a
+    byte-identical MISSING REQUIRED VALUE block, and the comment printed
+    the same three lines of remediation advice 22 times. That is one
+    problem with one fix, reported as if it were 22.
+
+    The signature is the rendered explanation, not the raw stderr. Two
+    environments whose helm output differs only in a temp path or trailing
+    whitespace produce the same explanation and are the same problem; if
+    the raw string were the key, that noise would split the group and hand
+    the operator back the wall of text this exists to remove.
+
+    Keyed on reason as well, so a missing value and a schema violation
+    never merge even in the unlikely event their prose collides.
+    """
+    return (r.reason, tuple(_explain_required_error(r.error))
+            if r.reason == REASON_MISSING_REQUIRED
+            else (r.error or "").strip()[:400])
+
+
+def _group_failures(results, reasons) -> dict:
+    """app -> (representative_app, members) for grouped failure reasons.
+
+    Mirrors diff_group_for_app (COPS-2579) for the surface it left out.
+    Apps not in a multi-member group are absent, so callers render them
+    exactly as before: one app is not a group, and the single-app wording
+    is what every existing golden asserts.
+    """
+    buckets = {}
+    for app, r in results.items():
+        if r.outcome != OUT_INDETERMINATE or r.reason not in reasons:
+            continue
+        buckets.setdefault(_failure_signature(r), []).append(app)
+    out = {}
+    for members in buckets.values():
+        if len(members) < 2:
+            continue
+        members.sort()
+        for app in members:
+            out[app] = (members[0], members)
+    return out
+
+
 def format_comment(pr_sha, app_results, skipped_apps=None, base_sha="",
                     new_env_lines=None, new_env_structural=False, new_env_desc="",
                     decommission_lines=None, input_change_lines=None,
@@ -10295,6 +10426,32 @@ def format_comment(pr_sha, app_results, skipped_apps=None, base_sha="",
     for rep_app, members, rep_r in diff_groups:
         for m in members:
             diff_group_for_app[m] = (rep_app, members, rep_r)
+
+    # COPS-2629: the same move for FAILURES, which the fingerprint grouping
+    # above never covered because a failed app has no diff to fingerprint.
+    # On acme-config-prod PR #4026 that gap cost 22 repetitions of one
+    # MISSING REQUIRED VALUE block, 52% of the comment.
+    #
+    # Empty on the page. is_complete_record means this surface IS the
+    # record, and "which environment failed and why" is precisely what a
+    # reader opens the page to answer, so it keeps one block per app. The
+    # comment is a decision aid and says it once.
+    failure_group_for_app = (
+        {} if profile.is_complete_record
+        else _group_failures(results, (REASON_MISSING_REQUIRED,)))
+
+    # COPS-2629 part 2: same-SHAPE changes. The fingerprint grouping above
+    # only catches byte-identical diffs, and on a fleet bump every diff
+    # carries its own environment's names, so on PR #4026 all 22 `-glb`
+    # apps formed groups of one and rendered 44 near-identical lines. Apps
+    # already in a multi-member fingerprint group are skipped: that
+    # mechanism names its own members, and two claiming the same app would
+    # render it twice. Empty on the page, same reason as above.
+    _fp_grouped = {a for a, (_, m, _) in diff_group_for_app.items()
+                   if len(m) > 1}
+    shape_group_for_app = (
+        {} if profile.is_complete_record
+        else _group_changed_apps_by_shape(changed_apps, skip=_fp_grouped))
 
     # Routine-bump rollup, layered ON TOP of the fingerprint grouping: the
     # grouping collapses byte-identical diffs into one representative;
@@ -10642,17 +10799,37 @@ def format_comment(pr_sha, app_results, skipped_apps=None, base_sha="",
         elif r.outcome == OUT_INDETERMINATE:
             any_unknown = True
             unknown_apps.append(app)
+            # COPS-2629: N environments failing the same way is one problem
+            # with one fix. Grouped ONLY here, never on the page: the page
+            # is where "which environment failed and why" is answered, so
+            # is_complete_record keeps one block per app. Nothing is
+            # collapsed out of both surfaces.
+            _fgrp = failure_group_for_app.get(app)
+            if _fgrp and app != _fgrp[0]:
+                continue          # rendered with the group representative
             if r.reason == REASON_MISSING_REQUIRED:
                 # v2.6.2: spell out the missing required value in full - the
                 # developer must know exactly what to add and where, without
                 # decoding raw helm stderr (acme-config-dev PR #6848).
-                lines += [
-                    f"\u274c **`{app}`** \u2014 \u2699\ufe0f **MISSING REQUIRED VALUE "
-                    f"\u2014 helm cannot render this environment**",
-                ]
-                lines += _explain_required_error(r.error)
-                lines += _missing_value_remedies()
-                lines += [""]
+                if _fgrp:
+                    _members = _fgrp[1]
+                    lines += [
+                        f"\u274c **{len(_members)} environments cannot "
+                        f"render** \u2014 \u2699\ufe0f **MISSING REQUIRED "
+                        f"VALUE**",
+                    ]
+                    lines += _explain_required_error(r.error)
+                    lines += _missing_value_remedies()
+                    lines += ["", f"> {_fmt_service_list(_members)}", ""]
+                else:
+                    lines += [
+                        f"\u274c **`{app}`** \u2014 \u2699\ufe0f **MISSING "
+                        f"REQUIRED VALUE \u2014 helm cannot render this "
+                        f"environment**",
+                    ]
+                    lines += _explain_required_error(r.error)
+                    lines += _missing_value_remedies()
+                    lines += [""]
             elif r.reason == REASON_SCHEMA_INVALID:
                 # COPS-2554: same clarity principle, adapted to Helm's own
                 # multi-violation format instead of a single line/location.
@@ -10697,10 +10874,45 @@ def format_comment(pr_sha, app_results, skipped_apps=None, base_sha="",
                 # every total and listed in the table, its duplicate diff
                 # block omitted.
                 continue
-            _risky = bool(rep_r.deleted_resources or rep_r.replicas_zeroed
-                          or getattr(rep_r, "vm_changes", None)
-                          or (rep_r.version_change
-                              and _is_version_downgrade(*rep_r.version_change)))
+            # COPS-2629 part 2: N applications changing the same resources
+            # is one statement. Placed AFTER total_changed above, so the
+            # headline counts keep describing the changeset rather than the
+            # number of groups. Risky apps never reach here: they are
+            # excluded when the group is built.
+            _sgrp = shape_group_for_app.get(app)
+            if _sgrp:
+                if app != _sgrp[0]:
+                    continue
+                _members = _sgrp[1]
+                lines += [
+                    f"\u26a0\ufe0f **{len(_members)} application(s) changed "
+                    f"the same {rep_r.n_res} resource(s)**",
+                    "",
+                ]
+                # The names ARE the pointers. COPS-2622 requires every app
+                # pointer to land on that app's own section, and a single
+                # group link would have taken that away from every member
+                # but one. One sentence of prose, one clickable name each:
+                # both contracts hold, and the reader still gets to jump
+                # straight to the environment they care about.
+                if artifact_url:
+                    _shown = _members[:8]
+                    # One per line, not one long line. Deep links carry the
+                    # full page URL, so six of them joined with commas came
+                    # to 582 characters and the markdown hazard guard
+                    # rejected it: a line that wraps into a block is not
+                    # more readable than the 24 lines this replaced.
+                    lines += [
+                        f"- [{m}]({artifact_url}#{diff_ui.app_anchor(m)})"
+                        for m in _shown]
+                    if len(_members) > len(_shown):
+                        lines += [f"- (+{len(_members) - len(_shown)} more "
+                                  f"on the full-diff page)"]
+                    lines += [""]
+                else:
+                    lines += [f"> {_fmt_service_list(_members)}", ""]
+                continue
+            _risky = _is_risky_result(rep_r)
             if budget and not _risky and _body_size() > budget:
                 collapsed_apps.extend(members)
                 continue
