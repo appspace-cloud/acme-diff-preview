@@ -10130,9 +10130,32 @@ def _build_merge_summary(results, rollup_by_sig, vm_change_lines,
     changed = [a for a, r in results.items() if r.outcome == OUT_DIFF]
     errored = [a for a, r in results.items() if r.outcome == OUT_ERROR]
     unknown = [a for a, r in results.items() if r.outcome == OUT_INDETERMINATE]
-    if errored or unknown:
+    # COPS-2629 point 4: split by whether the failure is PERMANENT.
+    #
+    # Escalating every undiffable app to BLOCK would be wrong. One
+    # transient timeout among 200 apps is not a reason to stop a
+    # maintenance window, and a verdict that cries wolf is one people learn
+    # to scroll past -- the same failure this umbrella keeps guarding
+    # against, arriving from the other direction.
+    #
+    # PERMANENT_REASONS is already defined as "the deployer would fail the
+    # same way", which is exactly the condition that makes merging unsafe:
+    # helm could not render it here and it will not render in the cluster
+    # either. Reusing that set rather than inventing a second opinion means
+    # the verdict and the retry logic can never disagree about what is
+    # broken.
+    blocked = [a for a in unknown
+               if results[a].reason in PERMANENT_REASONS]
+    soft = [a for a in unknown if a not in set(blocked)]
+    if blocked:
+        findings.append((_SEV_BLOCK,
+                         f"\u26d4 **{len(blocked)} environment(s) cannot "
+                         f"render** \u2014 helm failed here and the "
+                         f"deployer will fail the same way: "
+                         f"{_fmt_env_list(blocked)}"))
+    if errored or soft:
         findings.append((_SEV_REVIEW,
-                         f"\u2754 **{len(errored) + len(unknown)} app(s) "
+                         f"\u2754 **{len(errored) + len(soft)} app(s) "
                          f"could not be diffed** \u2014 the comment below "
                          f"cannot prove they are safe"))
     if not findings:

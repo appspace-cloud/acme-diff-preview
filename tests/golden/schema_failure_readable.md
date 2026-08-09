@@ -6,9 +6,9 @@
 
 ### 🧭 Merge summary
 
-⚠️ **Review before merging** (1 item(s))
+⛔ **DO NOT MERGE** without checking the item(s) below (1 item(s))
 
-- ❔ **1 app(s) could not be diffed** — the comment below cannot prove they are safe
+- ⛔ **1 environment(s) cannot render** — helm failed here and the deployer will fail the same way: pv-glencore-c
 
 ---
 

@@ -176,4 +176,6 @@ def test_the_blocker_count_survives_grouping(monkeypatch):
     number of groups."""
     monkeypatch.setattr(dp, "generate_ai_summary", lambda *a, **k: None)
     out = _comment(_fail_set(22))
-    assert "22 app(s) could not be diffed" in out
+    # COPS-2629 point 4 renamed this: missing_required is a PERMANENT
+    # reason, so it now blocks and says so in the operator's language.
+    assert "22 environment(s) cannot render" in out
