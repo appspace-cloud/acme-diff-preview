@@ -10608,22 +10608,30 @@ def _build_merge_summary(results, rollup_by_sig, vm_change_lines,
                          "\u2b07\ufe0f **Chart version downgrade** in "
                          f"{_fmt_env_list(downgraded)}"))
     # COPS-2632: a rendered `%!s(<nil>)` or `<no value>` is a value the chart
-    # asked for and this environment does not set. It blocks for the same
-    # reason PERMANENT_REASONS blocks - the deployer fails the same way - and
-    # it has to be said out loud, because helm exits 0 and the diff otherwise
-    # looks routine. Live proof: pv-stage1-a shipped `hosting-id:
-    # hst-%!s(<nil>)` and KCC rejected every Compute* resource afterwards.
+    # read and this environment does not set. Live proof: pv-stage1-a shipped
+    # `hosting-id: hst-%!s(<nil>)` and KCC rejected every Compute* resource
+    # afterwards, while this summary called the PR routine.
+    #
+    # Reported, NOT blocking, and the distinction is deliberate. The chart is
+    # the authority on what a value must be: `required` means the author
+    # decided the render cannot proceed without it, and that already blocks
+    # through REASON_MISSING_REQUIRED / PERMANENT_REASONS. A field left with
+    # `| default` or with no guard at all is the author saying the opposite,
+    # and a tool that overrides that judgement blocks merges the chart is
+    # happy to render. The reviewer still needs to see it, because helm exits
+    # 0 and the diff otherwise looks ordinary - so it is a REVIEW item that
+    # names the resources, not a verdict of its own.
     artifact_apps = sorted(a for a, r in results.items()
                            if getattr(r, "template_artifacts", None))
     if artifact_apps:
         n_res = sum(len(results[a].template_artifacts) for a in artifact_apps)
-        findings.append((_SEV_BLOCK,
-                         "\U0001f6a8 **Unresolved chart value** \u2014 "
+        findings.append((_SEV_REVIEW,
+                         "\U0001f9ec **Unresolved chart value** \u2014 "
                          f"{n_res} resource(s) render `%!s(<nil>)` or "
                          f"`<no value>` in {_fmt_env_list(artifact_apps)}. "
                          "The chart read a value this environment does not "
-                         "set; the API server and KCC reject these as "
-                         "invalid after the merge."))
+                         "set. Check it is intended: the chart does not mark "
+                         "it `required`, so nothing failed the render."))
 
     # An environment going fully dark and a single service being scaled down
     # are different events. Both used to render as "Replicas scaled to zero",
