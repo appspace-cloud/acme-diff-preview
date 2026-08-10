@@ -139,12 +139,34 @@ def _summary(results):
     return "\n".join(m._build_merge_summary(results, {}, [], [], [], [], None))
 
 
-def test_artifacts_block_the_merge():
+def test_artifacts_are_reported_but_do_not_block():
+    """Operator decision: the chart is the authority on what is mandatory.
+
+    `required` means the author decided the render cannot proceed without the
+    value, and that already blocks through REASON_MISSING_REQUIRED. A field
+    left with `| default` or no guard is the author saying the opposite, so
+    overriding that here would block merges the chart is happy to render.
+    The reviewer still has to see it, because helm exits 0.
+    """
     secs = [("/compute.cnrm.cloud.google.com/ComputeInstance vm-a",
              _added("    hosting-id: hst-%!s(<nil>)"))]
     out = _summary({"pv-stage1-a-ss": _result(secs, [secs[0][0]])})
-    assert "DO NOT MERGE" in out, out
+    assert "Unresolved chart value" in out, out
+    assert "DO NOT MERGE" not in out, out
+    assert "Review before merging" in out, out
     assert "nothing dangerous detected" not in out
+
+
+def test_a_real_helm_required_failure_still_blocks():
+    """The one thing that DOES block: helm's own `required`, unchanged."""
+    assert m.REASON_MISSING_REQUIRED in m.PERMANENT_REASONS
+    r = m.DiffResult(
+        text=None, sections=None, n_res=0, has_diff=False,
+        error="execution error at (templates/x.yaml:5:6): "
+              "A valid appspace.hostingID entry is required!",
+        outcome=m.OUT_INDETERMINATE, reason=m.REASON_MISSING_REQUIRED)
+    out = _summary({"pv-stage1-a-ss": r})
+    assert "DO NOT MERGE" in out, out
 
 
 def test_the_blocking_finding_names_the_env_and_the_count():
@@ -156,12 +178,17 @@ def test_the_blocking_finding_names_the_env_and_the_count():
 
 
 def test_the_finding_explains_the_cause_not_just_the_symptom():
-    """A reviewer who has never seen %!s(<nil>) must still know what to do."""
+    """A reviewer who has never seen %!s(<nil>) must still know what to do.
+
+    It has to name the cause (a value the environment does not set) and say
+    why nothing failed, otherwise a non-blocking finding next to a green
+    render reads as noise.
+    """
     secs = [("/apps/Deployment api", _added("    x: %!s(<nil>)"))]
     out = _summary({"pv-stage1-a-ss": _result(secs, [secs[0][0]])})
     low = out.lower()
-    assert "value" in low
-    assert "reject" in low or "invalid" in low
+    assert "value this environment does not set" in low
+    assert "required" in low
 
 
 def test_no_artifacts_leaves_the_verdict_alone():
