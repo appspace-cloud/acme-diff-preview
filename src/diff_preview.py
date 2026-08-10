@@ -468,6 +468,11 @@ _bb_webhook_stats:      dict          = {
     "wakes": 0,                # pullrequest:* events that woke the loop
     "hints_recorded": 0,       # payloads that yielded a usable supersede hint
     "supersedes_triggered": 0, # renders actually aborted as superseded
+    # COPS-2633: base hints retired because the poller had already seen main
+    # move past them. A steady climb here is normal on repos that take direct
+    # pushes to main; it stayed invisible for as long as the bug existed,
+    # which is the whole reason it is counted.
+    "base_hints_stale_dropped": 0,
     "last_received_at": None,  # ISO timestamp of the most recent POST
 }
 _bb_webhook_stats_lock: threading.Lock = threading.Lock()
@@ -721,7 +726,25 @@ _pr_supersede_aborts: dict = {}   # (repo, pr_id) -> consecutive aborts, liveloc
 # Keyed by (repo, base_branch) rather than per PR: one merge invalidates
 # every open PR against that branch, and a burst of merges must cost one
 # extra pass in total, not one per merge. Most recent sha wins.
-_base_superseded: dict     = {}   # (repo, base_branch) -> newest base sha
+#
+# COPS-2633: the value carries a sequence number, not just a sha, and the
+# poller records what it actually saw in _base_observed. Inequality alone
+# cannot tell "this hint is newer than my snapshot" (a real supersede) from
+# "my snapshot is newer than this hint" (a hint left behind), and the second
+# case is permanent rather than rare: the config repos take direct pushes to
+# main from release automation, which fire no pullrequest:fulfilled event, so
+# main advances past the last merge commit and nothing ever corrects the
+# hint. Measured on acme-config-stage #2802: the hint sat at an ancestor of
+# main and cost every PR in the repo three skipped iterations before its
+# first comment. Ordering answers it exactly, with no ancestry lookup and no
+# extra Bitbucket call.
+_base_superseded: dict     = {}   # (repo, base_branch) -> (base sha, seq)
+_base_observed:   dict     = {}   # (repo, base_branch) -> (tip sha, seq) as polled
+# A counter, not a clock: two monotonic() reads can land on the same value,
+# and "same value" would have to be resolved one way or the other, silently
+# making one of the two cases wrong. Sequence numbers are unique by
+# construction, so the ordering is never ambiguous.
+_supersede_seq: int        = 0
 _supersede_lock            = threading.Lock()
 # A PR pushed to faster than it can render would abort forever and never
 # publish anything. After this many consecutive aborts, let the run finish.
@@ -788,12 +811,50 @@ def _record_base_hint(repo: str, base_branch: str, sha: str) -> None:
     Last writer wins on purpose: a burst of merges is one piece of news
     ("the base moved, and here is where to"), not N. That is what turns the
     measured four-merges-four-recomputes into four-merges-one-recompute.
+
+    Stamped with a sequence number (COPS-2633) so a later poll can tell
+    whether this hint is still news or something main has already moved past.
     """
+    global _supersede_seq
     if not SUPERSEDE_ABORT_ENABLED:
         return
     try:
         with _supersede_lock:
-            _base_superseded[(repo, base_branch)] = sha
+            _supersede_seq += 1
+            _base_superseded[(repo, base_branch)] = (sha, _supersede_seq)
+    except Exception:  # pragma: no cover - see _record_supersede_hint
+        pass
+
+
+def _note_base_observed(repo: str, base_branch: str, sha: str) -> None:
+    """Record the tip the poller actually read for `repo`/`base_branch`.
+
+    This is the ground truth the hints are checked against (COPS-2633).
+    Reading the tip proves where main is right now, so any hint recorded
+    before this read has already been overtaken and is retired here rather
+    than left to abort every future PR. That covers the cases a webhook
+    cannot: a direct push to main, a squash that rewrote the commit, or a
+    pullrequest:fulfilled event that never arrived.
+
+    Called from the poll loop, so it must never raise for any reason.
+    """
+    global _supersede_seq
+    if not SUPERSEDE_ABORT_ENABLED:
+        return
+    if not repo or not base_branch or not sha:
+        return
+    try:
+        with _supersede_lock:
+            _supersede_seq += 1
+            seq = _supersede_seq
+            _base_observed[(repo, base_branch)] = (sha, seq)
+            pending = _base_superseded.get((repo, base_branch))
+            stale = bool(pending) and pending[1] < seq and not _sha_eq(pending[0], sha)
+            if stale:
+                del _base_superseded[(repo, base_branch)]
+        if stale:
+            with _bb_webhook_stats_lock:
+                _bb_webhook_stats["base_hints_stale_dropped"] += 1
     except Exception:  # pragma: no cover - see _record_supersede_hint
         pass
 
@@ -810,17 +871,35 @@ def _base_superseded_by(repo: str, base_branch: str, base_sha: str, sk=None):
     and without this a large PR would abort forever and never publish
     anything -- which is worse than publishing slightly stale, because a
     reviewer gets nothing at all.
+
+    COPS-2633: a hint only supersedes `base_sha` if it arrived AFTER the poll
+    that produced it. `base_sha` is the tip as read at the start of the
+    iteration, so an earlier hint describes a move this snapshot already
+    includes. The trade-off is deliberate: if Bitbucket's refs read lags a
+    merge it has already announced, the hint is ignored and the PR renders
+    against a base a few seconds old -- the pre-COPS-2617 behaviour, still
+    caught after the render, and far cheaper than the alternative of every
+    PR waiting out the livelock guard on a hint that will never be correct.
     """
     if not SUPERSEDE_ABORT_ENABLED:
         return None
     with _supersede_lock:
         pending = _base_superseded.get((repo, base_branch))
+        observed = _base_observed.get((repo, base_branch))
         aborts = _pr_supersede_aborts.get(sk, 0) if sk else 0
     if aborts >= SUPERSEDE_MAX_CONSECUTIVE_ABORTS:
         return None
-    if pending and not _sha_eq(pending, base_sha):
-        return pending
-    return None
+    if not pending:
+        return None
+    pending_sha, pending_seq = pending
+    if _sha_eq(pending_sha, base_sha):
+        return None
+    # Only compare against an observation of THIS snapshot. A tip that is not
+    # the base_sha being asked about says nothing about the caller's ordering,
+    # so the pre-COPS-2633 answer stands.
+    if observed and _sha_eq(observed[0], base_sha) and pending_seq < observed[1]:
+        return None
+    return pending_sha
 
 
 def _superseded(sk, pr_sha: str):
@@ -12155,6 +12234,11 @@ def main_iteration():
                 auth=(BB_USER, BB_TOKEN))
             base_sha = main_info["target"]["hash"]
             _register_sha_repo(base_sha, repo)
+            # COPS-2633: this read is where main really is, so it retires any
+            # COPS-2617 hint it has already moved past. Before any PR is
+            # processed, on purpose: the snapshot every PR below is given IS
+            # this sha, and a hint older than it must not abort them.
+            _note_base_observed(repo, "main", base_sha)
             log(f"[{repo}] Base SHA (main): {base_sha[:8]}")
             # COPS-2564: one fetch per repo per iteration replaces hundreds of
             # per-file API calls. Inside this try on purpose: a git problem
