@@ -3385,8 +3385,11 @@ def _main_render_cache_get(key: str):
                 del _main_render_cache[k]
                 try:
                     os.remove(_main_render_disk_path(k))
-                except OSError:
-                    pass
+                except OSError as e:
+                    # Best-effort: inability to remove an evicted disk cache
+                    # entry is non-fatal; pruning will retry on future stores.
+                    log(f"[main-render-cache] evict cleanup failed (non-fatal): {e}",
+                        "WARNING")
     return resources, raw, "disk"
 
 
