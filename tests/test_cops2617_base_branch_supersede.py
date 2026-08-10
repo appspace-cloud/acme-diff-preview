@@ -45,11 +45,16 @@ def _clean_state():
         m._pr_superseded.clear()
         m._pr_supersede_aborts.clear()
         getattr(m, "_base_superseded", {}).clear()
+        # COPS-2633 added the poller's observations alongside the hints, and
+        # they gate every assertion below. Left over from another module they
+        # would decide these outcomes instead of the hints under test.
+        getattr(m, "_base_observed", {}).clear()
     yield
     with m._supersede_lock:
         m._pr_superseded.clear()
         m._pr_supersede_aborts.clear()
         getattr(m, "_base_superseded", {}).clear()
+        getattr(m, "_base_observed", {}).clear()
 
 
 # --- 1. the hint exists at all --------------------------------------------

@@ -352,6 +352,30 @@ Three properties of the destination hint, each deliberate:
   never read as "main moved", or every other open PR would abort on every
   unrelated push.
 
+**A hint only counts if it arrived after the poll that produced the snapshot
+(COPS-2633).** Comparing the hint and `base_sha` for plain inequality cannot
+tell a hint that is *newer* than the snapshot (a real supersede) from one the
+snapshot has already moved *past* (a leftover), and the second case is
+permanent rather than rare: the config repos take direct pushes to `main`
+from release automation, which fire no `pullrequest:fulfilled` event, so
+`main` advances beyond the last merge commit and nothing corrects the hint
+again. Measured on acme-config-stage #2802: the hint sat at an ancestor of
+`main`, and every PR in the repo was skipped three times — about 3 minutes of
+delay before its first comment — until the livelock guard released it.
+
+So hints carry a sequence number, and the poll loop publishes the tip it
+actually read (`_note_base_observed`) before processing any PR. That read is
+ground truth about where the branch is, so it retires any hint recorded
+earlier — which covers what a webhook cannot: a direct push, a squash that
+rewrote the commit, or a `fulfilled` event that never arrived. A sequence
+counter rather than a clock, because two `monotonic()` reads can be equal and
+"equal" would have to be resolved one way or the other, silently making one of
+the two cases wrong. The trade-off is deliberate: if Bitbucket's refs read lags
+a merge it has already announced, the hint is ignored and the PR renders
+against a base a few seconds old — the pre-COPS-2617 behaviour, still caught
+after the render, and far cheaper than every PR waiting out the livelock guard
+on a hint that will never be correct.
+
 Both cases share `_supersede_lock`, `_sha_eq` normalisation, and the
 `SUPERSEDE_MAX_CONSECUTIVE_ABORTS` livelock guard — without that ceiling a
 merge train would starve a large PR out of ever publishing anything, which is
@@ -431,13 +455,19 @@ that can abort in-flight renders is a cheap denial of service.
 
 **Observability.** `/diff-preview/stats` now reports `bb_webhook` counters
 (`received`, `rejected_hmac`, `rejected_format`, `wakes`, `hints_recorded`,
-`supersedes_triggered`, `last_received_at`, plus `hmac_strict` and
-`supersede_enabled`), and `_diff_stats` tracks whether each iteration was
-started by a webhook or by the safety-net tick. That ratio is what catches the
-failures no unit test can: the hook deleted or disabled in Bitbucket, the URL
-changed, an ingress rule dropping the POST, or the secret drifting out of sync
-after a rotation. In all of those the code is perfectly correct and the
-service is quietly running on the 60s poll.
+`supersedes_triggered`, `base_hints_stale_dropped`, `last_received_at`, plus
+`hmac_strict` and `supersede_enabled`), and `_diff_stats` tracks whether each
+iteration was started by a webhook or by the safety-net tick. That ratio is
+what catches the failures no unit test can: the hook deleted or disabled in
+Bitbucket, the URL changed, an ingress rule dropping the POST, or the secret
+drifting out of sync after a rotation. In all of those the code is perfectly
+correct and the service is quietly running on the 60s poll.
+
+`base_hints_stale_dropped` is the COPS-2633 equivalent for the destination
+hint: it counts hints retired because the poller had already seen `main` move
+past them. A steady climb is expected on any repo that takes direct pushes to
+`main`; it is here because that condition was invisible for as long as the bug
+lasted.
 
 ### Secret-leak and comment-integrity hardening
 
