@@ -42,7 +42,7 @@ image:
   # Kept in sync with Chart.yaml appVersion (RELEASING.md). This default had
   # drifted since v2.7.0; it never bit us because acme-infrastructure pins the
   # tag explicitly, but anyone installing the chart as-is got a stale image.
-  tag: "2.46.0"
+  tag: "2.47.0"
   pullPolicy: IfNotPresent
 
 # Log verbosity for the diff-preview service. Set to DEBUG to emit the full

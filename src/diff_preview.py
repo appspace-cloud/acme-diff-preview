@@ -2536,9 +2536,14 @@ DiffResult = namedtuple("DiffResult",
                         ["text", "sections", "n_res", "has_diff", "error", "outcome", "reason",
                          "version_change", "deleted_resources", "replicas_zeroed",
                          "fingerprint", "renamed_resources", "vm_changes",
-                         "version_fold", "shutdown_stats"],
+                         "version_fold", "shutdown_stats",
+                         "template_artifacts"],
                         defaults=[None, None, None, None, None, None, None,
-                                  None])
+                                  None, None])
+# template_artifacts: headers whose applied side renders `%!s(<nil>)` or
+# `<no value>` - a value the chart read and this environment does not set.
+# Blocking: the API server and KCC reject these exactly as reliably in the
+# cluster as here (COPS-2632).
 # shutdown_stats: {"zeroed": n, "workloads": total} for this app, counted on
 # the full pre-cap section list. Distinguishes an environment being switched
 # off (every workload at zero) from a single service scaled down.
@@ -5756,6 +5761,42 @@ def _detect_replicas_zeroed(sections: list) -> list:
     return zeroed
 
 
+# Go's own output for a nil or missing template/printf argument. Matched
+# tightly on purpose: a bare "%!" or the word "value" appears in legitimate
+# ConfigMap data (log format strings, embedded templates), and a block that
+# fires on real config is a block people learn to override. These three
+# shapes are only ever produced by a value the chart read and did not get.
+_TEMPLATE_ARTIFACT_RE = re.compile(
+    r"%![a-zA-Z]?\((?:<nil>|MISSING)\)|<no value>")
+
+
+def _detect_template_artifacts(sections: list) -> list:
+    """Sections whose APPLIED side renders an unresolved template value.
+
+    COPS-2632 shape: with `appspace.hostingID` absent the chart rendered
+    `hosting-id: hst-%!s(<nil>)`, helm exited 0, and the comment reported a
+    routine change. The chart's own guard could not catch it - it reads
+    `{{- if .Values.appspace.hostingID }}`, so an absent value skips the
+    validation rather than failing it. A chart author who uses `required`
+    lands in REASON_MISSING_REQUIRED already; one who uses an `if` guard
+    produced silence until this existed.
+
+    Only `+` lines count. An artifact on the `-` side, or replaced by a real
+    value, means this PR is FIXING one, and blocking that would be exactly
+    backwards. Context lines are ignored for the same reason: an artifact
+    already present on both sides is not this PR's doing.
+    """
+    hit = []
+    for header, body in sections:
+        for line in body.splitlines():
+            if not line.startswith("+") or line.startswith("+++"):
+                continue
+            if _TEMPLATE_ARTIFACT_RE.search(line):
+                hit.append(header)
+                break
+    return hit
+
+
 def _detect_workload_shutdown(sections: list):
     """{"zeroed": n, "workloads": total} over the workload sections, or None.
 
@@ -6254,12 +6295,15 @@ def _package_sections(filtered_sections: list, version_change=None):
     # section is visible in the comment, not just named by the panel —
     # detecting a risk is only half the job (the PR-3845 lesson).
     vm_changes = _detect_vm_changes(filtered_sections)
+    # COPS-2632: same rule for unresolved chart values. The blocking finding
+    # names the resource, so the resource has to be reachable in the comment.
+    artifacts = _detect_template_artifacts(filtered_sections)
     fingerprint = _fingerprint_sections(filtered_sections)
     # Version-transition fold, computed here for the same reason deletions
     # are: on the FULL pre-cap list, so what folds and what stays inline
     # never depends on a display cap. Sections already claimed by a safety
     # fact are exempt by construction.
-    exempt = (set(deleted or []) | set(zeroed or [])
+    exempt = (set(deleted or []) | set(zeroed or []) | set(artifacts or [])
               | {f["header"] for f in vm_changes})
     version_fold = _classify_version_fold(
         filtered_sections, version_change=version_change, exempt=exempt)
@@ -6274,7 +6318,8 @@ def _package_sections(filtered_sections: list, version_change=None):
     # cannot see anywhere in the comment.
     filtered_sections = _prioritise_risk_sections(
         filtered_sections, deleted, zeroed, RISK_SECTION_RESERVE,
-        extra=[f["header"] for f in vm_changes] + needle_headers)
+        extra=list(artifacts or []) + [f["header"] for f in vm_changes]
+        + needle_headers)
     display_secs = filtered_sections[:MAX_RESOURCES_FULL]
     truncated_parts = []
     for hdr, body in display_secs:
@@ -7786,10 +7831,12 @@ def argocd_diff(app, pr_sha, main_sha, chart_revision=None, changed_paths=None, 
                 filtered_sections, version_change=version_change)
         # Counted on the full pre-cap list, like every other safety fact.
         shutdown_stats = _detect_workload_shutdown(filtered_sections)
+        artifacts = _detect_template_artifacts(filtered_sections)
         return DiffResult(clean_diff, capped_sections,
                           n_res, True, None, OUT_DIFF, "changes", version_change,
                           deleted_res, zeroed_res, fingerprint, renamed_res,
-                          vm_changes_res, version_fold, shutdown_stats)
+                          vm_changes_res, version_fold, shutdown_stats,
+                          artifacts)
     # Exhausted retries
     return _indeterminate(last_reason, last_detail or "unknown error")
 
@@ -10560,6 +10607,24 @@ def _build_merge_summary(results, rollup_by_sig, vm_change_lines,
         findings.append((_SEV_REVIEW,
                          "\u2b07\ufe0f **Chart version downgrade** in "
                          f"{_fmt_env_list(downgraded)}"))
+    # COPS-2632: a rendered `%!s(<nil>)` or `<no value>` is a value the chart
+    # asked for and this environment does not set. It blocks for the same
+    # reason PERMANENT_REASONS blocks - the deployer fails the same way - and
+    # it has to be said out loud, because helm exits 0 and the diff otherwise
+    # looks routine. Live proof: pv-stage1-a shipped `hosting-id:
+    # hst-%!s(<nil>)` and KCC rejected every Compute* resource afterwards.
+    artifact_apps = sorted(a for a, r in results.items()
+                           if getattr(r, "template_artifacts", None))
+    if artifact_apps:
+        n_res = sum(len(results[a].template_artifacts) for a in artifact_apps)
+        findings.append((_SEV_BLOCK,
+                         "\U0001f6a8 **Unresolved chart value** \u2014 "
+                         f"{n_res} resource(s) render `%!s(<nil>)` or "
+                         f"`<no value>` in {_fmt_env_list(artifact_apps)}. "
+                         "The chart read a value this environment does not "
+                         "set; the API server and KCC reject these as "
+                         "invalid after the merge."))
+
     # An environment going fully dark and a single service being scaled down
     # are different events. Both used to render as "Replicas scaled to zero",
     # and on acme-config-dev PR #7063 the whole-environment case did not
@@ -10763,6 +10828,7 @@ def _is_risky_result(r) -> bool:
     protecting anything.
     """
     return bool(r.deleted_resources or r.replicas_zeroed
+                or getattr(r, "template_artifacts", None)
                 or getattr(r, "vm_changes", None)
                 or (r.version_change
                     and _is_version_downgrade(*r.version_change)))
