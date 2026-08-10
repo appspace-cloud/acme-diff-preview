@@ -9,10 +9,8 @@ text on disk, and keeps a memory front cache of parsed resources.
 A wrong cache entry produces a wrong diff, which is worse than slow. The
 shadow audit and the content-key tests are the gate.
 """
-import hashlib
 import os
 import sys
-import tempfile
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
 os.environ.setdefault("BB_USER", "t")

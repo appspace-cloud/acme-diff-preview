@@ -1210,6 +1210,13 @@ class _HealthHandler(BaseHTTPRequestHandler):
             with _diff_stats_lock:
                 payload = dict(_diff_stats)
             payload["version"] = APP_VERSION   # v2.5.19 (F1): running version
+            # COPS-2631 stage 1: which SequenceMatcher is live, and which
+            # stdlib class the byte-identity tests compare against. Exposed
+            # so a wheel-less rollout is visible on /stats, not only in logs.
+            payload["difflib_engine"] = _DIFFLIB_ENGINE
+            payload["difflib_stdlib_matcher"] = (
+                f"{_STDLIB_SEQUENCE_MATCHER.__module__}."
+                f"{_STDLIB_SEQUENCE_MATCHER.__qualname__}")
             # COPS-2577: the high-water mark in the payload is meaningless
             # on its own; the cap it is approaching has to travel with it.
             payload["max_apps_per_run"] = MAX_APPS_PER_RUN
@@ -3271,8 +3278,11 @@ def _main_render_disk_store(key: str, raw: str) -> None:
         if os.path.exists(tmp):  # pragma: no cover
             try:
                 os.remove(tmp)
-            except OSError:
-                pass
+            except OSError as e:
+                # Best-effort: a leftover tmp after a successful replace is
+                # harmless; a failed cleanup must not poison the cache write.
+                log(f"[main-render-cache] tmp cleanup failed (non-fatal): {e}",
+                    "WARNING")
 
 
 def _main_render_cache_put(key: str, raw: str, resources: dict) -> None:
@@ -7528,8 +7538,10 @@ def _run_one_diff(app, pr_sha, main_sha, chart_revision=None, changed_paths=None
                                 _main_render_cache.pop(content_key, None)
                             try:
                                 os.remove(_main_render_disk_path(content_key))
-                            except OSError:
-                                pass
+                            except OSError as e:
+                                # Best-effort: entry already dropped from memory.
+                                log(f"[main-render-cache] disk discard failed "
+                                    f"(non-fatal): {e}", "WARNING")
                             main_resources = _parse_manifest_resources(shadow_yaml)
                             _main_render_cache_put(content_key, shadow_yaml, main_resources)
                 except Exception as e:

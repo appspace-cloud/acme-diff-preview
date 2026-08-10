@@ -131,13 +131,18 @@ def _artifact_path(base_dir, repo, pr_id, sha):
 
 
 def _artifact_zst_path(base_dir, repo, pr_id, sha):
-    return _artifact_path(base_dir, repo, pr_id, sha) + ".zst"
+    # Re-assert after appending `.zst`: CodeQL's py/path-injection loses the
+    # sanitizer barrier across string concatenation (COPS-2580 / COPS-2631).
+    return _assert_within_base_dir(
+        _artifact_path(base_dir, repo, pr_id, sha) + ".zst", base_dir)
 
 
 def _artifact_paths_for_read(base_dir, repo, pr_id, sha):
     """Preferred-first local paths to try on load (zst, then legacy json)."""
-    json_path = _artifact_path(base_dir, repo, pr_id, sha)
-    return (json_path + ".zst", json_path)
+    return (
+        _artifact_zst_path(base_dir, repo, pr_id, sha),
+        _artifact_path(base_dir, repo, pr_id, sha),
+    )
 
 
 def _zstd_available():
@@ -278,7 +283,8 @@ def save_artifact(base_dir, repo, pr_id, sha, body, pr_url="",
     }
     raw = json.dumps(artifact, ensure_ascii=False).encode("utf-8")
     payload, suffix = _encode_artifact_bytes(raw)
-    path = legacy_path if suffix == ".json" else legacy_path + ".zst"
+    path = (legacy_path if suffix == ".json"
+            else _assert_within_base_dir(legacy_path + ".zst", base_dir))
     fd, tmp = tempfile.mkstemp(dir=base_dir, suffix=".tmp")
     try:
         with os.fdopen(fd, "wb") as f:
@@ -288,11 +294,13 @@ def save_artifact(base_dir, repo, pr_id, sha, body, pr_url="",
         if os.path.exists(tmp):  # pragma: no cover - only on a failed replace
             os.remove(tmp)
     # One live object per PR: drop the other encoding if it lingered.
-    other = legacy_path if path.endswith(".zst") else legacy_path + ".zst"
+    other = (legacy_path if path.endswith(".zst")
+             else _assert_within_base_dir(legacy_path + ".zst", base_dir))
     if other != path and os.path.exists(other):
         try:
             os.remove(other)
         except OSError:
+            # Best-effort: a locked/vanished sibling must not fail the save.
             pass
     _prune(base_dir, max_artifacts, max_bytes)
     if bucket:
@@ -353,6 +361,9 @@ def load_artifact(base_dir, repo, pr_id, sha, bucket=""):
         return None
     for path in paths:
         try:
+            # Re-assert at the sink so CodeQL sees the sanitizer adjacent to
+            # open() (same pattern as COPS-2580).
+            path = _assert_within_base_dir(path, base_dir)
             with open(path, "rb") as f:
                 data = f.read()
             return _decode_artifact_bytes(data)
@@ -365,9 +376,15 @@ def load_artifact(base_dir, repo, pr_id, sha, bucket=""):
             raise
     if not bucket:
         return None
-    # Prefer the compressed object name, then the legacy one.
-    for name in (os.path.basename(paths[0]), os.path.basename(paths[1])):
-        data = _gcs_download(bucket, name)
+    # Prefer the compressed object name, then the legacy one. Rebuild the
+    # local warm path through the validated constructors (not basename join)
+    # so py/path-injection sees the same sanitizer as a local write.
+    candidates = (
+        (_artifact_zst_path(base_dir, repo, pr_id, sha), True),
+        (_artifact_path(base_dir, repo, pr_id, sha), False),
+    )
+    for warm, _is_zst in candidates:
+        data = _gcs_download(bucket, os.path.basename(warm))
         if data is None:
             continue
         try:
@@ -378,10 +395,8 @@ def load_artifact(base_dir, repo, pr_id, sha, bucket=""):
             if type(e).__name__ == "ZstdError":
                 continue
             raise
-        # Warm local cache under the same basename we fetched.
         try:
             os.makedirs(base_dir, exist_ok=True)
-            warm = os.path.join(base_dir, name)
             warm = _assert_within_base_dir(warm, base_dir)
             fd, tmp = tempfile.mkstemp(dir=base_dir, suffix=".tmp")
             with os.fdopen(fd, "wb") as f:
