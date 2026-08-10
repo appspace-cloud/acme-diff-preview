@@ -129,8 +129,8 @@ def test_invalidate_for_republish_evicts_forces_and_wakes(monkeypatch):
     m._app_chart_map["pv-repub-a-ms"] = chart
     m._app_chart_revision_map["pv-repub-a-ms"] = ver
     with m._main_render_lock:
-        m._main_render_cache[("pv-repub-a-ms", "sha1")] = "cached-render"
-        m._main_render_cache[("pv-unrelated-b-ms", "sha1")] = "keep-me"
+        m._main_render_cache["deadbeef" * 8] = "cached-render"
+        m._main_render_cache["cafebabe" * 8] = "keep-me"
     with m._seen_lock:
         m._pr_chart_targets[("acme-config-dev", 777)] = {(chart, ver)}
         m._pr_chart_targets[("acme-config-dev", 888)] = {(chart, "1.1.1")}
@@ -140,8 +140,9 @@ def test_invalidate_for_republish_evicts_forces_and_wakes(monkeypatch):
         m._invalidate_for_republish(chart, ver)
         assert key_match not in m._helm_chart_cache
         assert key_other in m._helm_chart_cache, "other versions stay cached"
-        assert ("pv-repub-a-ms", "sha1") not in m._main_render_cache
-        assert ("pv-unrelated-b-ms", "sha1") in m._main_render_cache
+        # COPS-2631: content-keyed memory front is cleared wholesale on
+        # republish (keys are digests, not app tuples).
+        assert m._main_render_cache == {}
         assert ("acme-config-dev", 777) in m._force_recompute and ("acme-config-dev", 888) not in m._force_recompute
         assert ("acme-config-dev", 777) not in m._seen, "dedup must be bypassed for the forced PR"
         assert m._wake.is_set(), "the polling loop must wake up immediately"

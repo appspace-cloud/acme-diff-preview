@@ -1210,8 +1210,11 @@ def test_format_app_diff_block_applies_redaction():
     assert "c2VjcmV0" not in out and "[REDACTED]" in out
 
 
-def test_main_render_cache_key_is_chart_and_pull_aware():
-    """(app, main_sha) alone reuses stale renders after a tag republish."""
+def test_main_render_cache_key_is_content_keyed():
+    """COPS-2631: key on chart+values digest, not (app, main_sha, ...)."""
     src = _source()
     assert "main_cache_key = (app, main_sha)" not in src, "old 2-tuple key still present"
-    assert "main_cache_key = (app, main_sha, main_rev, main_pull_gen)" in src
+    assert "main_cache_key = (app, main_sha, main_rev, main_pull_gen)" not in src, \
+        "pre-COPS-2631 4-tuple key still present"
+    assert "_main_render_content_key" in src
+    assert "_CLEAR_MAIN_RENDER_ON_TIP_MOVE = False" in src

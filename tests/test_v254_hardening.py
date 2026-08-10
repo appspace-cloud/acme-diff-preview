@@ -291,6 +291,10 @@ def test_run_one_diff_follows_renamed_value_file_into_render(monkeypatch):
     monkeypatch.setattr(m, "_bb_fetch_status", fake_bb_fetch_status)
     m._vf_cache.clear()
     m._vf_inflight.clear()
+    import tempfile
+    monkeypatch.setattr(m, "MAIN_RENDER_CACHE_DIR",
+                        tempfile.mkdtemp(prefix="main-render-test-"))
+    m._main_render_cache.clear()
 
     diff_text, reason, detail, *_vc = m._run_one_diff(
         app, pr_sha="prsha000", main_sha="mainsha000",
@@ -335,6 +339,12 @@ def test_run_one_diff_genuine_deletion_still_omitted(monkeypatch):
     monkeypatch.setattr(m, "_bb_fetch_status", fake_bb_fetch_status)
     m._vf_cache.clear()
     m._vf_inflight.clear()
+    # COPS-2631: content-keyed cache (memory + disk) survives across tests
+    # that share the same fake chart path; isolate so both sides render.
+    import tempfile
+    monkeypatch.setattr(m, "MAIN_RENDER_CACHE_DIR",
+                        tempfile.mkdtemp(prefix="main-render-test-"))
+    m._main_render_cache.clear()
 
     diff_text, reason, detail, *_vc = m._run_one_diff(
         app, pr_sha="prsha001", main_sha="mainsha001",

@@ -220,12 +220,25 @@ def test_prune_enforces_a_byte_budget(tmp_path):
     """DIFF_UI_DIR is a 1Gi emptyDir and the kubelet EVICTS the pod past the
     limit. A count-only prune (500) is measured in the wrong unit: 500 of
     the observed 26.7MB worst case is 13GB. Oldest goes first; GCS remains
-    the durable copy, so a local prune costs one re-download."""
+    the durable copy, so a local prune costs one re-download.
+
+    Bodies are near-incompressible so zstd (COPS-2631 stage 4) does not
+    collapse five files under the budget the way a repeated `"x"` would.
+    Assert the budget invariant and FIFO order, not a magic keep-count
+    (compressed size still varies a little with the compressor).
+    """
+    max_bytes = 35_000
+    rnd = __import__("random").Random(0)
     for i in range(5):
+        body = "".join(chr(rnd.randint(32, 126)) for _ in range(10_000))
         ui.save_artifact(str(tmp_path), "acme-config-dev", 100 + i, SHA,
-                         "x" * 10_000, max_artifacts=500,
-                         max_bytes=35_000)
+                         body, max_artifacts=500,
+                         max_bytes=max_bytes)
     kept = sorted(os.listdir(str(tmp_path)))
-    assert len(kept) == 3, f"byte budget must hold, kept: {kept}"
-    assert "acme-config-dev__104.json" in kept, "newest must survive"
-    assert "acme-config-dev__100.json" not in kept, "oldest must go first"
+    total = sum(os.path.getsize(tmp_path / n) for n in kept)
+    assert total <= max_bytes, f"byte budget must hold, kept={kept} total={total}"
+    assert len(kept) < 5, f"at least one artifact must be pruned, kept: {kept}"
+    assert any(n.startswith("acme-config-dev__104.") for n in kept), \
+        "newest must survive"
+    assert not any(n.startswith("acme-config-dev__100.") for n in kept), \
+        "oldest must go first"

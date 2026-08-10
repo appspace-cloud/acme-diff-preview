@@ -10,8 +10,8 @@ MAX_COMMENT_BYTES); the COMPLETE, untruncated diff body is persisted here per
 This mirrors Atlantis: the Bitbucket build status "Details" link opens the
 full output page instead of the truncated comment.
 
-Standalone module on purpose (stdlib only, never imports diff_preview), same
-pattern as the provider split: independently testable, no circular imports.
+Standalone module on purpose (never imports diff_preview), same pattern as
+the provider split: independently testable, no circular imports.
 diff_preview passes configuration as arguments.
 
 Storage v1 is a bounded flat directory (one JSON file per artifact, atomic
@@ -26,10 +26,15 @@ on an emptyDir, so this is what keeps permalinks alive across pod restarts,
 and it is replica-ready: any pod can serve any artifact, and because the
 content for a (repo, pr) is deterministic per sha, concurrent writers
 converge on the same bytes (last-writer-wins is safe). Plain GCS JSON API
-over urllib keeps the module stdlib-only; auth is the pod's Workload
+over urllib keeps GCS I/O free of cloud SDKs; auth is the pod's Workload
 Identity token from the GKE metadata server. Every GCS failure is soft: the
 worst outcome is a 404 after a restart (exactly the old behavior), never a
 broken diff run or a broken page.
+
+COPS-2631 stage 4: new writes compress the JSON payload with zstd level 3
+(optional `zstandard` wheel; falls back to raw `.json` if the wheel is
+missing). The read path accepts both `.json.zst` and legacy `.json` so
+existing local/GCS entries keep serving during the transition.
 """
 from __future__ import annotations
 
@@ -42,6 +47,11 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
+
+# zstd magic (RFC 8878). Used to sniff GCS/local payloads that may be either
+# raw UTF-8 JSON or a compressed frame during the dual-read transition.
+_ZSTD_MAGIC = b"\x28\xb5\x2f\xfd"
+_ZSTD_LEVEL = 3
 
 # Mirrors diff_preview.STATUS_NAME. Duplicated on purpose: this module stays
 # standalone stdlib-only (see module docstring) and never imports
@@ -95,14 +105,16 @@ def _assert_within_base_dir(path: str, base_dir: str) -> str:
     legitimately) and adds a second, independent layer of defense that
     stays correct even if the regexes above are ever loosened.
 
-    Returns path unchanged on success; raises ValueError if it would
-    resolve outside base_dir.
+    Returns the normalized absolute path on success (not the original
+    string): CodeQL only treats the checked value as sanitized when that
+    same value reaches the filesystem sink. Raises ValueError if the path
+    would resolve outside base_dir.
     """
     norm_base = os.path.abspath(base_dir)
     norm_path = os.path.abspath(path)
     if norm_path != norm_base and not norm_path.startswith(norm_base + os.sep):
         raise ValueError(f"path escapes base_dir: {path!r} not under {base_dir!r}")
-    return path
+    return norm_path
 
 
 def _artifact_path(base_dir, repo, pr_id, sha):
@@ -112,9 +124,58 @@ def _artifact_path(base_dir, repo, pr_id, sha):
     # os.replace), and load-by-sha resolves to whatever the PR's current diff
     # is, so the build-status link never 404s just because the tip moved. The
     # sha is still validated (below) and stored inside the artifact.
+    #
+    # Legacy path (pre-COPS-2631 stage 4): `.json`. New writes prefer
+    # `.json.zst`; see _artifact_paths_for_read / save_artifact.
     repo, pr_s, sha = _validate(repo, pr_id, sha)
     path = os.path.join(base_dir, f"{repo}__{pr_s}.json")
     return _assert_within_base_dir(path, base_dir)
+
+
+def _artifact_zst_path(base_dir, repo, pr_id, sha):
+    # Re-assert after appending `.zst`: CodeQL's py/path-injection loses the
+    # sanitizer barrier across string concatenation (COPS-2580 / COPS-2631).
+    return _assert_within_base_dir(
+        _artifact_path(base_dir, repo, pr_id, sha) + ".zst", base_dir)
+
+
+def _artifact_paths_for_read(base_dir, repo, pr_id, sha):
+    """Preferred-first local paths to try on load (zst, then legacy json)."""
+    return (
+        _artifact_zst_path(base_dir, repo, pr_id, sha),
+        _artifact_path(base_dir, repo, pr_id, sha),
+    )
+
+
+def _zstd_available():
+    try:
+        import zstandard  # noqa: F401
+        return True
+    except ImportError:  # pragma: no cover - production image has the wheel
+        return False
+
+
+def _encode_artifact_bytes(payload_utf8: bytes):
+    """Compress with zstd level 3 when available. Returns (bytes, path_suffix)."""
+    if not _zstd_available():
+        return payload_utf8, ".json"
+    import zstandard as zstd
+    return zstd.ZstdCompressor(level=_ZSTD_LEVEL).compress(payload_utf8), ".json.zst"
+
+
+def _decode_artifact_bytes(data: bytes):
+    """Decode raw JSON UTF-8 or a zstd frame into an artifact dict.
+
+    Raises ValueError when the payload is a zstd frame but the wheel is
+    missing, so callers can fall through to a legacy `.json` sibling.
+    """
+    if data.startswith(_ZSTD_MAGIC):
+        try:
+            import zstandard as zstd
+        except ImportError as e:  # pragma: no cover - production has the wheel
+            raise ValueError("zstd payload but zstandard wheel missing") from e
+        data = zstd.ZstdDecompressor().decompress(data)
+    return json.loads(data.decode("utf-8"))
 
 
 # ── durable GCS layer ───────────────────────────────────────────────────────
@@ -193,6 +254,28 @@ def _gcs_download(bucket, name):
         return None
 
 
+def _gcs_delete(bucket, name):
+    """Best-effort delete of one object. Returns True on success."""
+    try:
+        url = ("https://storage.googleapis.com/storage/v1/b/"
+               f"{urllib.parse.quote(bucket, safe='')}/o/"
+               f"{urllib.parse.quote(name, safe='')}")
+        req = urllib.request.Request(
+            url, method="DELETE",
+            headers={"Authorization": f"Bearer {_gcs_token()}"})
+        with urllib.request.urlopen(req, timeout=_GCS_TIMEOUT):
+            pass
+        return True
+    except urllib.error.HTTPError as e:
+        if e.code == 404:
+            return True
+        _warn(f"[diff-ui] GCS delete of {name} failed (non-fatal): HTTP {e.code}")
+        return False
+    except Exception as e:
+        _warn(f"[diff-ui] GCS delete of {name} failed (non-fatal): {e}")
+        return False
+
+
 def save_artifact(base_dir, repo, pr_id, sha, body, pr_url="",
                   max_artifacts=500, base_sha="", outcome_counts=None,
                   app_count=None, bucket="", max_bytes=None):
@@ -211,8 +294,12 @@ def save_artifact(base_dir, repo, pr_id, sha, body, pr_url="",
     When bucket is set the exact same bytes are also uploaded to GCS
     (best-effort, soft failure) so the artifact survives pod restarts and
     is reachable from any replica.
+
+    COPS-2631: payload is zstd-compressed (level 3) when the zstandard wheel
+    is present, written as `.json.zst`. A sibling legacy `.json` for the
+    same PR is removed so prune and load see one live object.
     """
-    path = _artifact_path(base_dir, repo, pr_id, sha)
+    legacy_path = _artifact_path(base_dir, repo, pr_id, sha)
     os.makedirs(base_dir, exist_ok=True)
     artifact = {
         "repo": str(repo),
@@ -225,19 +312,37 @@ def save_artifact(base_dir, repo, pr_id, sha, body, pr_url="",
         "created_utc": time.strftime("%Y-%m-%d %H:%M:%S UTC", time.gmtime()),
         "body": body,
     }
-    payload = json.dumps(artifact, ensure_ascii=False)
+    raw = json.dumps(artifact, ensure_ascii=False).encode("utf-8")
+    payload, suffix = _encode_artifact_bytes(raw)
+    path = (legacy_path if suffix == ".json"
+            else _assert_within_base_dir(legacy_path + ".zst", base_dir))
     fd, tmp = tempfile.mkstemp(dir=base_dir, suffix=".tmp")
     try:
-        with os.fdopen(fd, "w", encoding="utf-8") as f:
+        with os.fdopen(fd, "wb") as f:
             f.write(payload)
         os.replace(tmp, path)
     finally:
         if os.path.exists(tmp):  # pragma: no cover - only on a failed replace
             os.remove(tmp)
+    # One live object per PR: drop the other encoding if it lingered.
+    other = (legacy_path if path.endswith(".zst")
+             else _assert_within_base_dir(legacy_path + ".zst", base_dir))
+    if other != path and os.path.exists(other):
+        try:
+            os.remove(other)
+        except OSError:
+            # Best-effort: a locked/vanished sibling must not fail the save.
+            pass
     _prune(base_dir, max_artifacts, max_bytes)
     if bucket:
-        _gcs_upload(bucket, os.path.basename(path),
-                    payload.encode("utf-8"))
+        name = os.path.basename(path)
+        if _gcs_upload(bucket, name, payload):
+            # Drop the other encoding in GCS so a failed zst upload cannot
+            # leave a stale legacy object preferred on the next miss.
+            other_name = (name[:-4] if name.endswith(".zst")
+                          else name + ".zst")
+            if other_name != name:
+                _gcs_delete(bucket, other_name)
     return path
 
 
@@ -252,10 +357,13 @@ def _prune(base_dir, max_artifacts, max_bytes=None):
     before uncapping), so a count is measured in the wrong unit. Local
     pruning is cheap to be aggressive about: GCS is the durable copy and a
     pruned entry costs exactly one re-download on the next view.
+
+    Counts both `.json` and `.json.zst` (COPS-2631 dual-write transition).
     """
     try:
         entries = [os.path.join(base_dir, n) for n in os.listdir(base_dir)
-                   if n.endswith(".json")]
+                   if n.endswith(".json.zst")
+                   or (n.endswith(".json") and not n.endswith(".zst"))]
         entries.sort(key=lambda p: os.path.getmtime(p))
         sizes = {p: os.path.getsize(p) for p in entries}
     except OSError:  # pragma: no cover - directory vanished mid-run
@@ -280,37 +388,66 @@ def _prune(base_dir, max_artifacts, max_bytes=None):
 def load_artifact(base_dir, repo, pr_id, sha, bucket=""):
     """Return the artifact dict, or None if missing/corrupt/bad key.
 
-    Local cache first. On a miss (fresh pod after a restart, or a sibling
-    replica wrote it) fall back to the GCS bucket when configured, and warm
-    the local cache with the downloaded bytes so the next read is local.
+    Local cache first (`.json.zst` then legacy `.json`). On a miss (fresh
+    pod after a restart, or a sibling replica wrote it) fall back to the
+    GCS bucket when configured, and warm the local cache with the
+    downloaded bytes so the next read is local.
     """
     try:
-        path = _artifact_path(base_dir, repo, pr_id, sha)
+        repo, pr_s, sha = _validate(repo, pr_id, sha)
     except ValueError:
         return None
-    try:
-        with open(path, encoding="utf-8") as f:
-            return json.load(f)
-    except (OSError, ValueError):
-        pass
+    # CodeQL py/path-injection: build the filename from validated segments
+    # only, then use the exact normpath(join(base, name)) + startswith +
+    # raise idiom from the CodeQL docs. Helpers alone do not clear the
+    # alert (see alerts 1/2 still open on main, 10/11 on this PR).
+    base_path = os.path.abspath(base_dir)
+    names = (f"{repo}__{pr_s}.json.zst", f"{repo}__{pr_s}.json")
+    for name in names:
+        fullpath = os.path.normpath(os.path.join(base_path, name))
+        if not fullpath.startswith(base_path):
+            raise ValueError(
+                f"path escapes base_dir: {fullpath!r} not under {base_path!r}")
+        try:
+            with open(fullpath, "rb") as f:
+                data = f.read()
+            return _decode_artifact_bytes(data)
+        except (OSError, ValueError, UnicodeDecodeError, json.JSONDecodeError):
+            continue
+        except Exception as e:
+            # zstandard.ZstdError is not always a ValueError subclass.
+            if type(e).__name__ == "ZstdError":
+                continue
+            raise
     if not bucket:
         return None
-    data = _gcs_download(bucket, os.path.basename(path))
-    if data is None:
-        return None
-    try:
-        artifact = json.loads(data.decode("utf-8"))
-    except ValueError:
-        return None
-    try:
-        os.makedirs(base_dir, exist_ok=True)
-        fd, tmp = tempfile.mkstemp(dir=base_dir, suffix=".tmp")
-        with os.fdopen(fd, "wb") as f:
-            f.write(data)
-        os.replace(tmp, path)
-    except OSError:  # pragma: no cover - cache warm is best-effort only
-        pass
-    return artifact
+    for name in names:
+        data = _gcs_download(bucket, name)
+        if data is None:
+            continue
+        try:
+            artifact = _decode_artifact_bytes(data)
+        except (ValueError, UnicodeDecodeError, json.JSONDecodeError):
+            continue
+        except Exception as e:
+            if type(e).__name__ == "ZstdError":
+                continue
+            raise
+        try:
+            os.makedirs(base_path, exist_ok=True)
+            fullpath = os.path.normpath(os.path.join(base_path, name))
+            if not fullpath.startswith(base_path):
+                raise ValueError(
+                    f"path escapes base_dir: {fullpath!r} not under "
+                    f"{base_path!r}")
+            fd, tmp = tempfile.mkstemp(dir=base_path, suffix=".tmp")
+            with os.fdopen(fd, "wb") as f:
+                f.write(data)
+            os.replace(tmp, fullpath)
+        except (OSError, ValueError):  # pragma: no cover - cache warm is best-effort
+            pass
+        return artifact
+    return None
 
 
 def has_artifact(base_dir, repo, pr_id, sha, bucket=""):
