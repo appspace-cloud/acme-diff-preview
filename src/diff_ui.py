@@ -392,6 +392,18 @@ def load_artifact(base_dir, repo, pr_id, sha, bucket=""):
     pod after a restart, or a sibling replica wrote it) fall back to the
     GCS bucket when configured, and warm the local cache with the
     downloaded bytes so the next read is local.
+
+    A local hit whose stored sha is NOT the one being asked for is treated as
+    a miss when a bucket is configured. The artifact is keyed by (repo, pr)
+    and overwritten in place, so a replica that warmed its cache from GCS
+    while an older commit was current would otherwise serve that older diff
+    for the rest of the PR's life, while the leader served the current one.
+    Live proof, acme-config-dev PR #7063 on 2.45.0: the two hub replicas
+    disagreed about whether the PR changed 110 resources or nothing at all.
+
+    Falling back to the newest artifact that exists is still the contract
+    when GCS has nothing better (the build-status link must not 404 just
+    because the tip moved), and a matching sha still costs zero network.
     """
     try:
         repo, pr_s, sha = _validate(repo, pr_id, sha)
@@ -403,6 +415,7 @@ def load_artifact(base_dir, repo, pr_id, sha, bucket=""):
     # alert (see alerts 1/2 still open on main, 10/11 on this PR).
     base_path = os.path.abspath(base_dir)
     names = (f"{repo}__{pr_s}.json.zst", f"{repo}__{pr_s}.json")
+    local = None
     for name in names:
         fullpath = os.path.normpath(os.path.join(base_path, name))
         if not fullpath.startswith(base_path):
@@ -411,7 +424,8 @@ def load_artifact(base_dir, repo, pr_id, sha, bucket=""):
         try:
             with open(fullpath, "rb") as f:
                 data = f.read()
-            return _decode_artifact_bytes(data)
+            local = _decode_artifact_bytes(data)
+            break
         except (OSError, ValueError, UnicodeDecodeError, json.JSONDecodeError):
             continue
         except Exception as e:
@@ -419,8 +433,10 @@ def load_artifact(base_dir, repo, pr_id, sha, bucket=""):
             if type(e).__name__ == "ZstdError":
                 continue
             raise
+    if local is not None and (not bucket or str(local.get("sha")) == sha):
+        return local
     if not bucket:
-        return None
+        return local
     for name in names:
         data = _gcs_download(bucket, name)
         if data is None:
@@ -433,6 +449,11 @@ def load_artifact(base_dir, repo, pr_id, sha, bucket=""):
             if type(e).__name__ == "ZstdError":
                 continue
             raise
+        if (local is not None
+                and str(artifact.get("sha")) == str(local.get("sha"))):
+            # GCS is no fresher than what we already hold: keep serving the
+            # local copy rather than rewriting it for nothing.
+            return local
         try:
             os.makedirs(base_path, exist_ok=True)
             fullpath = os.path.normpath(os.path.join(base_path, name))
@@ -444,10 +465,22 @@ def load_artifact(base_dir, repo, pr_id, sha, bucket=""):
             with os.fdopen(fd, "wb") as f:
                 f.write(data)
             os.replace(tmp, fullpath)
+            # Drop the other encoding so the healed copy is the only one the
+            # next local read can find.
+            other = os.path.normpath(os.path.join(
+                base_path, name[:-4] if name.endswith(".zst") else name + ".zst"))
+            if other != fullpath and other.startswith(base_path):
+                try:
+                    os.remove(other)
+                except OSError:
+                    # Best-effort: the preferred name is written already.
+                    pass
         except (OSError, ValueError):  # pragma: no cover - cache warm is best-effort
             pass
         return artifact
-    return None
+    # GCS had nothing usable. A local copy for an older commit is still the
+    # newest diff that exists for this PR, so serve it instead of a 404.
+    return local
 
 
 def has_artifact(base_dir, repo, pr_id, sha, bucket=""):
