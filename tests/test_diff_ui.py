@@ -617,6 +617,10 @@ def _gcs_env(monkeypatch, objects, calls):
             return _FakeResp(b"{}")
         if "/storage/v1/b/" in url:
             name = urllib.parse.unquote(url.split("/o/")[1].split("?")[0])
+            if getattr(req, "get_method", lambda: "GET")() == "DELETE" or (
+                    getattr(req, "method", None) == "DELETE"):
+                objects.pop(name, None)
+                return _FakeResp(b"")
             if name not in objects:
                 raise urllib.error.HTTPError(url, 404, "not found", {}, None)
             return _FakeResp(objects[name])

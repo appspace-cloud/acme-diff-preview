@@ -89,3 +89,46 @@ def test_prune_counts_both_json_and_zst(tmp_path):
                               BODY, max_artifacts=3)
     names = os.listdir(str(tmp_path))
     assert len([n for n in names if n.endswith((".json", ".json.zst"))]) <= 3
+
+
+def test_decode_zstd_without_wheel_raises_valueerror(monkeypatch):
+    """Wheel-less envs must fall through to legacy .json, not abort."""
+    monkeypatch.setattr(diff_ui, "_zstd_available", lambda: False)
+    import zstandard as zstd
+    payload = zstd.ZstdCompressor(level=3).compress(b'{"body":"x"}')
+    # Force import failure inside decode even though we have the wheel for
+    # building the fixture: patch the import path via a fake module miss.
+    import builtins
+    real_import = builtins.__import__
+
+    def _block_zstd(name, *a, **kw):
+        if name == "zstandard":
+            raise ImportError("blocked for test")
+        return real_import(name, *a, **kw)
+
+    monkeypatch.setattr(builtins, "__import__", _block_zstd)
+    try:
+        diff_ui._decode_artifact_bytes(payload)
+        assert False, "expected ValueError"
+    except ValueError as e:
+        assert "zstandard" in str(e).lower() or "zstd" in str(e).lower()
+
+
+def test_load_falls_through_to_legacy_json_when_zst_undecodable(tmp_path,
+                                                                monkeypatch):
+    import zstandard as zstd
+    legacy = {
+        "repo": "acme-config-dev", "pr_id": 42, "sha": "ab12cd3",
+        "pr_url": "", "base_sha": "", "outcome_counts": {},
+        "app_count": None, "created_utc": "2026-01-01 00:00:00 UTC",
+        "body": BODY,
+    }
+    zst = os.path.join(str(tmp_path), "acme-config-dev__42.json.zst")
+    with open(zst, "wb") as f:
+        f.write(zstd.ZstdCompressor(level=3).compress(b"{not-json"))
+    path = os.path.join(str(tmp_path), "acme-config-dev__42.json")
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(legacy, f)
+    art = diff_ui.load_artifact(str(tmp_path), "acme-config-dev", 42,
+                                "ab12cd3")
+    assert art["body"] == BODY

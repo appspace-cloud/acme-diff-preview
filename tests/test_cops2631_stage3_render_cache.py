@@ -106,3 +106,13 @@ def test_main_sha_advance_does_not_wipe_content_cache(monkeypatch):
     # Simulate what main_iteration used to do.
     assert hasattr(m, "_CLEAR_MAIN_RENDER_ON_TIP_MOVE")
     assert m._CLEAR_MAIN_RENDER_ON_TIP_MOVE is False
+
+
+def test_disk_prune_enforces_count_cap(tmp_path, monkeypatch):
+    monkeypatch.setattr(m, "MAIN_RENDER_CACHE_DIR", str(tmp_path))
+    monkeypatch.setattr(m, "MAIN_RENDER_DISK_MAX", 3)
+    monkeypatch.setattr(m, "MAIN_RENDER_DISK_MAX_BYTES", 10 ** 9)
+    for i in range(5):
+        m._main_render_disk_store(f"key-{i}", "raw-" + ("x" * 100))
+    kept = [n for n in os.listdir(str(tmp_path)) if n.endswith(".yaml")]
+    assert len(kept) == 3

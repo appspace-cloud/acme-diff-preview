@@ -112,6 +112,19 @@ def _env_int(name: str, default: int) -> int:
         return default
 
 
+def _env_float(name: str, default: float) -> float:
+    """Parse a float env var, falling back to default on any bad value."""
+    raw = os.environ.get(name)
+    if raw is None:
+        return default
+    try:
+        return float(raw)
+    except ValueError:
+        print(f'WARNING: env var {name}="{raw}" is not a valid float; '
+              f'using default {default}', file=sys.stderr, flush=True)
+        return default
+
+
 # Running version, injected at image build (docker.yml passes the git tag as
 # the APP_VERSION build-arg -> ENV). Falls back to "dev" for local runs.
 # v2.5.19 (F1): before this, nothing in the pod told you what version was
@@ -712,6 +725,15 @@ _PROM_REGISTRY = (
      "Cumulative seconds spent saving the full-diff artifact."),
     ("stage_store_count", "stage_store_count_total", "counter",
      "Number of store-stage samples recorded."),
+    # COPS-2631 stage 3: content-keyed cache correctness. A non-zero
+    # shadow_mismatches means a wrong entry was about to be served.
+    ("main_render_cache_shadow_mismatches",
+     "main_render_cache_shadow_mismatches_total", "counter",
+     "Shadow-audit mismatches on the main-side render cache. Must stay 0."),
+    ("main_render_cache_hits", "main_render_cache_hits_total", "counter",
+     "Main-side helm renders served from the content-keyed cache."),
+    ("main_render_cache_misses", "main_render_cache_misses_total", "counter",
+     "Main-side helm renders that had to run fresh."),
 )
 
 
@@ -3177,12 +3199,18 @@ MAIN_RENDER_CACHE_DIR = os.environ.get(
     "MAIN_RENDER_CACHE_DIR",
     os.path.join(os.environ.get("HELM_CACHE_DIR", "/tmp/acme-helm-cache"),
                  "main-renders"))
+# Disk entries can outlive the memory front cache. Cap both count and bytes
+# so the 1Gi emptyDir is never filled by orphaned {key}.yaml files (the
+# tip-move wipe is deliberately off for content-keyed keys).
+MAIN_RENDER_DISK_MAX = _env_int("MAIN_RENDER_DISK_MAX", MAIN_RENDER_CACHE_MAX * 2)
+MAIN_RENDER_DISK_MAX_BYTES = _env_int(
+    "MAIN_RENDER_DISK_MAX_BYTES", 400 * 1024 * 1024)
 # Salt bumped when render-affecting code changes (same idea as ArgoCD
 # CacheVersion). Part of every content key.
 MAIN_RENDER_CACHE_SALT = os.environ.get("MAIN_RENDER_CACHE_SALT", "cops2631-v1")
 # Fraction of cache hits that re-render and byte-compare (0 disables).
-MAIN_RENDER_CACHE_SHADOW_RATE = float(
-    os.environ.get("MAIN_RENDER_CACHE_SHADOW_RATE", "0.01"))
+MAIN_RENDER_CACHE_SHADOW_RATE = _env_float(
+    "MAIN_RENDER_CACHE_SHADOW_RATE", 0.01)
 # Content-keyed cache must NOT clear on a main tip move. Kept as an explicit
 # flag so tests can pin the regression without reading main_iteration.
 _CLEAR_MAIN_RENDER_ON_TIP_MOVE = False
@@ -3256,6 +3284,40 @@ def _main_render_disk_path(key: str) -> str:
     return os.path.join(MAIN_RENDER_CACHE_DIR, f"{key}.yaml")
 
 
+def _main_render_disk_prune() -> None:
+    """Drop oldest on-disk render entries past count/byte caps. Best-effort.
+
+    Memory eviction alone is not enough: disk keys survive tip moves and
+    republish, and live under the same 1Gi emptyDir as helm scratch.
+    """
+    try:
+        entries = [
+            os.path.join(MAIN_RENDER_CACHE_DIR, n)
+            for n in os.listdir(MAIN_RENDER_CACHE_DIR)
+            if n.endswith(".yaml") and not n.endswith(".tmp")
+        ]
+        entries.sort(key=lambda p: os.path.getmtime(p))
+        sizes = {p: os.path.getsize(p) for p in entries}
+    except OSError:
+        return
+    total = sum(sizes.values())
+    over_count = max(0, len(entries) - MAIN_RENDER_DISK_MAX)
+    doomed = entries[:over_count]
+    total -= sum(sizes[p] for p in doomed)
+    if MAIN_RENDER_DISK_MAX_BYTES:
+        for path in entries[over_count:]:
+            if total <= MAIN_RENDER_DISK_MAX_BYTES:
+                break
+            doomed.append(path)
+            total -= sizes[path]
+    for path in doomed:
+        try:
+            os.remove(path)
+        except OSError:
+            # Best-effort: a locked/vanished file must not break a render.
+            pass
+
+
 def _main_render_disk_load(key: str):
     path = _main_render_disk_path(key)
     try:
@@ -3283,6 +3345,7 @@ def _main_render_disk_store(key: str, raw: str) -> None:
                 # harmless; a failed cleanup must not poison the cache write.
                 log(f"[main-render-cache] tmp cleanup failed (non-fatal): {e}",
                     "WARNING")
+    _main_render_disk_prune()
 
 
 def _main_render_cache_put(key: str, raw: str, resources: dict) -> None:
@@ -3297,6 +3360,11 @@ def _main_render_cache_put(key: str, raw: str, resources: dict) -> None:
             drop = len(_main_render_cache) - MAIN_RENDER_CACHE_MAX // 2
             for k in list(_main_render_cache.keys())[:drop]:
                 del _main_render_cache[k]
+                try:
+                    os.remove(_main_render_disk_path(k))
+                except OSError:
+                    # Best-effort: disk prune still runs on the next store.
+                    pass
 
 
 def _main_render_cache_get(key: str):
@@ -3315,6 +3383,10 @@ def _main_render_cache_get(key: str):
             drop = len(_main_render_cache) - MAIN_RENDER_CACHE_MAX // 2
             for k in list(_main_render_cache.keys())[:drop]:
                 del _main_render_cache[k]
+                try:
+                    os.remove(_main_render_disk_path(k))
+                except OSError:
+                    pass
     return resources, raw, "disk"
 
 

@@ -164,9 +164,16 @@ def _encode_artifact_bytes(payload_utf8: bytes):
 
 
 def _decode_artifact_bytes(data: bytes):
-    """Decode raw JSON UTF-8 or a zstd frame into an artifact dict."""
+    """Decode raw JSON UTF-8 or a zstd frame into an artifact dict.
+
+    Raises ValueError when the payload is a zstd frame but the wheel is
+    missing, so callers can fall through to a legacy `.json` sibling.
+    """
     if data.startswith(_ZSTD_MAGIC):
-        import zstandard as zstd
+        try:
+            import zstandard as zstd
+        except ImportError as e:  # pragma: no cover - production has the wheel
+            raise ValueError("zstd payload but zstandard wheel missing") from e
         data = zstd.ZstdDecompressor().decompress(data)
     return json.loads(data.decode("utf-8"))
 
@@ -247,6 +254,28 @@ def _gcs_download(bucket, name):
         return None
 
 
+def _gcs_delete(bucket, name):
+    """Best-effort delete of one object. Returns True on success."""
+    try:
+        url = ("https://storage.googleapis.com/storage/v1/b/"
+               f"{urllib.parse.quote(bucket, safe='')}/o/"
+               f"{urllib.parse.quote(name, safe='')}")
+        req = urllib.request.Request(
+            url, method="DELETE",
+            headers={"Authorization": f"Bearer {_gcs_token()}"})
+        with urllib.request.urlopen(req, timeout=_GCS_TIMEOUT):
+            pass
+        return True
+    except urllib.error.HTTPError as e:
+        if e.code == 404:
+            return True
+        _warn(f"[diff-ui] GCS delete of {name} failed (non-fatal): HTTP {e.code}")
+        return False
+    except Exception as e:
+        _warn(f"[diff-ui] GCS delete of {name} failed (non-fatal): {e}")
+        return False
+
+
 def save_artifact(base_dir, repo, pr_id, sha, body, pr_url="",
                   max_artifacts=500, base_sha="", outcome_counts=None,
                   app_count=None, bucket="", max_bytes=None):
@@ -306,7 +335,14 @@ def save_artifact(base_dir, repo, pr_id, sha, body, pr_url="",
             pass
     _prune(base_dir, max_artifacts, max_bytes)
     if bucket:
-        _gcs_upload(bucket, os.path.basename(path), payload)
+        name = os.path.basename(path)
+        if _gcs_upload(bucket, name, payload):
+            # Drop the other encoding in GCS so a failed zst upload cannot
+            # leave a stale legacy object preferred on the next miss.
+            other_name = (name[:-4] if name.endswith(".zst")
+                          else name + ".zst")
+            if other_name != name:
+                _gcs_delete(bucket, other_name)
     return path
 
 
@@ -358,20 +394,22 @@ def load_artifact(base_dir, repo, pr_id, sha, bucket=""):
     downloaded bytes so the next read is local.
     """
     try:
-        paths = _artifact_paths_for_read(base_dir, repo, pr_id, sha)
+        repo, pr_s, sha = _validate(repo, pr_id, sha)
     except ValueError:
         return None
-    for path in paths:
+    # CodeQL py/path-injection: build the filename from validated segments
+    # only, then use the exact normpath(join(base, name)) + startswith +
+    # raise idiom from the CodeQL docs. Helpers alone do not clear the
+    # alert (see alerts 1/2 still open on main, 10/11 on this PR).
+    base_path = os.path.abspath(base_dir)
+    names = (f"{repo}__{pr_s}.json.zst", f"{repo}__{pr_s}.json")
+    for name in names:
+        fullpath = os.path.normpath(os.path.join(base_path, name))
+        if not fullpath.startswith(base_path):
+            raise ValueError(
+                f"path escapes base_dir: {fullpath!r} not under {base_path!r}")
         try:
-            # Inline the COPS-2580 / CodeQL-documented sanitizer at the sink.
-            # A helper return is not enough: py/path-injection only clears when
-            # the same normalized value that was startswith-checked is passed
-            # to open() in this function (alerts 10/11 on #108).
-            norm_base = os.path.abspath(base_dir)
-            path = os.path.abspath(path)
-            if path != norm_base and not path.startswith(norm_base + os.sep):
-                continue
-            with open(path, "rb") as f:
+            with open(fullpath, "rb") as f:
                 data = f.read()
             return _decode_artifact_bytes(data)
         except (OSError, ValueError, UnicodeDecodeError, json.JSONDecodeError):
@@ -383,14 +421,8 @@ def load_artifact(base_dir, repo, pr_id, sha, bucket=""):
             raise
     if not bucket:
         return None
-    # Prefer the compressed object name, then the legacy one. Rebuild the
-    # local warm path through the validated constructors (not basename join).
-    candidates = (
-        _artifact_zst_path(base_dir, repo, pr_id, sha),
-        _artifact_path(base_dir, repo, pr_id, sha),
-    )
-    for warm in candidates:
-        data = _gcs_download(bucket, os.path.basename(warm))
+    for name in names:
+        data = _gcs_download(bucket, name)
         if data is None:
             continue
         try:
@@ -402,17 +434,16 @@ def load_artifact(base_dir, repo, pr_id, sha, bucket=""):
                 continue
             raise
         try:
-            os.makedirs(base_dir, exist_ok=True)
-            # Same inlined sanitizer as the local open() path above.
-            norm_base = os.path.abspath(base_dir)
-            warm = os.path.abspath(warm)
-            if warm != norm_base and not warm.startswith(norm_base + os.sep):
+            os.makedirs(base_path, exist_ok=True)
+            fullpath = os.path.normpath(os.path.join(base_path, name))
+            if not fullpath.startswith(base_path):
                 raise ValueError(
-                    f"path escapes base_dir: {warm!r} not under {base_dir!r}")
-            fd, tmp = tempfile.mkstemp(dir=base_dir, suffix=".tmp")
+                    f"path escapes base_dir: {fullpath!r} not under "
+                    f"{base_path!r}")
+            fd, tmp = tempfile.mkstemp(dir=base_path, suffix=".tmp")
             with os.fdopen(fd, "wb") as f:
                 f.write(data)
-            os.replace(tmp, warm)
+            os.replace(tmp, fullpath)
         except (OSError, ValueError):  # pragma: no cover - cache warm is best-effort
             pass
         return artifact
