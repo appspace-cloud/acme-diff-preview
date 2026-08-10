@@ -2536,8 +2536,12 @@ DiffResult = namedtuple("DiffResult",
                         ["text", "sections", "n_res", "has_diff", "error", "outcome", "reason",
                          "version_change", "deleted_resources", "replicas_zeroed",
                          "fingerprint", "renamed_resources", "vm_changes",
-                         "version_fold"],
-                        defaults=[None, None, None, None, None, None, None])
+                         "version_fold", "shutdown_stats"],
+                        defaults=[None, None, None, None, None, None, None,
+                                  None])
+# shutdown_stats: {"zeroed": n, "workloads": total} for this app, counted on
+# the full pre-cap section list. Distinguishes an environment being switched
+# off (every workload at zero) from a single service scaled down.
 # vm_changes: structured facts about KCC linux-services (VM) resources this
 # diff touches, extracted by _detect_vm_changes on the FULL pre-cap section
 # list (same design as deleted_resources: safety facts never depend on
@@ -5705,28 +5709,72 @@ def _split_renames_from_deletions(deleted: list, created: list):
     return real, renames
 
 
+def _replicas_end_state(body: str):
+    """(ends_at_zero, ends_positive) for one workload section body.
+
+    Reads only the `+` side, because that is the state being applied. The
+    previous version required a paired `- replicas: N` and therefore missed
+    the most consequential case there is: the chart does not render
+    `replicas` at all until `appspace.zeroPods` sets it, so switching an
+    environment off produces a bare `+ replicas: 0` with no minus line.
+    Live proof, acme-config-dev PR #7063: 110 workloads went to zero and the
+    merge summary said "Routine - nothing dangerous detected".
+    """
+    ends_zero = ends_pos = False
+    for line in body.splitlines():
+        if not line.startswith("+"):
+            continue
+        ls = line.lstrip("+ ").strip()
+        if not ls.startswith("replicas:"):
+            continue
+        try:
+            value = int(ls.split(":", 1)[1].strip())
+        except ValueError:
+            continue
+        if value == 0:
+            ends_zero = True
+        else:
+            ends_pos = True
+    return ends_zero, ends_pos
+
+
 def _detect_replicas_zeroed(sections: list) -> list:
-    """Workload sections where replicas drop from >0 to exactly 0. Kept as
-    an AI prompt fact only (not a shouty block): zeroing can be legitimate
-    hibernation (zeroPods), but the model must reliably see it even when
-    the section did not fit its capped prompt."""
+    """Workload sections whose applied state is exactly 0 replicas.
+
+    Zeroing can be legitimate hibernation (`zeroPods`), so this is a fact to
+    report rather than a reason to block. It is computed on the FULL pre-cap
+    section list for the usual reason: a safety fact may never depend on what
+    survived a display cap.
+    """
     zeroed = []
     for header, body in sections:
         if _section_kind(header) not in _WORKLOAD_KINDS:
             continue
-        had_pos = has_zero = False
-        for line in body.splitlines():
-            ls = line.strip()
-            if line.startswith("-") and ls.lstrip("- ").startswith("replicas:"):
-                try:
-                    had_pos = int(ls.split(":", 1)[1].strip()) > 0 or had_pos
-                except ValueError:
-                    pass
-            if line.startswith("+") and ls.lstrip("+ ").startswith("replicas: 0"):
-                has_zero = True
-        if had_pos and has_zero:
+        ends_zero, ends_pos = _replicas_end_state(body)
+        if ends_zero and not ends_pos:
             zeroed.append(header)
     return zeroed
+
+
+def _detect_workload_shutdown(sections: list):
+    """{"zeroed": n, "workloads": total} over the workload sections, or None.
+
+    The ratio is what separates "one service was scaled down" from "this
+    environment is being switched off", and the two deserve different
+    wording in the merge summary. Counted here, pre-cap, alongside the other
+    safety facts.
+    """
+    total = zeroed = 0
+    for header, body in sections:
+        if _section_kind(header) not in _WORKLOAD_KINDS:
+            continue
+        total += 1
+        ends_zero, ends_pos = _replicas_end_state(body)
+        if ends_zero and not ends_pos:
+            zeroed += 1
+    if not total:
+        return None
+    return {"zeroed": zeroed, "workloads": total}
 
 
 # ── VM-domain (KCC linux-services) risk detection ────────────────────
@@ -7736,10 +7784,12 @@ def argocd_diff(app, pr_sha, main_sha, chart_revision=None, changed_paths=None, 
         clean_diff, capped_sections, deleted_res, zeroed_res, fingerprint, \
             renamed_res, vm_changes_res, version_fold = _package_sections(
                 filtered_sections, version_change=version_change)
+        # Counted on the full pre-cap list, like every other safety fact.
+        shutdown_stats = _detect_workload_shutdown(filtered_sections)
         return DiffResult(clean_diff, capped_sections,
                           n_res, True, None, OUT_DIFF, "changes", version_change,
                           deleted_res, zeroed_res, fingerprint, renamed_res,
-                          vm_changes_res, version_fold)
+                          vm_changes_res, version_fold, shutdown_stats)
     # Exhausted retries
     return _indeterminate(last_reason, last_detail or "unknown error")
 
@@ -10510,11 +10560,28 @@ def _build_merge_summary(results, rollup_by_sig, vm_change_lines,
         findings.append((_SEV_REVIEW,
                          "\u2b07\ufe0f **Chart version downgrade** in "
                          f"{_fmt_env_list(downgraded)}"))
+    # An environment going fully dark and a single service being scaled down
+    # are different events. Both used to render as "Replicas scaled to zero",
+    # and on acme-config-dev PR #7063 the whole-environment case did not
+    # render at all (see _replicas_end_state). A reviewer needs the shutdown
+    # stated as a shutdown, in the summary, not inferred from a resource count.
     zeroed_apps = sorted(a for a, r in results.items() if r.replicas_zeroed)
-    if zeroed_apps:
+    shutdown_apps = [a for a in zeroed_apps
+                     if _is_env_shutdown(results[a])]
+    partial_apps = [a for a in zeroed_apps if a not in set(shutdown_apps)]
+    if shutdown_apps:
+        n_workloads = sum(results[a].shutdown_stats["workloads"]
+                          for a in shutdown_apps)
+        findings.append((_SEV_REVIEW,
+                         "\U0001f6d1 **Environment shutting down** \u2014 "
+                         f"every workload ({n_workloads}) scaled to 0 in "
+                         f"{_fmt_env_list(shutdown_apps)}. `appspace.zeroPods` "
+                         "hibernates the environment: nothing will be running "
+                         "after this merges."))
+    if partial_apps:
         findings.append((_SEV_REVIEW,
                          "\U0001f9ca **Replicas scaled to zero** in "
-                         f"{_fmt_env_list(zeroed_apps)}"))
+                         f"{_fmt_env_list(partial_apps)}"))
 
     if appspace_state_lines:
         txt = "\n".join(appspace_state_lines)
@@ -10668,6 +10735,23 @@ def _group_changed_apps_by_fingerprint(changed_apps: list) -> list:
         groups.append((rep_app, [a for a, _ in members], rep_r))
     groups.sort(key=lambda g: g[0])
     return groups
+
+
+_SHUTDOWN_MIN_WORKLOADS = 2
+
+
+def _is_env_shutdown(r) -> bool:
+    """True when every workload in this app ends at zero replicas.
+
+    The floor of two workloads is deliberate: a one-workload app dropping to
+    zero is a scale-down, and calling that an environment shutdown on every
+    small app is how a warning trains people to skip it (the same reasoning
+    as COPS-2605's three-group rollup floor).
+    """
+    stats = getattr(r, "shutdown_stats", None) or {}
+    total = stats.get("workloads") or 0
+    return (total >= _SHUTDOWN_MIN_WORKLOADS
+            and stats.get("zeroed") == total)
 
 
 def _is_risky_result(r) -> bool:

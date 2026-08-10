@@ -78,17 +78,27 @@ def test_section_kind_on_non_string_returns_empty():
     assert m._section_kind(None) == ""
 
 
-# ── _detect_replicas_zeroed: non-integer old replicas is tolerated ───────
+# ── _detect_replicas_zeroed: judged on the applied state ────────────────
 
 def test_detect_replicas_zeroed_ignores_unparseable_old_value():
-    # Old replicas line is present but not an int (L3223 except ValueError):
-    # had_pos stays False, so with only a "+ replicas: 0" this is NOT
-    # counted as a real >0 -> 0 transition. Header shape: _section_kind takes
-    # the segment after the LAST "/", so the workload kind must sit there.
+    # An unreadable OLD value no longer suppresses the finding (COPS-2631).
+    # Detection reads the "+" side only, because that is the state being
+    # applied: whatever it was before, this workload ends up at 0 replicas
+    # and a reviewer needs to be told. The previous expectation here encoded
+    # the pairing requirement that made an environment-wide shutdown
+    # invisible on acme-config-dev PR #7063. Header shape: _section_kind
+    # takes the segment after the LAST "/", so the kind must sit there.
     kind = next(iter(m._WORKLOAD_KINDS))
     header = f"/apps/ns/{kind} appname"
     assert m._section_kind(header) == kind          # guard the header shape
     body = "-  replicas: notanint\n+  replicas: 0\n"
+    assert m._detect_replicas_zeroed([(header, body)]) == [header]
+
+
+def test_detect_replicas_zeroed_ignores_unparseable_new_value():
+    kind = next(iter(m._WORKLOAD_KINDS))
+    header = f"/apps/ns/{kind} appname"
+    body = "-  replicas: 3\n+  replicas: notanint\n"
     assert m._detect_replicas_zeroed([(header, body)]) == []
 
 
