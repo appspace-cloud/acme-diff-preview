@@ -105,14 +105,16 @@ def _assert_within_base_dir(path: str, base_dir: str) -> str:
     legitimately) and adds a second, independent layer of defense that
     stays correct even if the regexes above are ever loosened.
 
-    Returns path unchanged on success; raises ValueError if it would
-    resolve outside base_dir.
+    Returns the normalized absolute path on success (not the original
+    string): CodeQL only treats the checked value as sanitized when that
+    same value reaches the filesystem sink. Raises ValueError if the path
+    would resolve outside base_dir.
     """
     norm_base = os.path.abspath(base_dir)
     norm_path = os.path.abspath(path)
     if norm_path != norm_base and not norm_path.startswith(norm_base + os.sep):
         raise ValueError(f"path escapes base_dir: {path!r} not under {base_dir!r}")
-    return path
+    return norm_path
 
 
 def _artifact_path(base_dir, repo, pr_id, sha):
@@ -361,9 +363,14 @@ def load_artifact(base_dir, repo, pr_id, sha, bucket=""):
         return None
     for path in paths:
         try:
-            # Re-assert at the sink so CodeQL sees the sanitizer adjacent to
-            # open() (same pattern as COPS-2580).
-            path = _assert_within_base_dir(path, base_dir)
+            # Inline the COPS-2580 / CodeQL-documented sanitizer at the sink.
+            # A helper return is not enough: py/path-injection only clears when
+            # the same normalized value that was startswith-checked is passed
+            # to open() in this function (alerts 10/11 on #108).
+            norm_base = os.path.abspath(base_dir)
+            path = os.path.abspath(path)
+            if path != norm_base and not path.startswith(norm_base + os.sep):
+                continue
             with open(path, "rb") as f:
                 data = f.read()
             return _decode_artifact_bytes(data)
@@ -377,13 +384,12 @@ def load_artifact(base_dir, repo, pr_id, sha, bucket=""):
     if not bucket:
         return None
     # Prefer the compressed object name, then the legacy one. Rebuild the
-    # local warm path through the validated constructors (not basename join)
-    # so py/path-injection sees the same sanitizer as a local write.
+    # local warm path through the validated constructors (not basename join).
     candidates = (
-        (_artifact_zst_path(base_dir, repo, pr_id, sha), True),
-        (_artifact_path(base_dir, repo, pr_id, sha), False),
+        _artifact_zst_path(base_dir, repo, pr_id, sha),
+        _artifact_path(base_dir, repo, pr_id, sha),
     )
-    for warm, _is_zst in candidates:
+    for warm in candidates:
         data = _gcs_download(bucket, os.path.basename(warm))
         if data is None:
             continue
@@ -397,7 +403,12 @@ def load_artifact(base_dir, repo, pr_id, sha, bucket=""):
             raise
         try:
             os.makedirs(base_dir, exist_ok=True)
-            warm = _assert_within_base_dir(warm, base_dir)
+            # Same inlined sanitizer as the local open() path above.
+            norm_base = os.path.abspath(base_dir)
+            warm = os.path.abspath(warm)
+            if warm != norm_base and not warm.startswith(norm_base + os.sep):
+                raise ValueError(
+                    f"path escapes base_dir: {warm!r} not under {base_dir!r}")
             fd, tmp = tempfile.mkstemp(dir=base_dir, suffix=".tmp")
             with os.fdopen(fd, "wb") as f:
                 f.write(data)

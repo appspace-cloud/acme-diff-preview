@@ -32,7 +32,7 @@ import diff_ui as m
 def test_assert_within_base_dir_allows_normal_path(tmp_path):
     base = str(tmp_path)
     path = os.path.join(base, "acme-config-prod__3837.json")
-    assert m._assert_within_base_dir(path, base) == path
+    assert m._assert_within_base_dir(path, base) == os.path.abspath(path)
 
 
 def test_assert_within_base_dir_blocks_direct_traversal(tmp_path):
@@ -59,4 +59,4 @@ def test_assert_within_base_dir_blocks_absolute_escape(tmp_path):
 
 def test_assert_within_base_dir_allows_base_dir_itself(tmp_path):
     base = str(tmp_path)
-    assert m._assert_within_base_dir(base, base) == base
+    assert m._assert_within_base_dir(base, base) == os.path.abspath(base)
