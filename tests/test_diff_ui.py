@@ -68,7 +68,8 @@ def test_new_commit_overwrites_same_pr_in_place(tmp_path):
                           "old body")
     diff_ui.save_artifact(str(tmp_path), "acme-config-dev", 42, "bbbbbbb",
                           "new body")
-    files = [f for f in os.listdir(str(tmp_path)) if f.endswith(".json")]
+    files = [f for f in os.listdir(str(tmp_path))
+             if f.endswith(".json.zst") or f.endswith(".json")]
     assert len(files) == 1  # overwritten in place, not accumulated
     art = diff_ui.load_artifact(str(tmp_path), "acme-config-dev", 42, "bbbbbbb")
     assert art["body"] == "new body"
@@ -631,7 +632,11 @@ def test_save_artifact_uploads_to_gcs_when_bucket_set(tmp_path, monkeypatch):
     p = diff_ui.save_artifact(str(tmp_path), "acme-config-stage", 2679,
                               "d7dfd92fd43b", BODY, bucket="my-bucket")
     assert os.path.isfile(p)
-    uploaded = json.loads(objects["acme-config-stage__2679.json"].decode())
+    # COPS-2631 stage 4: uploads are `.json.zst` when zstandard is available.
+    name = "acme-config-stage__2679.json.zst"
+    if name not in objects:
+        name = "acme-config-stage__2679.json"
+    uploaded = diff_ui._decode_artifact_bytes(objects[name])
     assert uploaded["body"] == BODY
     assert any("/upload/storage/v1/b/my-bucket/o" in u for u in calls)
 
@@ -694,7 +699,9 @@ def test_load_artifact_falls_back_to_gcs_and_caches_locally(tmp_path,
     art = diff_ui.load_artifact(dst, "acme-config-stage", 2679,
                                 "d7dfd92fd43b", bucket="b")
     assert art and art["body"] == BODY
-    assert os.path.isfile(os.path.join(dst, "acme-config-stage__2679.json"))
+    warm_zst = os.path.join(dst, "acme-config-stage__2679.json.zst")
+    warm_json = os.path.join(dst, "acme-config-stage__2679.json")
+    assert os.path.isfile(warm_zst) or os.path.isfile(warm_json)
     n = len(calls)
     art2 = diff_ui.load_artifact(dst, "acme-config-stage", 2679,
                                  "d7dfd92fd43b", bucket="b")

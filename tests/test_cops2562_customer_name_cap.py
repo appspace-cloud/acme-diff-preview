@@ -180,11 +180,11 @@ def test_parsed_yaml_is_cached_per_sha_and_path(monkeypatch):
     """gcp/config.yaml is 1543 lines and was re-parsed once per app (212x on
     a mass bump). Parsing is cached alongside the text."""
     parses = {"n": 0}
-    real_load = m.yaml.safe_load
+    real_load = m._yaml_safe_load
     def counting_load(s):
         parses["n"] += 1
         return real_load(s)
-    monkeypatch.setattr(m.yaml, "safe_load", counting_load)
+    monkeypatch.setattr(m, "_yaml_safe_load", counting_load)
     monkeypatch.setattr(m, "_bb_fetch_status",
                         lambda path, sha, repo=None: (GOOD, m.BB_OK))
     a = m._flat_yaml_cached(CUST, "prsha")
@@ -212,7 +212,7 @@ def test_unparseable_yaml_is_cached_as_empty_not_retried(monkeypatch):
     def counting_load(s):
         parses["n"] += 1
         raise m.yaml.YAMLError("boom")
-    monkeypatch.setattr(m.yaml, "safe_load", counting_load)
+    monkeypatch.setattr(m, "_yaml_safe_load", counting_load)
     monkeypatch.setattr(m, "_bb_fetch_status",
                         lambda path, sha, repo=None: ("bad: [", m.BB_OK))
     assert m._flat_yaml_cached(CUST, "prsha") == {}

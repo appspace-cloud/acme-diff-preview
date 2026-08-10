@@ -14,3 +14,26 @@
 PyYAML==6.0.3 \
     --hash=sha256:ba1cc08a7ccde2d2ec775841541641e4548226580ab850948cbfda66a1befcdc \
     --hash=sha256:d76623373421df22fb4cf8817020cbb7ef15c725b9d5e45f17e189bfc384190f
+
+# cydifflib (COPS-2631 stage 1): C-accelerated drop-in for
+# difflib.SequenceMatcher. Monkeypatched at import onto the stdlib module so
+# _diff_resources (which does `import difflib` inside the function) picks it
+# up with no call-site edit. Measured ~2.4x on the per-app diff stage,
+# byte-identical on Kubernetes manifests including resources over 200 lines.
+# This is a deliberate change of the previous "stdlib only in production"
+# posture (see requirements-dev.txt); keep the justification next to the pin
+# the same way PyYAML does.
+# Hashes: cp312 manylinux_x86_64 wheel + sdist fallback.
+cydifflib==1.2.0 \
+    --hash=sha256:81126e2c2d2fecd926e25cc117d5c6bc71ce4ceb570c54ccd33aff790dd9e9be \
+    --hash=sha256:b8fb1bd1a1ac4360aacd9210baed6e342a1e1a3972e033b0aeaad7f6c536d96d
+
+# zstandard (COPS-2631 stage 4): compress full-diff artifacts at level 3.
+# Measured on real multi-app comment bodies: ~4x smaller than gzip -6 and
+# ~20x faster to compress, because artifacts carry near-duplicate diff
+# blocks across apps and zstd's window sees across them. Read path still
+# accepts raw `.json` so existing GCS/local entries keep working.
+# Hashes: cp312 manylinux_x86_64 wheel + sdist fallback.
+zstandard==0.25.0 \
+    --hash=sha256:5a56ba0db2d244117ed744dfa8f6f5b366e14148e00de44723413b2f3938a902 \
+    --hash=sha256:7713e1179d162cf5c7906da876ec2ccb9c3a9dcbdffef0cc7f70c3667a205f0b

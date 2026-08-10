@@ -1,4 +1,5 @@
-# Dev / CI dependencies only — no runtime deps (stdlib only in production).
+# Dev / CI dependencies only. Runtime deps live in requirements.txt
+# (PyYAML + cydifflib + zstandard as of COPS-2631); keep this file for test tooling.
 # Pin exact versions to ensure reproducible CI runs, and keep them equal to
 # the versions developers actually run locally: a CI pin that lags the local
 # toolchain by a major version (pytest 8 vs 9) is the same class of silent
@@ -9,6 +10,8 @@ pytest==9.1.1
 pytest-cov==7.1.0
 coverage==7.15.0
 PyYAML==6.0.3
+cydifflib==1.2.0
+zstandard==0.25.0
 # Property-based tests (tests/test_property_based.py) run in CI's `test` job.
 hypothesis==6.161.0
 # Mutation testing (local, opt-in): `mutmut run` — config in pyproject.toml.

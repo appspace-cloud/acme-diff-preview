@@ -53,6 +53,7 @@ SHA dedup:
 """
 import json, os, posixpath, random, re, shutil, signal, socket, ssl, sys, subprocess, time, threading, urllib.error, urllib.parse, urllib.request
 import hashlib
+import difflib as _difflib
 import yaml  # PyYAML (requirements.txt) - input root-cause panel only, v2.6.2
 import diff_ui  # full-diff web UI (same-dir module, stdlib only)
 import leader  # Lease-based leader election (same-dir module, stdlib only)
@@ -66,6 +67,31 @@ from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
 import concurrent.futures
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone
+
+# COPS-2631 stage 1: CyDifflib. _diff_resources does `import difflib` inside
+# the function, so patching the module's SequenceMatcher here is picked up
+# with no call-site edit. Stdlib grouping/formatting stay untouched; only
+# the matching algorithm swaps. ImportError keeps the stdlib path so a
+# libyaml-less / wheel-less environment still boots (tests, local smoke).
+_STDLIB_SEQUENCE_MATCHER = _difflib.SequenceMatcher
+_DIFFLIB_ENGINE = "stdlib"
+try:
+    import cydifflib as _cydifflib  # type: ignore
+    _difflib.SequenceMatcher = _cydifflib.SequenceMatcher
+    _DIFFLIB_ENGINE = "cydifflib"
+except ImportError:  # pragma: no cover - production image always has the wheel
+    pass
+
+# COPS-2631 stage 2: CSafeLoader for values-file YAML. Rendered manifests
+# never touch PyYAML; every former yaml.safe_load site parses customer.yaml /
+# config.yaml. Prefer the C loader when libyaml is present, fall back so a
+# libyaml-less environment still boots. Call sites keep catching YAMLError.
+_YAML_SAFE_LOADER = getattr(yaml, "CSafeLoader", yaml.SafeLoader)
+
+
+def _yaml_safe_load(text):
+    """Parse a values/config YAML document with the preferred safe loader."""
+    return yaml.load(text, Loader=_YAML_SAFE_LOADER)
 
 def _env_int(name: str, default: int) -> int:
     """Parse an integer env var, falling back to default on any bad value.
@@ -502,6 +528,7 @@ _diff_stats:      dict          = {
     "apps_timeout": 0,       # a diff step exceeded DIFF_TIMEOUT — bughunt N4
     "main_render_cache_hits": 0,   # reused a parsed main-side render — bughunt N4
     "main_render_cache_misses": 0, # had to render main fresh — bughunt N4
+    "main_render_cache_shadow_mismatches": 0,  # COPS-2631 shadow audit failures
     # v2.5.19 (M8): visibility into the v2.5.18 scale machinery — are these
     # paths firing in production, and how often?
     "comments_truncated": 0,       # comments that exceeded MAX_COMMENT_BYTES
@@ -557,8 +584,47 @@ _diff_stats:      dict          = {
     "oci_consecutive_pull_failures": 0,  # systemic pull failures since last success
     "last_iteration_s": None,# seconds taken by most recent iteration
     "last_iteration_at": None,
+    # COPS-2631 stage 0: per-stage cumulative wall time on the hot path.
+    # Seconds + count so /metrics and /diff-preview/stats can prove the
+    # render-cache work (stage 3) moved the needle, instead of guessing
+    # from end-to-end PR duration. Keys are declared here AND in
+    # _PROM_REGISTRY (a metric is a contract; inventing one by accident
+    # is forbidden — see COPS-2627).
+    "stage_pull_seconds": 0.0,     # chart ensure + value-file fetch
+    "stage_pull_count": 0,
+    "stage_render_seconds": 0.0,   # helm template wall clock
+    "stage_render_count": 0,
+    "stage_parse_seconds": 0.0,    # _parse_manifest_resources
+    "stage_parse_count": 0,
+    "stage_diff_seconds": 0.0,     # _diff_resources
+    "stage_diff_count": 0,
+    "stage_store_seconds": 0.0,    # full-diff artifact save
+    "stage_store_count": 0,
 }
 _diff_stats_lock: threading.Lock = threading.Lock()
+
+# Stages _record_stage will accept. Anything else is ignored so a typo
+# cannot invent a new stats key (and therefore a new metric contract).
+_STAGE_TIMING_NAMES = frozenset({"pull", "render", "parse", "diff", "store"})
+
+
+def _record_stage(stage, seconds):
+    """Accumulate one sample of hot-path stage wall time (COPS-2631).
+
+    Thread-safe: DIFF_WORKERS record concurrently. Unknown stage names are
+    dropped rather than creating keys. Negative / None samples are ignored.
+    """
+    if stage not in _STAGE_TIMING_NAMES:
+        return
+    try:
+        s = float(seconds)
+    except (TypeError, ValueError):
+        return
+    if s < 0:
+        return
+    with _diff_stats_lock:
+        _diff_stats["stage_%s_seconds" % stage] += s
+        _diff_stats["stage_%s_count" % stage] += 1
 
 
 # ── Prometheus exposition (COPS-2627) ───────────────────────────────────
@@ -622,6 +688,30 @@ _PROM_REGISTRY = (
      "Seconds taken by the most recent poll iteration."),
     ("is_leader", "is_leader", "gauge",
      "1 on the replica that owns the poll loop, 0 on standby."),
+    # COPS-2631 stage 0: cumulative stage wall times. Typed counter so
+    # increase()/rate() survive a pod restart the same way the other
+    # monotonic series do. The render_seconds series is the one that must
+    # drop once the content-keyed cache (stage 3) starts hitting.
+    ("stage_pull_seconds", "stage_pull_seconds_total", "counter",
+     "Cumulative seconds spent pulling charts and fetching value files."),
+    ("stage_pull_count", "stage_pull_count_total", "counter",
+     "Number of pull-stage samples recorded."),
+    ("stage_render_seconds", "stage_render_seconds_total", "counter",
+     "Cumulative seconds spent in helm template (wall clock of the wait)."),
+    ("stage_render_count", "stage_render_count_total", "counter",
+     "Number of render-stage samples recorded."),
+    ("stage_parse_seconds", "stage_parse_seconds_total", "counter",
+     "Cumulative seconds spent in _parse_manifest_resources."),
+    ("stage_parse_count", "stage_parse_count_total", "counter",
+     "Number of parse-stage samples recorded."),
+    ("stage_diff_seconds", "stage_diff_seconds_total", "counter",
+     "Cumulative seconds spent in _diff_resources."),
+    ("stage_diff_count", "stage_diff_count_total", "counter",
+     "Number of diff-stage samples recorded."),
+    ("stage_store_seconds", "stage_store_seconds_total", "counter",
+     "Cumulative seconds spent saving the full-diff artifact."),
+    ("stage_store_count", "stage_store_count_total", "counter",
+     "Number of store-stage samples recorded."),
 )
 
 
@@ -1508,14 +1598,12 @@ def _invalidate_for_republish(chart_name: str, chart_version: str) -> None:
         for k in [k for k in list(_helm_pull_locks) if k.endswith(suffix)]:
             _helm_pull_locks.pop(k, None)
 
-    # Drop stale main-side renders for apps tracking this chart:version.
-    stale_apps = {a for a, c in list(_app_chart_map.items())
-                  if c == chart_name
-                  and _app_chart_revision_map.get(a) == chart_version}
-    if stale_apps:
-        with _main_render_lock:
-            for k in [k for k in list(_main_render_cache) if k[0] in stale_apps]:
-                del _main_render_cache[k]
+    # COPS-2631: main-render keys are content digests, not (app, ...). A
+    # republished tag changes the chart tree on the next pull; clear the
+    # memory front cache so nothing stale is served in the meantime. Disk
+    # entries for the old digest become unreachable and age out.
+    with _main_render_lock:
+        _main_render_cache.clear()
 
     # Force recompute of open PRs that render with this chart build.
     forced = []
@@ -3060,19 +3148,164 @@ def _get_subtask_pool() -> ThreadPoolExecutor:
 _vf_inflight: dict = {}
 _vf_inflight_lock   = threading.Lock()
 
-# ── Main-side render cache (#3) ───────────────────────────────────────────────
-# The main-sha render of an app is identical for every diff that runs within the
-# same loop iteration (same base_sha). Cache the parsed resource dict so
-# concurrent and sequential diffs on the same app skip re-fetching + re-rendering.
-# Key: (app, main_sha)   Value: dict of parsed manifest resources
-# Cleared when the base_sha changes (detected in main_iteration).
-_main_render_cache: dict = {}
+# ── Main-side render cache (#3 / COPS-2631 stage 3) ──────────────────────────
+# Pre-COPS-2631 the key was (app, main_sha, main_rev, pull_gen) and the cache
+# was wiped whenever ANY configured repo's main moved. Measured hit rate on
+# the live leader: 0 / 275. The inputs that actually determine helm output are
+# the chart bytes + the resolved value-file contents + release/namespace +
+# render flags. Key on those, store the RAW render text on disk (so a shadow
+# audit can byte-compare), and keep the parsed dict only as a memory front
+# cache. main_sha is deliberately NOT in the key.
+#
+# A wrong entry produces a wrong diff, which is worse than slow. Default to
+# cache-miss on any doubt; bump MAIN_RENDER_CACHE_SALT on any render-affecting
+# code change; the optional shadow audit re-renders a sampled hit.
+_main_render_cache: dict = {}       # content_key -> parsed resources (memory)
 _main_render_lock        = threading.Lock()
-_main_render_sha: dict   = {}   # per-repo: {repo: main_sha} the cache is valid for (COPS-2507)
-# Cap to prevent memory pressure during long-lived pods with many apps.
-# Each entry holds parsed YAML dicts per resource — can be several hundred KB
-# for a large micro-services chart. 200 entries ≈ a few hundred MB worst case.
-MAIN_RENDER_CACHE_MAX = _env_int("MAIN_RENDER_CACHE_MAX", 200)
+_main_render_sha: dict   = {}       # per-repo tip tracking (observability only)
+# Memory front-cache cap. Disk is the durable store; memory is an LRU-ish
+# front. Default raised from 200 (could not hold prod's ~900 apps) to 2048.
+MAIN_RENDER_CACHE_MAX = _env_int("MAIN_RENDER_CACHE_MAX", 2048)
+MAIN_RENDER_CACHE_DIR = os.environ.get(
+    "MAIN_RENDER_CACHE_DIR",
+    os.path.join(os.environ.get("HELM_CACHE_DIR", "/tmp/acme-helm-cache"),
+                 "main-renders"))
+# Salt bumped when render-affecting code changes (same idea as ArgoCD
+# CacheVersion). Part of every content key.
+MAIN_RENDER_CACHE_SALT = os.environ.get("MAIN_RENDER_CACHE_SALT", "cops2631-v1")
+# Fraction of cache hits that re-render and byte-compare (0 disables).
+MAIN_RENDER_CACHE_SHADOW_RATE = float(
+    os.environ.get("MAIN_RENDER_CACHE_SHADOW_RATE", "0.01"))
+# Content-keyed cache must NOT clear on a main tip move. Kept as an explicit
+# flag so tests can pin the regression without reading main_iteration.
+_CLEAR_MAIN_RENDER_ON_TIP_MOVE = False
+
+
+def _hash_chart_tree(chart_path: str) -> bytes:
+    """Digest of the on-disk chart tree (files, relative paths, contents).
+
+    Empty / missing tree hashes to a fixed sentinel so a missing chart becomes
+    a cache miss rather than a KeyError.
+    """
+    h = hashlib.sha256()
+    if not chart_path or not os.path.isdir(chart_path):
+        h.update(b"missing-chart")
+        return h.digest()
+    for root, dirs, files in os.walk(chart_path):
+        dirs.sort()
+        for name in sorted(files):
+            path = os.path.join(root, name)
+            rel = os.path.relpath(path, chart_path).replace(os.sep, "/")
+            h.update(rel.encode("utf-8", "surrogateescape"))
+            h.update(b"\0")
+            try:
+                with open(path, "rb") as f:
+                    while True:
+                        chunk = f.read(1024 * 1024)
+                        if not chunk:
+                            break
+                        h.update(chunk)
+            except OSError:
+                h.update(b"unreadable")
+            h.update(b"\0")
+    return h.digest()
+
+
+def _hash_value_files(vals: dict) -> bytes:
+    """Digest of resolved value-file contents in helm -f order."""
+    h = hashlib.sha256()
+    for path, body in (vals or {}).items():
+        h.update(str(path).encode("utf-8", "surrogateescape"))
+        h.update(b"\0")
+        h.update((body or "").encode("utf-8", "surrogateescape"))
+        h.update(b"\0")
+    return h.digest()
+
+
+def _main_render_content_key(chart_path, release, namespace, vals) -> str:
+    """Content key for a main-side helm render (COPS-2631).
+
+    Inputs: chart tree digest, release, namespace, value-file contents,
+    kube version, include-crds flag, salt. main_sha is intentionally absent.
+    """
+    h = hashlib.sha256()
+    h.update(MAIN_RENDER_CACHE_SALT.encode("utf-8"))
+    h.update(b"\0")
+    h.update(_hash_chart_tree(chart_path))
+    h.update(b"\0")
+    h.update(str(release or "").encode("utf-8"))
+    h.update(b"\0")
+    h.update(str(namespace or "").encode("utf-8"))
+    h.update(b"\0")
+    h.update(str(KUBE_VERSION).encode("utf-8"))
+    h.update(b"\0")
+    h.update(b"include-crds=1")  # _helm_template always passes --include-crds
+    h.update(b"\0")
+    h.update(_hash_value_files(vals))
+    return h.hexdigest()
+
+
+def _main_render_disk_path(key: str) -> str:
+    return os.path.join(MAIN_RENDER_CACHE_DIR, f"{key}.yaml")
+
+
+def _main_render_disk_load(key: str):
+    path = _main_render_disk_path(key)
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            return f.read()
+    except OSError:
+        return None
+
+
+def _main_render_disk_store(key: str, raw: str) -> None:
+    import tempfile as _tf
+    os.makedirs(MAIN_RENDER_CACHE_DIR, exist_ok=True)
+    path = _main_render_disk_path(key)
+    fd, tmp = _tf.mkstemp(dir=MAIN_RENDER_CACHE_DIR, suffix=".tmp")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            f.write(raw)
+        os.replace(tmp, path)
+    finally:
+        if os.path.exists(tmp):  # pragma: no cover
+            try:
+                os.remove(tmp)
+            except OSError:
+                pass
+
+
+def _main_render_cache_put(key: str, raw: str, resources: dict) -> None:
+    """Write raw text to disk and parsed resources into the memory front cache."""
+    try:
+        _main_render_disk_store(key, raw)
+    except OSError as e:
+        log(f"[main-render-cache] disk store failed (non-fatal): {e}", "WARNING")
+    with _main_render_lock:
+        _main_render_cache[key] = resources
+        if len(_main_render_cache) > MAIN_RENDER_CACHE_MAX:
+            drop = len(_main_render_cache) - MAIN_RENDER_CACHE_MAX // 2
+            for k in list(_main_render_cache.keys())[:drop]:
+                del _main_render_cache[k]
+
+
+def _main_render_cache_get(key: str):
+    """Return (resources, raw_or_None, source) where source is memory|disk|miss."""
+    with _main_render_lock:
+        cached = _main_render_cache.get(key)
+    if cached is not None:
+        return cached, None, "memory"
+    raw = _main_render_disk_load(key)
+    if raw is None:
+        return None, None, "miss"
+    resources = _parse_manifest_resources(raw)
+    with _main_render_lock:
+        _main_render_cache[key] = resources
+        if len(_main_render_cache) > MAIN_RENDER_CACHE_MAX:
+            drop = len(_main_render_cache) - MAIN_RENDER_CACHE_MAX // 2
+            for k in list(_main_render_cache.keys())[:drop]:
+                del _main_render_cache[k]
+    return resources, raw, "disk"
 
 
 class OciChartNotFound(Exception):
@@ -3742,7 +3975,7 @@ def _flat_yaml_cached(path: str, sha: str, repo: str = None) -> dict:
         flat = {}
     else:
         try:
-            flat = _flatten_yaml(yaml.safe_load(content) or {})
+            flat = _flatten_yaml(_yaml_safe_load(content) or {})
         except yaml.YAMLError:
             flat = {}
     with _vf_cache_lock:
@@ -4134,7 +4367,7 @@ def _values_wipes_definitions(body: str) -> bool:
     if not body or not body.strip():
         return False
     try:
-        doc = yaml.safe_load(body)
+        doc = _yaml_safe_load(body)
     except Exception:
         return False  # malformed YAML fails elsewhere; never block on it here
     if not isinstance(doc, dict):
@@ -4473,7 +4706,7 @@ def _evaluate_new_envs(new_env_candidates: list, pr_sha: str,
             # never fed the cohort to helm (F1). Block with the reason.
             if _cohort_st == BB_OK and _c:
                 try:
-                    yaml.safe_load(_c)
+                    _yaml_safe_load(_c)
                 except Exception as ye:
                     reason = (
                         f"the ApplicationSet generator loads `{cohort_path}` "
@@ -6562,22 +6795,20 @@ def _render_main_side_resources(app: str, main_sha: str) -> dict:
     release     = app.split("/")[-1]
     if not (chart_name and main_rev and registry and value_files):
         raise RuntimeError(f"app metadata not in cache for {app}")
-    main_pull_gen = _helm_chart_pull_ts.get(f"{registry}/{chart_name}:{main_rev}", 0)
-    cache_key = (app, main_sha, main_rev, main_pull_gen)
-    with _main_render_lock:
-        cached = _main_render_cache.get(cache_key)
-    if cached is not None:
-        return cached
     main_chart = _ensure_chart(registry, chart_name, main_rev)
     if not main_chart:
         raise RuntimeError(f"chart pull failed for {chart_name}:{main_rev}")
     main_vals = _fetch_value_files(value_files, main_sha)
+    content_key = _main_render_content_key(
+        main_chart, release, namespace, main_vals)
+    cached, _raw, _src = _main_render_cache_get(content_key)
+    if cached is not None:
+        return cached
     main_yaml, err = _helm_template(main_chart, release, namespace, main_vals)
     if err or not main_yaml:
         raise RuntimeError(err or "empty render")
     resources = _parse_manifest_resources(main_yaml)
-    with _main_render_lock:
-        _main_render_cache[cache_key] = resources
+    _main_render_cache_put(content_key, main_yaml, resources)
     return resources
 
 
@@ -6710,7 +6941,7 @@ def _decommission_fully_phased(identity_file: str, main_sha: str) -> bool:
     if status != BB_OK or not content:
         return False
     try:
-        flat = _flatten_yaml(yaml.safe_load(content) or {})
+        flat = _flatten_yaml(_yaml_safe_load(content) or {})
     except Exception:
         return False
     has_vms = any(k.startswith("appspace.infra.deployLinuxServicesK8s")
@@ -6767,7 +6998,7 @@ def _evaluate_env_decommissions(candidates: list, pr_sha: str, main_sha: str,
         _vm_content, _vm_status = _bb_fetch_cached(c["identity_file"], main_sha)
         if _vm_status == BB_OK and _vm_content:
             try:
-                _vm_flat = _flatten_yaml(yaml.safe_load(_vm_content) or {})
+                _vm_flat = _flatten_yaml(_yaml_safe_load(_vm_content) or {})
                 vm_armed = _vm_deletion_armed_flat(_vm_flat)
                 declares_vms = _declares_vms_flat(_vm_flat)
             except Exception:
@@ -7094,6 +7325,9 @@ def _run_one_diff(app, pr_sha, main_sha, chart_revision=None, changed_paths=None
     # lets a running pull finish in the background (bounded by its own
     # subprocess timeouts) without holding this worker hostage; on the
     # success path both futures are already done, so it is a no-op.
+    # COPS-2631 stage 0: pull wall clock covers chart ensure + value-file
+    # fetch below (the two input-acquisition steps before render).
+    _t_pull0 = time.perf_counter()
     _pull_ex = ThreadPoolExecutor(max_workers=2)
     try:
         # COPS-2549: each side from the registry its own version lives in.
@@ -7232,23 +7466,21 @@ def _run_one_diff(app, pr_sha, main_sha, chart_revision=None, changed_paths=None
             main_vals = main_vf_fut.result(timeout=DIFF_TIMEOUT)
             pr_vals   = pr_vf_fut.result(timeout=DIFF_TIMEOUT)
 
-        # Main-side render cache: reuse parsed resources if we already rendered
-        # this app at main_sha (common when the same app appears in multiple PRs
-        # or when a retry loop re-runs the diff).
-        # Key includes the chart revision AND its pull generation: a dev tag
-        # republished under the same version gets a new pull timestamp on
-        # re-pull, which invalidates renders made from the previous build
-        # even if the webhook-driven eviction was missed.
-        main_pull_gen = _helm_chart_pull_ts.get(f"{registry}/{chart_name}:{main_rev}", 0)
-        main_cache_key = (app, main_sha, main_rev, main_pull_gen)
-        with _main_render_lock:
-            main_resources = _main_render_cache.get(main_cache_key)
+        _record_stage("pull", time.perf_counter() - _t_pull0)
+
+        # COPS-2631 stage 3: content-keyed main-side render cache. Key is the
+        # digest of chart tree + value files + release/namespace + flags, NOT
+        # main_sha. Disk holds raw YAML; memory holds the parsed dict.
+        content_key = _main_render_content_key(
+            main_chart, release, namespace, main_vals)
+        main_resources, cached_raw, cache_source = _main_render_cache_get(content_key)
         needs_main_render = main_resources is None
         with _diff_stats_lock:
             _diff_stats["main_render_cache_misses" if needs_main_render
                         else "main_render_cache_hits"] += 1
 
         pool     = _get_subtask_pool()
+        _t_render0 = time.perf_counter()
         pr_fut   = pool.submit(_helm_template, pr_chart, release, namespace, pr_vals)
         _diff_futs.append(pr_fut)
         main_fut = pool.submit(_helm_template, main_chart, release, namespace, main_vals) \
@@ -7265,14 +7497,44 @@ def _run_one_diff(app, pr_sha, main_sha, chart_revision=None, changed_paths=None
             main_yaml, main_err = main_fut.result(timeout=DIFF_TIMEOUT)
             if main_err:
                 return None, _render_reason(main_err), main_err
+            _record_stage("render", time.perf_counter() - _t_render0)
+            _t_parse0 = time.perf_counter()
             main_resources = _parse_manifest_resources(main_yaml)
-            with _main_render_lock:
-                _main_render_cache[main_cache_key] = main_resources
-                # Evict oldest half when cap exceeded (dict preserves insertion order)
-                if len(_main_render_cache) > MAIN_RENDER_CACHE_MAX:
-                    drop = len(_main_render_cache) - MAIN_RENDER_CACHE_MAX // 2
-                    for k in list(_main_render_cache.keys())[:drop]:
-                        del _main_render_cache[k]
+            _main_render_cache_put(content_key, main_yaml, main_resources)
+            _parse_main_s = time.perf_counter() - _t_parse0
+        else:
+            # Cache hit: only the PR side rendered. Optional shadow audit
+            # re-renders a sampled hit and byte-compares (COPS-2631).
+            _record_stage("render", time.perf_counter() - _t_render0)
+            _parse_main_s = 0.0
+            if (MAIN_RENDER_CACHE_SHADOW_RATE > 0
+                    and random.random() < MAIN_RENDER_CACHE_SHADOW_RATE):
+                try:
+                    shadow_yaml, shadow_err = _helm_template(
+                        main_chart, release, namespace, main_vals)
+                    if not shadow_err and shadow_yaml is not None:
+                        baseline = cached_raw
+                        if baseline is None:
+                            baseline = _main_render_disk_load(content_key)
+                        if baseline is not None and shadow_yaml != baseline:
+                            log(f"[main-render-cache] SHADOW MISMATCH for "
+                                f"{app} key={content_key[:12]}… "
+                                f"(source={cache_source}); discarding entry",
+                                "ERROR")
+                            with _diff_stats_lock:
+                                _diff_stats["main_render_cache_shadow_mismatches"] = (
+                                    _diff_stats.get("main_render_cache_shadow_mismatches", 0) + 1)
+                            with _main_render_lock:
+                                _main_render_cache.pop(content_key, None)
+                            try:
+                                os.remove(_main_render_disk_path(content_key))
+                            except OSError:
+                                pass
+                            main_resources = _parse_manifest_resources(shadow_yaml)
+                            _main_render_cache_put(content_key, shadow_yaml, main_resources)
+                except Exception as e:
+                    log(f"[main-render-cache] shadow audit failed (non-fatal): {e}",
+                        "WARNING")
 
     except (subprocess.TimeoutExpired, concurrent.futures.TimeoutError):
         _cancel_futs()   # S4: never leave zombies in the shared pool
@@ -7281,12 +7543,17 @@ def _run_one_diff(app, pr_sha, main_sha, chart_revision=None, changed_paths=None
         _cancel_futs()   # S4: same rule for every abnormal exit
         return None, REASON_RENDER, str(e)[:200]
 
+    _t_parse_pr0 = time.perf_counter()
     pr_resources = _parse_manifest_resources(pr_yaml)
+    _record_stage("parse", _parse_main_s + (time.perf_counter() - _t_parse_pr0))
     # v2.5.8: report the effective chart-version change (if any) so the
     # comment can shout on downgrades. pr_rev is final here — including a
     # tier-default version discovered after a folder move.
     version_change = (main_rev, pr_rev) if pr_rev != main_rev else None
-    return _diff_resources(main_resources, pr_resources), None, None, version_change
+    _t_diff0 = time.perf_counter()
+    diff_text = _diff_resources(main_resources, pr_resources)
+    _record_stage("diff", time.perf_counter() - _t_diff0)
+    return diff_text, None, None, version_change
 
 
 def _indeterminate(reason, detail):
@@ -7670,6 +7937,7 @@ def _save_diff_ui_artifact(repo, pr_id, pr_sha, body, base_sha=None,
     if not DIFF_UI_ENABLED:
         return False
     try:
+        _t0 = time.perf_counter()
         diff_ui.save_artifact(
             DIFF_UI_DIR, repo or BB_REPO, pr_id, pr_sha, body,
             pr_url=(f"https://bitbucket.org/{BB_WORKSPACE}/"
@@ -7678,6 +7946,7 @@ def _save_diff_ui_artifact(repo, pr_id, pr_sha, body, base_sha=None,
             max_bytes=DIFF_UI_MAX_BYTES,
             base_sha=base_sha, outcome_counts=outcome_counts,
             app_count=app_count, bucket=DIFF_UI_GCS_BUCKET)
+        _record_stage("store", time.perf_counter() - _t0)
         return True
     except Exception as e:
         log(f"[diff-ui] artifact save failed (non-fatal): {e}", "WARNING")
@@ -9269,8 +9538,8 @@ def _summarize_input_changes(changed_files, pr_sha, base_sha, repo=None,
         if st_new != BB_OK or st_old != BB_OK:
             continue  # added/deleted file: new-env / decommission territory
         try:
-            new_flat = _flatten_yaml(yaml.safe_load(new_txt) or {})
-            old_flat = _flatten_yaml(yaml.safe_load(old_txt) or {})
+            new_flat = _flatten_yaml(_yaml_safe_load(new_txt) or {})
+            old_flat = _flatten_yaml(_yaml_safe_load(old_txt) or {})
         except yaml.YAMLError:
             out += [f"`{path}`: changed (not parseable as YAML)", ""]
             continue
@@ -9478,8 +9747,8 @@ def _summarize_appspace_state_changes(changed_files, pr_sha, base_sha, path_map,
             continue  # added/deleted file -- new-env/decommission-by-deletion territory
 
         try:
-            new_flat = _flatten_yaml(yaml.safe_load(new_txt) or {})
-            old_flat = _flatten_yaml(yaml.safe_load(old_txt) or {})
+            new_flat = _flatten_yaml(_yaml_safe_load(new_txt) or {})
+            old_flat = _flatten_yaml(_yaml_safe_load(old_txt) or {})
         except yaml.YAMLError:
             continue  # unparseable -- _summarize_input_changes already flags this
 
@@ -9847,8 +10116,8 @@ def _summarize_vm_changes(changed_files, pr_sha, base_sha, path_map,
         if st_new != BB_OK or st_old != BB_OK:
             continue  # added/deleted file: new-env / decommission territory
         try:
-            new_flat = _flatten_yaml(yaml.safe_load(new_txt) or {})
-            old_flat = _flatten_yaml(yaml.safe_load(old_txt) or {})
+            new_flat = _flatten_yaml(_yaml_safe_load(new_txt) or {})
+            old_flat = _flatten_yaml(_yaml_safe_load(old_txt) or {})
         except yaml.YAMLError:
             continue  # the input panel already flags unparseable files
         keys = sorted(k for k in (set(old_flat) | set(new_flat))
@@ -12244,15 +12513,15 @@ def main_iteration():
             # per-file API calls. Inside this try on purpose: a git problem
             # must not starve the other repos, and reads fall back anyway.
             mirror_sync(repo)
-            # Invalidate the main-side render cache whenever THIS repo's main
-            # moves. _main_render_sha became a per-repo dict; the cache clear
-            # stays whole-cache (same correctness as before, slightly
-            # conservative on cross-repo hit rate — dev dominates traffic).
+            # COPS-2631: content-keyed cache does NOT clear when main moves.
+            # Unrelated commits used to wipe every entry (0% hit rate). Track
+            # the tip for observability only.
             if not isinstance(_main_render_sha, dict):
                 _main_render_sha = {}
             if base_sha != _main_render_sha.get(repo):
-                with _main_render_lock:
-                    _main_render_cache.clear()
+                if _CLEAR_MAIN_RENDER_ON_TIP_MOVE:
+                    with _main_render_lock:
+                        _main_render_cache.clear()
                 _main_render_sha[repo] = base_sha
             prs = get_open_prs(repo)
             per_repo.append((repo, prs, base_sha))
