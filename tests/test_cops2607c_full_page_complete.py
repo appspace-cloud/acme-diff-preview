@@ -15,9 +15,10 @@ worthy of it. Measured before writing a line of code:
   a merged PR has no retrievable record; retention moves to 365 days in
   the bucket's terragrunt module (the durable layer -- _prune only walks
   the local cache).
-- The local cache prunes by COUNT (500) while living in a 1Gi emptyDir.
-  500 x the observed 26.7MB worst case is 25x the eviction limit, so the
-  prune gains a byte budget.
+- The local cache prunes by COUNT (500) while sharing one emptyDir with
+  every other /tmp consumer. 500 x the observed 26.7MB worst case is many
+  times the volume whatever its size, so the prune gains a byte budget.
+  (The volume is 4Gi since COPS-2644; the ledger lives in values.yaml.)
 
 Non-negotiable, tested here: redaction is not truncation. Uncapping must
 not move one byte out of _redact_for_display.
@@ -217,10 +218,11 @@ def test_raw_is_byte_exact_against_the_stored_body(tmp_path):
 # --- 9. the local cache prunes by bytes, not only by count ----------------
 
 def test_prune_enforces_a_byte_budget(tmp_path):
-    """DIFF_UI_DIR is a 1Gi emptyDir and the kubelet EVICTS the pod past the
-    limit. A count-only prune (500) is measured in the wrong unit: 500 of
-    the observed 26.7MB worst case is 13GB. Oldest goes first; GCS remains
-    the durable copy, so a local prune costs one re-download.
+    """DIFF_UI_DIR shares one emptyDir with every other /tmp consumer and the
+    kubelet EVICTS the pod past its sizeLimit. A count-only prune (500) is
+    measured in the wrong unit: 500 of the observed 26.7MB worst case is
+    13GB, past any size this volume will ever have. Oldest goes first; GCS
+    remains the durable copy, so a local prune costs one re-download.
 
     Bodies are near-incompressible so zstd (COPS-2631 stage 4) does not
     collapse five files under the budget the way a repeated `"x"` would.

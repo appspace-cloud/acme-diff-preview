@@ -30,19 +30,47 @@ aiSummary:
 
 # Optional PriorityClass so the pods are not the first candidates for
 # preemption under node pressure. Empty = cluster default.
+#
+# Deliberately still empty after COPS-2644 looked at it. The hub cluster has
+# no user-defined priority classes - only gmp-critical and the two system-*
+# ones, which are reserved for cluster components - and NO argocd workload
+# sets one, including argocd-server and the repo-servers. Giving this pod a
+# class without giving one to the control plane it depends on would rank the
+# diff tool above ArgoCD itself, which is the wrong answer to node pressure.
+# That is a cluster-wide scheduling decision, not something to slip into a
+# chart bump for one service.
 priorityClassName: ""
 
-# Size of the writable /tmp emptyDir. It holds helm scratch files and, since
-# v2.15.0, the local git mirrors of the config repos (COPS-2564), which
-# replace one Bitbucket API call per value file with one fetch per iteration.
-tmpSizeLimit: "1Gi"
+# Size of the writable /tmp emptyDir. readOnlyRootFilesystem is on, so this
+# is the ONLY writable path in the container and every consumer below shares
+# it. The kubelet enforces sizeLimit by EVICTING THE POD, so this number is
+# not a quota that prunes, it is the line where the leader disappears
+# mid-run. Keep the ledger below accurate: anything new that writes to /tmp
+# gets a row here BEFORE it ships.
+#
+# | Consumer                        | Cap     | Set by                     |
+# |---------------------------------|---------|----------------------------|
+# | Main render cache               | 400 MB  | MAIN_RENDER_DISK_MAX_BYTES |
+# | Full-diff artifact cache        | 400 MB  | diffUi.maxBytes            |
+# | Git mirrors of 3 config repos   | ~400 MB | uncapped, grows with history |
+# | Helm chart cache + untarred     | ~500 MB | uncapped, per chart version |
+# | helm scratch, HOME, render temp | ~200 MB | uncapped, 16 workers        |
+# | Sum                             | ~1.9 GB |                            |
+#
+# 1Gi was correct when COPS-2564 sized this for the git mirrors and scratch.
+# COPS-2631 then added a 400 MB render cache underneath without revisiting
+# it, which put the two declared caps alone (800 MB) above the volume. That
+# made the render cache self-defeating: the better it worked, the closer the
+# pod got to the eviction that wipes it. 4Gi is the ~1.9 GB ledger with
+# headroom, so both caches can actually reach their caps.
+tmpSizeLimit: "4Gi"
 
 image:
   repository: us-central1-docker.pkg.dev/appspace-devops/artifact/acme-diff-preview
   # Kept in sync with Chart.yaml appVersion (RELEASING.md). This default had
   # drifted since v2.7.0; it never bit us because acme-infrastructure pins the
   # tag explicitly, but anyone installing the chart as-is got a stale image.
-  tag: "2.53.0"
+  tag: "2.55.0"
   pullPolicy: IfNotPresent
 
 # Log verbosity for the diff-preview service. Set to DEBUG to emit the full
@@ -224,6 +252,15 @@ resources:
     # plus Bitbucket API fan-out. Each helm template call uses <0.1 CPU serially.
     cpu: 500m
     memory: 2Gi
+    # The /tmp emptyDir counts against the node's ephemeral storage, so
+    # without a request the scheduler places this pod as if it needed none
+    # and a full cache becomes node pressure that evicts something at random.
+    # Request covers steady state (measured 87Mi on a 30-minute-old pod:
+    # 85Mi mirrors, 3Mi helm cache, 1Mi artifacts); the limit sits ABOVE
+    # tmpSizeLimit on purpose so the emptyDir cap is what binds first. An
+    # eviction attributable to this volume is debuggable; a node-pressure
+    # eviction is not.
+    ephemeral-storage: 1Gi
   limits:
     # CPU limit prevents noisy-neighbor starvation on shared GKE nodes during
     # 800-app PR bursts. Aligned with 48 concurrent subprocesses × node capacity.
@@ -233,6 +270,9 @@ resources:
     # each on a 919-app hub, several hundred Mi parsed) alongside 16 helm
     # renders, which OOM-killed the pod at 2Gi. COPS-2543.
     memory: 8Gi
+    # Above tmpSizeLimit (4Gi) so the emptyDir cap binds first, with room for
+    # container logs, which also count against ephemeral storage.
+    ephemeral-storage: 5Gi
 
 # Hard-refresh CronJob — re-pulls charts for the projects that track MUTABLE
 # tags, so ArgoCD notices a `-dev` tag that was overwritten in place.
