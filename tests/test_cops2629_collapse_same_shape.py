@@ -149,9 +149,15 @@ def test_each_grouped_app_name_is_its_own_deep_link(monkeypatch):
     names themselves are the pointers."""
     monkeypatch.setattr(dp, "generate_ai_summary", lambda *a, **k: None)
     out = _comment(_glb_set(22))
-    assert "[pv-c00-glb](%s#app-pv-c00-glb)" % URL in out
-    assert "[pv-c07-glb](%s#app-pv-c07-glb)" % URL in out
-    assert "(+14 more on the full-diff page)" in out
+    # COPS-2640: the pointer moved into the Changeset overview row; the
+    # group lists members as the plain one-line roster. COPS-2622 still
+    # holds -- every member reachable through its own linked row.
+    assert "| [`pv-c00-glb`](%s#app-pv-c00-glb)" % URL in out
+    assert "| [`pv-c21-glb`](%s#app-pv-c21-glb)" % URL in out
+    roster = next(l for l in out.split("\n")
+                  if l.startswith(">") and "pv-c00-glb" in l)
+    assert "pv-c07-glb" in roster and "more" in roster
+    assert "- [pv-c00-glb]" not in out
 
 
 def test_a_single_app_renders_exactly_as_before(monkeypatch):

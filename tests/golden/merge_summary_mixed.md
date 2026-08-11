@@ -41,11 +41,9 @@
 
 ⚠️ **`pv-vm-a-ss`** — 1 resource(s) changed
 
-[Full hunks for `pv-vm-a-ss`](https://diffs.appspace.example/diff/acme-config-prod/42/abc12345#app-pv-vm-a-ss)
 
 ⚠️ **`pv-zzz-risky-ms`** — 1 resource(s) changed
 
-[Full hunks for `pv-zzz-risky-ms`](https://diffs.appspace.example/diff/acme-config-prod/42/abc12345#app-pv-zzz-risky-ms)
 
 🔎 **Full rendered diff (every hunk):** https://diffs.appspace.example/diff/acme-config-prod/42/abc12345
 
