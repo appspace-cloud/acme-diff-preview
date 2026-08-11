@@ -8,7 +8,7 @@
 
 ⚠️ **Review before merging** (1 item(s))
 
-- ⬇️ **Chart version downgrade** in pv-acme-a
+- ⬇️ **Chart version downgrade** `2603.1.0` → `2603.0.0` in pv-acme-a
 
 ---
 

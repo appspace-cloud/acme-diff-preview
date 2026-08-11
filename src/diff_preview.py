@@ -10714,8 +10714,15 @@ def _build_merge_summary(results, rollup_by_sig, vm_change_lines,
                         if r.version_change
                         and _is_version_downgrade(*r.version_change))
     if downgraded:
+        # COPS-2638: name the version pair, not just the fact. "Chart
+        # version downgrade in pv-x" left the reviewer opening the app
+        # block to learn FROM and TO what -- the same gap the bump line
+        # closes for the routine direction.
+        _dg = ", ".join(f"`{o}` \u2192 `{n}`" for o, n in
+                        sorted({results[a].version_change
+                                for a in downgraded}))
         findings.append((_SEV_REVIEW,
-                         "\u2b07\ufe0f **Chart version downgrade** in "
+                         f"\u2b07\ufe0f **Chart version downgrade** {_dg} in "
                          f"{_fmt_env_list(downgraded)}"))
     # COPS-2632: a rendered `%!s(<nil>)` or `<no value>` is a value the chart
     # read and this environment does not set. Live proof: pv-stage1-a shipped
@@ -10811,6 +10818,29 @@ def _build_merge_summary(results, rollup_by_sig, vm_change_lines,
                          f"environment(s) jumping** "
                          f"{_routine_bump_label(_sig)}: "
                          f"{_fmt_env_list(apps)}"))
+
+    # COPS-2638: the line above only fires for PURE bumps (the rollup only
+    # forms when an app's entire diff is the transition). A bump mixed
+    # with any other change -- acme-config-prod #4037, where 31 resources
+    # moved for other reasons -- lost the line entirely, and the single
+    # most common PR shape became invisible in the verdict. version_change
+    # is the general fact: the chart targetRevision ArgoCD currently has
+    # versus the one the PR pins, set whenever they differ. Transitions a
+    # fleet-jump line already names are skipped, as are downgrades (their
+    # REVIEW finding below names them); this line is ROUTINE because a
+    # bump is these PRs' normal business.
+    _named = {(s[0], s[1]) for s in (rollup_by_sig or {}) if s[0] or s[1]}
+    _bumps = {}
+    for a, r in results.items():
+        if (r.outcome == OUT_DIFF and r.version_change
+                and r.version_change not in _named
+                and not _is_version_downgrade(*r.version_change)):
+            _bumps.setdefault(r.version_change, []).append(a)
+    for (_old, _new), apps in sorted(_bumps.items()):
+        findings.append((_SEV_ROUTINE,
+                         f"\u2b06\ufe0f **{len(set(_envs_from_apps(apps)))} "
+                         f"environment(s) bump** `{_old}` \u2192 `{_new}`: "
+                         f"{_fmt_env_list(sorted(apps))}"))
 
     changed = [a for a, r in results.items() if r.outcome == OUT_DIFF]
     errored = [a for a, r in results.items() if r.outcome == OUT_ERROR]
