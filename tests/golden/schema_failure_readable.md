@@ -4,7 +4,7 @@
 
 ⚠️ The full-diff page could not be produced for this run, so every hunk is inlined below.
 
-### 🧭 Merge summary
+## ℹ️ Merge summary
 
 ⛔ **DO NOT MERGE** without checking the item(s) below (1 item(s))
 
@@ -12,6 +12,12 @@
 
 ---
 
+
+#### Changeset overview
+
+| App | Status | Changed resources | Diff group |
+|-----|--------|--------------------|------------|
+| `pv-glencore-c-ms` | ❔ diff unavailable | — | — |
 
 ❌ **`pv-glencore-c-ms`** — ⚙️ **SCHEMA VALIDATION FAILED — this environment's values violate the chart's schema**
 > at '/appspace/microservices/definitions/svc-00': got null, want object

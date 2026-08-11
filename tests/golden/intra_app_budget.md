@@ -2,7 +2,7 @@
 
 **Commit** `abc12345` → `main` | `acme-config-prod`
 
-### 🧭 Merge summary
+## ℹ️ Merge summary
 
 ✅ **Routine** — nothing dangerous detected
 
@@ -10,6 +10,12 @@
 
 ---
 
+
+#### Changeset overview
+
+| App | Status | Changed resources | Diff group |
+|-----|--------|--------------------|------------|
+| [`pv-big-a-ms`](https://diffs.appspace.example/diff/acme-config-prod/42/abc12345#app-pv-big-a-ms) | ⚠️ changed | 12 | — |
 
 ⚠️ **`pv-big-a-ms`** — 12 resource(s) changed
 
@@ -137,40 +143,9 @@
    pad-003-19: value
 ```
 
-**`/v1/ConfigMap cfg-004`**
-
-```diff
---- 
-+++ 
-@@ -2,24 +2,24 @@
- data:
--  maxConnections: "100"
-+  maxConnections: "204"
-   pad-004-00: value
-   pad-004-01: value
-   pad-004-02: value
-   pad-004-03: value
-   pad-004-04: value
-   pad-004-05: value
-   pad-004-06: value
-   pad-004-07: value
-   pad-004-08: value
-   pad-004-09: value
-   pad-004-10: value
-   pad-004-11: value
-   pad-004-12: value
-   pad-004-13: value
-   pad-004-14: value
-   pad-004-15: value
-   pad-004-16: value
-   pad-004-17: value
-   pad-004-18: value
-   pad-004-19: value
-```
-
-> ✂️ **7 more changed resource(s) omitted** here to keep the comment scannable. None is a deletion, zeroed replica or VM change. [Full hunks for `pv-big-a-ms`](https://diffs.appspace.example/diff/acme-config-prod/42/abc12345#app-pv-big-a-ms)
+> ✂️ **8 more changed resource(s) omitted** here to keep the comment scannable. None is a deletion, zeroed replica or VM change. [Full hunks for `pv-big-a-ms`](https://diffs.appspace.example/diff/acme-config-prod/42/abc12345#app-pv-big-a-ms)
 >
-> Omitted: `/v1/ConfigMap cfg-005`, `/v1/ConfigMap cfg-006`, `/v1/ConfigMap cfg-007`, `/v1/ConfigMap cfg-008`, `/v1/ConfigMap cfg-009`, `/v1/ConfigMap cfg-010`, `/v1/ConfigMap cfg-011`
+> Omitted: `/v1/ConfigMap cfg-004`, `/v1/ConfigMap cfg-005`, `/v1/ConfigMap cfg-006`, `/v1/ConfigMap cfg-007`, `/v1/ConfigMap cfg-008`, `/v1/ConfigMap cfg-009`, `/v1/ConfigMap cfg-010`, `/v1/ConfigMap cfg-011`
 
 🔎 **Full rendered diff (every hunk):** https://diffs.appspace.example/diff/acme-config-prod/42/abc12345
 

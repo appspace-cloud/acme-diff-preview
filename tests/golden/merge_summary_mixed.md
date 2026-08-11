@@ -2,7 +2,7 @@
 
 **Commit** `abc12345` → `main` | `acme-config-prod` | 📦 Large changeset (6 apps)
 
-### 🧭 Merge summary
+## ℹ️ Merge summary
 
 ⛔ **DO NOT MERGE** without checking the item(s) below (2 item(s))
 
@@ -12,7 +12,7 @@
 
 ---
 
-## 🖥️🚨 VM INFRASTRUCTURE CHANGES 🚨
+## 🖥️ VM INFRASTRUCTURE CHANGES
 
 **This PR touches virtual machine infrastructure (KCC linux-services). A botched VM change is slow and painful to recover from — verify every line below before merging.**
 

@@ -10247,8 +10247,8 @@ def _kcc_adoption_card(env_name: str, info: dict) -> list:
 # Panel headers are constants because the merge summary recognises its own
 # panels by them. Danger uses "##", routine and clean use "###", so the
 # summary can tell severity apart without re-deriving any facts.
-_VM_PANEL_DANGER_HDR = ("## \U0001f5a5\ufe0f\U0001f6a8 VM INFRASTRUCTURE "
-                        "CHANGES \U0001f6a8")
+_VM_PANEL_DANGER_HDR = ("## \U0001f5a5\ufe0f VM INFRASTRUCTURE "
+                        "CHANGES")
 _VM_PANEL_ROUTINE_HDR = "### \U0001f5a5\ufe0f VM INFRASTRUCTURE CHANGES (routine)"
 _VM_PANEL_CLEAN_HDR = "### \U0001f5a5\ufe0f VM infrastructure \u2014 no changes"
 
@@ -10857,7 +10857,7 @@ def _build_merge_summary(results, rollup_by_sig, vm_change_lines,
         verdict += f" ({n_check} item(s))"
     order = {_SEV_BLOCK: 0, _SEV_REVIEW: 1, _SEV_ROUTINE: 2}
     findings.sort(key=lambda f: order[f[0]])
-    return ["### \U0001f9ed Merge summary", "", verdict, ""] + \
+    return ["## \u2139\ufe0f Merge summary", "", verdict, ""] + \
            [f"- {line}" for _s, line in findings] + [""]
 
 
@@ -11408,13 +11408,21 @@ def format_comment(pr_sha, app_results, skipped_apps=None, base_sha="",
 
     lines += ["---", ""]
 
-    # ── Large-PR summary table ────────────────────────────────────────
-    # For large changesets, show a compact overview table first so reviewers
-    # can scan all affected apps at a glance before reading the inline diffs.
+    # ── Changeset overview table ──────────────────────────────────────
+    # A compact overview first, so reviewers scan all affected apps at a
+    # glance. Originally large-mode only; COPS-2636 renders it for every
+    # changeset with at least one table-worthy app, because after
+    # COPS-2635 the App cells carry the deep links, and a small PR was
+    # still painting the old two-line header+pointer blocks instead.
     # Apps confirmed unchanged are OMITTED from the table (bughunt N2): a
-    # 300+3-change PR previously listed all 300 as "no changes" rows, adding
-    # pure scroll with zero review value. A one-line count replaces them.
-    if is_large:
+    # 300+3-change PR previously listed all 300 as "no changes" rows,
+    # adding pure scroll with zero review value. A one-line count replaces
+    # them, and a PR whose every app is unchanged renders no table at all.
+    _table_rendered = any(
+        r.outcome in (OUT_DIFF, OUT_DECOMMISSIONED, OUT_INDETERMINATE,
+                      OUT_ERROR)
+        for r in results.values())
+    if _table_rendered:
         lines += [
             "#### Changeset overview",
             "",
@@ -11647,15 +11655,28 @@ def format_comment(pr_sha, app_results, skipped_apps=None, base_sha="",
                     lines += [f"> {_fmt_service_list(_members)}", ""]
                 continue
             _risky = _is_risky_result(rep_r)
-            # COPS-2635: in large mode the Changeset overview row for this
-            # app already carries its deep link in the App cell, so the
-            # plain "header + Full hunks for" block below would restate the
-            # row (26 lines for 13 rows on acme-config-dev #7064). Risky
-            # apps, fingerprint-group representatives and shape groups keep
-            # their blocks: those say something the table does not. Never
-            # on the page — is_complete_record renders every block.
-            if (is_large and artifact_url and not profile.is_complete_record
-                    and not _risky and app not in _fp_grouped):
+            # COPS-2635/2636: the Changeset overview row for this app
+            # already carries its deep link in the App cell, so the plain
+            # "header + Full hunks for" block below would restate the row
+            # (26 lines for 13 rows on acme-config-dev #7064, and the
+            # same shape on every small PR until COPS-2636). Only when the
+            # block IS just header+pointer: a profile with inline_diffs
+            # renders evidence hunks inside the block, and the table row
+            # cannot replace evidence. Risky apps, fingerprint-group
+            # representatives and shape groups keep their blocks too:
+            # those say something the table does not. Never on the page —
+            # is_complete_record renders every block.
+            if (_table_rendered and artifact_url
+                    and not profile.inline_diffs
+                    and not profile.is_complete_record
+                    and not _risky and app not in _fp_grouped
+                    and not getattr(rep_r, "version_fold", None)):
+                # A block carrying a version-fold CONCLUSION ("6 of 7
+                # changed resource(s) are the version transition, one
+                # changed for another reason") says something no table
+                # cell does, and COPS-2612 deliberately kept those
+                # sentences on the comment. Only the pure
+                # header-plus-pointer block is redundant with its row.
                 continue
             if budget and not _risky and _body_size() > budget:
                 collapsed_apps.extend(members)

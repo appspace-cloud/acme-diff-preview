@@ -84,9 +84,12 @@ def test_the_comment_names_a_sample_and_accounts_for_the_rest(monkeypatch):
     monkeypatch.setattr(dp, "generate_ai_summary", lambda *a, **k: None)
     results = _fail_set(22)
     out = _comment(results)
-    named = [a for a in results if a in out]
-    assert len(named) == 8, "expected the standard 8-name sample, got %d" % len(named)
-    assert "(+14 more)" in out
+    # COPS-2636: the overview table names every environment in its own
+    # "diff unavailable" row, so a global name-count no longer measures
+    # the GROUP. The group's roster line keeps the 8-name sample.
+    roster = next(l for l in out.split("\n")
+                  if l.startswith(">") and "(+14 more)" in l)
+    assert sum(a in roster for a in results) == 8
     assert "22 environments cannot render" in out
 
 

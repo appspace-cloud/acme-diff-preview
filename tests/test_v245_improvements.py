@@ -84,7 +84,19 @@ def test_n2_no_change_apps_collapsed_to_one_row(monkeypatch):
 
 
 def test_n2_small_pr_unaffected(monkeypatch):
-    """The collapse only applies in large mode; small PRs are unchanged."""
+    """COPS-2636 deliberately reversed half of this.
+
+    The table is no longer large-mode only: after COPS-2635 the App cells
+    carry the deep links, so a small PR that did not render the table was
+    left painting the old two-line header+pointer blocks instead. Small
+    PRs now get the table too.
+
+    What N2 actually guarded survives untouched, and is what this test
+    pins now: apps confirmed unchanged are OMITTED from the rows and
+    collapsed into a single count. That is the bug N2 fixed (a 300+3
+    change PR listing 300 "no changes" rows), and it is independent of
+    which mode renders the table.
+    """
     mod = _import_module()
     monkeypatch.setattr(mod, "generate_ai_summary", lambda *a, **k: None)
 
@@ -95,7 +107,12 @@ def test_n2_small_pr_unaffected(monkeypatch):
     results = {"app-a": mkres(mod.OUT_DIFF, n=1, text="===== /v1/ConfigMap ns/x =====\n+ a\n"),
               "app-b": mkres(mod.OUT_NO_DIFF, n=0)}
     body = mod.format_comment("a" * 40, results, base_sha="b" * 40)
-    assert "Changeset overview" not in body, "small PRs must not get the large-mode table"
+    assert "Changeset overview" in body, \
+        "COPS-2636: small PRs get the overview table too"
+    assert "| `app-b` |" not in body, \
+        "an unchanged app must never get its own row"
+    assert "(+1 more)" in body, \
+        "unchanged apps collapse into one count (bughunt N2)"
 
 
 # ── N3: a bad numeric env var degrades to default instead of crashing ───────

@@ -4,7 +4,7 @@
 
 ⚠️ The full-diff page could not be produced for this run, so every hunk is inlined below.
 
-### 🧭 Merge summary
+## ℹ️ Merge summary
 
 ✅ **Routine** — nothing dangerous detected
 

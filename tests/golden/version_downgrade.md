@@ -4,7 +4,7 @@
 
 ⚠️ The full-diff page could not be produced for this run, so every hunk is inlined below.
 
-### 🧭 Merge summary
+## ℹ️ Merge summary
 
 ⚠️ **Review before merging** (1 item(s))
 
@@ -19,6 +19,12 @@
 ### 🔻 `pv-acme-a-ms`: `2603.1.0` → **`2603.0.0`**
 
 ---
+
+#### Changeset overview
+
+| App | Status | Changed resources | Diff group |
+|-----|--------|--------------------|------------|
+| `pv-acme-a-ms` | ⚠️ changed | 1 | — |
 
 ⚠️ **`pv-acme-a-ms`** — 1 resource(s) changed
 

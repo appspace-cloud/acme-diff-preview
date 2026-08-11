@@ -132,9 +132,19 @@ def test_without_a_page_there_are_no_pointers_and_the_yaml_stays():
 
 
 def test_every_app_is_still_named_with_its_real_count():
+    """COPS-2636: the name and the count moved into the Changeset
+    overview table row; the per-app block that used to carry them is the
+    redundancy that ticket removed. The contract is unchanged: every app
+    named, with its real count, one deep link each."""
     names = ["pv-alpha-a-ms", "pv-beta-b-ss"]
     out = _comment(names)
     for n in names:
-        assert n in out
-    assert out.count("resource(s) changed") == len(names)
+        assert ("| [`%s`]" % n) in out, "%s lost its table row" % n
+        assert ("#app-%s)" % n) in out, "%s lost its deep link" % n
+    import re
+    for n in names:
+        assert re.search(
+            r"\| \[`%s`\]\([^)]+\) \| \u26a0\ufe0f changed \| \d+ \|"
+            % re.escape(n), out), \
+            "%s's row must carry its status and real count" % n
 

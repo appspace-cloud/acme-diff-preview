@@ -2,7 +2,7 @@
 
 **Commit** `abc12345` → `main` | `acme-config-prod` | 📦 Large changeset (6 apps)
 
-### 🧭 Merge summary
+## ℹ️ Merge summary
 
 ✅ **Routine** — nothing dangerous detected
 

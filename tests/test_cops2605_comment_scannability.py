@@ -388,11 +388,12 @@ def test_artifact_url_only_adds_the_full_view_lines():
     # underneath: the page-less body is the strictly larger one, and every
     # app named in one is named in the other. Losing a URL may cost brevity;
     # it may never cost information.
-    def _apps(body):
-        return {l for l in body.splitlines() if "resource(s) changed" in l}
-
-    assert _apps(a) == _apps(b), \
-        "the same apps must be named whether or not a page exists"
+    # COPS-2636 moved the with-URL naming into the overview table, so
+    # comparing the LINE SHAPES no longer works; the invariant is about
+    # the APPS, and it is pinned by name.
+    for _app in results:
+        assert _app in a and _app in b, \
+            "the same apps must be named whether or not a page exists"
     assert "```diff" in a, "no page means the comment keeps the evidence"
     assert "```diff" not in b, "a page means the evidence lives there"
     assert len(a) > len(b), \
@@ -596,8 +597,7 @@ def test_merge_summary_surfaces_a_quiet_decommission_arming():
     results = {"pv-adaptive-b-ms": _result(outcome=m.OUT_NO_DIFF)}
     body = m.format_comment(
         PR_SHA, results, base_sha=BASE_SHA,
-        vm_change_lines=["## \U0001f5a5\ufe0f\U0001f6a8 VM INFRASTRUCTURE "
-                         "CHANGES \U0001f6a8", "",
+        vm_change_lines=[m._VM_PANEL_DANGER_HDR, "",
                          "- \U0001f6a8 `pv-adaptive-b` \u00b7 **defaults**: "
                          "**added** `defaults.allowDeletion` = `True`", ""])
     head = _merge_summary_of(body)
