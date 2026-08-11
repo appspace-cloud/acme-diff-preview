@@ -239,10 +239,11 @@ spec:
             {{- toYaml .Values.resources | nindent 12 }}
       volumes:
         - name: tmp
-          # COPS-2564: /tmp now also holds the local git mirrors of the config
-          # repos, which is why it is sized explicitly. Measured today: prod
-          # 16Mi, dev 71Mi, stage 13Mi of .git, so 1Gi leaves a lot of room for
-          # growth and for helm's own scratch files. The container has
-          # readOnlyRootFilesystem, so this emptyDir is the only writable path.
+          # The container has readOnlyRootFilesystem, so this emptyDir is the
+          # only writable path: git mirrors (COPS-2564), the main render cache
+          # (COPS-2631), the artifact cache and all helm scratch share it. The
+          # kubelet enforces sizeLimit by EVICTING THE POD. The per-consumer
+          # budget that produced this number is the ledger in values.yaml -
+          # update it there before adding anything that writes to /tmp.
           emptyDir:
             sizeLimit: {{ .Values.tmpSizeLimit | default "1Gi" }}
