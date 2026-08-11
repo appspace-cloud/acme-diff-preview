@@ -23,6 +23,35 @@ import os
 
 os.environ["DIFF_HTTP_POOLING"] = "off"
 
+# ── COPS-2637: src/ importable before ANY fixture runs ──────────────────────
+#
+# The autouse fixture below imports diff_preview at fixture time. Every test
+# module makes that import possible by inserting src/ into sys.path at its
+# own import, and module imports happen at collection, before fixtures — so
+# the order works out in a full run. It stops working the moment a file
+# defers its insert into a helper called inside the test body
+# (test_v245_improvements.py does): run that file standalone and the fixture
+# fires before anything has made diff_preview importable, erroring all 12 of
+# its tests with a ModuleNotFoundError pointing HERE.
+#
+# conftest.py is the one file pytest guarantees to import before any test
+# module, so the insert lives here and every file becomes runnable alone.
+# The per-file inserts stay; they are redundant now, and removing them from
+# ~40 files is churn without benefit.
+#
+# The env defaults exist for the same reason: diff_preview requires them at
+# import, and test modules set them before importing. setdefault only, so a
+# real value in the environment is never overridden.
+import sys
+
+_SRC = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "src"))
+if _SRC not in sys.path:
+    sys.path.insert(0, _SRC)
+for _k, _v in (("BB_USER", "test"), ("BB_TOKEN", "test"),
+               ("ARGOCD_PASS", "test"),
+               ("JFROG_WEBHOOK_SECRET", "testsecret")):
+    os.environ.setdefault(_k, _v)
+
 
 # ── COPS-2546: hermetic fetch cache between tests ───────────────────────────
 #
