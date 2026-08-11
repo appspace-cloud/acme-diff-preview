@@ -10290,6 +10290,7 @@ def _summarize_vm_changes(changed_files, pr_sha, base_sha, path_map,
     # not a single flag.
     adopted_envs = set()
     seen = set()
+    _prov_pending = {}   # (env, domain) -> [(rest, new_s, danger, line)]
     for f in (changed_files or [])[:12]:
         clean = posixpath.normpath(f.lstrip("/"))
         if clean in seen or not clean.endswith((".yaml", ".yml")):
@@ -10337,6 +10338,16 @@ def _summarize_vm_changes(changed_files, pr_sha, base_sha, path_map,
         scope = (f"`{env_name}`" if path_map.get(clean) else
                  f"ancestor `{clean}` (inherited by every environment "
                  f"below it)")
+        # COPS-2635: a domain tree with NO key on the base branch is a
+        # PROVISION, not a set of mutations. Its added keys are buffered
+        # per (environment, domain) instead of emitted one line each, so
+        # identical provisions across environments can collapse into one
+        # statement (acme-config-dev #7064: 8 envs x 4 keys = 32 lines
+        # saying one fact). Ancestor files never buffer: they are
+        # inherited by many environments, so one line already covers all
+        # of them and there is nothing to group.
+        _env_file = bool(path_map.get(clean))
+        _domain_new_by_prefix = {}
         for k in keys:
             prefix = next(p for p in _VM_VALUES_PREFIXES if k.startswith(p))
             domain = _VM_DOMAIN_LABELS[prefix]
@@ -10346,6 +10357,10 @@ def _summarize_vm_changes(changed_files, pr_sha, base_sha, path_map,
                           else role if role in _VM_ROLE_NAMES else rest)
             role_label = f"{domain} \u00b7 {role_label}"
             old_v, new_v = old_flat.get(k), new_flat.get(k)
+            domain_new = _domain_new_by_prefix.setdefault(
+                prefix,
+                _env_file and adoption is None
+                and not any(k2.startswith(prefix) for k2 in old_flat))
             old_s = "" if old_v is None else str(old_v)
             new_s = "" if new_v is None else str(new_v)
             leaf = rest.rsplit(".", 1)[-1]
@@ -10376,14 +10391,25 @@ def _summarize_vm_changes(changed_files, pr_sha, base_sha, path_map,
                 # the original rule untouched.
                 adopted_move = (adoption is not None
                                 and prefix in (_LEGACY_PREFIX, _KCC_PREFIX))
-                if str(ds) != "TERMINATED" and not adopted_move:
+                # COPS-2635: on a domain that is NEW in this file there is
+                # no VM to stop — the resize runbook describes mutating a
+                # RUNNING machine, and emitting it for a fresh provision is
+                # what sent an operator to file a bug against the tool
+                # (acme-config-stage #2807). The provision itself is still
+                # flagged, once, by the group line built after this loop.
+                if (str(ds) != "TERMINATED" and not adopted_move
+                        and not domain_new):
                     danger = True
                     reason = ("machineType changes while desiredStatus is "
                               "not TERMINATED \u2014 the runbook requires "
                               "stopping the VM first")
             elif leaf == "zone":
-                danger = True
-                reason = "zone is immutable \u2014 destroy-and-recreate"
+                # Creation attributes on a NEW domain describe the machine
+                # being built, not a mutation of one that exists; nothing
+                # is destroyed or recreated (COPS-2635).
+                if not domain_new:
+                    danger = True
+                    reason = "zone is immutable \u2014 destroy-and-recreate"
             elif leaf in _VM_DISK_SIZE_KEYS:
                 try:
                     if float(new_s) < float(old_s):
@@ -10397,11 +10423,23 @@ def _summarize_vm_changes(changed_files, pr_sha, base_sha, path_map,
                     # change itself is still reported as a routine line.
                     pass
             elif leaf in _VM_DISK_TYPE_KEYS:
-                danger = True
-                reason = "disk type is immutable \u2014 destroy-and-recreate"
+                if not domain_new:
+                    danger = True
+                    reason = ("disk type is immutable \u2014 "
+                              "destroy-and-recreate")
             mark = "\U0001f6a8 " if danger else ""
             tail = f" \u2014 {reason}" if reason else ""
             line = f"- {mark}{scope} \u00b7 **{role_label}**: {change}{tail}"
+            if domain_new and old_v is None:
+                # Buffered, not emitted: resolved after the file loop. A
+                # provision whose keys carry a real danger (allowDeletion
+                # armed from birth) is TAINTED — its lines replay verbatim
+                # and it never groups, because folding a flagged line into
+                # "and 7 others" is the outcome this service exists to
+                # prevent.
+                _prov_pending.setdefault((env_name, domain), []).append(
+                    (rest, new_s, danger, line))
+                continue
             if danger:
                 dangerous_lines.append(line)
             else:
@@ -10410,6 +10448,24 @@ def _summarize_vm_changes(changed_files, pr_sha, base_sha, path_map,
                 # suppressed by one environment's adoption card.
                 routine_lines.append(
                     (env_name if path_map.get(clean) else None, line))
+
+    # COPS-2635: resolve the buffered provisions. Tainted ones (any real
+    # danger among their keys) replay their lines verbatim and never
+    # group; clean ones group by signature — same domain, same key/value
+    # set — so eight environments enabling the same VM read as one fact.
+    _prov_groups = {}    # (domain, frozenset((rest, new_s))) -> [envs]
+    for (env, domain), entries in sorted(_prov_pending.items()):
+        if any(d for _, _, d, _ in entries):
+            for rest, new_s, d, line in entries:
+                if d:
+                    dangerous_lines.append(line)
+                else:
+                    routine_lines.append((env, line))
+            continue
+        sig = (domain, frozenset((r_, v_) for r_, v_, _, _ in entries))
+        _prov_groups.setdefault(sig, []).append(env)
+    _prov_envs = {e for envs in _prov_groups.values() for e in envs}
+    _prov_kinds = {}     # env -> {kind} of first-time resources
 
     for app, r in sorted((app_results or {}).items()):
         for fact in (getattr(r, "vm_changes", None) or []):
@@ -10427,9 +10483,44 @@ def _summarize_vm_changes(changed_files, pr_sha, base_sha, path_map,
                                       "resource-level change"),
                         "; ".join(fact["dangerous"])))
             elif fact["fields"] or fact["notes"]:
+                # COPS-2635: a "new Kind — appears for the first time"
+                # note on a provisioned environment restates the group
+                # line. Fold it into the group's kind roster instead.
+                if (env in _prov_envs and not fact["fields"]
+                        and any("first time" in n for n in fact["notes"])):
+                    _prov_kinds.setdefault(env, set()).add(fact["kind"])
+                    continue
                 routine_lines.append(
                     (env, "- %s: %s" % (where,
                                         field_txt or "; ".join(fact["notes"]))))
+
+    # COPS-2635: one statement per provision signature. 🚨 because a new
+    # machine in GCP deserves the operator's eyes, but said once, in the
+    # operator's own words, with the roster and the resource kinds. The
+    # per-key detail is derivable from the PR's own file diff, and the
+    # full manifests are on the page.
+    for (domain, kv), envs in sorted(_prov_groups.items(),
+                                     key=lambda x: (-len(x[1]), x[0][0])):
+        kvd = dict(kv)
+        role = next((r_.split(".", 1)[0] for r_ in sorted(kvd)
+                     if "." in r_), "")
+        mt = next((v_ for r_, v_ in sorted(kvd.items())
+                   if r_.endswith("machineType")), None)
+        boot = str(kvd.get(f"{role}.createNewBootDisk", "")).lower() == "true"
+        n = len(envs)
+        head = (f"- \U0001f6a8 **{n} environment{'s' if n != 1 else ''} "
+                f"provision{'' if n != 1 else 's'} a new {domain}"
+                + (f" \u00b7 {role}" if role else "") + "**")
+        tail = f" \u2014 `machineType {mt}`" if mt else ""
+        if boot:
+            tail += ", new boot disk"
+        dangerous_lines.append(head + tail)
+        dangerous_lines.append(f"  {_fmt_service_list(sorted(envs))}")
+        kinds = sorted({k_ for e in envs for k_ in _prov_kinds.get(e, ())})
+        if kinds:
+            dangerous_lines.append(
+                "  New resources per environment: %s \u2014 full manifests "
+                "on the page" % ", ".join(kinds))
 
     return _vm_panel_lines(adoption_cards, adopted_envs,
                            routine_lines, dangerous_lines)
@@ -10578,9 +10669,28 @@ def _build_merge_summary(results, rollup_by_sig, vm_change_lines,
     if vm_change_lines:
         hdr = vm_change_lines[0]
         if hdr == _VM_PANEL_DANGER_HDR:
-            findings.append((_SEV_BLOCK,
-                             "\U0001f5a5\ufe0f **VM infrastructure change "
-                             "flagged dangerous** \u2014 see the VM section"))
+            # COPS-2635: when every dangerous bullet is a provision group,
+            # the headline says what is actually happening in the
+            # operator's words — "N environment(s) provision a NEW linux
+            # VM" — instead of the generic danger flag. Any other danger
+            # in the section (a resize, an armed deletion) keeps the
+            # generic wording, because then "see the VM section" must not
+            # sound like it is only about new machines.
+            _dang = [l for l in vm_change_lines
+                     if l.startswith("- \U0001f6a8")]
+            _prov = [re.match(
+                r"- \U0001f6a8 \*\*(\d+) environments? provisions? a new",
+                l) for l in _dang]
+            if _dang and all(_prov):
+                _n = sum(int(m.group(1)) for m in _prov)
+                findings.append((_SEV_BLOCK,
+                                 f"\U0001f5a5\ufe0f **{_n} environment(s) "
+                                 f"provision a NEW linux VM** \u2014 see "
+                                 f"the VM section"))
+            else:
+                findings.append((_SEV_BLOCK,
+                                 "\U0001f5a5\ufe0f **VM infrastructure change "
+                                 "flagged dangerous** \u2014 see the VM section"))
         elif hdr == _VM_PANEL_ROUTINE_HDR:
             findings.append((_SEV_ROUTINE,
                              "\U0001f5a5\ufe0f VM infrastructure changed "
@@ -11325,7 +11435,15 @@ def format_comment(pr_sha, app_results, skipped_apps=None, base_sha="",
         for app, r in sorted(results.items(), key=lambda kv: _app_sort_key(*kv)):
             if r.outcome == OUT_DIFF:
                 label = group_label.get(app, "\u2014")
-                rows.append(f"| `{app}` | \u26a0\ufe0f changed | {r.n_res} | {label} |")
+                # COPS-2635: the App cell IS the deep link. The two-line
+                # "header + Full hunks for" block this used to pair with
+                # restated the row, adding only the pointer; the pointer
+                # moves here and the block goes (plain apps only — risk
+                # blocks and group blocks still render below).
+                _cell = (f"[`{app}`]({artifact_url}#{diff_ui.app_anchor(app)})"
+                         if artifact_url else f"`{app}`")
+                rows.append(f"| {_cell} | \u26a0\ufe0f changed | {r.n_res} "
+                            f"| {label} |")
             elif r.outcome == OUT_DECOMMISSIONED:
                 rows.append(f"| `{app}` | \U0001f5d1\ufe0f decommissioned | \u2014 | \u2014 |")
             elif r.outcome == OUT_INDETERMINATE:
@@ -11529,6 +11647,16 @@ def format_comment(pr_sha, app_results, skipped_apps=None, base_sha="",
                     lines += [f"> {_fmt_service_list(_members)}", ""]
                 continue
             _risky = _is_risky_result(rep_r)
+            # COPS-2635: in large mode the Changeset overview row for this
+            # app already carries its deep link in the App cell, so the
+            # plain "header + Full hunks for" block below would restate the
+            # row (26 lines for 13 rows on acme-config-dev #7064). Risky
+            # apps, fingerprint-group representatives and shape groups keep
+            # their blocks: those say something the table does not. Never
+            # on the page — is_complete_record renders every block.
+            if (is_large and artifact_url and not profile.is_complete_record
+                    and not _risky and app not in _fp_grouped):
+                continue
             if budget and not _risky and _body_size() > budget:
                 collapsed_apps.extend(members)
                 continue
