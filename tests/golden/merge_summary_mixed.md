@@ -30,12 +30,12 @@
 
 | App | Status | Changed resources | Diff group |
 |-----|--------|--------------------|------------|
-| `pv-fleet-00-ms` | ⚠️ changed | 1 | — |
-| `pv-fleet-01-ms` | ⚠️ changed | 1 | — |
-| `pv-fleet-02-ms` | ⚠️ changed | 1 | — |
-| `pv-fleet-03-ms` | ⚠️ changed | 1 | — |
-| `pv-vm-a-ss` | ⚠️ changed | 1 | — |
-| `pv-zzz-risky-ms` | ⚠️ changed | 1 | — |
+| [`pv-fleet-00-ms`](https://diffs.appspace.example/diff/acme-config-prod/42/abc12345#app-pv-fleet-00-ms) | ⚠️ changed | 1 | — |
+| [`pv-fleet-01-ms`](https://diffs.appspace.example/diff/acme-config-prod/42/abc12345#app-pv-fleet-01-ms) | ⚠️ changed | 1 | — |
+| [`pv-fleet-02-ms`](https://diffs.appspace.example/diff/acme-config-prod/42/abc12345#app-pv-fleet-02-ms) | ⚠️ changed | 1 | — |
+| [`pv-fleet-03-ms`](https://diffs.appspace.example/diff/acme-config-prod/42/abc12345#app-pv-fleet-03-ms) | ⚠️ changed | 1 | — |
+| [`pv-vm-a-ss`](https://diffs.appspace.example/diff/acme-config-prod/42/abc12345#app-pv-vm-a-ss) | ⚠️ changed | 1 | — |
+| [`pv-zzz-risky-ms`](https://diffs.appspace.example/diff/acme-config-prod/42/abc12345#app-pv-zzz-risky-ms) | ⚠️ changed | 1 | — |
 
 > ⬆️ **Routine version bump** `image`: `appspace-ms:2603.0.0` → `appspace-ms:2603.1.0` — **4 environments**: pv-fleet-00, pv-fleet-01, pv-fleet-02, pv-fleet-03 — full diffs in the [full diff view](https://diffs.appspace.example/diff/acme-config-prod/42/abc12345)
 
