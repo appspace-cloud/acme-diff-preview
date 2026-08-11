@@ -111,27 +111,27 @@ spec:
             {{- end }}
             {{- if .maxAppsPerRun }}
             - name: MAX_APPS_PER_RUN
-              value: {{ .maxAppsPerRun | quote }}
+              value: {{ .maxAppsPerRun | int64 | quote }}
             {{- end }}
             {{- if .workers }}
             - name: DIFF_WORKERS
-              value: {{ .workers | quote }}
+              value: {{ .workers | int64 | quote }}
             {{- end }}
             {{- if .prWorkers }}
             - name: PR_WORKERS
-              value: {{ .prWorkers | quote }}
+              value: {{ .prWorkers | int64 | quote }}
             {{- end }}
             {{- if .timeout }}
             - name: DIFF_TIMEOUT
-              value: {{ .timeout | quote }}
+              value: {{ .timeout | int64 | quote }}
             {{- end }}
             {{- if .retries }}
             - name: DIFF_RETRIES
-              value: {{ .retries | quote }}
+              value: {{ .retries | int64 | quote }}
             {{- end }}
             {{- if .warmWorkers }}
             - name: WARM_WORKERS
-              value: {{ .warmWorkers | quote }}
+              value: {{ .warmWorkers | int64 | quote }}
             {{- end }}
             {{- /* warmThreshold removed — no effect after warm-diff pass was replaced by pre-pull */ -}}
             {{- if hasKey . "gitMirrorEnabled" }}
@@ -144,7 +144,7 @@ spec:
             {{- end }}
             {{- if .supersedeMaxConsecutiveAborts }}
             - name: SUPERSEDE_MAX_CONSECUTIVE_ABORTS
-              value: {{ .supersedeMaxConsecutiveAborts | quote }}
+              value: {{ .supersedeMaxConsecutiveAborts | int64 | quote }}
             {{- end }}
             {{- end }}
             {{- with .Values.diffUi }}
@@ -167,14 +167,17 @@ spec:
             {{- end }}
             {{- if .maxArtifacts }}
             - name: DIFF_UI_MAX_ARTIFACTS
-              value: {{ .maxArtifacts | quote }}
+              value: {{ .maxArtifacts | int64 | quote }}
             {{- end }}
             {{- if .maxBytes }}
+            # int64 before quote: Helm hands YAML numbers to templates as
+            # float64, and Go prints a float64 this large in scientific
+            # notation ("4.194304e+08"), which the service rejects.
             # Byte budget for the local artifact cache. The count cap is in
             # the wrong unit: the cache is an emptyDir whose sizeLimit the
             # kubelet enforces by evicting the pod (see values.yaml).
             - name: DIFF_UI_MAX_BYTES
-              value: {{ .maxBytes | quote }}
+              value: {{ .maxBytes | int64 | quote }}
             {{- end }}
             {{- if .gcsBucket }}
             # Durable artifact store: saves are mirrored to this bucket and
