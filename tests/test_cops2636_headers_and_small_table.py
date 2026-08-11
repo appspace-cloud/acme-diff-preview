@@ -85,7 +85,7 @@ def test_small_pr_renders_the_table_with_linked_cells(monkeypatch):
     monkeypatch.setattr(dp, "generate_ai_summary", lambda *a, **k: None)
     out = _comment(_small(), artifact_url=URL)
     assert "#### Changeset overview" in out
-    assert "| [`pv-t00-a-ss`](%s#app-pv-t00-a-ss) |" % URL in out
+    assert "| [pv-t00-a-ss](%s#app-pv-t00-a-ss) |" % URL in out
 
 
 def test_small_pr_drops_the_redundant_blocks(monkeypatch):

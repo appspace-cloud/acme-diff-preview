@@ -15,7 +15,7 @@
 
 | App | Status | Changed resources | Diff group |
 |-----|--------|--------------------|------------|
-| [`pv-hp-a-ms`](https://diffs.appspace.example/diff/acme-config-prod/42/abc12345#app-pv-hp-a-ms) | ⚠️ changed | 8 | — |
+| [pv-hp-a-ms](https://diffs.appspace.example/diff/acme-config-prod/42/abc12345#app-pv-hp-a-ms) | ⚠️ changed | 8 | — |
 
 ⚠️ **`pv-hp-a-ms`** — 8 resource(s) changed
 

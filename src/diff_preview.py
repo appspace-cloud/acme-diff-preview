@@ -11486,7 +11486,16 @@ def format_comment(pr_sha, app_results, skipped_apps=None, base_sha="",
                 # restated the row, adding only the pointer; the pointer
                 # moves here and the block goes (plain apps only — risk
                 # blocks and group blocks still render below).
-                _cell = (f"[`{app}`]({artifact_url}#{diff_ui.app_anchor(app)})"
+                # COPS-2642: NO backticks in link text. Bitbucket drops
+                # the anchor entirely when the link text is code, so
+                # [`app`](url) rendered as plain monospace with no link
+                # at all -- verified against the DOM of a real merged PR,
+                # where the whole table contained zero <a> elements. The
+                # name loses monospace and gains a working link, which is
+                # the entire point of the cell: COPS-2636 and COPS-2640
+                # removed every other pointer on the belief this one
+                # worked.
+                _cell = (f"[{app}]({artifact_url}#{diff_ui.app_anchor(app)})"
                          if artifact_url else f"`{app}`")
                 rows.append(f"| {_cell} | \u26a0\ufe0f changed | {r.n_res} "
                             f"| {label} |")
