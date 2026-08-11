@@ -59,7 +59,7 @@ def test_every_member_still_reachable_via_its_table_row(monkeypatch):
     results = {"pv-g%02d-a-ms" % i: _same_shape("same") for i in range(8)}
     out = _comment(results, artifact_url=URL)
     for i in range(8):
-        assert "| [`pv-g%02d-a-ms`](%s#app-pv-g%02d-a-ms)" % (i, URL, i) in out
+        assert "| [pv-g%02d-a-ms](%s#app-pv-g%02d-a-ms)" % (i, URL, i) in out
 
 
 def test_fold_block_keeps_conclusions_drops_pointer(monkeypatch):

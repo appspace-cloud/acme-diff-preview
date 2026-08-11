@@ -15,12 +15,12 @@
 
 | App | Status | Changed resources | Diff group |
 |-----|--------|--------------------|------------|
-| [`pv-env-0-ms`](https://diffs.appspace.example/diff/acme-config-prod/42/abc12345#app-pv-env-0-ms) | ⚠️ changed | 1 | — |
-| [`pv-env-1-ms`](https://diffs.appspace.example/diff/acme-config-prod/42/abc12345#app-pv-env-1-ms) | ⚠️ changed | 1 | — |
-| [`pv-env-2-ms`](https://diffs.appspace.example/diff/acme-config-prod/42/abc12345#app-pv-env-2-ms) | ⚠️ changed | 1 | — |
-| [`pv-env-3-ms`](https://diffs.appspace.example/diff/acme-config-prod/42/abc12345#app-pv-env-3-ms) | ⚠️ changed | 1 | — |
-| [`pv-env-4-ms`](https://diffs.appspace.example/diff/acme-config-prod/42/abc12345#app-pv-env-4-ms) | ⚠️ changed | 1 | — |
-| [`pv-env-5-ms`](https://diffs.appspace.example/diff/acme-config-prod/42/abc12345#app-pv-env-5-ms) | ⚠️ changed | 1 | — |
+| [pv-env-0-ms](https://diffs.appspace.example/diff/acme-config-prod/42/abc12345#app-pv-env-0-ms) | ⚠️ changed | 1 | — |
+| [pv-env-1-ms](https://diffs.appspace.example/diff/acme-config-prod/42/abc12345#app-pv-env-1-ms) | ⚠️ changed | 1 | — |
+| [pv-env-2-ms](https://diffs.appspace.example/diff/acme-config-prod/42/abc12345#app-pv-env-2-ms) | ⚠️ changed | 1 | — |
+| [pv-env-3-ms](https://diffs.appspace.example/diff/acme-config-prod/42/abc12345#app-pv-env-3-ms) | ⚠️ changed | 1 | — |
+| [pv-env-4-ms](https://diffs.appspace.example/diff/acme-config-prod/42/abc12345#app-pv-env-4-ms) | ⚠️ changed | 1 | — |
+| [pv-env-5-ms](https://diffs.appspace.example/diff/acme-config-prod/42/abc12345#app-pv-env-5-ms) | ⚠️ changed | 1 | — |
 
 ⚠️ **6 application(s) changed the same 1 resource(s)**
 

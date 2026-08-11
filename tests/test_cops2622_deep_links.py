@@ -139,12 +139,12 @@ def test_every_app_is_still_named_with_its_real_count():
     names = ["pv-alpha-a-ms", "pv-beta-b-ss"]
     out = _comment(names)
     for n in names:
-        assert ("| [`%s`]" % n) in out, "%s lost its table row" % n
+        assert ("| [%s](" % n) in out, "%s lost its table row" % n
         assert ("#app-%s)" % n) in out, "%s lost its deep link" % n
     import re
     for n in names:
         assert re.search(
-            r"\| \[`%s`\]\([^)]+\) \| \u26a0\ufe0f changed \| \d+ \|"
+            r"\| \[%s\]\([^)]+\) \| \u26a0\ufe0f changed \| \d+ \|"
             % re.escape(n), out), \
             "%s's row must carry its status and real count" % n
 

@@ -174,8 +174,8 @@ def test_table_app_cells_are_deep_links(monkeypatch):
     out = dp.format_comment("a" * 40, _big(), base_sha="b" * 40,
                             artifact_url=URL)
     assert "#### Changeset overview" in out
-    assert "| [`pv-t00-a-ss`](%s#app-pv-t00-a-ss) |" % URL in out
-    assert "| [`pv-t11-a-ss`](%s#app-pv-t11-a-ss) |" % URL in out
+    assert "| [pv-t00-a-ss](%s#app-pv-t00-a-ss) |" % URL in out
+    assert "| [pv-t11-a-ss](%s#app-pv-t11-a-ss) |" % URL in out
 
 
 def test_the_redundant_per_app_blocks_are_gone(monkeypatch):

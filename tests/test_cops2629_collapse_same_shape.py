@@ -134,7 +134,7 @@ def test_two_apps_do_not_form_a_group(monkeypatch):
     out = _comment(_glb_set(2))
     assert "application(s) changed the same" not in out
     # COPS-2636: the two apps render as their own linked table rows.
-    assert "[`pv-c00-glb`]" in out and "[`pv-c01-glb`]" in out
+    assert "[pv-c00-glb]" in out and "[pv-c01-glb]" in out
 
 
 def test_three_apps_are_enough_to_form_a_group(monkeypatch):
@@ -152,8 +152,8 @@ def test_each_grouped_app_name_is_its_own_deep_link(monkeypatch):
     # COPS-2640: the pointer moved into the Changeset overview row; the
     # group lists members as the plain one-line roster. COPS-2622 still
     # holds -- every member reachable through its own linked row.
-    assert "| [`pv-c00-glb`](%s#app-pv-c00-glb)" % URL in out
-    assert "| [`pv-c21-glb`](%s#app-pv-c21-glb)" % URL in out
+    assert "| [pv-c00-glb](%s#app-pv-c00-glb)" % URL in out
+    assert "| [pv-c21-glb](%s#app-pv-c21-glb)" % URL in out
     roster = next(l for l in out.split("\n")
                   if l.startswith(">") and "pv-c00-glb" in l)
     assert "pv-c07-glb" in roster and "more" in roster
@@ -166,7 +166,7 @@ def test_a_single_app_renders_exactly_as_before(monkeypatch):
     monkeypatch.setattr(dp, "generate_ai_summary", lambda *a, **k: None)
     out = _comment({"pv-solo-a-glb": _changed(name="solo")})
     # COPS-2636 moved the per-app line into its Changeset overview row.
-    assert "[`pv-solo-a-glb`](%s#app-pv-solo-a-glb)" % URL in out
+    assert "[pv-solo-a-glb](%s#app-pv-solo-a-glb)" % URL in out
     assert "application(s) changed the same" not in out
 
 
