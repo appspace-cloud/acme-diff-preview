@@ -24,12 +24,7 @@
 
 ⚠️ **6 application(s) changed the same 1 resource(s)**
 
-- [pv-env-0-ms](https://diffs.appspace.example/diff/acme-config-prod/42/abc12345#app-pv-env-0-ms)
-- [pv-env-1-ms](https://diffs.appspace.example/diff/acme-config-prod/42/abc12345#app-pv-env-1-ms)
-- [pv-env-2-ms](https://diffs.appspace.example/diff/acme-config-prod/42/abc12345#app-pv-env-2-ms)
-- [pv-env-3-ms](https://diffs.appspace.example/diff/acme-config-prod/42/abc12345#app-pv-env-3-ms)
-- [pv-env-4-ms](https://diffs.appspace.example/diff/acme-config-prod/42/abc12345#app-pv-env-4-ms)
-- [pv-env-5-ms](https://diffs.appspace.example/diff/acme-config-prod/42/abc12345#app-pv-env-5-ms)
+> pv-env-0-ms, pv-env-1-ms, pv-env-2-ms, pv-env-3-ms, pv-env-4-ms, pv-env-5-ms
 
 🔎 **Full rendered diff (every hunk):** https://diffs.appspace.example/diff/acme-config-prod/42/abc12345
 

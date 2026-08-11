@@ -9284,7 +9284,8 @@ def _full_hunks_link(artifact_url: str, app: str = "") -> str:
 def _format_app_diff_block(app, sections, diff_text, show_diff=True, n_res=None,
                            risk_headers=None, version_fold=None,
                            artifact_url="", size_budget=None,
-                           group_repeats=False, profile=None):
+                           group_repeats=False, profile=None,
+                           row_pointer=True):
     """Return a list of markdown lines for one app's diff block.
 
     sections is DiffResult.sections — already truncated to display budget.
@@ -9371,7 +9372,14 @@ def _format_app_diff_block(app, sections, diff_text, show_diff=True, n_res=None,
                 _ev = "\n".join(_ev.split("\n")[:_n])
                 out += [f"**`{_fence_safe(hdr)}`**", "", "```diff",
                         _fence_safe(_ev), "```", ""]
-        return out + [_full_hunks_link(artifact_url, app=app), ""]
+        if row_pointer:
+            return out + [_full_hunks_link(artifact_url, app=app), ""]
+        # COPS-2640: the app's Changeset overview row already carries this
+        # exact link, and Bitbucket rendered the duplicate broken anyway
+        # (link text "Full hunks for " with the app name outside the
+        # anchor, audited on acme-config-prod #4095). The conclusions
+        # above are the block's value; the pointer is the row's job.
+        return out + [""]
     out += _fold_lines
     inline = [(h, b) for h, b in (sections or []) if h not in folded]
     # Identical changes collapse to one hunk plus a count. Off on the
@@ -11661,13 +11669,18 @@ def format_comment(pr_sha, app_results, skipped_apps=None, base_sha="",
                     f"the same {rep_r.n_res} resource(s)**",
                     "",
                 ]
-                # The names ARE the pointers. COPS-2622 requires every app
-                # pointer to land on that app's own section, and a single
-                # group link would have taken that away from every member
-                # but one. One sentence of prose, one clickable name each:
-                # both contracts hold, and the reader still gets to jump
-                # straight to the environment they care about.
-                if artifact_url:
+                # COPS-2640: the names used to BE the pointers (one link
+                # bullet per member, COPS-2622). Since COPS-2635/2636 the
+                # Changeset overview row of every member carries its deep
+                # link, so eight bullets restated eight rows directly
+                # above (audited on acme-config-prod #4095). The group
+                # keeps its statement; members list as the one-line
+                # roster the failure groups already use, and COPS-2622
+                # holds through the table. Bullets survive only where the
+                # table does not carry the links: no table, or the
+                # complete-record page.
+                if (artifact_url and not (_table_rendered
+                                          and not profile.is_complete_record)):
                     _shown = _members[:8]
                     # One per line, not one long line. Deep links carry the
                     # full page URL, so six of them joined with commas came
@@ -11738,7 +11751,12 @@ def format_comment(pr_sha, app_results, skipped_apps=None, base_sha="",
                 n_res=rep_r.n_res, risk_headers=_risk_hdrs,
                 version_fold=_fold, artifact_url=artifact_url,
                 size_budget=_room, group_repeats=profile.group_repeats,
-                profile=profile)
+                profile=profile,
+                # COPS-2640: the app's table row carries the deep link
+                # whenever the table renders on this surface, so the
+                # block's trailing "Full hunks for" line would repeat it.
+                row_pointer=not (_table_rendered and artifact_url
+                                 and not profile.is_complete_record))
 
         else:
             # COPS-2612: on a fleet PR this emitted one green line per clean

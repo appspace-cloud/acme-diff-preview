@@ -25,7 +25,6 @@
 >
 > Changed for another reason: `mongo`
 
-[Full hunks for `pv-hp-a-ms`](https://diffs.appspace.example/diff/acme-config-prod/42/abc12345#app-pv-hp-a-ms)
 
 🔎 **Full rendered diff (every hunk):** https://diffs.appspace.example/diff/acme-config-prod/42/abc12345
 
