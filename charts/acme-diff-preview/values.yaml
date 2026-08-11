@@ -50,7 +50,7 @@ priorityClassName: ""
 #
 # | Consumer                        | Cap     | Set by                     |
 # |---------------------------------|---------|----------------------------|
-# | Main render cache               | 400 MB  | MAIN_RENDER_DISK_MAX_BYTES |
+# | Main render cache (disk tier)   | 400 MB  | MAIN_RENDER_DISK_MAX_BYTES |
 # | Full-diff artifact cache        | 400 MB  | diffUi.maxBytes            |
 # | Git mirrors of 3 config repos   | ~400 MB | uncapped, grows with history |
 # | Helm chart cache + untarred     | ~500 MB | uncapped, per chart version |
@@ -70,7 +70,7 @@ image:
   # Kept in sync with Chart.yaml appVersion (RELEASING.md). This default had
   # drifted since v2.7.0; it never bit us because acme-infrastructure pins the
   # tag explicitly, but anyone installing the chart as-is got a stale image.
-  tag: "2.55.0"
+  tag: "2.56.0"
   pullPolicy: IfNotPresent
 
 # Log verbosity for the diff-preview service. Set to DEBUG to emit the full
