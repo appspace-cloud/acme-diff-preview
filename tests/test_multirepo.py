@@ -525,5 +525,11 @@ def test_comment_paints_missing_required_prominently():
     assert "bigquerydataset.yaml:25" in body
     assert "customer.yaml" in body and "config.yaml" in body, \
         "the fix hint must tell the developer WHERE values live"
-    assert "diff unavailable" not in body, \
-        "must not fall through to the generic unhelpful hint"
+    # COPS-2636: the Changeset overview row for a failed app carries
+    # the status "diff unavailable"; that is a table cell, not a fallback
+    # explanation. The guard's intent stands: the phrase must never
+    # appear as prose in place of the MISSING REQUIRED block above.
+    for _l in body.split("\n"):
+        if "diff unavailable" in _l:
+            assert _l.lstrip().startswith("|"), \
+                "generic hint outside the overview table: " + _l

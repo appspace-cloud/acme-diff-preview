@@ -4,7 +4,7 @@
 
 ⚠️ The full-diff page could not be produced for this run, so every hunk is inlined below.
 
-### 🧭 Merge summary
+## ℹ️ Merge summary
 
 ✅ **Routine** — nothing dangerous detected
 
@@ -12,6 +12,13 @@
 
 ---
 
+
+#### Changeset overview
+
+| App | Status | Changed resources | Diff group |
+|-----|--------|--------------------|------------|
+| `pv-acme-a-ms` | ⚠️ changed | 1 | — |
+| *(+1 more)* | ✅ no changes | — | — |
 
 ⚠️ **`pv-acme-a-ms`** — 1 resource(s) changed
 

@@ -133,7 +133,8 @@ def test_two_apps_do_not_form_a_group(monkeypatch):
     monkeypatch.setattr(dp, "generate_ai_summary", lambda *a, **k: None)
     out = _comment(_glb_set(2))
     assert "application(s) changed the same" not in out
-    assert out.count("resource(s) changed") == 2
+    # COPS-2636: the two apps render as their own linked table rows.
+    assert "[`pv-c00-glb`]" in out and "[`pv-c01-glb`]" in out
 
 
 def test_three_apps_are_enough_to_form_a_group(monkeypatch):
@@ -158,7 +159,8 @@ def test_a_single_app_renders_exactly_as_before(monkeypatch):
     asserts."""
     monkeypatch.setattr(dp, "generate_ai_summary", lambda *a, **k: None)
     out = _comment({"pv-solo-a-glb": _changed(name="solo")})
-    assert "**`pv-solo-a-glb`** — 9 resource(s) changed" in out
+    # COPS-2636 moved the per-app line into its Changeset overview row.
+    assert "[`pv-solo-a-glb`](%s#app-pv-solo-a-glb)" % URL in out
     assert "application(s) changed the same" not in out
 
 

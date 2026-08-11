@@ -70,7 +70,10 @@ def _panel(monkeypatch, old, new, ident=IDENT, path_map=None, sfx="a",
 
 
 def _is_danger(out):
-    return m._VM_PANEL_DANGER_HDR in out
+    # COPS-2636 dropped the sirens, making the danger header a
+    # substring of the routine one. Match the way production does:
+    # the panel's FIRST line, exactly.
+    return out.startswith(m._VM_PANEL_DANGER_HDR)
 
 
 def _machinetype_danger(out):

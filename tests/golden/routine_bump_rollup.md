@@ -4,7 +4,7 @@
 
 ⚠️ The full-diff page could not be produced for this run, so every hunk is inlined below.
 
-### 🧭 Merge summary
+## ℹ️ Merge summary
 
 ✅ **Routine** — nothing dangerous detected
 
@@ -12,6 +12,16 @@
 
 ---
 
+
+#### Changeset overview
+
+| App | Status | Changed resources | Diff group |
+|-----|--------|--------------------|------------|
+| `pv-fleet-00-ms` | ⚠️ changed | 1 | — |
+| `pv-fleet-01-ms` | ⚠️ changed | 1 | — |
+| `pv-fleet-02-ms` | ⚠️ changed | 1 | — |
+| `pv-fleet-03-ms` | ⚠️ changed | 1 | — |
+| `pv-fleet-04-ms` | ⚠️ changed | 1 | — |
 
 > ⬆️ **Routine version bump** `image`: `appspace-ms:2603.0.0` → `appspace-ms:2603.1.0` — **5 environments**: pv-fleet-00, pv-fleet-01, pv-fleet-02, pv-fleet-03, pv-fleet-04 — see ArgoCD or the diff-preview full-diff view
 

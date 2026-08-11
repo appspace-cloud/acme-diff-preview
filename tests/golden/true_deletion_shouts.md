@@ -4,7 +4,7 @@
 
 ⚠️ The full-diff page could not be produced for this run, so every hunk is inlined below.
 
-### 🧭 Merge summary
+## ℹ️ Merge summary
 
 ⛔ **DO NOT MERGE** without checking the item(s) below (1 item(s))
 
@@ -19,6 +19,12 @@
 - `pv-acme-a-ms` → `/v1/Service gone`
 
 ---
+
+#### Changeset overview
+
+| App | Status | Changed resources | Diff group |
+|-----|--------|--------------------|------------|
+| `pv-acme-a-ms` | ⚠️ changed | 2 | — |
 
 ⚠️ **`pv-acme-a-ms`** — 2 resource(s) changed
 

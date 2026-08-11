@@ -4,7 +4,7 @@
 
 ⚠️ The full-diff page could not be produced for this run, so every hunk is inlined below.
 
-### 🧭 Merge summary
+## ℹ️ Merge summary
 
 ⛔ **DO NOT MERGE** without checking the item(s) below (1 item(s))
 
@@ -12,7 +12,7 @@
 
 ---
 
-## 🖥️🚨 VM INFRASTRUCTURE CHANGES 🚨
+## 🖥️ VM INFRASTRUCTURE CHANGES
 
 **This PR touches virtual machine infrastructure (KCC linux-services). A botched VM change is slow and painful to recover from — verify every line below before merging.**
 
@@ -21,6 +21,12 @@
 - 🚨 `pv-acme-a` · `ComputeInstance pv-acme-svc-a`: `machineType` `n2d-standard-4` → `n2d-standard-8` — machineType changes while the VM is not parked TERMINATED — the runbook requires stopping the VM first
 
 ---
+
+#### Changeset overview
+
+| App | Status | Changed resources | Diff group |
+|-----|--------|--------------------|------------|
+| `pv-acme-a-ss` | ⚠️ changed | 1 | — |
 
 ⚠️ **`pv-acme-a-ss`** — 1 resource(s) changed
 
