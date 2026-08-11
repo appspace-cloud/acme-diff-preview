@@ -248,6 +248,11 @@ full-diff web UI.
 | `DIFF_UI_DIR` | `diffUi.dir` | `/tmp/acme-diff-ui` | Artifact directory (bounded, pruned oldest-first) |
 | `DIFF_UI_MAX_ARTIFACTS` | `diffUi.maxArtifacts` | `500` | Max artifacts in the **local cache** before pruning oldest-first. Not a retention policy: `DIFF_UI_GCS_BUCKET` is the durable copy and its bucket lifecycle sets how long a page really lives |
 | `DIFF_UI_MAX_BYTES` | `diffUi.maxBytes` | `419430400` (400MiB) | Byte budget for the same local cache, enforced alongside the count. The directory is an emptyDir whose `sizeLimit` the kubelet enforces by **evicting the pod**, and artifacts range from ~2KB to tens of MB, so a count alone is measured in the wrong unit. A pruned entry costs one GCS re-download |
+| `MAIN_RENDER_GCS_BUCKET` | — | *(inherits `DIFF_UI_GCS_BUCKET`)* | Durable tier for the main-side render cache. Lookup is memory -> disk -> bucket -> render, so a replacement pod or a standby taking the lease warms from the bucket instead of re-rendering the fleet. Both local tiers live in an emptyDir that dies with the pod. Empty disables the tier; writes are best-effort and off the diff path |
+| `MAIN_RENDER_GCS_PREFIX` | — | `render-cache` | Object prefix, salt appended: `render-cache/<salt>/<key>.yaml.zst`. The bucket lifecycle deletes this prefix at 14 days; the entries are disposable, losing one costs a single render |
+| `MAIN_RENDER_CACHE_MAX` | — | `2048` | In-process front cache size. Eviction is **LRU** and drops the memory entry only: disk owns its own caps and keeps serving evicted keys |
+| `MAIN_RENDER_CACHE_SALT` | — | `cops2631-v1` | CacheVersion equivalent. Bump on any render-affecting code change: it is part of the content key **and** of the bucket object name, so a bump orphans every durable copy rather than serving it |
+| `MAIN_RENDER_CACHE_SHADOW_RATE` | — | `0.01` | Fraction of cache hits that re-render and byte-compare. A mismatch discards the entry from **every** tier, bucket included, so a poisoned object cannot re-infect fresh pods, and increments `main_render_cache_shadow_mismatches` (must stay 0) |
 | `COMMENT_INLINE_DIFFS` | — | `false` | Render the YAML hunks inside the PR comment. `false` (the default since 2.35.0) makes the comment a **decision summary**: verdicts, names and counts stay, the evidence lives on the full-diff page. `true` restores the pre-2.35.0 comment in one variable, and is also the **first** step of a phase C rollback — see below |
 | `COMMENT_INPUT_PANEL` | — | `false` | Render the `Config changes in this PR` panel in the comment. Off by default; the page always keeps it |
 | `COMMENT_INLINE_EVIDENCE_LINES` | — | `0` | With inline diffs off, still show this many lines of evidence for **risk-flagged** applications only (deletions, zeroed replicas, VM facts), so a reviewer never leaves the comment to see *why* something is dangerous — only to see the rest. `0` means the comment ships with no fenced block at all |
@@ -349,7 +354,7 @@ All endpoints are served on port **8080** inside the pod.
 | Method | Path | Description |
 |---|---|---|
 | `POST` | `/diff-preview/webhook` | Bitbucket PR webhook (wakes the diff loop) |
-| `GET` | `/diff-preview/stats` | Diff outcome counters, main-render cache hits/misses, last iteration timing (JSON) |
+| `GET` | `/diff-preview/stats` | Diff outcome counters, main-render cache hits split by tier (memory/disk/gcs) and misses, last iteration timing (JSON) |
 | `POST` | `/jfrog-webhook` | JFrog OCI push webhook (triggers hard-refresh) |
 | `GET` | `/jfrog-webhook/stats` | Webhook counters (JSON) |
 | `GET` | `/healthz` | Liveness probe |

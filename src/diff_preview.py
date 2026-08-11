@@ -53,6 +53,7 @@ SHA dedup:
 """
 import json, os, posixpath, random, re, shutil, signal, socket, ssl, sys, subprocess, time, threading, urllib.error, urllib.parse, urllib.request
 import hashlib
+import collections
 import difflib as _difflib
 import yaml  # PyYAML (requirements.txt) - input root-cause panel only, v2.6.2
 import diff_ui  # full-diff web UI (same-dir module, stdlib only)
@@ -542,6 +543,14 @@ _diff_stats:      dict          = {
     "main_render_cache_hits": 0,   # reused a parsed main-side render — bughunt N4
     "main_render_cache_misses": 0, # had to render main fresh — bughunt N4
     "main_render_cache_shadow_mismatches": 0,  # COPS-2631 shadow audit failures
+    # COPS-2645: hits split by tier. A single hit counter cannot tell "the
+    # cache works" from "the cache works only inside one pod's life", which
+    # is exactly the confusion that hid the 0% hit rate for two releases.
+    "main_render_cache_hits_memory": 0,
+    "main_render_cache_hits_disk": 0,
+    "main_render_cache_hits_gcs": 0,
+    "main_render_cache_gcs_stores": 0,
+    "main_render_cache_gcs_store_failures": 0,
     # v2.5.19 (M8): visibility into the v2.5.18 scale machinery — are these
     # paths firing in production, and how often?
     "comments_truncated": 0,       # comments that exceeded MAX_COMMENT_BYTES
@@ -734,6 +743,19 @@ _PROM_REGISTRY = (
      "Main-side helm renders served from the content-keyed cache."),
     ("main_render_cache_misses", "main_render_cache_misses_total", "counter",
      "Main-side helm renders that had to run fresh."),
+    # COPS-2645: which tier served the hit. gcs > 0 on a young pod is the
+    # proof that the cache now outlives the pod it was built in.
+    ("main_render_cache_hits_memory", "main_render_cache_hits_memory_total",
+     "counter", "Cache hits served from the in-process front cache."),
+    ("main_render_cache_hits_disk", "main_render_cache_hits_disk_total",
+     "counter", "Cache hits served from the pod-local disk tier."),
+    ("main_render_cache_hits_gcs", "main_render_cache_hits_gcs_total",
+     "counter", "Cache hits served from the durable bucket tier."),
+    ("main_render_cache_gcs_stores", "main_render_cache_gcs_stores_total",
+     "counter", "Render-cache entries mirrored to the bucket."),
+    ("main_render_cache_gcs_store_failures",
+     "main_render_cache_gcs_store_failures_total", "counter",
+     "Failed bucket mirrors. Non-fatal: durability lost, diffs unaffected."),
 )
 
 
@@ -3198,7 +3220,11 @@ _vf_inflight_lock   = threading.Lock()
 # A wrong entry produces a wrong diff, which is worse than slow. Default to
 # cache-miss on any doubt; bump MAIN_RENDER_CACHE_SALT on any render-affecting
 # code change; the optional shadow audit re-renders a sampled hit.
-_main_render_cache: dict = {}       # content_key -> parsed resources (memory)
+# OrderedDict, not dict: eviction has to drop the LEAST RECENTLY USED key,
+# and a plain dict only knows insertion order. On a mixed dev/stage/prod
+# workload that evicted the keys being reused and kept the ones nobody
+# asked for again (COPS-2645).
+_main_render_cache: "collections.OrderedDict" = collections.OrderedDict()
 _main_render_lock        = threading.Lock()
 _main_render_sha: dict   = {}       # per-repo tip tracking (observability only)
 # Memory front-cache cap. Disk is the durable store; memory is an LRU-ish
@@ -3215,8 +3241,20 @@ MAIN_RENDER_DISK_MAX = _env_int("MAIN_RENDER_DISK_MAX", MAIN_RENDER_CACHE_MAX * 
 MAIN_RENDER_DISK_MAX_BYTES = _env_int(
     "MAIN_RENDER_DISK_MAX_BYTES", 400 * 1024 * 1024)
 # Salt bumped when render-affecting code changes (same idea as ArgoCD
-# CacheVersion). Part of every content key.
+# CacheVersion). Part of every content key AND of every bucket object name,
+# so a bump orphans the durable copies instead of serving them.
 MAIN_RENDER_CACHE_SALT = os.environ.get("MAIN_RENDER_CACHE_SALT", "cops2631-v1")
+# COPS-2645: durable tier. memory -> disk -> GCS -> render. Both local tiers
+# live in the /tmp emptyDir, which dies with the pod; the pod was replaced
+# three times in ninety minutes during the 2026-08-11 audit (a deploy plus an
+# autoscaler zone move), and the standby holds nothing at all because only
+# the leader renders. A bucket read of a ~850KB object costs tens of ms
+# against a ~500ms render, so even a slow read is an order of magnitude
+# cheaper. Defaults to the artifact bucket; empty disables the tier entirely.
+MAIN_RENDER_GCS_BUCKET = os.environ.get(
+    "MAIN_RENDER_GCS_BUCKET", DIFF_UI_GCS_BUCKET).strip()
+MAIN_RENDER_GCS_PREFIX = os.environ.get(
+    "MAIN_RENDER_GCS_PREFIX", "render-cache").strip("/")
 # Fraction of cache hits that re-render and byte-compare (0 disables).
 MAIN_RENDER_CACHE_SHADOW_RATE = _env_float(
     "MAIN_RENDER_CACHE_SHADOW_RATE", 0.01)
@@ -3357,49 +3395,209 @@ def _main_render_disk_store(key: str, raw: str) -> None:
     _main_render_disk_prune()
 
 
+_ZSTD_MAGIC = b"\x28\xb5\x2f\xfd"
+# Uploads run off the diff path: a bucket blip must never slow a render.
+_main_render_gcs_futs: list = []
+_main_render_gcs_futs_lock = threading.Lock()
+
+
+def _main_render_gcs_name(key: str) -> str:
+    """Object name for one cached render.
+
+    The SALT is part of the name, not only of the content key, so bumping
+    it orphans every durable copy instead of resolving to one written by
+    render-affecting code that no longer exists.
+    """
+    return f"{MAIN_RENDER_GCS_PREFIX}/{MAIN_RENDER_CACHE_SALT}/{key}.yaml.zst"
+
+
+def _main_render_gcs_encode(raw: str) -> bytes:
+    """zstd level 3 when the wheel is there, plain UTF-8 otherwise.
+
+    Renders are highly compressible, and the wheel is already a runtime
+    dependency (COPS-2631 stage 4), so this is bandwidth for free. The
+    decoder sniffs the magic bytes, so a mixed bucket stays readable.
+    """
+    data = raw.encode("utf-8", "surrogateescape")
+    try:
+        import zstandard as zstd
+    except ImportError:  # pragma: no cover - production image has the wheel
+        return data
+    return zstd.ZstdCompressor(level=3).compress(data)
+
+
+def _main_render_gcs_decode(data: bytes) -> str:
+    if data.startswith(_ZSTD_MAGIC):
+        import zstandard as zstd
+        data = zstd.ZstdDecompressor().decompress(data)
+    return data.decode("utf-8", "surrogateescape")
+
+
+def _main_render_gcs_store(key: str, raw: str) -> None:
+    """Mirror one entry to the bucket. Best-effort, off the diff path."""
+    if not MAIN_RENDER_GCS_BUCKET:
+        return
+    payload = _main_render_gcs_encode(raw)
+    name = _main_render_gcs_name(key)
+
+    def _upload():
+        try:
+            if diff_ui._gcs_upload(MAIN_RENDER_GCS_BUCKET, name, payload):
+                with _diff_stats_lock:
+                    _diff_stats["main_render_cache_gcs_stores"] += 1
+            else:
+                with _diff_stats_lock:
+                    _diff_stats["main_render_cache_gcs_store_failures"] += 1
+        except Exception as e:
+            # Durability is a bonus tier: losing it must never fail a diff.
+            with _diff_stats_lock:
+                _diff_stats["main_render_cache_gcs_store_failures"] += 1
+            log(f"[main-render-cache] bucket store failed (non-fatal): {e}",
+                "WARNING")
+
+    try:
+        fut = _get_subtask_pool().submit(_upload)
+        with _main_render_gcs_futs_lock:
+            # Drop settled futures on every append. Without this the list
+            # grows by one entry per cache write for the life of the pod,
+            # and each closure pins the compressed render bytes it was
+            # about to upload -- a slow leak measured in hundreds of MB.
+            # Only tests and shutdown ever call the flush.
+            _main_render_gcs_futs[:] = [
+                f for f in _main_render_gcs_futs if not f.done()]
+            _main_render_gcs_futs.append(fut)
+    except Exception:
+        # No pool (tests, shutdown): do it inline rather than lose the entry.
+        _upload()
+
+
+def _main_render_gcs_flush(timeout: float = 30.0) -> None:
+    """Wait for in-flight mirror uploads. Only tests and shutdown need this."""
+    with _main_render_gcs_futs_lock:
+        futs, _main_render_gcs_futs[:] = list(_main_render_gcs_futs), []
+    for fut in futs:
+        try:
+            fut.result(timeout=timeout)
+        except Exception:
+            pass
+
+
+def _main_render_gcs_load(key: str):
+    """Raw render text from the bucket, or None. Never raises.
+
+    Any doubt -- missing object, wheel-less environment, corrupt frame,
+    undecodable bytes -- returns None so the caller re-renders. A wrong
+    entry is worse than a slow one.
+    """
+    if not MAIN_RENDER_GCS_BUCKET:
+        return None
+    try:
+        data = diff_ui._gcs_download(MAIN_RENDER_GCS_BUCKET,
+                                     _main_render_gcs_name(key))
+    except Exception as e:
+        log(f"[main-render-cache] bucket load failed (non-fatal): {e}",
+            "WARNING")
+        return None
+    if not data:
+        return None
+    try:
+        return _main_render_gcs_decode(data)
+    except Exception as e:
+        log(f"[main-render-cache] bucket object undecodable, treating as a "
+            f"miss (non-fatal): {e}", "WARNING")
+        return None
+
+
+def _main_render_gcs_delete(key: str) -> None:
+    if not MAIN_RENDER_GCS_BUCKET:
+        return
+    try:
+        diff_ui._gcs_delete(MAIN_RENDER_GCS_BUCKET, _main_render_gcs_name(key))
+    except Exception as e:
+        log(f"[main-render-cache] bucket delete failed (non-fatal): {e}",
+            "WARNING")
+
+
+def _main_render_cache_discard(key: str) -> None:
+    """Remove one entry from EVERY tier.
+
+    Used by the shadow audit. A wrong entry in a store that dies with the
+    pod is bad; a wrong object in the bucket re-infects every fresh pod
+    that warms from it, so the discard has to reach all three.
+    """
+    with _main_render_lock:
+        _main_render_cache.pop(key, None)
+    try:
+        os.remove(_main_render_disk_path(key))
+    except OSError:
+        pass          # already gone, or never written: nothing to undo
+    _main_render_gcs_delete(key)
+
+
+def _main_render_memory_put(key: str, resources: dict) -> None:
+    """Insert into the memory front cache and evict LRU past the cap.
+
+    Eviction drops the MEMORY entry only. Deleting the disk file here
+    capped the disk tier at whatever memory had recently held, which is
+    the opposite of the stage-3 design; disk owns its own count and byte
+    caps through _main_render_disk_prune (COPS-2645).
+    """
+    with _main_render_lock:
+        _main_render_cache[key] = resources
+        _main_render_cache.move_to_end(key)
+        while len(_main_render_cache) > MAIN_RENDER_CACHE_MAX:
+            _main_render_cache.popitem(last=False)
+
+
 def _main_render_cache_put(key: str, raw: str, resources: dict) -> None:
-    """Write raw text to disk and parsed resources into the memory front cache."""
+    """Write through every tier: disk, memory front cache, and the bucket."""
     try:
         _main_render_disk_store(key, raw)
     except OSError as e:
         log(f"[main-render-cache] disk store failed (non-fatal): {e}", "WARNING")
-    with _main_render_lock:
-        _main_render_cache[key] = resources
-        if len(_main_render_cache) > MAIN_RENDER_CACHE_MAX:
-            drop = len(_main_render_cache) - MAIN_RENDER_CACHE_MAX // 2
-            for k in list(_main_render_cache.keys())[:drop]:
-                del _main_render_cache[k]
-                try:
-                    os.remove(_main_render_disk_path(k))
-                except OSError:
-                    # Best-effort: disk prune still runs on the next store.
-                    pass
+    _main_render_memory_put(key, resources)
+    _main_render_gcs_store(key, raw)
 
 
 def _main_render_cache_get(key: str):
-    """Return (resources, raw_or_None, source) where source is memory|disk|miss."""
+    """Return (resources, raw_or_None, source) with source memory|disk|gcs|miss.
+
+    Lookup order is cheapest-first: memory, then the disk file, then the
+    bucket. A hit in a colder tier warms the warmer ones, so the network
+    is paid at most once per key per pod.
+
+    raw is returned whenever this call actually read the bytes, because
+    the shadow audit byte-compares against exactly what was served.
+    """
     with _main_render_lock:
         cached = _main_render_cache.get(key)
+        if cached is not None:
+            _main_render_cache.move_to_end(key)   # LRU: a hit is a use
     if cached is not None:
+        with _diff_stats_lock:
+            _diff_stats["main_render_cache_hits_memory"] += 1
         return cached, None, "memory"
+
     raw = _main_render_disk_load(key)
+    source = "disk"
+    if raw is None:
+        raw = _main_render_gcs_load(key)
+        source = "gcs"
+        if raw is not None:
+            # Warm the local disk tier so the next pod-local read is free.
+            try:
+                _main_render_disk_store(key, raw)
+            except OSError as e:
+                log(f"[main-render-cache] disk warm failed (non-fatal): {e}",
+                    "WARNING")
     if raw is None:
         return None, None, "miss"
+
     resources = _parse_manifest_resources(raw)
-    with _main_render_lock:
-        _main_render_cache[key] = resources
-        if len(_main_render_cache) > MAIN_RENDER_CACHE_MAX:
-            drop = len(_main_render_cache) - MAIN_RENDER_CACHE_MAX // 2
-            for k in list(_main_render_cache.keys())[:drop]:
-                del _main_render_cache[k]
-                try:
-                    os.remove(_main_render_disk_path(k))
-                except OSError as e:
-                    # Best-effort: inability to remove an evicted disk cache
-                    # entry is non-fatal; pruning will retry on future stores.
-                    log(f"[main-render-cache] evict cleanup failed (non-fatal): {e}",
-                        "WARNING")
-    return resources, raw, "disk"
+    _main_render_memory_put(key, resources)
+    with _diff_stats_lock:
+        _diff_stats[f"main_render_cache_hits_{source}"] += 1
+    return resources, raw, source
 
 
 class OciChartNotFound(Exception):
@@ -7702,14 +7900,10 @@ def _run_one_diff(app, pr_sha, main_sha, chart_revision=None, changed_paths=None
                             with _diff_stats_lock:
                                 _diff_stats["main_render_cache_shadow_mismatches"] = (
                                     _diff_stats.get("main_render_cache_shadow_mismatches", 0) + 1)
-                            with _main_render_lock:
-                                _main_render_cache.pop(content_key, None)
-                            try:
-                                os.remove(_main_render_disk_path(content_key))
-                            except OSError as e:
-                                # Best-effort: entry already dropped from memory.
-                                log(f"[main-render-cache] disk discard failed "
-                                    f"(non-fatal): {e}", "WARNING")
+                            # COPS-2645: the discard has to reach the bucket
+                            # too. A poisoned durable object would re-infect
+                            # every fresh pod that warms from it.
+                            _main_render_cache_discard(content_key)
                             main_resources = _parse_manifest_resources(shadow_yaml)
                             _main_render_cache_put(content_key, shadow_yaml, main_resources)
                 except Exception as e:
