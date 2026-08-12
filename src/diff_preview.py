@@ -2479,6 +2479,81 @@ def _argocd_fetch_token() -> str:
         return json.loads(resp.read())["token"]
 
 
+# COPS-2653: startup grace period for a transient ArgoCD login failure.
+#
+# On 2026-08-12 a hub pod restarted because the node's DNS was not ready
+# yet: "Temporary failure in name resolution" on the very first login. The
+# second attempt worked, so the restart bought nothing and cost ~20s.
+#
+# Fail-fast is right for a wrong password: a loud CrashLoopBackOff is the
+# correct signal, and a pod that limps along without a session is worse
+# than one that dies. It is wrong for DNS, connection resets and a
+# momentarily unreachable API, none of which say anything about whether
+# this pod is configured correctly.
+#
+# Sized against the real probes rather than a round number. Readiness is
+# 30s initial + 30s period + 3 failures, and it only removes the pod from
+# endpoints - exactly where a pod with no session belongs. Liveness
+# restarts at roughly 360s. A 60s budget therefore costs at most two
+# readiness failures and never approaches the liveness restart, so a
+# genuinely dead ArgoCD still surfaces quickly instead of being hidden
+# behind a slower version of the crash this replaces.
+_STARTUP_LOGIN_BUDGET_S = 60
+
+
+def _login_error_is_transient(e) -> bool:
+    """Retry timeouts, connection errors, 408, 429 and 5xx. Nothing else.
+
+    Deliberately the same judgement as _gcs_error_is_transient in diff_ui
+    (COPS-2647): 401 and 403 need a human, not another attempt.
+    """
+    if isinstance(e, urllib.error.HTTPError):
+        return e.code in (408, 429) or 500 <= e.code < 600
+    return isinstance(e, (TimeoutError, urllib.error.URLError, OSError))
+
+
+def _startup_argocd_login():
+    """argocd_login() with a bounded retry on TRANSIENT failures only.
+
+    Startup only. The running loop calls argocd_login() directly, where a
+    failure is already handled by the caller and _consecutive_login_fails
+    drives readiness.
+    """
+    waited = 0.0
+    delay = 2.0
+    attempt = 0
+    while True:
+        attempt += 1
+        try:
+            argocd_login()
+            if attempt > 1:
+                log(f"ArgoCD login recovered on attempt {attempt} after "
+                    f"{waited:.0f}s of transient failures",
+                    event="startup_login_recovered", attempts=attempt)
+            return
+        except Exception as e:
+            if not _login_error_is_transient(e):
+                log(f"ArgoCD login failed with a permanent error; not "
+                    f"retrying: {e}", "ERROR",
+                    event="startup_login_permanent")
+                raise
+            if waited + delay > _STARTUP_LOGIN_BUDGET_S:
+                log(f"ArgoCD login still failing after {waited:.0f}s and "
+                    f"{attempt} attempt(s); giving up so the failure is "
+                    f"visible: {e}", "ERROR",
+                    event="startup_login_budget_exhausted", attempts=attempt)
+                raise
+            # Logged in the CURRENT container. After a restart this reason
+            # only survives in the previous container's log, which is the
+            # first thing lost on the next restart.
+            log(f"ArgoCD login attempt {attempt} failed transiently, "
+                f"retrying in {delay:.0f}s: {e}", "WARNING",
+                event="startup_login_retry", attempt=attempt)
+            time.sleep(delay)
+            waited += delay
+            delay = min(delay * 2, 16.0)
+
+
 def argocd_login():
     global _ready, _path_map_ts, _path_map_count, _path_map_app_count, \
            _argocd_token, _argocd_token_ts, _consecutive_login_fails
@@ -13576,8 +13651,10 @@ def main():
     _get_subtask_pool()   # warm the shared thread pool before the first iteration
     log(f"Sub-task pool ready ({_SUBTASK_POOL_WORKERS} workers)")
 
-    # Initial login — raises on failure so the container restarts immediately.
-    argocd_login()
+    # Initial login. Transient failures (DNS not ready on a fresh node,
+    # connection reset, ArgoCD restarting) get a bounded retry; a permanent
+    # one still raises so the container restarts immediately and loudly.
+    _startup_argocd_login()
     log("ArgoCD login OK")
 
     # HA (leader election): the poll loop below runs only on the replica
