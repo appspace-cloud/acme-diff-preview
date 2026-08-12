@@ -385,6 +385,23 @@ DIFF_UI_GCS_BUCKET    = os.environ.get("DIFF_UI_GCS_BUCKET", "").strip()
 # call time, not at assignment time.
 diff_ui.on_warning = lambda msg: log(msg, "WARNING")
 
+
+def _diff_ui_stat(key, n=1):
+    """COPS-2647: turn diff_ui bucket outcomes into host counters.
+
+    artifact_gcs_pending is a GAUGE, so it is read from the source of
+    truth rather than accumulated -- an incremented gauge drifts the
+    moment the reconcile drains an entry.
+    """
+    with _diff_stats_lock:
+        if key == "artifact_gcs_pending":
+            _diff_stats[key] = diff_ui.pending_upload_count()
+        elif key in _diff_stats:
+            _diff_stats[key] += n
+
+
+diff_ui.on_stat = _diff_ui_stat
+
 # Leader election (HA): with 2+ replicas, only the lease holder runs the
 # poll loop; every replica keeps serving HTTP (diff UI, webhooks, probes).
 # Env knobs (read by _make_leader_elector at startup, client-go defaults):
@@ -551,6 +568,16 @@ _diff_stats:      dict          = {
     "main_render_cache_hits_gcs": 0,
     "main_render_cache_gcs_stores": 0,
     "main_render_cache_gcs_store_failures": 0,
+    # COPS-2647: artifact bucket outcomes. A failed upload leaves the
+    # PREVIOUS commit in the bucket while the leader serves the current
+    # one, and load_artifact sends a replica to the bucket whenever its
+    # local sha does not match -- so this counter rising means the two
+    # pods may now present different diffs for the same URL.
+    "artifact_gcs_upload_ok": 0,
+    "artifact_gcs_upload_failed": 0,
+    "artifact_gcs_upload_retries": 0,
+    "artifact_gcs_download_failed": 0,   # 404 is a miss, NOT a failure
+    "artifact_gcs_pending": 0,           # gauge: uploads awaiting reconcile
     # v2.5.19 (M8): visibility into the v2.5.18 scale machinery — are these
     # paths firing in production, and how often?
     "comments_truncated": 0,       # comments that exceeded MAX_COMMENT_BYTES
@@ -756,6 +783,20 @@ _PROM_REGISTRY = (
     ("main_render_cache_gcs_store_failures",
      "main_render_cache_gcs_store_failures_total", "counter",
      "Failed bucket mirrors. Non-fatal: durability lost, diffs unaffected."),
+    # COPS-2647. upload_failed rising is the alertable one: the replicas
+    # may now serve different pages for the same URL.
+    ("artifact_gcs_upload_ok", "artifact_gcs_upload_ok_total", "counter",
+     "Artifacts successfully mirrored to the bucket."),
+    ("artifact_gcs_upload_failed", "artifact_gcs_upload_failed_total",
+     "counter",
+     "Artifact uploads that failed after retries. The bucket may now hold "
+     "an older commit than the leader is serving."),
+    ("artifact_gcs_upload_retries", "artifact_gcs_upload_retries_total",
+     "counter", "Transient upload failures that were retried."),
+    ("artifact_gcs_download_failed", "artifact_gcs_download_failed_total",
+     "counter", "Artifact downloads that failed. A 404 is a miss, not this."),
+    ("artifact_gcs_pending", "artifact_gcs_pending", "gauge",
+     "Artifact uploads queued for the reconcile pass."),
 )
 
 
@@ -13176,6 +13217,20 @@ def main_iteration():
 
     # Trim the on-disk chart cache before any diffs so it never races a pull.
     _prune_helm_cache()
+
+    # COPS-2647: re-attempt artifact uploads that failed on an earlier pass.
+    # A failed upload leaves the PREVIOUS commit in the bucket while the
+    # leader serves the current one, and load_artifact sends a replica to
+    # the bucket whenever its local sha does not match -- so until this
+    # heals, the two pods can present different diffs for the same URL.
+    # Best-effort and off the diff path: it runs for durability, never for
+    # the correctness of the diffs about to be computed.
+    try:
+        healed = diff_ui.retry_pending_uploads()
+        if healed:
+            log(f"Re-uploaded {healed} artifact(s) that had failed earlier")
+    except Exception as e:
+        log(f"Artifact upload reconcile failed (non-fatal): {e}", "WARNING")
 
     # Proactively refresh the ArgoCD JWT before it expires so a busy iteration
     # never hits a mid-run 401. ARGOCD_TOKEN_TTL default=12h (well under the
