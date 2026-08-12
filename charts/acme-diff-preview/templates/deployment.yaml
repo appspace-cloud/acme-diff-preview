@@ -147,6 +147,14 @@ spec:
               value: {{ .supersedeMaxConsecutiveAborts | int64 | quote }}
             {{- end }}
             {{- end }}
+            {{- if .Values.ociSelfCheckRef }}
+            # COPS-2650: startup-only reference for the OCI self-check. The
+            # last real successful pull takes precedence, so this is used
+            # only before any pull has succeeded -- including the outage
+            # case where none ever will. See values.yaml.
+            - name: DIFF_OCI_SELFCHECK_REF
+              value: {{ .Values.ociSelfCheckRef | quote }}
+            {{- end }}
             {{- with .Values.diffUi }}
             # Full-diff web UI (Atlantis-style): the complete, untruncated
             # diff is persisted per (repo, pr, sha) and served on /diff/...

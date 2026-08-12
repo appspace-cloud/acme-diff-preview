@@ -3758,9 +3758,11 @@ def _oci_selfcheck():
     `helm show chart`. Returns True/False, or None when skipped (no
     reference known yet). Never raises."""
     ref_env = os.environ.get("DIFF_OCI_SELFCHECK_REF", "").strip()
+    used_env_ref = False
     if ref_env and "/" in ref_env and ":" in ref_env:
         reg, rest = ref_env.split("/", 1)
         chart, version = rest.rsplit(":", 1)
+        used_env_ref = True
     elif _last_pull_ok_ref:
         reg, chart, version = _last_pull_ok_ref
     else:
@@ -3794,6 +3796,48 @@ def _oci_selfcheck():
     except Exception as exc:
         detail = f"{type(exc).__name__}: {exc}"[:200]
         ok = False
+
+    # COPS-2650: DIFF_OCI_SELFCHECK_REF pins a chart VERSION, and versions
+    # get retired. This check measures whether the authenticated pull path
+    # works, not whether one specific chart still exists, so a failure on
+    # the configured reference must not stand while a chart this pod really
+    # pulled still resolves. Without this, the day that pinned version is
+    # retired the check goes permanently red and pages someone (COPS-2648)
+    # for config rot with no operational meaning.
+    if not ok and used_env_ref and _last_pull_ok_ref:
+        _reg2, _chart2, _ver2 = _last_pull_ok_ref
+        if (_reg2, _chart2, _ver2) != (reg, chart, version):
+            log(f"OCI self-check failed for the configured reference "
+                f"{chart}:{version}; re-probing with the last chart this pod "
+                f"pulled ({_chart2}:{_ver2}) to tell a stale reference from a "
+                f"broken pull path", "WARNING")
+            try:
+                import tempfile as _tf2
+                _home2 = _tf2.mkdtemp(prefix=".oci-selfcheck-")
+                env2 = dict(os.environ)
+                env2.update(
+                    HELM_REPOSITORY_CACHE=os.path.join(_home2, "repository"),
+                    HELM_CACHE_HOME=os.path.join(_home2, "cache"),
+                    HELM_DATA_HOME=os.path.join(_home2, "data"),
+                )
+                try:
+                    if _helm_login(_reg2):
+                        r2 = subprocess.run(
+                            [HELM_BIN, "show", "chart", f"oci://{_reg2}/{_chart2}",
+                             "--version", _ver2],
+                            capture_output=True, text=True, timeout=60, env=env2)
+                        if r2.returncode == 0:
+                            ok = True
+                            detail = (f"configured reference {chart}:{version} is "
+                                      f"stale; pull path verified with "
+                                      f"{_chart2}:{_ver2}")
+                            chart, version = _chart2, _ver2
+                finally:
+                    shutil.rmtree(_home2, ignore_errors=True)
+            except Exception as exc:
+                # The fallback is a second opinion, never a new failure mode.
+                debug(f"OCI self-check fallback probe failed: {exc}")
+
     _diff_stats["oci_selfcheck"] = "ok" if ok else "failed"
     _diff_stats["oci_selfcheck_at"] = datetime.now(timezone.utc).isoformat()
     if ok:
@@ -7491,8 +7535,14 @@ def _evaluate_env_decommissions(candidates: list, pr_sha: str, main_sha: str,
                 _vm_flat = _flatten_yaml(_yaml_safe_load(_vm_content) or {})
                 vm_armed = _vm_deletion_armed_flat(_vm_flat)
                 declares_vms = _declares_vms_flat(_vm_flat)
-            except Exception:
-                pass
+            except Exception as e:
+                # Swallowed ON PURPOSE: both flags stay False, which is the
+                # fail-closed default set above, so an unparseable identity
+                # file renders Phase 1 as pending instead of claiming it is
+                # done. Logged so the reason is visible rather than guessed
+                # at from a phase table that looks wrong (COPS-2650).
+                debug(f"VM arming state unreadable for "
+                      f"{c['identity_file']}, failing closed: {e}")
         collect_full = (with_full_output and cascade
                         and _decommission_fully_phased(c["identity_file"], main_sha))
         app_deleted_docs: dict = {}
@@ -12849,8 +12899,14 @@ def process_pr(pr, path_map, base_sha="", repo=None):
                             fut.result()
                         except OciChartNotFound as e:
                             log(str(e), "WARNING")
-                        except Exception:
-                            pass
+                        except Exception as e:
+                            # Pre-warm is an optimisation: _run_one_diff pulls
+                            # the chart itself if it is not on disk, so a
+                            # failure here costs latency, never correctness.
+                            # Logged because "every diff is slow" is otherwise
+                            # invisible from here (COPS-2650).
+                            debug(f"chart pre-warm failed, the diff will pull "
+                                  f"it instead: {e}")
 
         # Fan-out: diff all affected apps. The chart pre-pull phase above already
         # has the tarball for every needed version on disk, so _run_one_diff will

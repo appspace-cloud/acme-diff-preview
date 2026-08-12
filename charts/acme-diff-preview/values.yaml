@@ -70,7 +70,7 @@ image:
   # Kept in sync with Chart.yaml appVersion (RELEASING.md). This default had
   # drifted since v2.7.0; it never bit us because acme-infrastructure pins the
   # tag explicitly, but anyone installing the chart as-is got a stale image.
-  tag: "2.58.0"
+  tag: "2.59.0"
   pullPolicy: IfNotPresent
 
 # Log verbosity for the diff-preview service. Set to DEBUG to emit the full
@@ -223,6 +223,7 @@ secrets:
   # ERROR at startup if OCI_PASS is empty.
   ociUserKey: acme-repo-username
   ociPassKey: acme-repo-password
+
   # GCP Secret Manager keys for the full-diff UI's IAP OAuth client
   # (diffUi.ingress.enabled). Both empty (default) skips creating that
   # ExternalSecret entirely; set both once a real IAP OAuth client exists.
@@ -230,6 +231,23 @@ secrets:
   iapOauthClientSecretKey: ""
 
 # Webhook endpoint exposed via the ArgoCD Ingress extraPaths
+# COPS-2650: chart reference for the OCI self-check, as registry/chart:version.
+#
+# The self-check probes the authenticated pull path with a metadata-only
+# `helm show chart`. It normally reuses the last chart this pod pulled
+# successfully, which is always current -- so this value is ONLY consulted
+# before any pull has succeeded. That is two cases: a pod in its first
+# minute, and the case that matters, an outage where credentials are broken
+# and no pull will ever succeed. Without this set, the self-check reports
+# `skipped` for the entire duration of exactly the incident it was built to
+# detect (the v2.5.25 403 outage).
+#
+# Because the real pull always wins, a version retired from the registry
+# cannot turn a healthy pod's check red -- the stale reference is only
+# reachable when pulls are already failing, where `failed` is the right
+# answer anyway. Update it when convenient, not urgently.
+ociSelfCheckRef: ""
+
 webhook:
   path: /diff-preview/webhook
 
