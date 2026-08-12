@@ -456,6 +456,34 @@ def _should_run_iteration(elector) -> bool:
     return elector is None or elector.is_leader()
 
 
+def _still_leader() -> bool:
+    """True when this pod may still write on behalf of the cluster.
+
+    COPS-2654. Leadership is gated once, before main_iteration(), and an
+    iteration can outlive the lease: lease_duration is 15s and a fleet PR
+    runs for minutes. When renewals fail the standby legitimately takes
+    over while this pod finishes what it started, and both then comment on
+    the same PRs, overwrite the same artifacts, and spend the shared
+    Bitbucket token twice -- at exactly the moment the cluster is already
+    unhealthy.
+
+    Reads cached elector state, never the API server: a guard that added
+    API calls during a partition would make the partition worse.
+
+    Fails OPEN. No elector means single-instance mode, where there is no
+    lease to lose, and a raising elector returns the pre-COPS-2654
+    behaviour rather than silently stopping the service from posting. This
+    guard exists to avoid duplicate writes, not to become a new way for
+    writes to stop.
+    """
+    if _leader is None:
+        return True
+    try:
+        return bool(_leader.is_leader())
+    except Exception:
+        return True
+
+
 def _forward_webhook_to_leader(body: bytes, headers) -> bool:
     """Relay a verified Bitbucket webhook from a standby to the leader pod.
 
@@ -8555,6 +8583,13 @@ def _save_diff_ui_artifact(repo, pr_id, pr_sha, body, base_sha=None,
     no page, and the caller has to take the same branch."""
     if not DIFF_UI_ENABLED:
         return False
+    if not _still_leader():
+        # COPS-2654: the bucket is last-write-wins, so a demoted pod can
+        # overwrite the new leader's artifact with its own older render.
+        log(f"Lease lost mid-iteration; skipping artifact write for PR "
+            f"#{pr_id}", "WARNING", pr=pr_id,
+            event="artifact_skipped_not_leader")
+        return False
     try:
         _t0 = time.perf_counter()
         diff_ui.save_artifact(
@@ -8576,6 +8611,13 @@ def upsert_comment(pr_id, body, existing_id=None, repo=None, artifact_url=""):
 
     artifact_url is threaded into the truncation note so an oversized
     comment links straight to the full-diff view (see _truncate_comment)."""
+    if not _still_leader():
+        # COPS-2654: the standby took the lease while this iteration was
+        # running. It is now computing the same PRs, so writing here would
+        # fight it for the same comment.
+        log(f"Lease lost mid-iteration; skipping comment write on PR "
+            f"#{pr_id}", "WARNING", pr=pr_id, event="write_skipped_not_leader")
+        return
     orig_bytes = len(body.encode("utf-8"))
     if orig_bytes > MAX_COMMENT_BYTES:
         body = _truncate_comment(body, artifact_url=artifact_url)
@@ -12427,6 +12469,16 @@ def process_pr(pr, path_map, base_sha="", repo=None):
     repo   = repo or BB_REPO
     pr_id  = pr["id"]
     pr_sha = pr["source"]["commit"]["hash"]
+    # COPS-2654: PRs run in parallel and an iteration can outlive the 15s
+    # lease. Stopping only at the write still pays for the whole diff, and
+    # the shared Bitbucket token is where the real cost is, so a PR that
+    # has not started yet is skipped outright. The new leader is already
+    # processing it.
+    if not _still_leader():
+        log(f"Lease lost mid-iteration; skipping PR #{pr_id} (the new "
+            f"leader owns it)", "WARNING", pr=pr_id, repo=repo,
+            event="pr_skipped_not_leader")
+        return
     # COPS-2564: attribute Bitbucket cost to THIS PR. A delta, not a private
     # counter: the cache is shared, so what this measures is the calls the PR
     # actually caused, which is the number worth knowing when a mass PR makes
