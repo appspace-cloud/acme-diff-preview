@@ -121,8 +121,17 @@ def test_risky_app_keeps_its_block_in_small_mode(monkeypatch):
         deleted_resources=["/apps/Deployment d0"])
     out = _comment(results, artifact_url=URL)
     tail = out.split("Changeset overview")[1]
-    assert "`pv-risky-a-ss`" in tail
+    # COPS-2651: this looked for the BACKTICKED app name, a form that after
+    # COPS-2642 exists only in the per-app header -- the table cell is a
+    # plain link, because Bitbucket silently drops links whose text is
+    # code. So the assertion was pinning the orphan header rather than the
+    # property. The property is that a risky app stays readable below the
+    # overview, which its linked row and the deletion panel both provide.
+    assert "pv-risky-a-ss" in tail, (
+        "the risky app must remain visible below the overview")
     assert "deleted" in out.lower()
+    assert "/apps/Deployment d0" in out, (
+        "the deleted resource itself must be named")
 
 
 def test_the_page_profile_keeps_its_blocks(monkeypatch):

@@ -170,6 +170,14 @@ def test_a_single_app_renders_exactly_as_before(monkeypatch):
     assert "application(s) changed the same" not in out
 
 
+def _collapsed_names(out):
+    """The text of the group-summary lines, where a risky app must never
+    end up (COPS-2629's actual safety property)."""
+    return "\n".join(ln for ln in out.splitlines()
+                     if "application(s) changed the same" in ln
+                     or "Identical diff across" in ln)
+
+
 # -- risk always wins ------------------------------------------------------
 
 def test_an_app_with_a_deleted_resource_keeps_its_own_block(monkeypatch):
@@ -183,10 +191,21 @@ def test_an_app_with_a_deleted_resource_keeps_its_own_block(monkeypatch):
         None, dp.OUT_DIFF, None, None, ["/apps/Deployment api"])
     results["pv-risky-a-glb"] = risky
     out = _comment(results)
-    assert "**`pv-risky-a-glb`** \u2014 9 resource(s) changed" in out, (
-        "the risky app must keep its own block")
+    # COPS-2651: this asserted the app's header line, which was a PROXY for
+    # the property in the docstring -- that the deletion is readable for
+    # THIS environment. The header never said a deletion happened, nor
+    # which resource; with COMMENT_INLINE_EVIDENCE_LINES at its default of
+    # 0 it said only the app name and a count, both of which its Changeset
+    # overview row already carried. The property is asserted directly now,
+    # and it is served by the dedicated deletion panel, which is strictly
+    # more informative than the header ever was.
+    assert "pv-risky-a-glb" in out and "/apps/Deployment api" in out, (
+        "the deleted resource must be named for this environment")
+    assert "RESOURCE(S) DELETED" in out, "the deletion panel must render"
     assert "21 application(s) changed the same 9 resource(s)" in out, (
         "the other 21 still collapse")
+    assert "pv-risky-a-glb" not in _collapsed_names(out), (
+        "the risky app must never be folded into the group summary")
 
 
 def test_a_zeroed_replica_app_keeps_its_own_block(monkeypatch):
@@ -196,7 +215,12 @@ def test_a_zeroed_replica_app_keeps_its_own_block(monkeypatch):
         "\n".join("--- %s" % h for h in HDRS9), _sections(HDRS9), 9, True,
         None, dp.OUT_DIFF, None, None, None, ["/apps/Deployment api"])
     out = _comment(results)
-    assert "**`pv-zero-a-glb`** \u2014 9 resource(s) changed" in out
+    # COPS-2651, same reasoning as the deletion case above: assert that the
+    # zeroed environment is readable on its own, not that one specific line
+    # is the thing that makes it readable.
+    assert "pv-zero-a-glb" in out
+    assert "pv-zero-a-glb" not in _collapsed_names(out), (
+        "a zeroed-replica app must never be folded into the group summary")
     assert "21 application(s) changed the same 9 resource(s)" in out
 
 
