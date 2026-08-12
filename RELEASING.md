@@ -120,6 +120,34 @@ curl -s -o /dev/null -w "%{http_code}\n" \
 `200` means the tag is pullable, whether or not it shows up in the tag
 list yet.
 
+**Run this check only after `docker.yml` has reported success.** The
+negative-cache trap above is not limited to a premature infra apply: this
+very curl poisons the cache in exactly the same way. Artifact Registry
+caches Docker tag metadata for **about an hour** by default, and that
+includes the "not found" answer. Asking for a tag while the build is still
+failing therefore blocks the deploy for the rest of that hour, after the
+image has landed and through any number of retries.
+
+Seen for real on the 2.61.0 release: `docker.yml` failed twice on a
+transient `curl: (56)` while downloading the argocd and helm binaries, the
+manifest was checked in between, and the tag then answered `404` for the
+next hour even though the third build pushed the image successfully.
+
+If you are already in that hole, **query by digest to tell the two cases
+apart**:
+
+```bash
+DIGEST=$(gh run view <docker-run-id> --log \
+  | grep -oE '"containerimage.digest": "sha256:[a-f0-9]+"' \
+  | head -1 | grep -oE 'sha256:[a-f0-9]+')
+curl -s -o /dev/null -w "%{http_code}\n" -H "Authorization: Bearer $TOKEN" \
+  "https://us-central1-docker.pkg.dev/v2/appspace-devops/artifact/acme-diff-preview/manifests/$DIGEST"
+```
+
+`200` by digest with `404` by tag means the image is present and only the
+tag lookup is stale. Wait out the TTL; do not rebuild, do not retag, and do
+not push anything by hand.
+
 ## Critical: never push the image manually AND push a git tag for the same version
 
 If you push a Docker image manually with `docker push` and then also push the
