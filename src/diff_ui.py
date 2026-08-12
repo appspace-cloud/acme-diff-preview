@@ -38,11 +38,13 @@ existing local/GCS entries keep serving during the transition.
 """
 from __future__ import annotations
 
+import collections
 import html
 import json
 import os
 import re
 import tempfile
+import threading
 import time
 import urllib.error
 import urllib.parse
@@ -190,6 +192,23 @@ _token_cache = {"token": "", "exp": 0.0}
 # assumptions about the host's log format).
 on_warning = None
 
+# COPS-2647: optional callable(str, int) so bucket outcomes become COUNTERS
+# in the host, not just warning lines in whichever pod happens to be the
+# leader. Same shape as on_warning for the same reason: this module keeps
+# no opinion about the host's stats plumbing.
+on_stat = None
+
+
+def _stat(key, n=1):
+    cb = on_stat
+    if cb is None:
+        return
+    try:
+        cb(key, n)
+    except Exception:
+        # Observability must never break the thing it observes.
+        pass
+
 
 def _warn(msg):
     cb = on_warning
@@ -215,22 +234,126 @@ def _gcs_token():
     return _token_cache["token"]
 
 
+# COPS-2647: bounded retries. 2.46.0 made load_artifact treat a local sha
+# mismatch as a miss and go to the bucket, which assumes the bucket holds
+# the CURRENT artifact. A single-attempt upload broke that assumption on
+# any transient blip: the bucket kept the previous commit and the two
+# replicas could serve different pages for the same URL again, silently.
+_GCS_UPLOAD_ATTEMPTS = 3
+_GCS_RETRY_SLEEP = 0.25          # doubled per attempt; monkeypatched to 0 in tests
+
+
+def _gcs_error_is_transient(e) -> bool:
+    """Retry timeouts, connection errors, 408, 429 and 5xx. Nothing else.
+
+    A 403 will still be a 403 in 200ms: retrying it wastes the diff run's
+    time and hammers a bucket that is already telling us something. Auth
+    and permission failures need a human, not another attempt.
+    """
+    if isinstance(e, urllib.error.HTTPError):
+        return e.code in (408, 429) or 500 <= e.code < 600
+    return isinstance(e, (TimeoutError, urllib.error.URLError, OSError))
+
+
 def _gcs_upload(bucket, name, data):
-    """Best-effort upload of one object. Returns True on success."""
-    try:
-        url = ("https://storage.googleapis.com/upload/storage/v1/b/"
-               f"{urllib.parse.quote(bucket, safe='')}/o?uploadType=media"
-               f"&name={urllib.parse.quote(name, safe='')}")
-        req = urllib.request.Request(
-            url, data=data, method="POST",
-            headers={"Authorization": f"Bearer {_gcs_token()}",
-                     "Content-Type": "application/json"})
-        with urllib.request.urlopen(req, timeout=_GCS_TIMEOUT):
-            pass
-        return True
-    except Exception as e:
-        _warn(f"[diff-ui] GCS upload of {name} failed (non-fatal): {e}")
-        return False
+    """Upload one object, retrying transient failures. True on success.
+
+    Still non-fatal in every case: durability is a bonus tier and a bucket
+    outage must never block a PR comment or fail a diff run.
+    """
+    last = None
+    for attempt in range(1, _GCS_UPLOAD_ATTEMPTS + 1):
+        try:
+            url = ("https://storage.googleapis.com/upload/storage/v1/b/"
+                   f"{urllib.parse.quote(bucket, safe='')}/o?uploadType=media"
+                   f"&name={urllib.parse.quote(name, safe='')}")
+            req = urllib.request.Request(
+                url, data=data, method="POST",
+                headers={"Authorization": f"Bearer {_gcs_token()}",
+                         "Content-Type": "application/json"})
+            with urllib.request.urlopen(req, timeout=_GCS_TIMEOUT):
+                pass
+            _stat("artifact_gcs_upload_ok")
+            return True
+        except Exception as e:
+            last = e
+            if attempt >= _GCS_UPLOAD_ATTEMPTS or not _gcs_error_is_transient(e):
+                break
+            _stat("artifact_gcs_upload_retries")
+            time.sleep(_GCS_RETRY_SLEEP * (2 ** (attempt - 1)))
+    _stat("artifact_gcs_upload_failed")
+    _warn(f"[diff-ui] GCS upload of {name} failed after {attempt} "
+          f"attempt(s) (non-fatal): {last}")
+    return False
+
+
+# COPS-2647: uploads that failed after their retries. A failed upload is
+# not just a lost copy -- it leaves the PREVIOUS commit's artifact in the
+# bucket, and load_artifact sends a replica there whenever its local sha
+# does not match, so the two pods can present different diffs for the same
+# URL. Retrying on a later iteration heals that within a poll cycle
+# instead of waiting for the next commit to overwrite it.
+#
+# Keyed by (repo, pr_id) so a newer commit REPLACES an older pending entry:
+# uploading the superseded one would put a stale artifact in the bucket,
+# which is the very failure this exists to prevent.
+#
+# Values hold the local PATH, never the payload. COPS-2645 shipped a leak
+# by pinning compressed bytes in a closure; the bytes are re-read from disk
+# at retry time, and a vanished file is dropped rather than retried forever.
+_PENDING_UPLOAD_MAX = 128
+_pending_uploads: "collections.OrderedDict" = collections.OrderedDict()
+_pending_lock = threading.Lock()
+
+
+def _note_pending_upload(bucket, name, path, repo, pr_id):
+    with _pending_lock:
+        _pending_uploads[(str(repo), int(pr_id))] = (bucket, name, path)
+        _pending_uploads.move_to_end((str(repo), int(pr_id)))
+        while len(_pending_uploads) > _PENDING_UPLOAD_MAX:
+            _pending_uploads.popitem(last=False)
+    # Refresh the gauge OUTSIDE the lock. The host reads it back through
+    # pending_upload_count(), which takes _pending_lock, and this one is
+    # not reentrant -- calling _stat while holding it deadlocked the
+    # process (caught by test_retries_are_bounded hanging).
+    _stat("artifact_gcs_pending", 0)
+
+
+def pending_upload_count() -> int:
+    with _pending_lock:
+        return len(_pending_uploads)
+
+
+def reset_pending_uploads() -> None:
+    with _pending_lock:
+        _pending_uploads.clear()
+
+
+def retry_pending_uploads() -> int:
+    """Re-attempt uploads that failed earlier. Returns how many landed.
+
+    Called once per iteration by the host. Best-effort throughout: this
+    runs for durability, never for correctness of the current diff.
+    """
+    with _pending_lock:
+        items = list(_pending_uploads.items())
+    healed = 0
+    for key, (bucket, name, path) in items:
+        try:
+            with open(path, "rb") as f:
+                payload = f.read()
+        except OSError:
+            # The local artifact was pruned or superseded. There is nothing
+            # to upload and retrying forever would only grow the map.
+            with _pending_lock:
+                _pending_uploads.pop(key, None)
+            continue
+        if _gcs_upload(bucket, name, payload):
+            healed += 1
+            with _pending_lock:
+                _pending_uploads.pop(key, None)
+    _stat("artifact_gcs_pending", 0)      # outside the lock, see above
+    return healed
 
 
 def _gcs_download(bucket, name):
@@ -343,6 +466,11 @@ def save_artifact(base_dir, repo, pr_id, sha, body, pr_url="",
                           else name + ".zst")
             if other_name != name:
                 _gcs_delete(bucket, other_name)
+        else:
+            # COPS-2647: the bucket now holds the PREVIOUS commit for this
+            # PR while the leader serves the current one. Queue it so the
+            # divergence closes on a later pass.
+            _note_pending_upload(bucket, name, path, repo, pr_id)
     return path
 
 
