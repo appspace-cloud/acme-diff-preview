@@ -539,8 +539,10 @@ def load_artifact(base_dir, repo, pr_id, sha, bucket=""):
         return None
     # CodeQL py/path-injection: build the filename from validated segments
     # only, then use the exact normpath(join(base, name)) + startswith +
-    # raise idiom from the CodeQL docs. Helpers alone do not clear the
-    # alert (see alerts 1/2 still open on main, 10/11 on this PR).
+    # raise idiom from the CodeQL docs. The verbose inline form is
+    # deliberate: extracting it into a helper does NOT clear the alert,
+    # because CodeQL loses the guarantee across the call boundary. Keep it
+    # inline even though it reads worse.
     base_path = os.path.abspath(base_dir)
     names = (f"{repo}__{pr_s}.json.zst", f"{repo}__{pr_s}.json")
     local = None
