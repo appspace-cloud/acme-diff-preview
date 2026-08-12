@@ -8162,8 +8162,10 @@ def argocd_diff(app, pr_sha, main_sha, chart_revision=None, changed_paths=None, 
                 delay = _diff_backoff(attempt)
                 with _diff_stats_lock:
                     _diff_stats["diff_retries"] += 1
-                print(f"    [{app}] {reason} (attempt {attempt + 1}/{DIFF_RETRIES}), "
-                      f"retrying in {delay:.0f}s: {(detail or '')[:80]}", flush=True)
+                log(f"[{app}] {reason} (attempt {attempt + 1}/"
+                    f"{DIFF_RETRIES}), retrying in {delay:.0f}s: "
+                    f"{(detail or '')[:80]}", app=app, reason=reason,
+                    event="diff_retry")
                 time.sleep(delay)
                 continue
             # Non-retryable soft failure (e.g. render_failed) or retries spent.
@@ -8598,7 +8600,8 @@ def fix_stuck_inprogress(pr_sha, pr_id, comment_raw, repo=None):
         else:
             state, desc = "SUCCESSFUL", "No manifest changes"
         post_build_status(pr_sha, state, desc, pr_id=pr_id)
-        print(f"    Fixed stuck INPROGRESS for PR #{pr_id} -> {state}")
+        log(f"Fixed stuck INPROGRESS for PR #{pr_id} -> {state}",
+            pr=pr_id, event="stuck_inprogress_fixed")
     except Exception as e:
         log(f"[fix_stuck_inprogress] PR #{pr_id}: {e}", "WARNING")
 
@@ -8845,7 +8848,7 @@ def _gcp_access_token() -> str:
     with _gcp_token_lock:
         if _gcp_token and time.monotonic() < (_gcp_token_exp - 60):
             return _gcp_token
-        print("      [AI] Fetching GCP token from metadata server...")
+        log("[AI] Fetching GCP token from metadata server...", "DEBUG")
         resp           = http(
             "GET",
             "http://metadata.google.internal/computeMetadata/v1"
@@ -8855,7 +8858,7 @@ def _gcp_access_token() -> str:
         _gcp_token     = resp["access_token"]
         _gcp_token_exp = time.monotonic() + resp.get("expires_in", 3600)
         exp = resp.get("expires_in", "?")
-        print(f"      [AI] Token refreshed (valid for {exp}s)")
+        log(f"[AI] Token refreshed (valid for {exp}s)", "DEBUG")
         return _gcp_token
 
 def _sanitize_ai_summary(text: str) -> str:
@@ -9324,7 +9327,8 @@ def generate_ai_summary(app_results: dict) -> str | None:
         # COPS-2555: disabled by operator request. Short-circuits before any
         # prompt building or Vertex AI call, not just before rendering, so
         # disabling this also removes its cost/latency, not only its output.
-        print("      [AI] AI_SUMMARY_ENABLED=false — skipping AI call")
+        log("[AI] AI_SUMMARY_ENABLED=false — skipping AI call", "DEBUG",
+            event="ai_disabled")
         return None
     try:
         results = {app: _result(v) for app, v in app_results.items()}
@@ -9341,10 +9345,11 @@ def generate_ai_summary(app_results: dict) -> str | None:
             if r.outcome in (OUT_INDETERMINATE, OUT_ERROR)
         }
         if not changed and not errors:
-            print("      [AI] No changed apps — skipping AI call")
+            log("[AI] No changed apps — skipping AI call", "DEBUG",
+                event="ai_no_changes")
             return None
-        print(f"      [AI] Preparing prompt: {len(changed)} changed app(s), "
-              f"{sum(len(s) for s in changed.values())} section(s)")
+        log(f"[AI] Preparing prompt: {len(changed)} changed app(s), "
+            f"{sum(len(s) for s in changed.values())} section(s)", "DEBUG")
 
         # FIX B2 (v2.5.1): the top summary line must use the REAL resource
         # count (DiffResult.n_res), not len(sections) which is truncated to
@@ -9369,8 +9374,9 @@ def generate_ai_summary(app_results: dict) -> str | None:
             omitted = len(changed) - AI_MAX_APPS
             with _diff_stats_lock:
                 _diff_stats["ai_prompt_capped"] += 1
-            print(f"      [AI] Prompt capped to {AI_MAX_APPS} of "
-                  f"{len(changed)} changed apps ({omitted} omitted)")
+            log(f"[AI] Prompt capped to {AI_MAX_APPS} of "
+                f"{len(changed)} changed apps ({omitted} omitted)",
+                "WARNING", event="ai_prompt_capped", omitted=omitted)
 
         sections_parts = []
         for app in prompt_apps:
@@ -9470,8 +9476,8 @@ def generate_ai_summary(app_results: dict) -> str | None:
             f"/publishers/google/models/{VERTEX_MODEL}:generateContent"
         )
         prompt_chars = len(prompt)
-        print(f"      [AI] Calling {VERTEX_MODEL} | prompt={prompt_chars} chars | "
-              f"maxTokens={2000}")
+        log(f"[AI] Calling {VERTEX_MODEL} | prompt={prompt_chars} chars | "
+            f"maxTokens={2000}", "DEBUG")
         _t0 = time.monotonic()
         resp = http(
             "POST",
@@ -9500,9 +9506,10 @@ def generate_ai_summary(app_results: dict) -> str | None:
         usage     = resp.get("usageMetadata", {})
         in_tok    = usage.get("promptTokenCount", "?")
         out_tok   = usage.get("candidatesTokenCount", "?")
-        print(f"      [AI] Response OK | finish={finish} | "
-              f"tokens in={in_tok} out={out_tok} | "
-              f"output={len(ai_text)} chars | elapsed={elapsed}ms")
+        log(f"[AI] Response OK | finish={finish} | "
+            f"tokens in={in_tok} out={out_tok} | "
+            f"output={len(ai_text)} chars | elapsed={elapsed}ms", "DEBUG",
+            finish=finish, elapsed_ms=elapsed)
         if finish == "MAX_TOKENS":
             log("AI response truncated (MAX_TOKENS) — increase maxOutputTokens or shorten prompt",
                 "WARNING")
@@ -11621,14 +11628,17 @@ def format_comment(pr_sha, app_results, skipped_apps=None, base_sha="",
                 rolled_apps.update(_members)
 
     mode_label = "large" if is_large else "small"
-    print(f"    [comment] mode={mode_label} | changed_apps={len(changed_apps)} | "
-          f"diff_bytes={total_diff_bytes}")
+    log(f"[comment] mode={mode_label} | changed_apps={len(changed_apps)} | "
+        f"diff_bytes={total_diff_bytes}", "DEBUG", mode=mode_label,
+        changed_apps=len(changed_apps), diff_bytes=total_diff_bytes)
     ai_summary = generate_ai_summary(app_results)
     if ai_summary:
-        print(f"    [comment] AI summary included ({len(ai_summary)} chars)")
+        log(f"[comment] AI summary included ({len(ai_summary)} chars)",
+            "DEBUG")
     elif not any(_result(v).outcome == OUT_DIFF for v in app_results.values()):
         # Nothing changed, so there was nothing to summarise. Routine.
-        print("    [comment] AI summary absent (no changes to summarise)")
+        log("[comment] AI summary absent (no changes to summarise)",
+            "DEBUG")
     else:
         # COPS-2617 secondary finding: this and the line above used to share
         # one INFO message, so a Vertex call failing on every PR looked
@@ -12354,7 +12364,8 @@ def process_pr(pr, path_map, base_sha="", repo=None):
     dest   = pr["destination"]["branch"]["name"]
     _title = pr['title']
     _title_disp = _title if len(_title) <= 80 else _title[:80] + "..."
-    print(f"  PR {repo}#{pr_id}: {_title_disp!r} -> {dest} ({pr_sha[:8]})")
+    log(f"PR {repo}#{pr_id}: {_title_disp!r} -> {dest} ({pr_sha[:8]})",
+        pr=pr_id, repo=repo, event="pr_considered")
 
     if dest != "main":
         return
@@ -12402,12 +12413,16 @@ def process_pr(pr, path_map, base_sha="", repo=None):
         forced = sk in _force_recompute
         if forced:
             _force_recompute.discard(sk)
-            print(f"    Forced recompute: a chart this PR renders with was republished")
+            log("Forced recompute: a chart this PR renders with was republished",
+                pr=pr_id, repo=repo, event="forced_recompute")
 
     # In-memory dedup: skip same SHA already processed in this pod run
     with _seen_lock:
         if not forced and _seen.get(sk) == (pr_sha, base_sha):
-            print(f"    Skipping: SHA {pr_sha[:8]} (base {base_sha[:8] if base_sha else '?'}) already processed in this run")
+            log(f"Skipping: SHA {pr_sha[:8]} "
+            f"(base {base_sha[:8] if base_sha else '?'}) already processed "
+            f"in this run", "DEBUG", pr=pr_id, repo=repo,
+            event="skip_already_processed")
             return
 
     # COPS-2546: transient-failure backoff. Skips a growing number of
@@ -12415,7 +12430,9 @@ def process_pr(pr, path_map, base_sha="", repo=None):
     # so a quota exhaustion cannot turn into a retry storm. A new push
     # bypasses and resets it (handled inside the helper).
     if not forced and _backoff_should_skip(sk, pr_sha):
-        print(f"    Skipping: transient-failure backoff active for SHA {pr_sha[:8]} (will retry)")
+        log(f"Skipping: transient-failure backoff active for SHA "
+            f"{pr_sha[:8]} (will retry)", pr=pr_id, repo=repo,
+            event="backoff_skip")
         return
 
     # Cross-pod dedup: existing comment already covers this exact SHA
@@ -12454,12 +12471,15 @@ def process_pr(pr, path_map, base_sha="", repo=None):
                     f"({base_m.group(1) if base_m else 'legacy'} -> {base_sha[:8]})",
                     pr=pr_id, event="main_advanced_recompute")
         if rerun:
-            print(f"    Re-running: previous comment for SHA {pr_sha[:8]} was not clean, retrying diff")
+            log(f"Re-running: previous comment for SHA {pr_sha[:8]} was "
+                f"not clean, retrying diff", pr=pr_id, repo=repo,
+                event="rerun_not_clean")
             # existing_id is kept — the comment will be updated in place, not duplicated.
         else:
             with _seen_lock:
                 _seen[sk] = (pr_sha, base_sha)
-            print(f"    Skipping: comment up to date for SHA {pr_sha[:8]}")
+            log(f"Skipping: comment up to date for SHA {pr_sha[:8]}",
+                "DEBUG", pr=pr_id, repo=repo, event="skip_up_to_date")
             # Fix potential stuck INPROGRESS from a previously killed pod
             fix_stuck_inprogress(pr_sha, pr_id, comment_raw, repo=repo)
             return
@@ -12485,8 +12505,9 @@ def process_pr(pr, path_map, base_sha="", repo=None):
             renames  = {o: n for o, n in renames.items()
                         if any(o.startswith(s) or n.startswith(s) for s in scopes)}
             if n_before != len(changed):
-                print(f"    Scope filter [{'|'.join(scopes)}]: "
-                      f"{n_before} -> {len(changed)} files in scope")
+                log(f"Scope filter [{'|'.join(scopes)}]: "
+                    f"{n_before} -> {len(changed)} files in scope", "DEBUG",
+                    pr=pr_id, repo=repo)
             if n_before > 0 and not changed and not renames:
                 # ENTIRELY out-of-scope PR (e.g. aws/-only in stage): full
                 # silence — no comment, no build status. These PRs belong to
@@ -12495,7 +12516,8 @@ def process_pr(pr, path_map, base_sha="", repo=None):
                 # misread as ArgoCD validation. PRs with in-scope files (even
                 # if they match no app) keep the historical "No ArgoCD apps
                 # affected" comment+status behavior.
-                print(f"    Entirely out of scope for {repo} — skipping silently")
+                log(f"Entirely out of scope for {repo} — skipping silently",
+                "DEBUG", pr=pr_id, repo=repo, event="skip_out_of_scope")
                 with _seen_lock:
                     _seen[sk] = (pr_sha, base_sha)
                 return
@@ -12503,7 +12525,9 @@ def process_pr(pr, path_map, base_sha="", repo=None):
         # _app_to_files is reused below for the version-bump detection pass
         # instead of every app independently rescanning changed x path_map.
         affected, _app_to_files = _match_files_to_apps(changed, path_map)
-        print(f"    Changed files: {len(changed)} | Affected apps: {len(affected)}")
+        log(f"Changed files: {len(changed)} | Affected apps: {len(affected)}",
+            "DEBUG", pr=pr_id, repo=repo,
+            changed_files=len(changed), affected_apps=len(affected))
 
         # v2.12.0 (COPR-31637): hard guard. A value file that sets
         # appspace.microservices.definitions to null/empty wipes every
@@ -12640,7 +12664,8 @@ def process_pr(pr, path_map, base_sha="", repo=None):
                 return
 
             # No apps affected and no new env pattern found.
-            print(f"    No ArgoCD apps affected - posting SUCCESSFUL")
+            log("No ArgoCD apps affected - posting SUCCESSFUL",
+                pr=pr_id, repo=repo, event="no_apps_affected")
             post_build_status(pr_sha, "SUCCESSFUL",
                 "No ArgoCD apps affected by this PR", pr_id=pr_id)
             no_apps_body = (
@@ -12658,7 +12683,7 @@ def process_pr(pr, path_map, base_sha="", repo=None):
                 _seen[sk] = (pr_sha, base_sha)
             return
 
-        print(f"    Apps: {affected}")
+        log(f"Apps: {affected}", "DEBUG", pr=pr_id, repo=repo)
         post_build_status(pr_sha, "INPROGRESS", "Running ArgoCD diff...", pr_id=pr_id)
 
         # v2.5.11 (live PR #6677): apps whose environment was CONFIRMED
@@ -12687,8 +12712,10 @@ def process_pr(pr, path_map, base_sha="", repo=None):
         if len(affected) > MAX_APPS_PER_RUN:
             skipped_apps = affected[MAX_APPS_PER_RUN:]
             affected    = affected[:MAX_APPS_PER_RUN]
-            print(f"    Capped to {MAX_APPS_PER_RUN} apps "
-                  f"({len(skipped_apps)} skipped)")
+            log(f"Capped to {MAX_APPS_PER_RUN} apps "
+                f"({len(skipped_apps)} skipped)", "WARNING",
+                pr=pr_id, repo=repo, event="app_cap_applied",
+                skipped=len(skipped_apps))
         # v2.5.11: total app count this run is actually responsible for,
         # for the SIGTERM-drain safety check below — affected was reduced by
         # decommissioned_apps above, but those already have a final result
@@ -12932,7 +12959,7 @@ def process_pr(pr, path_map, base_sha="", repo=None):
                 msg = f"    Helm pre-warm: {len(pulls_needed)} to pull"
                 if already_cached:
                     msg += f", {already_cached} already cached"
-                print(msg, flush=True)
+                log(msg, "DEBUG", event="helm_prewarm")
             if pulls_needed:
                 with ThreadPoolExecutor(max_workers=max(1, min(WARM_WORKERS, len(pulls_needed)))) as ex:
                     futures = [ex.submit(_ensure_chart, reg, chart, ver)
@@ -13121,7 +13148,8 @@ def process_pr(pr, path_map, base_sha="", repo=None):
         upsert_comment(pr_id, body, existing_id, repo=repo,
                        artifact_url=artifact_url)
         action = "updated" if existing_id else "posted"
-        print(f"    Comment {action} on PR #{pr_id} ({comment_kb}KB)")
+        log(f"Comment {action} on PR #{pr_id} ({comment_kb}KB)",
+            pr=pr_id, event="comment_posted", comment_kb=comment_kb)
 
         # Count changed resources and classify indeterminate reasons FIRST,
         # then update stats and build status (oci_not_found_count must be defined
