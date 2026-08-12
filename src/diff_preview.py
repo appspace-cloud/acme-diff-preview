@@ -9639,6 +9639,28 @@ def _full_hunks_link(artifact_url: str, app: str = "") -> str:
             "from the build status.")
 
 
+def _is_header_only_block(block) -> bool:
+    """True when an emitted app block carries nothing but its own header.
+
+    COPS-2651. Such a block repeats exactly the two facts its Changeset
+    overview row already carries -- the app name and the resource count --
+    while the row additionally carries the deep link the header lacks.
+
+    Judged on what was actually emitted rather than on why it was kept,
+    because the reasons multiply (risky, fingerprint-grouped, shape-grouped)
+    and each one assumes a body will follow. The lines are the only thing
+    that knows whether one did.
+
+    The group preamble ("Identical diff across N environments") counts as
+    content: it names environments no single row does.
+    """
+    body = [ln for ln in block if ln.strip()]
+    if len(body) != 1:
+        return False
+    only = body[0].lstrip()
+    return only.startswith("\u26a0\ufe0f **`") and "resource(s) changed" in only
+
+
 def _format_app_diff_block(app, sections, diff_text, show_diff=True, n_res=None,
                            risk_headers=None, version_fold=None,
                            artifact_url="", size_budget=None,
@@ -12088,6 +12110,22 @@ def format_comment(pr_sha, app_results, skipped_apps=None, base_sha="",
                 # sentences on the comment. Only the pure
                 # header-plus-pointer block is redundant with its row.
                 continue
+            # COPS-2651: the gate above is a PROXY -- it assumes a risky or
+            # grouped app has something to show. On acme-config-prod #4115
+            # that assumption broke: two apps carried vm_changes, so
+            # _is_risky_result kept them, and then the block rendered with
+            # COMMENT_INLINE_EVIDENCE_LINES at its default of 0 and no
+            # pointer (COPS-2640), leaving a bare "app -- N resource(s)
+            # changed" line directly under the row that already said the
+            # same thing with a deep link attached.
+            #
+            # So decide on the OUTCOME instead of the prediction: render
+            # the block, and if it turns out to be nothing but its header,
+            # drop it. The header states the app name and the resource
+            # count, both of which the row states, so removing it loses no
+            # information -- and the risk itself is carried by the Merge
+            # summary and the VM panel, not by a bare header.
+            _at = len(lines)
             if budget and not _risky and _body_size() > budget:
                 collapsed_apps.extend(members)
                 continue
@@ -12124,6 +12162,11 @@ def format_comment(pr_sha, app_results, skipped_apps=None, base_sha="",
                 # block's trailing "Full hunks for" line would repeat it.
                 row_pointer=not (_table_rendered and artifact_url
                                  and not profile.is_complete_record))
+            if (_table_rendered and artifact_url
+                    and not profile.is_complete_record
+                    and _is_header_only_block(lines[_at:])):
+                del lines[_at:]
+                continue
 
         else:
             # COPS-2612: on a fleet PR this emitted one green line per clean

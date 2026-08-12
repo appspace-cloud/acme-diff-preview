@@ -39,12 +39,6 @@
 
 > ⬆️ **Routine version bump** `image`: `appspace-ms:2603.0.0` → `appspace-ms:2603.1.0` — **4 environments**: pv-fleet-00, pv-fleet-01, pv-fleet-02, pv-fleet-03 — full diffs in the [full diff view](https://diffs.appspace.example/diff/acme-config-prod/42/abc12345)
 
-⚠️ **`pv-vm-a-ss`** — 1 resource(s) changed
-
-
-⚠️ **`pv-zzz-risky-ms`** — 1 resource(s) changed
-
-
 🔎 **Full rendered diff (every hunk):** https://diffs.appspace.example/diff/acme-config-prod/42/abc12345
 
 ---
