@@ -13,15 +13,14 @@ environment.
 `_check_customer_name` and `_extract_appspace_identity` supply the identity
 facts those comparisons read.
 
-`_section_kind` is imported from vm_analysis, where phase 4's closure put it
-because the workload detectors read it. It is a generic section classifier
-rather than VM-specific, so it wants a better home; moving it is an
-improvement and therefore belongs in its own change, not in a pure move.
+`_section_kind` comes from manifest.py, which is where the header format it
+decodes is built (`_diff_resources`). Phase 4's closure had parked it in
+vm_analysis because the workload detectors happened to read it first.
 """
 import re
 
 from comment_render import _section_name
-from vm_analysis import _section_kind
+from manifest import _section_kind
 
 
 _appspace_key_re      = re.compile(r"^\s*appspace:\s*(#.*)?$")

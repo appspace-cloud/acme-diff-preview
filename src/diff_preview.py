@@ -164,7 +164,6 @@ from grouping import (  # same-change grouping and rollup (same-dir module)
 )
 from vm_analysis import (  # VM/KCC infrastructure analysis (same-dir module)
     _WORKLOAD_KINDS,
-    _section_kind,
     _replicas_end_state,
     _detect_replicas_zeroed,
     _detect_workload_shutdown,
@@ -206,6 +205,7 @@ from decommission import (  # environment teardown and creation analysis
     _decommission_phase_table,
 )
 from manifest import (  # rendered-manifest parsing and resource diffing
+    _section_kind,
     _is_checksum_only_section,
     _summarize_rendered_manifest,
     _redact_rendered_manifest,
