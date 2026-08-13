@@ -35,6 +35,7 @@ os.environ.setdefault("ARGOCD_PASS", "t")
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
 
 import diff_preview as m
+import render_profile
 import diff_ui as ui
 
 SHA = "a2e6383e7c1d4f5a6b7c8d9e0f1a2b3c4d5e6f70"
@@ -127,7 +128,7 @@ def test_a_secret_far_past_the_old_cap_is_fully_redacted_on_the_page():
 # --- 4. the escape hatch restores today exactly --------------------------
 
 def test_uncapped_false_restores_the_old_page(monkeypatch):
-    monkeypatch.setattr(m, "FULL_PAGE_UNCAPPED", False)
+    monkeypatch.setattr(render_profile, "FULL_PAGE_UNCAPPED", False)
     body = "".join(f"+    filler-{i}: x\n" for i in range(700))
     page = m.format_comment(SHA, _one_app(body),
                             profile=m.FULL_PROFILE)
