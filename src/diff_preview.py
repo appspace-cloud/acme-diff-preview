@@ -7518,6 +7518,88 @@ def _split_resources_by_cascade_fate(resources: dict) -> tuple:
     return deleted, retained
 
 
+# COPS-2656. ArgoCD's own cascade finalizer. Its PRESENCE on the
+# Application is what makes deleting the Application delete the resources
+# it manages; without it the ApplicationSet's preserveResourcesOnDeletion
+# leaves every workload running.
+_ARGOCD_CASCADE_FINALIZER = "resources-finalizer.argocd.argoproj.io"
+
+
+def _cascade_finalizer_live(apps):
+    """Is ArgoCD's cascade finalizer actually on every one of these apps?
+
+    True / False / None, and the None matters. _decommission_cascades()
+    reads appspace.decommission out of a file in git, which says what was
+    DECLARED, not what ArgoCD has applied. Between the arming PR merging
+    and ArgoCD syncing, the panel reports Phase 2 done while the finalizer
+    is not there -- and if the environment is also paused
+    (appspace.autosync: false) it never will be.
+
+    None means "could not tell", and it is deliberately not False. False
+    drives a block; treating an unreachable ArgoCD as False would stop
+    every decommission during an ArgoCD outage, which is a far more likely
+    event than the mismatch this exists to catch.
+
+    ALL apps must carry it. One armed sibling among three is a partial
+    sync, and reporting that as armed would promise a cleanup for the two
+    that are about to orphan.
+    """
+    if not apps:
+        return None
+    seen_any = False
+    for app in apps:
+        name = app.split("/")[-1]
+        try:
+            r = subprocess.run(
+                [ARGOCD_BIN, "app", "get", name, "-o", "json"] + _auth_flags(),
+                capture_output=True, text=True, timeout=30,
+                env=_argocd_subprocess_env())
+            if r.returncode != 0:
+                debug(f"cascade finalizer check: argocd app get {name} "
+                      f"failed: {(r.stderr or '')[:120]}")
+                return None
+            meta = (json.loads(r.stdout or "{}") or {}).get("metadata") or {}
+        except Exception as e:
+            debug(f"cascade finalizer check failed for {name}: {e}")
+            return None
+        seen_any = True
+        if _ARGOCD_CASCADE_FINALIZER not in (meta.get("finalizers") or []):
+            return False
+    return True if seen_any else None
+
+
+def _cascade_mismatch_note(env_name, apps, cascade: bool) -> list:
+    """Markdown for the one state the panel could previously not describe:
+    the config claims the cascade and the cluster does not have it.
+
+    Empty for every other state. Not-armed is the documented default and
+    the panel already warns about it in detail; adding a second voice there
+    would just make the loud one easier to skip.
+    """
+    if not cascade:
+        return []
+    live = _cascade_finalizer_live(apps)
+    if live is not False:
+        # True: the promise is real. None: unknown, and a scary block on a
+        # failed lookup would train reviewers to ignore this panel.
+        return []
+    return [
+        "🚨 **The cascade is armed in config but NOT live in the "
+        "cluster.** `appspace.decommission: true` is set for "
+        f"`{env_name}`, so the phase table above reads as though deleting "
+        "this folder will clean everything up. ArgoCD has not applied the "
+        f"`{_ARGOCD_CASCADE_FINALIZER}` finalizer to its Application(s) "
+        "yet, and **without that finalizer every resource below is left "
+        "orphaned exactly as if the cascade had never been armed** \u2014 "
+        "still running, still costing money, still holding IPs and disks.",
+        "",
+        "Let the arming change SYNC before removing the folder. If the "
+        "environment is paused (`appspace.autosync: false`) it will never "
+        "sync at all, so the pause has to be lifted first (COPS-2583).",
+        "",
+    ]
+
+
 def _paused_apps_for(apps, path_map, sha, repo=None) -> set:
     """Apps whose OWN environment has `appspace.autosync: false` (COPS-2583).
 
@@ -7759,6 +7841,12 @@ def _evaluate_env_decommissions(candidates: list, pr_sha: str, main_sha: str,
         ) + [
             "",
         ]
+        # COPS-2656: the phase table above just reported Phase 2 from a
+        # config key. If the cluster does not actually carry the finalizer,
+        # everything below this point is a promise that will not be kept,
+        # so the correction goes immediately after the table and before the
+        # inventory it would otherwise appear to describe.
+        lines += _cascade_mismatch_note(c["env_name"], c["apps"], cascade)
         if not cascade:
             lines += [
                 "\u26a0\ufe0f **The ArgoCD Application is removed, but its resources "
