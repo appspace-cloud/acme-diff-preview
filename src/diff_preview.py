@@ -190,6 +190,33 @@ from decommission import (  # environment teardown and creation analysis
     _PH_NA,
     _decommission_phase_table,
 )
+from manifest import (  # rendered-manifest parsing and resource diffing
+    _is_checksum_only_section,
+    _summarize_rendered_manifest,
+    _redact_rendered_manifest,
+    _split_yaml_docs,
+    _detect_deleted_resources,
+    _detect_created_resources,
+    _TEMPLATE_ARTIFACT_RE,
+    _detect_template_artifacts,
+    _diff_resources,
+    _DECOM_WORKLOAD_KINDS,
+    _summarize_resources_dict,
+    _is_header_only_block,
+    _flatten_yaml,
+)
+from identity import (  # environment identity and rename detection
+    _appspace_key_re,
+    _customer_name_key_re,
+    _suffix_key_re,
+    _extract_appspace_identity,
+    CUSTOMER_NAME_MAX,
+    _CUSTOMER_NAME_RE,
+    _check_customer_name,
+    _is_rename_of,
+    _split_renames_from_deletions,
+    _same_env_identity,
+)
 import io as _io
 import http.client as _http_client
 import socketserver
@@ -2761,36 +2788,6 @@ def _diff_ignore_patterns(env_value=None):
 
 DIFF_IGNORE_RESOURCE_PATTERNS = _diff_ignore_patterns()
 
-def _is_checksum_only_section(body: str) -> bool:
-    """True when every changed line is a checksum/tracking annotation only.
-
-    These sections appear in Deployments as cascading side-effects of ConfigMap
-    changes. They carry no operator-useful information. Extended to cover helm
-    template output which includes argocd.argoproj.io/tracking-id and similar
-    annotations that always drift between renders.
-    """
-    _ANNOTATION_NOISE = (
-        "checksum/",
-        "argocd.argoproj.io/tracking-id",
-        "kubectl.kubernetes.io/last-applied-configuration",
-        "deployment.kubernetes.io/revision",
-        "meta.helm.sh/release-",
-        "helm.sh/resource-policy",
-        "helm.sh/chart",
-    )
-    changed = []
-    for l in body.splitlines():
-        # Skip difflib unified-diff structural lines (---, +++, @@ hunk headers);
-        # they start with -/+ but are not content changes.
-        if l.startswith("---") or l.startswith("+++") or l.startswith("@@"):
-            continue
-        if l.startswith("< ") or l.startswith("> ") or l.startswith("-") or l.startswith("+"):
-            stripped = l.lstrip("+-< >").strip()
-            if stripped:
-                changed.append(stripped)
-    return bool(changed) and all(
-        any(noise in l for noise in _ANNOTATION_NOISE) for l in changed
-    )
 
 def _filter_diff_sections(sections: list) -> list:
     """Remove noisy sections from a parsed diff section list.
@@ -3233,10 +3230,7 @@ def _bb_fetch_status(filepath, sha, repo=None):
     # so the loop never falls through naturally; defensive guard only.
 
 
-_appspace_key_re      = re.compile(r"^\s*appspace:\s*(#.*)?$")
 _version_key_re       = re.compile(r"^\s*version:\s*([^\s#]+)")
-_customer_name_key_re = re.compile(r"^\s*customerName:\s*([^\s#]+)")
-_suffix_key_re        = re.compile(r"^\s*suffix:\s*([^\s#]+)")
 
 # A chart targetRevision is an OCI tag / semver-ish string. It flows from a
 # PR-authored config file into `helm pull --version <v>` and into
@@ -3346,56 +3340,6 @@ def _extract_chart_version(content: str):
     """
     version, _status = _extract_chart_version_checked(content)
     return version
-
-
-def _extract_appspace_identity(content: str) -> tuple:
-    """Return (customer_name, suffix) as declared directly under the
-    top-level `appspace:` mapping in a customer.yaml/config.yaml file.
-
-    v2.5.15 (Finding 7). Mirrors _extract_chart_version_checked's
-    direct-child-of-appspace tracking (last-key-wins on a duplicate key),
-    applied to customerName and suffix instead of version.
-
-    customerName is the true identity of an environment (drives the
-    namespace and related wiring). suffix is the variant (a/b/c...); it can
-    be declared locally in this file OR inherited from a parent config.yaml
-    higher in the tier. instanceName is NOT read here -- it names virtual
-    machines only and is not an environment identity signal.
-
-    Either element of the returned tuple is None when not declared in THIS
-    file. A None suffix does not mean "no suffix", only "not declared here"
-    -- a caller that needs the chain-resolved effective value must fetch and
-    check ancestor config.yaml files separately; this function only reads
-    what one specific file states.
-    """
-    in_appspace     = False
-    appspace_indent = -1
-    child_indent    = None
-    customer_name = None
-    suffix        = None
-    for line in (content or "").splitlines():
-        if not line.strip() or line.lstrip().startswith("#"):
-            continue
-        indent = len(line) - len(line.lstrip())
-        if in_appspace and indent <= appspace_indent:
-            in_appspace  = False
-            child_indent = None
-        if _appspace_key_re.match(line):
-            in_appspace     = True
-            appspace_indent = indent
-            child_indent    = None
-            continue
-        if in_appspace:
-            if child_indent is None and indent > appspace_indent:
-                child_indent = indent
-            if indent == child_indent:
-                cm = _customer_name_key_re.match(line)
-                if cm:
-                    customer_name = cm.group(1).strip("'\"")
-                sm = _suffix_key_re.match(line)
-                if sm:
-                    suffix = sm.group(1).strip("'\"")
-    return customer_name, suffix
 
 
 # ── Helm-template local diff ─────────────────────────────────────────────────
@@ -4488,85 +4432,6 @@ def _backoff_clear(sk):
         _retry_backoff.pop(sk, None)
 
 
-# COPS-2546: read-at-sha caching for every fetch that is not a helm value file.
-# The v2.13.2/v2.13.3 additions (identity checks, cohort guard, identity-move
-# augmenter) called _bb_fetch_status directly, so every poll cycle re-fetched
-# files that cannot change (content at a git sha is immutable), multiplied by
-# every open PR and every retry. Combined with the retry-until-determinate loop
-# this exhausted the Bitbucket API budget live on 2026-07-29: 1449s iterations
-# and acme-config-dev PR 6938 stuck INPROGRESS for hours.
-#
-# This deliberately REUSES _vf_cache instead of adding a second dict:
-#   - _vf_cache is already bounded by _bound_vf_cache() once per iteration, so a
-#     long-lived pod cannot grow it without limit. A private cache here would
-#     have shipped an unbounded leak in a pod that runs for weeks.
-#   - the paths overlap heavily (the new-env ancestor chain reads the very same
-#     config.yaml files _fetch_value_files reads), so sharing turns those into
-#     cross-hits rather than duplicate calls.
-#   - one singleflight map means concurrent duplicates dedupe across both paths.
-#
-# Storage contract is _fetch_value_files': content for BB_OK, None for
-# BB_NOT_FOUND, and nothing at all for BB_ERROR, because a transient failure
-# must never be cached as a fact. Status is therefore derivable on read.
-# ── COPS-2562: cheap environment-name validation ────────────────────────────
-#
-# COPS-2552 resolved prefix/customerName/suffix/esSuffix through each app's
-# ENTIRE value-file chain at BOTH shas to rebuild the exact GCP service
-# account id. Correct, but on a mass version bump (PR 3831: 212 apps, 14
-# changed files) that was ~65s of a 121.5s iteration and the single largest
-# consumer of Bitbucket API calls, on a token shared with the Azure DevOps
-# pipelines (COPS-2543).
-#
-# The expensive part existed only to learn two values that are constants in
-# practice. Verified across all three config repos, 2026-07-30:
-#   appspace.prefix                     13 decls, {pv, cl},  always 2 chars
-#   appspace.suffix                    307 decls, {a, b, c}, always 1 char
-#   appspace.externalSecretsTool.suffix  0 decls, chart default "es", 2 chars
-# so len(GSA id) == len(customerName) + 8 and GCP's 30-char limit means
-# customerName <= 22. The cap below is 20, leaving two characters of margin
-# for a future longer prefix/suffix/esSuffix or another derived resource
-# without having to model each resource type again. Longest real name today
-# is 19 ("westinghousenuclear"), across 322 environments, so nothing needs
-# grandfathering.
-CUSTOMER_NAME_MAX = 20
-
-# Deliberately NOT the strict GCP id regex. pv-3ds-c is a real live prod
-# environment: "3ds" starts with a digit and fails ^[a-z]..., but the full
-# id "pv-3ds-c-es" is valid because the prefix supplies the leading letter.
-# Validating customerName alone with the strict pattern would block it.
-_CUSTOMER_NAME_RE = re.compile(r"^[a-z0-9]([a-z0-9-]*[a-z0-9])?$")
-
-
-def _check_customer_name(name):
-    """Validate appspace.customerName. Returns (status, detail).
-
-    "ok" / "invalid" / "unresolved" -- the three-way distinction FIX A
-    (v2.4.9) established, so "not declared here" can never be mistaken for
-    "rejected".
-    """
-    if not name:
-        return "unresolved", None
-    name = str(name)
-    if len(name) > CUSTOMER_NAME_MAX:
-        return "invalid", (
-            f"`appspace.customerName` is {len(name)} characters "
-            f"(`{name}`), the maximum is {CUSTOMER_NAME_MAX}. The derived GCP "
-            f"service account id is `<prefix>-<customerName>-<suffix>-es`, and "
-            f"GCP rejects service account IDs longer than 30 characters, which "
-            f"leaves {CUSTOMER_NAME_MAX} for the name plus margin. This is a "
-            f"hard Google limit, not an Appspace one: the environment would "
-            f"deploy and then silently fail, with ArgoCD reporting Synced "
-            f"while every pod sits in CreateContainerConfigError. Shorten the "
-            f"name and push again.")
-    if not _CUSTOMER_NAME_RE.match(name):
-        return "invalid", (
-            f"`appspace.customerName` (`{name}`) must contain only lowercase "
-            f"letters, digits and hyphens, and must not start or end with a "
-            f"hyphen. It becomes part of a GCP service account id, which GCP "
-            f"validates strictly.")
-    return "ok", None
-
-
 def _warn_if_name_invariant_broken(flat: dict):
     """The cap encodes an invariant that lives in the config repos, not in a
     schema: prefix is always 2 chars and suffix always 1. If that ever
@@ -5182,93 +5047,6 @@ def _detect_new_env_candidates(changed_files: list, path_map: dict, renames: dic
             if f.startswith(env_dir + "/") or "/".join(f.split("/")[:-1]) == env_dir:
                 info["all_yaml_files"].append(f)
     return list(candidates.values())
-
-
-def _summarize_rendered_manifest(rendered: str) -> tuple:
-    """Summarize a rendered multi-document manifest for the PR comment.
-
-    v2.5.6 (Finding B): a successfully rendered NEW environment used to be
-    posted as up to 30,000 chars of raw "+" pseudo-diff — a wall of text
-    with no review value (everything is new, there is nothing to compare).
-    What a reviewer needs instead: how many resources, of which kinds, and
-    which applications. This helper extracts exactly that.
-
-    Line-based parsing on purpose: PyYAML is not in the container (H9 was
-    deferred for that same reason) and helm's own output is stable enough
-    for top-level `kind:` and `metadata: -> name:` extraction.
-
-    Returns (total_resources, kind_counts: dict, workload_names: sorted list).
-    Workloads are Deployment/StatefulSet/DaemonSet/CronJob/Job — the names a
-    reviewer recognizes as "applications".
-    """
-    WORKLOAD_KINDS = {"Deployment", "StatefulSet", "DaemonSet", "CronJob", "Job"}
-    total = 0
-    kind_counts = {}
-    workloads = set()
-    for doc in rendered.split("\n---"):
-        kind = None
-        name = None
-        in_metadata = False
-        for line in doc.splitlines():
-            if line.startswith("kind:") and kind is None:
-                kind = line.split(":", 1)[1].strip()
-            elif line.startswith("metadata:"):
-                in_metadata = True
-            elif in_metadata and name is None and line.startswith("  name:"):
-                name = line.split(":", 1)[1].strip().strip("'\"")
-            elif in_metadata and line and not line.startswith(" "):
-                in_metadata = False
-        if not kind:
-            continue
-        total += 1
-        kind_counts[kind] = kind_counts.get(kind, 0) + 1
-        if kind in WORKLOAD_KINDS and name:
-            workloads.add(name)
-    return total, kind_counts, sorted(workloads)
-
-
-def _redact_rendered_manifest(rendered: str) -> str:
-    """Redact a full rendered multi-document manifest before it can reach a
-    PR comment or the full-diff artifact (v2.25.0).
-
-    Mirrors _redact_for_display per document instead of per diff section: a
-    v1 `kind: Secret` document is whole-masked; every other document gets
-    the key-name redaction plus the two-line k8s env-var pass. Kinds merely
-    containing "Secret" (ExternalSecret, SealedSecret) hold references, not
-    values, and are NOT whole-masked. Structural scheduling fields (`key`,
-    `topologyKey`) stay exempt from redaction via _redact_sensitive itself.
-    """
-    out = []
-    for doc in rendered.split("\n---"):
-        kind = None
-        for line in doc.splitlines():
-            if line.startswith("kind:"):
-                kind = line.split(":", 1)[1].strip()
-                break
-        if kind == "Secret":
-            # _redact_secret_section is built for diff section BODIES whose
-            # header carries the resource identity — on a whole document it
-            # would mask `kind:` and `metadata.name:` too, leaving an
-            # anonymous blob. Keep the identity part (apiVersion / kind /
-            # metadata) readable, but still run it through the standard
-            # key-name redaction (chart-authored annotations could hold
-            # values), and whole-mask everything from the first top-level
-            # `data:` / `stringData:` on with the proven Secret masker
-            # (covers block scalars, multi-line PEM blobs, etc.).
-            doc_lines = doc.split("\n")
-            split_at = next((i for i, l in enumerate(doc_lines)
-                             if l.startswith(("data:", "stringData:"))),
-                            None)
-            if split_at is None:
-                out.append(_redact_k8s_env_pairs(_redact_sensitive(doc)))
-            else:
-                head = "\n".join(doc_lines[:split_at])
-                tail = "\n".join(doc_lines[split_at:])
-                out.append(_redact_k8s_env_pairs(_redact_sensitive(head))
-                           + "\n" + _redact_secret_section(tail))
-        else:
-            out.append(_redact_k8s_env_pairs(_redact_sensitive(doc)))
-    return "\n---".join(out)
 
 
 def _evaluate_new_envs(new_env_candidates: list, pr_sha: str,
@@ -5915,45 +5693,6 @@ def _pr_chart_revision_checked(app, candidate_files, pr_sha, main_sha=None, rena
 
 
 
-def _split_yaml_docs(yaml_text):
-    """Yield top-level YAML documents, expanding a `kind: List` wrapper.
-
-    Helm/kubectl output can wrap resources in `kind: List` with an `items:`
-    array. Before v2.5.0 that whole document parsed to zero resources (silent
-    loss). We detect a List doc and re-emit each item as its own document at
-    top-level indentation so the normal line scan can pick it up.
-    """
-    for doc in re.split(r'\n---\s*\n|^---\s*\n', yaml_text, flags=re.MULTILINE):
-        if not doc.strip():
-            continue
-        # Is this a List wrapper? (kind: List with an items: sequence)
-        if re.search(r'^kind:\s*List\s*$', doc, re.MULTILINE) and \
-           re.search(r'^items:\s*$', doc, re.MULTILINE):
-            # Split items on the `- ` sequence markers at column 0 and dedent.
-            body = doc.split("items:", 1)[1]
-            # Each item starts with "- " at the item indent; capture blocks.
-            items = re.split(r'\n(?=- )', body.strip())
-            for it in items:
-                it = it.strip()
-                if it.startswith("- "):
-                    it = it[2:]
-                # dedent: drop the common leading whitespace helm added to items
-                lines = it.splitlines()
-                dedented = []
-                for i, ln in enumerate(lines):
-                    if i == 0:
-                        dedented.append(ln)
-                    elif ln.startswith("  "):
-                        dedented.append(ln[2:])
-                    else:
-                        dedented.append(ln)
-                block = "\n".join(dedented).strip()
-                if block:
-                    yield block
-        else:
-            yield doc
-
-
 def _parse_manifest_resources(yaml_text):
     """Split a multi-document YAML string into a dict keyed by (group/Kind, ns/name).
 
@@ -6073,151 +5812,6 @@ def _is_sensitive_kind(header: str) -> bool:
     return _section_kind(header) in _SENSITIVE_KINDS
 
 
-def _detect_deleted_resources(sections: list) -> list:
-    """Headers of sections that DELETE a resource entirely.
-
-    A true deletion is the manifest diffed against empty (_diff_resources
-    with an absent PR side): every content line is a minus and there are NO
-    context lines. Bodies come from difflib.unified_diff with its default 3
-    context lines, so any partial change where at least one line survives
-    always carries context lines (they start with a space). "Minus lines and
-    no plus lines" alone is NOT enough -- that is also the signature of a
-    change that only removes lines from a manifest that still exists, and
-    it made PR 3829 report 110 deletions for a removed `replicas:` line and
-    PR 6956 report 2480 for a removed tolerations block (COPS-2563)."""
-    deleted = []
-    for header, body in sections:
-        minus = plus = context = 0
-        for line in body.splitlines():
-            if line.startswith("+++") or line.startswith("---"):
-                continue
-            if line.startswith("+"):
-                plus += 1
-            elif line.startswith("-"):
-                minus += 1
-            elif line.startswith(" "):
-                context += 1
-        if minus and not plus and not context:
-            deleted.append(header)
-    return deleted
-
-
-def _detect_created_resources(sections: list) -> list:
-    """Headers of sections that CREATE a resource entirely.
-
-    Exact mirror of _detect_deleted_resources: the manifest diffed against
-    an absent main side, so every content line is a plus and there are NO
-    context lines. Needed to tell a rename from a deletion (COPS-2594).
-    """
-    created = []
-    for header, body in sections:
-        minus = plus = context = 0
-        for line in body.splitlines():
-            if line.startswith("+++") or line.startswith("---"):
-                continue
-            if line.startswith("+"):
-                plus += 1
-            elif line.startswith("-"):
-                minus += 1
-            elif line.startswith(" "):
-                context += 1
-        if plus and not minus and not context:
-            created.append(header)
-    return created
-
-
-def _is_rename_of(old_header: str, new_header: str) -> bool:
-    """True when two headers plausibly name the SAME resource renamed.
-
-    Deliberately narrow. A false positive here SUPPRESSES a real deletion
-    warning, which is strictly worse than the noise this fixes, so this is
-    two explainable rules rather than a similarity score. Both additionally
-    require the same kind.
-
-    Rule A - hash rename: identical except the final `-<token>` segment.
-      pv-x-acme-secret-generator-cb71f3d8 -> pv-x-acme-secret-generator-3abbd629
-      (the Job name carries a content hash, so every version bump renames it)
-
-    Rule B - one token inserted or removed anywhere in the hyphen-token list.
-      ...-mediatransform-access -> ...-mediatransform-gsa-access
-      (mediatransform moved from workload identity to a dedicated GSA)
-    """
-    if _section_kind(old_header) != _section_kind(new_header):
-        return False
-    a, b = _section_name(old_header), _section_name(new_header)
-    if not a or not b or a == b:
-        return False
-
-    ta, tb = a.split("-"), b.split("-")
-
-    # Rule A: same length, differ only in the final token.
-    if len(ta) == len(tb) and len(ta) > 1 and ta[:-1] == tb[:-1]:
-        return True
-
-    # Rule B: exactly one token inserted or removed.
-    if abs(len(ta) - len(tb)) == 1:
-        longer, shorter = (ta, tb) if len(ta) > len(tb) else (tb, ta)
-        for i in range(len(longer)):
-            if longer[:i] + longer[i + 1:] == shorter:
-                return True
-    return False
-
-
-def _split_renames_from_deletions(deleted: list, created: list):
-    """Split a deletion list into (real_deletions, renames).
-
-    Each creation can absorb at most one deletion, so two deletions racing
-    for one creation leave the loser reported as a genuine deletion. Order
-    of the surviving deletions is preserved.
-    """
-    unused = list(created or [])
-    real, renames = [], []
-    for d in (deleted or []):
-        match = next((c for c in unused if _is_rename_of(d, c)), None)
-        if match is None:
-            real.append(d)
-        else:
-            unused.remove(match)
-            renames.append((d, match))
-    return real, renames
-
-
-# Go's own output for a nil or missing template/printf argument. Matched
-# tightly on purpose: a bare "%!" or the word "value" appears in legitimate
-# ConfigMap data (log format strings, embedded templates), and a block that
-# fires on real config is a block people learn to override. These three
-# shapes are only ever produced by a value the chart read and did not get.
-_TEMPLATE_ARTIFACT_RE = re.compile(
-    r"%![a-zA-Z]?\((?:<nil>|MISSING)\)|<no value>")
-
-
-def _detect_template_artifacts(sections: list) -> list:
-    """Sections whose APPLIED side renders an unresolved template value.
-
-    COPS-2632 shape: with `appspace.hostingID` absent the chart rendered
-    `hosting-id: hst-%!s(<nil>)`, helm exited 0, and the comment reported a
-    routine change. The chart's own guard could not catch it - it reads
-    `{{- if .Values.appspace.hostingID }}`, so an absent value skips the
-    validation rather than failing it. A chart author who uses `required`
-    lands in REASON_MISSING_REQUIRED already; one who uses an `if` guard
-    produced silence until this existed.
-
-    Only `+` lines count. An artifact on the `-` side, or replaced by a real
-    value, means this PR is FIXING one, and blocking that would be exactly
-    backwards. Context lines are ignored for the same reason: an artifact
-    already present on both sides is not this PR's doing.
-    """
-    hit = []
-    for header, body in sections:
-        for line in body.splitlines():
-            if not line.startswith("+") or line.startswith("+++"):
-                continue
-            if _TEMPLATE_ARTIFACT_RE.search(line):
-                hit.append(header)
-                break
-    return hit
-
-
 def _prioritise_risk_sections(sections: list, deleted: list, zeroed: list,
                               reserve: int, extra: list = None) -> list:
     """Move risk sections to the front, up to `reserve` of them.
@@ -6330,32 +5924,6 @@ def _package_sections(filtered_sections: list, version_change=None):
             "WARNING")
     return (clean_diff, stored_sections,
             deleted, zeroed, fingerprint, renamed, vm_changes, version_fold)
-
-
-def _diff_resources(main_res: dict, pr_res: dict) -> str:
-    """Diff two pre-parsed resource dicts (from _parse_manifest_resources).
-
-    Returns a diff string in the ArgoCD `===== /Kind ns/name =====` format.
-    Returns empty string if there are no differences.
-    """
-    import difflib
-    all_keys = sorted(set(main_res) | set(pr_res),
-                      key=lambda k: (k[0], k[1], k[2]))
-    parts = []
-    for key in all_keys:
-        type_key, ns, name = key
-        a_text = main_res.get(key, "")
-        b_text = pr_res.get(key, "")
-        if a_text == b_text:
-            continue
-        a_lines = a_text.splitlines(keepends=True)
-        b_lines = b_text.splitlines(keepends=True)
-        delta = list(difflib.unified_diff(a_lines, b_lines, lineterm="\n"))
-        if not delta:   # pragma: no cover - differing text always diffs non-empty
-            continue
-        hdr = f"/{type_key} {ns}/{name}" if ns else f"/{type_key} {name}"
-        parts.append(f"===== {hdr} ======\n" + "".join(delta))
-    return "\n".join(parts)
 
 
 def _diff_manifests(main_yaml: str, pr_yaml: str) -> str:
@@ -6484,34 +6052,6 @@ def _missing_value_remedies() -> list:
     ]
 
 
-
-
-def _same_env_identity(old_identity: tuple, new_identity: tuple) -> bool:
-    """True when two (customer_name, suffix) pairs look like the SAME
-    environment (v2.5.15, Finding 7).
-
-    customer_name is the primary key: it drives the namespace and is the
-    real identity signal (confirmed on real prod renames: 'seagal'->'segal'
-    is a typo fix to a DIFFERENT identity even with the same suffix, and
-    'bnym--aec1'->'bny--aec1' likewise). A mismatch there is decisive
-    regardless of suffix.
-
-    suffix is compared only when BOTH sides declare one. An undeclared
-    suffix on either side is UNKNOWN, not "no suffix" -- treating it as a
-    mismatch would make an ordinary same-identity rename (suffix inherited
-    from a parent config.yaml, not stated in the leaf file) look like a
-    decommission. Missing/unparseable data on both customer_name and suffix
-    degrades to trusting the rename, the same conservative-default posture
-    already used elsewhere in this module (_is_version_downgrade returns
-    False rather than block on noise it cannot interpret).
-    """
-    old_name, old_suffix = old_identity
-    new_name, new_suffix = new_identity
-    if old_name and new_name and old_name != new_name:
-        return False
-    if old_suffix and new_suffix and old_suffix != new_suffix:
-        return False
-    return True
 
 
 # Memoizes _rename_identity_confirmed so the SAME (old, new, main_sha, pr_sha)
@@ -6920,19 +6460,7 @@ def _render_main_side_resources(app: str, main_sha: str) -> dict:
     return resources
 
 
-_DECOM_WORKLOAD_KINDS = ("Deployment", "StatefulSet", "DaemonSet", "CronJob", "Job")
 DECOM_WORKLOADS_MAX_SHOWN = 40
-
-
-def _summarize_resources_dict(resources: dict) -> tuple:
-    """(total, kind_counts, workload_names) from a _parse_manifest_resources dict."""
-    kind_counts = {}
-    workloads = set()
-    for (type_key, _ns, name) in resources:
-        kind_counts[type_key] = kind_counts.get(type_key, 0) + 1
-        if type_key.split("/")[-1] in _DECOM_WORKLOAD_KINDS:
-            workloads.add(name)
-    return len(resources), kind_counts, sorted(workloads)
 
 
 # COPS-2656. ArgoCD's own cascade finalizer. Its PRESENCE on the
@@ -8814,28 +8342,6 @@ def _result(value):
 # whole review value; the other 363 copies are scroll.
 
 
-def _is_header_only_block(block) -> bool:
-    """True when an emitted app block carries nothing but its own header.
-
-    COPS-2651. Such a block repeats exactly the two facts its Changeset
-    overview row already carries -- the app name and the resource count --
-    while the row additionally carries the deep link the header lacks.
-
-    Judged on what was actually emitted rather than on why it was kept,
-    because the reasons multiply (risky, fingerprint-grouped, shape-grouped)
-    and each one assumes a body will follow. The lines are the only thing
-    that knows whether one did.
-
-    The group preamble ("Identical diff across N environments") counts as
-    content: it names environments no single row does.
-    """
-    body = [ln for ln in block if ln.strip()]
-    if len(body) != 1:
-        return False
-    only = body[0].lstrip()
-    return only.startswith("\u26a0\ufe0f **`") and "resource(s) changed" in only
-
-
 def _format_app_diff_block(app, sections, diff_text, show_diff=True, n_res=None,
                            risk_headers=None, version_fold=None,
                            artifact_url="", size_budget=None,
@@ -9076,19 +8582,6 @@ def _fmt_input_val(key: str, val) -> str:
         return "***"
     txt = val if isinstance(val, str) else repr(val)
     return f"`{txt[:48]}{'...' if len(txt) > 48 else ''}`"
-
-
-def _flatten_yaml(node, prefix=""):
-    """Flatten nested mappings to {dotted.path: scalar/list} (PyYAML output)."""
-    out = {}
-    if isinstance(node, dict):
-        for k, v in node.items():
-            p = f"{prefix}.{k}" if prefix else str(k)
-            if isinstance(v, dict):
-                out.update(_flatten_yaml(v, p))
-            else:
-                out[p] = v
-    return out
 
 
 # ── Routine version-bump classification ─────────────────────────────
