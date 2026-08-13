@@ -45,8 +45,25 @@ def _import_module():
 
 
 def _source():
-    with open(os.path.join(SRC, "diff_preview.py")) as f:
-        return f.read()
+    """Every module the service ships, concatenated.
+
+    This used to read diff_preview.py alone, which was the whole service.
+    COPS-2658 moved `_extract_status_token` and `_extract_comment_sha` into
+    app_meta.py, and a guard that counts occurrences in one file would then
+    have found zero and failed for a reason that has nothing to do with the
+    bug it protects.
+
+    Scanning the tree is also what the guard actually meant. The v2.4.5 bug
+    survived because the marker pattern was DUPLICATED at a call site instead
+    of shared, so "exactly one occurrence" has to hold across every module a
+    call site could live in, not just the one the helper happens to sit in.
+    """
+    out = []
+    for fn in sorted(os.listdir(SRC)):
+        if fn.endswith(".py"):
+            with open(os.path.join(SRC, fn)) as f:
+                out.append(f.read())
+    return "\n".join(out)
 
 
 # ── The dead-code sentinel: both broken patterns must be gone entirely ──────
