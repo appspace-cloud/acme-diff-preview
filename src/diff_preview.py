@@ -11919,6 +11919,17 @@ def format_comment(pr_sha, app_results, skipped_apps=None, base_sha="",
     if ai_summary:
         log(f"[comment] AI summary included ({len(ai_summary)} chars)",
             "DEBUG")
+    elif not AI_SUMMARY_ENABLED:
+        # COPS-2657: the feature is switched off, so a missing summary is
+        # the expected outcome, not a failure. Without this branch every PR
+        # with changes fell through to the WARNING below and reported a
+        # Vertex call that never happened -- 152 times in one pod lifetime,
+        # and the ONLY recurring warning the service emitted. An operator
+        # filtering severity>=WARNING (which COPS-2652 exists to enable)
+        # saw nothing but this false alarm, which is how a warning channel
+        # stops being read.
+        log("[comment] AI summary absent (AI_SUMMARY_ENABLED=false)",
+            "DEBUG", event="ai_summary_disabled")
     elif not any(_result(v).outcome == OUT_DIFF for v in app_results.values()):
         # Nothing changed, so there was nothing to summarise. Routine.
         log("[comment] AI summary absent (no changes to summarise)",
