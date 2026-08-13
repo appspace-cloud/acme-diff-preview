@@ -141,6 +141,21 @@ def test_every_monkeypatch_seam_still_connects():
     )
 
 
+def test_no_seam_is_routed_around_by_a_qualified_read():
+    """The other half of the guard: `X.name` where the patch targets `M.name`.
+
+    A bare-name read is not the only way to escape a patch. Reaching the
+    function through a module object that is NOT the patched one escapes it
+    just as completely, and just as quietly.
+    """
+    problems = audit_seams.bypassed_seams(src=SRC, tests=TESTS)
+    assert not problems, "\n".join(
+        f"tests patch {mod}.{name} but the read in {', '.join(readers)} "
+        f"goes through {qualifier}.{name}, which that patch never reaches"
+        for mod, name, qualifier, readers in problems
+    )
+
+
 def test_the_suite_actually_has_seams_to_check():
     """If the collector silently returns nothing, the guard above is a no-op."""
     seams = audit_seams.patched_names(src=SRC, tests=TESTS)
@@ -182,6 +197,126 @@ def test_seam_audit_detects_a_cut_seam(tmp_path):
 
     problems = audit_seams.broken_seams(src=str(src), tests=str(tests))
     assert problems == [("hub", "fetch", ["helper"])], problems
+
+
+def test_seam_audit_detects_a_seam_reached_through_the_wrong_module(tmp_path):
+    """Prove the detector fires on the shape the log decision would create.
+
+    `log` moves to its own module, the hub re-exports it so every existing
+    `m.log` reference keeps resolving, and a leaf calls `logsink.log(...)`.
+    The suite still patches the hub. The re-export makes the seam LOOK
+    intact -- the name is there, the attribute exists, nothing raises -- but
+    the leaf's call resolves through logsink, which no patch touched.
+    """
+    src = tmp_path / "src"
+    tests = tmp_path / "tests"
+    src.mkdir()
+    tests.mkdir()
+
+    (src / "hub.py").write_text(
+        "import logsink\n"
+        "from logsink import log\n"
+    )
+    (src / "logsink.py").write_text(
+        "def log(msg):\n"
+        "    print(msg)\n"
+    )
+    # The leaf reaches log through the logsink module object, so
+    # monkeypatch.setattr(hub, "log", ...) rebinds a name this call never
+    # consults.
+    (src / "leaf.py").write_text(
+        "import logsink\n"
+        "\n"
+        "def render():\n"
+        "    logsink.log('rendering')\n"
+        "    return 'html'\n"
+    )
+    (tests / "test_thing.py").write_text(
+        "import hub as m\n"
+        "\n"
+        "def test_render(monkeypatch):\n"
+        "    monkeypatch.setattr(m, 'log', lambda msg: None)\n"
+    )
+
+    # The bare-name half of the audit is blind here, and that blindness is
+    # the whole reason this check exists: no module reads `log` as a bare
+    # global, so there is nothing for it to report.
+    assert audit_seams.broken_seams(src=str(src), tests=str(tests)) == []
+
+    problems = audit_seams.bypassed_seams(src=str(src), tests=str(tests))
+    assert problems == [("hub", "log", "logsink", ["leaf"])], problems
+
+
+def test_a_qualified_read_through_the_patched_module_is_not_a_break(tmp_path):
+    """The legitimate case the original docstring was right about.
+
+    `diff_ui._gcs_upload(...)` in the hub is fine, because the suite patches
+    _gcs_upload on diff_ui: the call resolves through the very module object
+    the patch modified. Flagging this would make the audit cry wolf on three
+    real call sites.
+    """
+    src = tmp_path / "src"
+    tests = tmp_path / "tests"
+    src.mkdir()
+    tests.mkdir()
+
+    (src / "hub.py").write_text(
+        "import store\n"
+        "\n"
+        "def save(blob):\n"
+        "    return store.upload(blob)\n"
+    )
+    (src / "store.py").write_text(
+        "def upload(blob):\n"
+        "    return 'gs://' + blob\n"
+    )
+    (tests / "test_thing.py").write_text(
+        "import store as s\n"
+        "\n"
+        "def test_save(monkeypatch):\n"
+        "    monkeypatch.setattr(s, 'upload', lambda b: 'fake')\n"
+    )
+
+    assert audit_seams.bypassed_seams(src=str(src), tests=str(tests)) == []
+
+
+def test_a_local_that_shares_a_module_name_is_not_a_qualified_read(tmp_path):
+    """Do not mistake `local.get(...)` for a read through a module.
+
+    This is not hypothetical: the hub takes a `version_fold` dict parameter
+    and calls `version_fold.get("label")` on it, while a real version_fold
+    module sits next to it in src/. Resolving the qualifier against the bare
+    list of module names would report that dict lookup as a cut seam. The
+    qualifier is therefore resolved only through the reading file's own
+    `import X` statements, and the hub imports this module with
+    `from version_fold import ...`, which binds no module object.
+    """
+    src = tmp_path / "src"
+    tests = tmp_path / "tests"
+    src.mkdir()
+    tests.mkdir()
+
+    (src / "hub.py").write_text(
+        "from version_fold import fold\n"
+        "\n"
+        "def render(version_fold):\n"
+        "    return fold(version_fold.get('label'))\n"
+    )
+    (src / "version_fold.py").write_text(
+        "def fold(x):\n"
+        "    return x\n"
+        "\n"
+        "def get(key):\n"
+        "    return None\n"
+    )
+    (tests / "test_thing.py").write_text(
+        "import version_fold as vf\n"
+        "\n"
+        "def test_get(monkeypatch):\n"
+        "    monkeypatch.setattr(vf, 'get', lambda k: 'x')\n"
+    )
+
+    assert audit_seams.bypassed_seams(src=str(src), tests=str(tests)) == []
 
 
 # ── dependency direction ────────────────────────────────────────────────────
