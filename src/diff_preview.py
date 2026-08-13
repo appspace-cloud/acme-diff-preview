@@ -7518,6 +7518,59 @@ def _split_resources_by_cascade_fate(resources: dict) -> tuple:
     return deleted, retained
 
 
+def _paused_apps_for(apps, path_map, sha, repo=None) -> set:
+    """Apps whose OWN environment has `appspace.autosync: false` (COPS-2583).
+
+    COPS-2655. The existing pause warning lives in
+    _summarize_appspace_state_changes, which only runs when the PR touches
+    an identity file. A version bump touches cicd-versions.yaml, so a PR
+    against a frozen environment rendered "Routine -- nothing dangerous
+    detected" and "3 resource(s) will change" when zero would change.
+    Reproduced live on pv-qa88-a before this was written.
+
+    Read at the PR's sha, not main's: the question is what will be true
+    after the merge, so a PR that resumes an environment correctly stops
+    being flagged and one that pauses it is flagged consistently with the
+    louder identity-file panel.
+
+    The env_name prefix check is the same rule _decommission_candidates
+    uses, and it is not optional. This repo has hierarchical defaults named
+    config.yaml at every ancestor level (gcp/config.yaml, gcp/qa/
+    config.yaml, ...), all present in path_map. Reading autosync from one of
+    those would freeze every environment underneath it -- the shape of the
+    v2.5.7 regression, where an ancestor-based rule silently swallowed every
+    new environment.
+    """
+    own_identity = {}
+    for ident, mapped in (path_map or {}).items():
+        if posixpath.basename(ident) not in _IDENTITY_BASENAMES:
+            continue
+        env_name = posixpath.basename(posixpath.dirname(ident))
+        for full in mapped or []:
+            app = full.split("/")[-1]
+            if app.startswith(env_name + "-"):
+                own_identity[app] = ident
+
+    paused = set()
+    by_file = {}
+    for app in apps or []:
+        ident = own_identity.get(app.split("/")[-1])
+        if ident:
+            by_file.setdefault(ident, []).append(app)
+    for ident, members in by_file.items():
+        try:
+            flat = _flat_yaml_cached(ident, sha, repo=repo)
+        except Exception as e:
+            # Fail toward today's behaviour. Wrongly claiming an environment
+            # is frozen sends someone chasing a pause that does not exist,
+            # which is worse than the silence this ticket is fixing.
+            debug(f"could not read {ident} for the autosync check: {e}")
+            continue
+        if _autosync_paused(flat or {}):
+            paused.update(members)
+    return paused
+
+
 def _decommission_cascades(identity_file: str, main_sha: str) -> bool:
     """True only when this environment opted into cascade deletion.
 
@@ -11157,7 +11210,8 @@ def _fmt_env_list(apps, shown=8) -> str:
 
 def _build_merge_summary(results, rollup_by_sig, vm_change_lines,
                          decommission_lines, appspace_state_lines,
-                         new_env_lines, new_env_structural) -> list:
+                         new_env_lines, new_env_structural,
+                         paused_changing=None, paused_envs=None) -> list:
     """The verdict block that opens every comment.
 
     Reads the same deterministic facts the panels below use, so the
@@ -11167,6 +11221,23 @@ def _build_merge_summary(results, rollup_by_sig, vm_change_lines,
     """
     findings = []          # (severity, line)
     sev = _SEV_ROUTINE
+
+    # COPS-2655. The pause finding below this one only fires when the PR
+    # touches an identity file. This one fires whenever a CHANGED app sits
+    # in a frozen environment, which is the case the pv-qa88-a probe
+    # exposed: a cicd-versions.yaml bump rendered "Routine -- nothing
+    # dangerous detected" for a change that would not be applied at all.
+    #
+    # _SEV_REVIEW, not _SEV_BLOCK: nothing dangerous is happening. The
+    # danger is the reviewer believing something happened when it did not,
+    # so the verdict must stop saying "Routine" and name the environments.
+    if paused_changing:
+        _envs = paused_envs or []
+        findings.append((_SEV_REVIEW,
+                         f"\u23f8\ufe0f **{len(_envs)} environment(s) are "
+                         f"PAUSED** (`appspace.autosync: false`) \u2014 their "
+                         f"changes below will NOT be applied on merge: "
+                         f"{_fmt_env_list(_envs)}"))
 
     if decommission_lines:
         txt = "\n".join(decommission_lines)
@@ -11616,7 +11687,7 @@ def format_comment(pr_sha, app_results, skipped_apps=None, base_sha="",
                     decommission_lines=None, input_change_lines=None,
                     appspace_state_lines=None, appendix_lines=None,
                     vm_change_lines=None, artifact_url="",
-                    readable_budget=None, profile=None):
+                    readable_budget=None, profile=None, paused_apps=None):
     """Format the full PR comment. Never uses <details>/<summary> — Bitbucket
     does not render them. Large changesets get a compact summary table at the
     top (all apps, one row each) and, for the diff sections below, apps
@@ -11644,6 +11715,14 @@ def format_comment(pr_sha, app_results, skipped_apps=None, base_sha="",
     so this is the headline, not a footnote.
     """
     skipped_apps  = skipped_apps or []
+    # COPS-2655: only apps that CHANGE matter here. A frozen environment
+    # this PR does not touch is not news, and flagging it would add noise to
+    # every fleet PR that happens to render one.
+    paused_apps   = set(paused_apps or ())
+    _paused_changing = sorted(
+        a for a, r in (app_results or {}).items()
+        if a in paused_apps and r.outcome == OUT_DIFF)
+    _paused_envs = _envs_from_apps(_paused_changing)
     results       = {app: _result(v) for app, v in app_results.items()}
     # Which surface is being rendered (COPS-2609). `readable_budget` is the
     # deprecated way to ask and still works everywhere; it maps onto a
@@ -11818,7 +11897,7 @@ def format_comment(pr_sha, app_results, skipped_apps=None, base_sha="",
     # this PR is safe to merge, and only then reads down for the why.
     lines += _build_merge_summary(
         results, rollup_by_sig, vm_change_lines, decommission_lines,
-        appspace_state_lines, new_env_lines, new_env_structural)
+        appspace_state_lines, new_env_lines, new_env_structural, _paused_changing, _paused_envs)
     lines += ["---", ""]
 
     # ── Application state-flag warning (COPS-2584) ───────────────────
@@ -12004,7 +12083,12 @@ def format_comment(pr_sha, app_results, skipped_apps=None, base_sha="",
                 # worked.
                 _cell = (f"[{app}]({artifact_url}#{diff_ui.app_anchor(app)})"
                          if artifact_url else f"`{app}`")
-                rows.append(f"| {_cell} | \u26a0\ufe0f changed | {r.n_res} "
+                # COPS-2655: the row carries the resource count, so the
+                # pause belongs next to it -- that count is exactly what
+                # will NOT be applied.
+                _st = ("\u23f8\ufe0f paused" if app in paused_apps
+                       else "\u26a0\ufe0f changed")
+                rows.append(f"| {_cell} | {_st} | {r.n_res} "
                             f"| {label} |")
             elif r.outcome == OUT_DECOMMISSIONED:
                 rows.append(f"| `{app}` | \U0001f5d1\ufe0f decommissioned | \u2014 | \u2014 |")
@@ -12398,6 +12482,13 @@ def format_comment(pr_sha, app_results, skipped_apps=None, base_sha="",
             status = "\u274c Error running diff"
     elif any_change:
         status = f"\u26a0\ufe0f {total_changed} resource(s) will change{unknown_note}"
+        if _paused_changing:
+            # The live comment on the pv-qa88-a probe said "3 resource(s)
+            # will change" when zero would. Whatever else this line says, it
+            # must not promise an apply that cannot happen.
+            _n = sum(app_results[a].n_res for a in _paused_changing)
+            status += (f" \u2014 {_n} of them in {len(_paused_envs)} PAUSED "
+                       f"environment(s), NOT applied until auto-sync resumes")
     elif any_unknown:
         status = (f"\u2754 Diff incomplete \u2014 {len(unknown_apps)} app(s) could not "
                   f"be evaluated (NOT confirmed unchanged)")
@@ -13225,6 +13316,17 @@ def process_pr(pr, path_map, base_sha="", repo=None):
             appendix_lines=((decom_full_lines or [])
                             + (new_env_full_lines or [])) or None,
             vm_change_lines=vm_change_lines or None)
+        # COPS-2655: a change to a paused environment is never applied, so
+        # both the comment and the full-diff page have to say so. Read at
+        # pr_sha because the question is what is true AFTER the merge.
+        try:
+            _comment_kwargs["paused_apps"] = _paused_apps_for(
+                list(app_results.keys()), path_map, pr_sha, repo=repo)
+        except Exception as e:
+            # Never let this cost a comment. Silence here is the behaviour
+            # every release before this one had.
+            log(f"autosync check failed (non-fatal): {e}", "WARNING",
+                pr=pr_id, repo=repo, event="autosync_check_failed")
         body = format_comment(pr_sha, app_results,
                               artifact_url=artifact_url, **_comment_kwargs)
         comment_kb = round(len(body.encode()) / 1024, 1)
