@@ -271,6 +271,8 @@ acme-diff-preview/
 │   ├── diff_ui.py             Full-diff artifact store + web UI (stdlib only)
 │   ├── leader.py              Lease-based leader election (stdlib only)
 │   ├── redact.py              Display-time redaction of sensitive values (stdlib only)
+│   ├── vocabulary.py          Diff outcome and failure-reason vocabulary (stdlib only)
+│   ├── comment_render.py      Merge summary and comment formatting helpers (stdlib only)
 │   └── dev_hard_refresh.py    Full sweep of the mutable-tag projects (opt-in CronJob)
 ├── tests/                     Full pytest suite, 100% coverage of src/ — see "Tests" below
 ├── charts/
