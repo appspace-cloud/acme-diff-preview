@@ -17,6 +17,7 @@ os.environ.setdefault("BB_USER", "t")
 os.environ.setdefault("BB_TOKEN", "t")
 os.environ.setdefault("ARGOCD_PASS", "t")
 import diff_preview as m  # noqa: E402
+import logsink
 
 
 def _http_error(code, url="https://api.bitbucket.org/x"):
@@ -42,7 +43,7 @@ def test_get_open_prs_stops_at_page_limit_with_warning(monkeypatch):
     monkeypatch.setattr(m, "http",
                         lambda method, url, **kw: {"values": [{"id": 9}], "next": url})
     logs = []
-    monkeypatch.setattr(m, "log", lambda msg, *a, **k: logs.append(str(msg)))
+    monkeypatch.setattr(logsink, "log", lambda msg, *a, **k: logs.append(str(msg)))
     prs = m.get_open_prs()
     assert len(prs) == 2
     assert any("page limit" in l for l in logs)
@@ -286,6 +287,6 @@ def test_main_iteration_survives_bitbucket_outage(monkeypatch):
         raise _http_error(503)
     monkeypatch.setattr(m, "http", boom)
     logs = []
-    monkeypatch.setattr(m, "log", lambda msg, *a, **k: logs.append(str(msg)))
+    monkeypatch.setattr(logsink, "log", lambda msg, *a, **k: logs.append(str(msg)))
     m.main_iteration()  # must not raise
     assert any("poll_fails" in l for l in logs)

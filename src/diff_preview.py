@@ -58,6 +58,21 @@ import difflib as _difflib
 import yaml  # PyYAML (requirements.txt) - input root-cause panel only, v2.6.2
 import diff_ui  # full-diff web UI (same-dir module, stdlib only)
 import leader  # Lease-based leader election (same-dir module, stdlib only)
+import logsink  # structured logging seam (same-dir module, stdlib only)
+import render_profile  # render profiles + app diff block (same-dir module)
+from render_profile import (  # re-exported: the suite reaches these on the hub
+    DISPLAY_BODY_MAX_CHARS,
+    COMMENT_READABLE_BYTES,
+    FULL_PAGE_UNCAPPED,
+    COMMENT_INLINE_DIFFS,
+    COMMENT_INPUT_PANEL,
+    COMMENT_INLINE_EVIDENCE_LINES,
+    FULL_SECTIONS_MAX_PER_APP,
+    RenderProfile,
+    COMMENT_PROFILE,
+    FULL_PROFILE,
+    _format_app_diff_block,
+)
 from vocabulary import (  # diff outcome vocabulary (same-dir module, stdlib only)
     OUT_DIFF,
     OUT_NO_DIFF,
@@ -149,7 +164,6 @@ from grouping import (  # same-change grouping and rollup (same-dir module)
 )
 from vm_analysis import (  # VM/KCC infrastructure analysis (same-dir module)
     _WORKLOAD_KINDS,
-    _section_kind,
     _replicas_end_state,
     _detect_replicas_zeroed,
     _detect_workload_shutdown,
@@ -191,6 +205,7 @@ from decommission import (  # environment teardown and creation analysis
     _decommission_phase_table,
 )
 from manifest import (  # rendered-manifest parsing and resource diffing
+    _section_kind,
     _is_checksum_only_section,
     _summarize_rendered_manifest,
     _redact_rendered_manifest,
@@ -360,10 +375,6 @@ MAX_DIFF_CHARS     = 2000    # chars per resource diff block
 # AI_MAX_SECTIONS_PER_APP (10), kept as a literal because that constant is
 # defined further down this module.
 RISK_SECTION_RESERVE = 5
-DISPLAY_BODY_MAX_CHARS = 6000  # v2.5.8: hard cap per resource body in the PR
-                               # comment, WITH an explicit marker (protects
-                               # the footer/status token from the blunt
-                               # MAX_COMMENT_BYTES global cut)
 # Capacity knobs (env-overridable). Defaults sized for a single PR that diffs
 # hundreds of apps (a chart version bump rolled out to many clusters at once).
 # The diff is a pure local `helm template` render (no ArgoCD agent round-trips),
@@ -375,18 +386,6 @@ DIFF_TIMEOUT       = _env_int("DIFF_TIMEOUT", 120)       # seconds per diff (OCI
 WARM_WORKERS       = _env_int("WARM_WORKERS", 4)         # parallel chart-cache warm-up pulls
 WARM_THRESHOLD     = _env_int("WARM_THRESHOLD", 8)       # only warm when a PR fans out to more apps than this
 MAX_COMMENT_BYTES  = 245_000 # Bitbucket ~256KB limit; leave headroom
-# Proactive readability budget, far below the Bitbucket hard limit.
-# Reality check on acme-config-prod (2026-08): 8 of the 14 most recent bot
-# comments sat EXACTLY at the 245KB truncation wall — one of them a routine
-# fleet-wide version bump (PR #3891) rendering 473 diff blocks. Meanwhile
-# every committed "readable" golden comment is under 4KB. Nobody reads
-# 150KB in a PR comment; the full-diff view exists for that. 30KB is ~8x
-# the largest small-PR comment today and a few screen-scrolls at most.
-# Critical panels (state flags, cause panel, decommission, VM changes,
-# downgrades, deletions, renames) always render in full; only ordinary
-# per-app diff blocks past this budget collapse into a pointer at the
-# full-diff view. Env-overridable like the other capacity knobs.
-COMMENT_READABLE_BYTES = _env_int("COMMENT_READABLE_BYTES", 30_000)
 # Overview-table row cap, applied only when the changeset is already past
 # the readability budget: a 774-row overview table (observed live on
 # acme-config-prod PR #3890) is pure scroll with no glance value.
@@ -420,29 +419,6 @@ DIFF_UI_MAX_ARTIFACTS = _env_int("DIFF_UI_MAX_ARTIFACTS", 500)
 # emptyDir to everything else that writes under /tmp. Cheap to be strict:
 # GCS is the durable copy, a pruned entry costs one re-download.
 DIFF_UI_MAX_BYTES     = _env_int("DIFF_UI_MAX_BYTES", 400 * 1024 * 1024)
-# Escape hatch for the uncapped full-diff page (COPS-2610): false restores
-# the pre-2.33.0 page (bodies cut at DISPLAY_BODY_MAX_CHARS with a marker).
-# ROLLBACK ORDER, once phase E (COPS-2612) is live: set
-# COMMENT_INLINE_DIFFS=true FIRST, then flip this. The other order leaves
-# the comment without YAML while the page truncates -- information is gone.
-FULL_PAGE_UNCAPPED    = os.environ.get("FULL_PAGE_UNCAPPED", "true").strip().lower() in ("1", "true", "yes")
-# ── Phase E switches (COPS-2612) ─────────────────────────────────────────
-# The comment becomes a decision summary: verdicts, names and counts stay,
-# the YAML evidence moves to the full-diff page. Safe only because phase C
-# proved the page holds everything and retains it, and phase D made it
-# navigable. Measured on the 36-PR corpus: median comment 9,874 bytes, of
-# which 70-93% is YAML that the same reader can now open in one click.
-#
-# COMMENT_INLINE_DIFFS=true is the one-variable rollback to the old shape,
-# and it is also the FIRST step when rolling back phase C -- see README.
-# These are read at render time through RenderProfile.resolved(), never
-# snapshotted at import, or the rollback would not work on a running pod.
-COMMENT_INLINE_DIFFS  = os.environ.get("COMMENT_INLINE_DIFFS", "false").strip().lower() in ("1", "true", "yes")
-COMMENT_INPUT_PANEL   = os.environ.get("COMMENT_INPUT_PANEL", "false").strip().lower() in ("1", "true", "yes")
-# Narrow escape hatch: with inline diffs off, still show this many lines of
-# evidence for BLOCK-severity findings only. 0 (default) means the comment
-# ships with no fenced block at all.
-COMMENT_INLINE_EVIDENCE_LINES = _env_int("COMMENT_INLINE_EVIDENCE_LINES", 0)
 # Durable artifact store: name of a GCS bucket. Empty keeps the old
 # behavior (local dir only, artifacts die with the pod). When set, saves
 # are mirrored to the bucket and local read misses fall back to it, so
@@ -452,7 +428,7 @@ DIFF_UI_GCS_BUCKET    = os.environ.get("DIFF_UI_GCS_BUCKET", "").strip()
 # Soft GCS failures from the store surface in this process's JSON log.
 # Late-bound on purpose: log() is defined further down and resolves at
 # call time, not at assignment time.
-diff_ui.on_warning = lambda msg: log(msg, "WARNING")
+diff_ui.on_warning = lambda msg: logsink.log(msg, "WARNING")
 
 
 def _diff_ui_stat(key, n=1):
@@ -496,7 +472,7 @@ def _make_leader_elector():
         renew_deadline=_env_int("LEADER_RENEW_DEADLINE", 10),
         retry_period=float(_env_int("LEADER_RETRY_PERIOD", 2)),
         enabled=enabled,
-        on_event=lambda msg: log(
+        on_event=lambda msg: logsink.log(
             f"[leader] {msg}",
             "WARNING" if ("non-fatal" in msg or "failed" in msg) else "INFO"))
 
@@ -513,10 +489,10 @@ def _record_affected_apps(count: int) -> None:
         if count > _diff_stats.get("max_affected_apps_seen", 0):
             _diff_stats["max_affected_apps_seen"] = count
     if count > MAX_APPS_PER_RUN:
-        log(f"app cap exceeded: {count} affected, cap {MAX_APPS_PER_RUN}, "
-            f"{count - MAX_APPS_PER_RUN} not evaluated")
+        logsink.log(f"app cap exceeded: {count} affected, cap {MAX_APPS_PER_RUN}, "
+                    f"{count - MAX_APPS_PER_RUN} not evaluated")
     elif count > MAX_APPS_PER_RUN * 0.9:
-        log(f"app cap headroom low: {count} affected, cap {MAX_APPS_PER_RUN}")
+        logsink.log(f"app cap headroom low: {count} affected, cap {MAX_APPS_PER_RUN}")
 
 
 def _should_run_iteration(elector) -> bool:
@@ -587,8 +563,8 @@ def _forward_webhook_to_leader(body: bytes, headers) -> bool:
             pass
         return True
     except Exception as e:
-        log(f"[leader] webhook relay to {holder or 'unknown leader'} failed "
-            f"(non-fatal, safety net covers it): {e}", "WARNING")
+        logsink.log(f"[leader] webhook relay to {holder or 'unknown leader'} failed "
+                    f"(non-fatal, safety net covers it): {e}", "WARNING")
         return False
 
 # JFrog webhook dedup state: {chart:version -> last_processed_timestamp}
@@ -1316,18 +1292,6 @@ _gcp_token:     str   = ""
 _gcp_token_exp: float = 0.0
 _gcp_token_lock       = threading.Lock()
 
-def log(msg: str, severity: str = "INFO", **labels) -> None:
-    """Emit a structured JSON log line in GCP Cloud Logging format."""
-    entry: dict = {
-        "severity":  severity,
-        "message":   msg,
-        "time":      datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%fZ"),
-        "component": "acme-diff-preview",
-    }
-    if labels:
-        entry["labels"] = {k: str(v) for k, v in labels.items()}
-    print(json.dumps(entry), flush=True)
-
 def debug(msg: str, **labels) -> None:
     """Emit a DEBUG log line only when LOG_LEVEL=DEBUG.
 
@@ -1336,13 +1300,13 @@ def debug(msg: str, **labels) -> None:
     etc. Kept off by default so normal INFO logs stay readable.
     """
     if DEBUG:
-        log(msg, "DEBUG", **labels)
+        logsink.log(msg, "DEBUG", **labels)
 
 def _handle_sigterm(signum, frame) -> None:
     """Mark shutdown so the main loop exits after the current iteration."""
     global _shutdown
     _shutdown = True
-    log("SIGTERM received — draining current iteration then exiting", "WARNING")
+    logsink.log("SIGTERM received — draining current iteration then exiting", "WARNING")
     # Hand leadership over NOW (best-effort): the standby replica takes the
     # poll loop in ~1 renewal instead of waiting out a full lease duration.
     # If an iteration is still draining here, the new leader's first
@@ -1517,7 +1481,7 @@ class _HealthHandler(BaseHTTPRequestHandler):
             # HMAC-SHA256 verification (Bitbucket X-Hub-Signature header).
             # Permissive when BB_WEBHOOK_SECRET is not set (backward compat).
             if not _verify_bb_hmac(body, self.headers.get("X-Hub-Signature", "")):
-                log("Bitbucket webhook: HMAC verification failed — rejecting request", "WARNING")
+                logsink.log("Bitbucket webhook: HMAC verification failed — rejecting request", "WARNING")
                 with _bb_webhook_stats_lock:
                     _bb_webhook_stats["rejected_hmac"] += 1
                 self.send_response(401)
@@ -1543,12 +1507,12 @@ class _HealthHandler(BaseHTTPRequestHandler):
                 _maybe_record_supersede_hint(event_key, body)
                 relayed_in = self.headers.get("X-ADP-Forwarded", "") == "1"
                 if relayed_in or _should_run_iteration(_leader):
-                    log(f"Webhook received: {event_key} — waking loop")
+                    logsink.log(f"Webhook received: {event_key} — waking loop")
                 else:
                     ok = _forward_webhook_to_leader(body, self.headers)
-                    log(f"Webhook received: {event_key} (standby): "
-                        + ("relayed to the leader" if ok
-                           else "relay unavailable, safety net covers it"))
+                    logsink.log(f"Webhook received: {event_key} (standby): "
+                                + ("relayed to the leader" if ok
+                                   else "relay unavailable, safety net covers it"))
             self.send_response(200)
             self.end_headers()
 
@@ -1563,7 +1527,7 @@ class _HealthHandler(BaseHTTPRequestHandler):
             # self.rfile.read(length) read UNTIL EOF — unbounded, on an
             # unauthenticated request (HMAC checked after the read) (v2.5.2 C1).
             if length < 0 or length > JFROG_MAX_BODY_BYTES:
-                log(f"JFrog webhook: rejecting invalid Content-Length ({length})", "WARNING")
+                logsink.log(f"JFrog webhook: rejecting invalid Content-Length ({length})", "WARNING")
                 self.send_response(413)
                 self.end_headers()
                 return
@@ -1577,7 +1541,7 @@ class _HealthHandler(BaseHTTPRequestHandler):
 
             # Verify HMAC-SHA256 shared secret (X-JFrog-Event-Auth header)
             if not _verify_jfrog_hmac(body, self.headers.get("X-JFrog-Event-Auth", "")):
-                log("JFrog webhook: HMAC verification failed — rejecting request", "WARNING")
+                logsink.log("JFrog webhook: HMAC verification failed — rejecting request", "WARNING")
                 with _jfrog_stats_lock:
                     _jfrog_stats["rejected_hmac"] += 1
                 self.send_response(401)
@@ -1592,7 +1556,7 @@ class _HealthHandler(BaseHTTPRequestHandler):
                 chart_name  = data["image_name"]
                 chart_ver   = data["tag"]
             except (KeyError, json.JSONDecodeError, TypeError) as exc:
-                log(f"JFrog webhook: malformed payload: {exc}", "WARNING")
+                logsink.log(f"JFrog webhook: malformed payload: {exc}", "WARNING")
                 with _jfrog_stats_lock:
                     _jfrog_stats["rejected_format"] += 1
                 self.send_response(400)
@@ -1615,8 +1579,8 @@ class _HealthHandler(BaseHTTPRequestHandler):
                 last = _jfrog_recent.get(dedup_key, 0)
                 if now - last < JFROG_DEDUP_WINDOW:
                     age = round(now - last, 1)
-                    log(f"JFrog webhook: skipping duplicate {dedup_key} "
-                        f"(last refresh {age}s ago, window={JFROG_DEDUP_WINDOW}s)")
+                    logsink.log(f"JFrog webhook: skipping duplicate {dedup_key} "
+                                f"(last refresh {age}s ago, window={JFROG_DEDUP_WINDOW}s)")
                     with _jfrog_stats_lock:
                         _jfrog_stats["dedup_skipped"] += 1
                     return
@@ -1628,13 +1592,13 @@ class _HealthHandler(BaseHTTPRequestHandler):
                 for k in stale:
                     del _jfrog_recent[k]
 
-            log(f"JFrog webhook: push event for {chart_name}:{chart_ver} — triggering hard-refresh")
+            logsink.log(f"JFrog webhook: push event for {chart_name}:{chart_ver} — triggering hard-refresh")
             # Invalidate our own local chart cache and force affected open
             # PRs to recompute with the fresh build (cheap, in-memory).
             try:
                 _invalidate_for_republish(chart_name, chart_ver)
             except Exception as exc:
-                log(f"JFrog webhook: local invalidation failed: {exc}", "ERROR")
+                logsink.log(f"JFrog webhook: local invalidation failed: {exc}", "ERROR")
             _jfrog_refresh_pool.submit(_jfrog_hard_refresh, chart_name, chart_ver)
 
         else:
@@ -1803,9 +1767,9 @@ def _invalidate_for_republish(chart_name: str, chart_version: str) -> None:
                 _seen.pop(pid, None)
                 forced.append(pid)
     if evicted or forced:
-        log(f"Chart republish {chart_name}:{chart_version} — evicted "
-            f"{evicted} local cache entrie(s), forcing recompute of "
-            f"PR(s): {forced if forced else 'none'}")
+        logsink.log(f"Chart republish {chart_name}:{chart_version} — evicted "
+                    f"{evicted} local cache entrie(s), forcing recompute of "
+                    f"PR(s): {forced if forced else 'none'}")
     if forced:
         _wake.set()
 
@@ -1817,8 +1781,8 @@ def _jfrog_hard_refresh(chart_name: str, chart_version: str) -> None:
     Bypasses the repo-server OCI cache so ArgoCD picks up the new image
     even when CI pushes a new build without bumping the chart version.
     """
-    log(f"JFrog webhook: looking for apps tracking {chart_name}:{chart_version}",
-        chart=chart_name, version=chart_version)
+    logsink.log(f"JFrog webhook: looking for apps tracking {chart_name}:{chart_version}",
+                chart=chart_name, version=chart_version)
 
     r = subprocess.run(
         [ARGOCD_BIN, "app", "list", "--output", "json"]
@@ -1827,14 +1791,14 @@ def _jfrog_hard_refresh(chart_name: str, chart_version: str) -> None:
         env=_argocd_subprocess_env())
 
     if r.returncode != 0:
-        log(f"JFrog webhook: app list failed: {r.stderr[:200]}"
-            + ("..." if len(r.stderr) > 200 else ""), "ERROR")
+        logsink.log(f"JFrog webhook: app list failed: {r.stderr[:200]}"
+                    + ("..." if len(r.stderr) > 200 else ""), "ERROR")
         return
 
     try:
         data = json.loads(r.stdout)
     except json.JSONDecodeError as exc:
-        log(f"JFrog webhook: malformed app list JSON: {exc}", "ERROR")
+        logsink.log(f"JFrog webhook: malformed app list JSON: {exc}", "ERROR")
         return
 
     # argocd app list -o json returns a JSON array directly (not {"items": [...]})
@@ -1848,11 +1812,11 @@ def _jfrog_hard_refresh(chart_name: str, chart_version: str) -> None:
                 break
 
     if not matching:
-        log(f"JFrog webhook: no apps found for {chart_name}:{chart_version}")
+        logsink.log(f"JFrog webhook: no apps found for {chart_name}:{chart_version}")
         return
 
-    log(f"JFrog webhook: {len(matching)} apps to hard-refresh: "
-        f"{', '.join(matching[:5])}{'...' if len(matching) > 5 else ''}")
+    logsink.log(f"JFrog webhook: {len(matching)} apps to hard-refresh: "
+                f"{', '.join(matching[:5])}{'...' if len(matching) > 5 else ''}")
 
     # Parallel hard-refresh: same approach as the CronJob in dev_hard_refresh.py
     # See JFROG_DISPATCH_WORKERS above for why this has its own name (N1):
@@ -1867,13 +1831,13 @@ def _jfrog_hard_refresh(chart_name: str, chart_version: str) -> None:
                 capture_output=True, text=True, timeout=60,
                 env=_argocd_subprocess_env())
             if r.returncode == 0:
-                log(f"  hard-refresh OK: {app_name}")
+                logsink.log(f"  hard-refresh OK: {app_name}")
                 return True
-            log(f"  hard-refresh FAILED: {app_name}: {r.stderr[:100]}"
-                + ("..." if len(r.stderr) > 100 else ""), "WARNING")
+            logsink.log(f"  hard-refresh FAILED: {app_name}: {r.stderr[:100]}"
+                        + ("..." if len(r.stderr) > 100 else ""), "WARNING")
             return False
         except subprocess.TimeoutExpired:
-            log(f"  hard-refresh timed out: {app_name}", "WARNING")
+            logsink.log(f"  hard-refresh timed out: {app_name}", "WARNING")
             return False
 
     ok = failed = 0
@@ -1889,7 +1853,7 @@ def _jfrog_hard_refresh(chart_name: str, chart_version: str) -> None:
         _jfrog_stats["refreshes_ok"]     += ok
         _jfrog_stats["refreshes_failed"] += failed
 
-    log(f"JFrog webhook: done — {ok} refreshed, {failed} failed")
+    logsink.log(f"JFrog webhook: done — {ok} refreshed, {failed} failed")
 
 
 def _touch_progress() -> None:
@@ -1936,7 +1900,7 @@ def _start_heartbeat() -> None:
             time.sleep(30)
     t = threading.Thread(target=_beat, daemon=True, name="heartbeat")
     t.start()
-    log("Heartbeat thread started (tick every 30s, liveness threshold 10 min)")
+    logsink.log("Heartbeat thread started (tick every 30s, liveness threshold 10 min)")
 
 
 class _FastBindHTTPServer(ThreadingHTTPServer):
@@ -1968,7 +1932,7 @@ def _start_health_server(port: int = 8080) -> ThreadingHTTPServer:
     server = _FastBindHTTPServer(("", port), _HealthHandler)
     t = threading.Thread(target=server.serve_forever, daemon=True, name="health-server")
     t.start()
-    log(f"Health server listening on :{port}")
+    logsink.log(f"Health server listening on :{port}")
     return server
 
 def _auth_flags():
@@ -2313,8 +2277,8 @@ def http(method, url, body=None, headers=None, auth=None):
                     # the cap keeps a broken header from stalling the loop.
                     wait = min(ra, BB_RATELIMIT_MAX_PAUSE) if ra is not None \
                         else BB_RATELIMIT_FALLBACK
-                    log(f"[http] 429 on {method} {endpoint} — pausing all "
-                        f"Bitbucket calls {wait}s (retry {attempt+1}/2)", "WARNING")
+                    logsink.log(f"[http] 429 on {method} {endpoint} — pausing all "
+                                f"Bitbucket calls {wait}s (retry {attempt+1}/2)", "WARNING")
                     _bb_ratelimit_hold(wait)
                     last_exc = e
                     continue   # the gate above does the sleeping, for everyone
@@ -2324,8 +2288,8 @@ def http(method, url, body=None, headers=None, auth=None):
                 wait = 2 ** attempt
                 if ra is not None:
                     wait = max(wait, min(ra, 60))
-                log(f"[http] {e.code} on {method} {endpoint} — retry {attempt+1}/2 in {wait}s",
-                    "WARNING")
+                logsink.log(f"[http] {e.code} on {method} {endpoint} — retry {attempt+1}/2 in {wait}s",
+                            "WARNING")
                 time.sleep(wait)
                 last_exc = e
                 continue
@@ -2333,8 +2297,8 @@ def http(method, url, body=None, headers=None, auth=None):
         except (OSError, urllib.error.URLError) as e:
             if attempt < 2:
                 wait = 2 ** attempt
-                log(f"[http] network error on {method} {endpoint} — retry {attempt+1}/2 in {wait}s",
-                    "WARNING")
+                logsink.log(f"[http] network error on {method} {endpoint} — retry {attempt+1}/2 in {wait}s",
+                            "WARNING")
                 time.sleep(wait)
                 last_exc = e
                 continue
@@ -2576,28 +2540,28 @@ def _startup_argocd_login():
         try:
             argocd_login()
             if attempt > 1:
-                log(f"ArgoCD login recovered on attempt {attempt} after "
-                    f"{waited:.0f}s of transient failures",
-                    event="startup_login_recovered", attempts=attempt)
+                logsink.log(f"ArgoCD login recovered on attempt {attempt} after "
+                            f"{waited:.0f}s of transient failures",
+                            event="startup_login_recovered", attempts=attempt)
             return
         except Exception as e:
             if not _login_error_is_transient(e):
-                log(f"ArgoCD login failed with a permanent error; not "
-                    f"retrying: {e}", "ERROR",
-                    event="startup_login_permanent")
+                logsink.log(f"ArgoCD login failed with a permanent error; not "
+                            f"retrying: {e}", "ERROR",
+                            event="startup_login_permanent")
                 raise
             if waited + delay > _STARTUP_LOGIN_BUDGET_S:
-                log(f"ArgoCD login still failing after {waited:.0f}s and "
-                    f"{attempt} attempt(s); giving up so the failure is "
-                    f"visible: {e}", "ERROR",
-                    event="startup_login_budget_exhausted", attempts=attempt)
+                logsink.log(f"ArgoCD login still failing after {waited:.0f}s and "
+                            f"{attempt} attempt(s); giving up so the failure is "
+                            f"visible: {e}", "ERROR",
+                            event="startup_login_budget_exhausted", attempts=attempt)
                 raise
             # Logged in the CURRENT container. After a restart this reason
             # only survives in the previous container's log, which is the
             # first thing lost on the next restart.
-            log(f"ArgoCD login attempt {attempt} failed transiently, "
-                f"retrying in {delay:.0f}s: {e}", "WARNING",
-                event="startup_login_retry", attempt=attempt)
+            logsink.log(f"ArgoCD login attempt {attempt} failed transiently, "
+                        f"retrying in {delay:.0f}s: {e}", "WARNING",
+                        event="startup_login_retry", attempt=attempt)
             time.sleep(delay)
             waited += delay
             delay = min(delay * 2, 16.0)
@@ -2610,11 +2574,11 @@ def argocd_login():
         _argocd_token = _argocd_fetch_token()
     except Exception as e:
         _consecutive_login_fails += 1
-        log(f"ArgoCD login failed (attempt {_consecutive_login_fails}): {e}", "ERROR")
+        logsink.log(f"ArgoCD login failed (attempt {_consecutive_login_fails}): {e}", "ERROR")
         if _consecutive_login_fails >= LOGIN_FAIL_THRESHOLD:
             _ready = False
-            log(f"ArgoCD login failed {_consecutive_login_fails} times — "
-                f"readiness cleared; pod may be restarted by readiness probe.", "ERROR")
+            logsink.log(f"ArgoCD login failed {_consecutive_login_fails} times — "
+                        f"readiness cleared; pod may be restarted by readiness probe.", "ERROR")
         raise
     _consecutive_login_fails = 0
     _argocd_token_ts    = time.monotonic()
@@ -2622,7 +2586,7 @@ def argocd_login():
     _path_map_count     = 0
     _path_map_app_count = 0
     _ready = True
-    log(f"ArgoCD auth: JWT obtained for {ARGOCD_USER} (no password on CLI)")
+    logsink.log(f"ArgoCD auth: JWT obtained for {ARGOCD_USER} (no password on CLI)")
 
 # Resource patterns filtered from ALL diff output and AI analysis.
 # micro-versions-info is an auto-generated ConfigMap that always changes
@@ -2910,10 +2874,10 @@ def _resolve_git_credential(probe_url: str):
         if r is not None and r.returncode == 0:
             _GIT_AUTH_HEADER = header
             _git_credential_resolved = True
-            log(f"[mirror] git credential accepted for user {user!r}")
+            logsink.log(f"[mirror] git credential accepted for user {user!r}")
             return
-    log("[mirror] no git credential shape was accepted -- every read will "
-        "fall back to the Bitbucket API", "WARNING")
+    logsink.log("[mirror] no git credential shape was accepted -- every read will "
+                "fall back to the Bitbucket API", "WARNING")
     _git_credential_resolved = True
 
 
@@ -2932,8 +2896,8 @@ def mirror_sync(repo: str):
         try:
             os.makedirs(GIT_MIRROR_DIR, exist_ok=True)
         except Exception as e:
-            log(f"[mirror] cannot create {GIT_MIRROR_DIR}: {e} -- "
-                f"falling back to the Bitbucket API", "WARNING")
+            logsink.log(f"[mirror] cannot create {GIT_MIRROR_DIR}: {e} -- "
+                        f"falling back to the Bitbucket API", "WARNING")
             return
         t0 = time.monotonic()
         if not os.path.isdir(os.path.join(path, "objects")):
@@ -2942,17 +2906,17 @@ def mirror_sync(repo: str):
             r = _git_run(["clone", "--mirror", "--quiet", url, path])
             if r is None or r.returncode != 0:
                 detail = (r.stderr or "")[:200] if r else "git not runnable"
-                log(f"[mirror] clone of {repo} failed: {detail} -- "
-                    f"falling back to the Bitbucket API", "WARNING")
+                logsink.log(f"[mirror] clone of {repo} failed: {detail} -- "
+                            f"falling back to the Bitbucket API", "WARNING")
                 _mirror_ready[repo] = False
                 return
             _mirror_ready[repo] = True
-            log(f"[mirror] cloned {repo} in {time.monotonic() - t0:.1f}s")
+            logsink.log(f"[mirror] cloned {repo} in {time.monotonic() - t0:.1f}s")
         r = _git_run(["--git-dir", path, "fetch", "--prune", "--quiet", "origin"])
         if r is None or r.returncode != 0:
             detail = (r.stderr or "")[:200] if r else "git not runnable"
-            log(f"[mirror] fetch of {repo} failed: {detail} -- serving what "
-                f"the mirror already has, API covers the rest", "WARNING")
+            logsink.log(f"[mirror] fetch of {repo} failed: {detail} -- serving what "
+                        f"the mirror already has, API covers the rest", "WARNING")
             return
         _mirror_ready[repo] = True
         # Shas that were absent may exist now, so the presence cache for this
@@ -3073,8 +3037,8 @@ def _bb_fetch_status(filepath, sha, repo=None):
                         else BB_RATELIMIT_FALLBACK
                     # WARNING, not debug(): rate limiting is an operational
                     # signal. Production only ever showed the aggregate error.
-                    log(f"[bb] 429 rate limited on {filepath} — pausing all "
-                        f"Bitbucket calls {wait}s (retry {attempt+1}/2)", "WARNING")
+                    logsink.log(f"[bb] 429 rate limited on {filepath} — pausing all "
+                                f"Bitbucket calls {wait}s (retry {attempt+1}/2)", "WARNING")
                     _bb_ratelimit_hold(wait)
                     continue   # the gate above does the sleeping, for everyone
                 wait = (attempt + 1) * 2  # 2s, 4s — one sick request, not a budget
@@ -3187,8 +3151,8 @@ def _extract_chart_version_checked(content: str):
     # must not silently fall back to an earlier, safe-looking duplicate --
     # that would just relocate the false-green bug instead of fixing it.
     if not _is_valid_chart_version(last_candidate):
-        log(f"_extract_chart_version: rejecting unsafe version "
-            f"{last_candidate!r} (not a valid OCI tag)", "WARNING")
+        logsink.log(f"_extract_chart_version: rejecting unsafe version "
+                    f"{last_candidate!r} (not a valid OCI tag)", "WARNING")
         return None, "invalid"
     return last_candidate, "ok"
 
@@ -3410,8 +3374,8 @@ def _main_render_disk_store(key: str, raw: str) -> None:
             except OSError as e:
                 # Best-effort: a leftover tmp after a successful replace is
                 # harmless; a failed cleanup must not poison the cache write.
-                log(f"[main-render-cache] tmp cleanup failed (non-fatal): {e}",
-                    "WARNING")
+                logsink.log(f"[main-render-cache] tmp cleanup failed (non-fatal): {e}",
+                            "WARNING")
     _main_render_disk_prune()
 
 
@@ -3472,8 +3436,8 @@ def _main_render_gcs_store(key: str, raw: str) -> None:
             # Durability is a bonus tier: losing it must never fail a diff.
             with _diff_stats_lock:
                 _diff_stats["main_render_cache_gcs_store_failures"] += 1
-            log(f"[main-render-cache] bucket store failed (non-fatal): {e}",
-                "WARNING")
+            logsink.log(f"[main-render-cache] bucket store failed (non-fatal): {e}",
+                        "WARNING")
 
     try:
         fut = _get_subtask_pool().submit(_upload)
@@ -3515,16 +3479,16 @@ def _main_render_gcs_load(key: str):
         data = diff_ui._gcs_download(MAIN_RENDER_GCS_BUCKET,
                                      _main_render_gcs_name(key))
     except Exception as e:
-        log(f"[main-render-cache] bucket load failed (non-fatal): {e}",
-            "WARNING")
+        logsink.log(f"[main-render-cache] bucket load failed (non-fatal): {e}",
+                    "WARNING")
         return None
     if not data:
         return None
     try:
         return _main_render_gcs_decode(data)
     except Exception as e:
-        log(f"[main-render-cache] bucket object undecodable, treating as a "
-            f"miss (non-fatal): {e}", "WARNING")
+        logsink.log(f"[main-render-cache] bucket object undecodable, treating as a "
+                    f"miss (non-fatal): {e}", "WARNING")
         return None
 
 
@@ -3534,8 +3498,8 @@ def _main_render_gcs_delete(key: str) -> None:
     try:
         diff_ui._gcs_delete(MAIN_RENDER_GCS_BUCKET, _main_render_gcs_name(key))
     except Exception as e:
-        log(f"[main-render-cache] bucket delete failed (non-fatal): {e}",
-            "WARNING")
+        logsink.log(f"[main-render-cache] bucket delete failed (non-fatal): {e}",
+                    "WARNING")
 
 
 def _main_render_cache_discard(key: str) -> None:
@@ -3574,7 +3538,7 @@ def _main_render_cache_put(key: str, raw: str, resources: dict) -> None:
     try:
         _main_render_disk_store(key, raw)
     except OSError as e:
-        log(f"[main-render-cache] disk store failed (non-fatal): {e}", "WARNING")
+        logsink.log(f"[main-render-cache] disk store failed (non-fatal): {e}", "WARNING")
     _main_render_memory_put(key, resources)
     _main_render_gcs_store(key, raw)
 
@@ -3608,8 +3572,8 @@ def _main_render_cache_get(key: str):
             try:
                 _main_render_disk_store(key, raw)
             except OSError as e:
-                log(f"[main-render-cache] disk warm failed (non-fatal): {e}",
-                    "WARNING")
+                logsink.log(f"[main-render-cache] disk warm failed (non-fatal): {e}",
+                            "WARNING")
     if raw is None:
         return None, None, "miss"
 
@@ -3713,10 +3677,10 @@ def _oci_selfcheck():
     if not ok and used_env_ref and _last_pull_ok_ref:
         _reg2, _chart2, _ver2 = _last_pull_ok_ref
         if (_reg2, _chart2, _ver2) != (reg, chart, version):
-            log(f"OCI self-check failed for the configured reference "
-                f"{chart}:{version}; re-probing with the last chart this pod "
-                f"pulled ({_chart2}:{_ver2}) to tell a stale reference from a "
-                f"broken pull path", "WARNING")
+            logsink.log(f"OCI self-check failed for the configured reference "
+                        f"{chart}:{version}; re-probing with the last chart this pod "
+                        f"pulled ({_chart2}:{_ver2}) to tell a stale reference from a "
+                        f"broken pull path", "WARNING")
             try:
                 import tempfile as _tf2
                 _home2 = _tf2.mkdtemp(prefix=".oci-selfcheck-")
@@ -3747,10 +3711,10 @@ def _oci_selfcheck():
     _diff_stats["oci_selfcheck"] = "ok" if ok else "failed"
     _diff_stats["oci_selfcheck_at"] = datetime.now(timezone.utc).isoformat()
     if ok:
-        log(f"OCI self-check OK ({chart}:{version})", "DEBUG")
+        logsink.log(f"OCI self-check OK ({chart}:{version})", "DEBUG")
     else:
-        log(f"OCI self-check FAILED for {chart}:{version} — the diff engine "
-            f"cannot pull charts. {detail}", "ERROR")
+        logsink.log(f"OCI self-check FAILED for {chart}:{version} — the diff engine "
+                    f"cannot pull charts. {detail}", "ERROR")
     return ok
 
 
@@ -3792,12 +3756,12 @@ def _helm_login(registry: str) -> bool:
         if r.returncode == 0:
             _helm_logged_in.add(registry)
             _helm_login_ts[registry] = time.monotonic()
-            log(f"Helm OCI login OK: {registry}")
+            logsink.log(f"Helm OCI login OK: {registry}")
             return True
         # Login failure: clear the cached state so the next call retries.
         _helm_logged_in.discard(registry)
-        log(f"Helm OCI login failed for {registry}: {r.stderr[:200]}"
-            + ("..." if len(r.stderr) > 200 else ""), "WARNING")
+        logsink.log(f"Helm OCI login failed for {registry}: {r.stderr[:200]}"
+                    + ("..." if len(r.stderr) > 200 else ""), "WARNING")
         return False
 
 
@@ -3812,10 +3776,10 @@ def _ensure_chart(registry: str, chart: str, version: str) -> str:
     # _extract_chart_version already filters PR input, but this guarantees
     # the invariant at the single choke point every pull goes through.
     if not _is_valid_chart_version(version):
-        log(f"_ensure_chart: refusing unsafe chart version {version!r}", "ERROR")
+        logsink.log(f"_ensure_chart: refusing unsafe chart version {version!r}", "ERROR")
         return None
     if "/" in chart or ".." in chart:
-        log(f"_ensure_chart: refusing unsafe chart name {chart!r}", "ERROR")
+        logsink.log(f"_ensure_chart: refusing unsafe chart name {chart!r}", "ERROR")
         return None
     key = f"{registry}/{chart}:{version}"
     # Dev registries can republish charts under the same tag. Treat any cached
@@ -3857,8 +3821,8 @@ def _ensure_chart(registry: str, chart: str, version: str) -> str:
     if not _helm_login(registry):
         sev = _record_pull_failure(f"{registry} (login)")
         if sev == "ERROR":
-            log(f"helm registry login persistently failing for {registry} — "
-                f"diff engine degraded", "ERROR")
+            logsink.log(f"helm registry login persistently failing for {registry} — "
+                        f"diff engine degraded", "ERROR")
         return None
 
     # Acquire a per-chart-version lock so concurrent diff threads don't all try
@@ -3955,15 +3919,15 @@ def _ensure_chart(registry: str, chart: str, version: str) -> str:
 
                 if pull_attempt < 2:
                     wait = (pull_attempt + 1) * 5  # 5s, 10s
-                    log(f"helm pull transient error ({chart}:{version}), "
-                        f"retry {pull_attempt+1}/2 in {wait}s: {last_err[:80]}", "WARNING")
+                    logsink.log(f"helm pull transient error ({chart}:{version}), "
+                                f"retry {pull_attempt+1}/2 in {wait}s: {last_err[:80]}", "WARNING")
                     time.sleep(wait)
                 else:
                     sev = _record_pull_failure(f"{registry}/{chart}:{version}")
-                    log(f"helm pull failed for {chart}:{version}: {last_err}"
-                        + (f" — {_diff_stats['oci_consecutive_pull_failures']} consecutive"
-                           f" systemic pull failures, diff engine degraded"
-                           if sev == "ERROR" else ""), sev)
+                    logsink.log(f"helm pull failed for {chart}:{version}: {last_err}"
+                                + (f" — {_diff_stats['oci_consecutive_pull_failures']} consecutive"
+                                   f" systemic pull failures, diff engine degraded"
+                                   if sev == "ERROR" else ""), sev)
                     # v2.5.14: tmp_dir is only renamed into chart_dir on success
                     # (below) or removed by the `except` handler on a raised
                     # exception. A plain `return` here does neither -- it does
@@ -4088,7 +4052,7 @@ def _prune_helm_cache():
         kept.append(entry)
     version_dirs = kept
     if removed_stale:
-        log(f"Helm cache prune: removed {removed_stale} stale/parked dev chart build(s)")
+        logsink.log(f"Helm cache prune: removed {removed_stale} stale/parked dev chart build(s)")
 
     if len(version_dirs) <= HELM_CACHE_MAX_CHARTS:
         return
@@ -4105,7 +4069,7 @@ def _prune_helm_cache():
             _helm_pull_locks.pop(key, None)
         removed += 1
     if removed:
-        log(f"Helm cache prune: removed {removed} old chart version(s)")
+        logsink.log(f"Helm cache prune: removed {removed} old chart version(s)")
 
 
 # Value file cache: {(sha, path) -> content}. Keyed by immutable commit sha, so
@@ -4167,15 +4131,15 @@ def _warn_if_name_invariant_broken(flat: dict):
     prefix = flat.get("appspace.prefix")
     suffix = flat.get("appspace.suffix")
     if prefix is not None and len(str(prefix)) > 2:
-        log(f"appspace.prefix {prefix!r} is longer than the 2 characters "
-            f"CUSTOMER_NAME_MAX={CUSTOMER_NAME_MAX} assumes -- the cap may no "
-            f"longer guarantee a valid GCP service account id (COPS-2562)",
-            "WARNING")
+        logsink.log(f"appspace.prefix {prefix!r} is longer than the 2 characters "
+                    f"CUSTOMER_NAME_MAX={CUSTOMER_NAME_MAX} assumes -- the cap may no "
+                    f"longer guarantee a valid GCP service account id (COPS-2562)",
+                    "WARNING")
     if suffix is not None and len(str(suffix)) > 1:
-        log(f"appspace.suffix {suffix!r} is longer than the 1 character "
-            f"CUSTOMER_NAME_MAX={CUSTOMER_NAME_MAX} assumes -- the cap may no "
-            f"longer guarantee a valid GCP service account id (COPS-2562)",
-            "WARNING")
+        logsink.log(f"appspace.suffix {suffix!r} is longer than the 1 character "
+                    f"CUSTOMER_NAME_MAX={CUSTOMER_NAME_MAX} assumes -- the cap may no "
+                    f"longer guarantee a valid GCP service account id (COPS-2562)",
+                    "WARNING")
 
 
 # The two basenames an environment's identity can live in. Exact basename
@@ -4293,8 +4257,8 @@ def _changed_files_with_bad_names(changed_files, pr_sha, base_sha,
         except Exception as e:
             # Same fail-open the old per-app pool gave each future: one
             # broken file must never take down the whole prep phase.
-            log(f"customerName check failed for {path}, skipping this "
-                f"file (fail-open): {e}", "WARNING")
+            logsink.log(f"customerName check failed for {path}, skipping this "
+                        f"file (fail-open): {e}", "WARNING")
     return bad
 
 
@@ -4536,9 +4500,9 @@ def _fetch_value_files(value_files: list, sha: str) -> dict:
     if unreadable:
         shown = [v.replace("$config/", "") for v in unreadable[:5]]
         more = f" (+{len(unreadable) - 5} more)" if len(unreadable) > 5 else ""
-        log(f"[bb] {len(unreadable)} value file(s) UNREADABLE at sha {sha[:8]} "
-            f"— 429/5xx after retries, NOT absent; the render will look like a "
-            f"missing required value: {shown}{more}", "WARNING")
+        logsink.log(f"[bb] {len(unreadable)} value file(s) UNREADABLE at sha {sha[:8]} "
+                    f"— 429/5xx after retries, NOT absent; the render will look like a "
+                    f"missing required value: {shown}{more}", "WARNING")
     absent = [v for v in missing if v not in
               {u.replace("$config/", "") for u in unreadable}]
     if absent:
@@ -4733,9 +4697,9 @@ def _detect_new_env_candidates(changed_files: list, path_map: dict, renames: dic
                 continue
             cname, _suffix = _extract_appspace_identity(content or "")
             if cname is None:
-                log(f"new-env candidate '{info['name']}' skipped: {cf} "
-                    f"declares no customerName (cohort/defaults values "
-                    f"level, not an environment)")
+                logsink.log(f"new-env candidate '{info['name']}' skipped: {cf} "
+                            f"declares no customerName (cohort/defaults values "
+                            f"level, not an environment)")
                 del candidates[env_dir]
     nested_children = {
         d for d in candidates
@@ -4815,8 +4779,8 @@ def _evaluate_new_envs(new_env_candidates: list, pr_sha: str,
                         f"environment until the file is valid, so nothing "
                         f"deploys on merge. Fix the YAML and push again to "
                         f"unblock.")
-                    log(f"  new env {env_info['name']}: blocked - {reason}",
-                        "WARNING")
+                    logsink.log(f"  new env {env_info['name']}: blocked - {reason}",
+                                "WARNING")
                     new_env_sections.append({
                         "name": env_info["name"], "version": "unknown",
                         "files": env_info["all_yaml_files"], "n_res": 0,
@@ -4837,8 +4801,8 @@ def _evaluate_new_envs(new_env_candidates: list, pr_sha: str,
                     f"config.yaml (a 4 line placeholder is enough, see "
                     f"gcp/prod/private-cloud/eu1-b/hardcoded/migration/"
                     f"monthly/config.yaml) and push again to unblock.")
-                log(f"  new env {env_info['name']}: blocked - {reason}",
-                    "WARNING")
+                logsink.log(f"  new env {env_info['name']}: blocked - {reason}",
+                            "WARNING")
                 new_env_sections.append({
                     "name": env_info["name"], "version": "unknown",
                     "files": env_info["all_yaml_files"], "n_res": 0,
@@ -4863,8 +4827,8 @@ def _evaluate_new_envs(new_env_candidates: list, pr_sha: str,
         _gsa_status, _gsa_detail = _check_customer_name(
             _env_flat.get("appspace.customerName"))
         if _gsa_status == "invalid":
-            log(f"  new env {env_info['name']}: blocked - {_gsa_detail}",
-                "WARNING")
+            logsink.log(f"  new env {env_info['name']}: blocked - {_gsa_detail}",
+                        "WARNING")
             new_env_sections.append({
                 "name": env_info["name"], "version": "unknown",
                 "files": env_info["all_yaml_files"], "n_res": 0,
@@ -4883,7 +4847,7 @@ def _evaluate_new_envs(new_env_candidates: list, pr_sha: str,
         env_name = env_info["name"]
         display_version = detected_version or env_info.get("version", "unknown")
         if rendered:
-            log(f"  new env {env_name}: rendered {n_res} resource(s)")
+            logsink.log(f"  new env {env_name}: rendered {n_res} resource(s)")
             # v2.5.6 (Finding B): summarize instead of dumping the manifest.
             total, kind_counts, workloads = _summarize_rendered_manifest(rendered)
             new_env_sections.append({
@@ -4899,7 +4863,7 @@ def _evaluate_new_envs(new_env_candidates: list, pr_sha: str,
                                       total or n_res,
                                       _redact_rendered_manifest(rendered)))
         else:
-            log(f"  new env {env_name}: render failed - {render_err}", "WARNING")
+            logsink.log(f"  new env {env_name}: render failed - {render_err}", "WARNING")
             new_env_sections.append({
                 "name": env_name, "version": display_version,
                 "files": env_info["all_yaml_files"], "n_res": 0,
@@ -5197,8 +5161,8 @@ def _resolve_effective_pr_chart_revision(app, pr_sha, main_sha=None, renames=Non
     try:
         vals = _fetch_value_files(pr_value_files, pr_sha)
     except Exception as e:
-        log(f"_resolve_effective_pr_chart_revision: value fetch failed for "
-            f"{app}: {str(e)[:150]}", "WARNING", app=app)
+        logsink.log(f"_resolve_effective_pr_chart_revision: value fetch failed for "
+                    f"{app}: {str(e)[:150]}", "WARNING", app=app)
         return None
     # Per-file renames (customer.yaml moved without a full tier move): fill
     # 404s from the rename target so last-wins still sees the leaf pin.
@@ -5483,8 +5447,8 @@ def _parse_manifest_resources(yaml_text):
             n2 = 2
             while (key[0], key[1], f"{name}#{n2}") in resources:
                 n2 += 1
-            log(f"manifest parser: duplicate resource {key} in render "
-                f"\u2014 keeping both as '#{n2}' variant", "WARNING")
+            logsink.log(f"manifest parser: duplicate resource {key} in render "
+                        f"\u2014 keeping both as '#{n2}' variant", "WARNING")
             key = (key[0], key[1], f"{name}#{n2}")
         resources[key] = doc + "\n"
     return resources
@@ -5614,7 +5578,7 @@ def _package_sections(filtered_sections: list, version_change=None):
         body_t = body[:MAX_DIFF_CHARS] + "\n... (truncated)" if len(body) > MAX_DIFF_CHARS else body
         truncated_parts.append(f"===== {hdr} =====\n{body_t}")
     clean_diff = "\n".join(truncated_parts)
-    stored_sections = filtered_sections[:FULL_SECTIONS_MAX_PER_APP]
+    stored_sections = filtered_sections[:render_profile.FULL_SECTIONS_MAX_PER_APP]
     if len(stored_sections) < len(filtered_sections):
         # COPS-2610: the storage cap is memory safety and may never again
         # be silent. What it drops here is gone from BOTH surfaces -- after
@@ -5622,10 +5586,10 @@ def _package_sections(filtered_sections: list, version_change=None):
         # itself and logs, and the FULL page names the shortfall.
         with _diff_stats_lock:
             _diff_stats["section_cap_trims"] += 1
-        log(f"[sections] storage cap hit: kept {len(stored_sections)} of "
-            f"{len(filtered_sections)} sections "
-            f"(FULL_SECTIONS_MAX_PER_APP={FULL_SECTIONS_MAX_PER_APP})",
-            "WARNING")
+        logsink.log(f"[sections] storage cap hit: kept {len(stored_sections)} of "
+                    f"{len(filtered_sections)} sections "
+                    f"(FULL_SECTIONS_MAX_PER_APP={render_profile.FULL_SECTIONS_MAX_PER_APP})",
+                    "WARNING")
     return (clean_diff, stored_sections,
             deleted, zeroed, fingerprint, renamed, vm_changes, version_fold)
 
@@ -5695,9 +5659,9 @@ def _rename_identity_confirmed(old_clean: str, new_clean: str,
     new_identity = _extract_appspace_identity(new_content or "")
     verdict = _same_env_identity(old_identity, new_identity)
     if not verdict:
-        log(f"identity-file rename {old_clean} -> {new_clean} rejected: "
-            f"declared identity changed ({old_identity} -> {new_identity}); "
-            f"treating as unrelated environments, not a move", "WARNING")
+        logsink.log(f"identity-file rename {old_clean} -> {new_clean} rejected: "
+                    f"declared identity changed ({old_identity} -> {new_identity}); "
+                    f"treating as unrelated environments, not a move", "WARNING")
     with _identity_rename_verdict_lock:
         _identity_rename_verdict_cache[cache_key] = verdict
         if len(_identity_rename_verdict_cache) > _IDENTITY_RENAME_CACHE_MAX:
@@ -5937,9 +5901,9 @@ def _augment_renames_with_identity_moves(changed_files: list, renames: dict,
             matches = [nf for nf, nid in added if _same_env_identity(old_id, nid)]
             if len(matches) == 1:
                 out[old] = matches[0]
-                log(f"identity move detected: {old} -> {matches[0]} "
-                    f"(Bitbucket did not pair the rename; matched by "
-                    f"declared identity {old_id})")
+                logsink.log(f"identity move detected: {old} -> {matches[0]} "
+                            f"(Bitbucket did not pair the rename; matched by "
+                            f"declared identity {old_id})")
     except Exception as e:
         debug(f"identity move augmentation skipped: {e}")
         return dict(renames or {})
@@ -6584,8 +6548,8 @@ def _run_one_diff(app, pr_sha, main_sha, chart_revision=None, changed_paths=None
     if env_move:
         old_env_dir, new_env_dir = env_move
         pr_value_files = _rebase_value_files(value_files, old_env_dir, new_env_dir)
-        log(f"  [{app}] env folder moved {old_env_dir} -> {new_env_dir}; "
-            f"rendering PR side against the new location's value-file chain")
+        logsink.log(f"  [{app}] env folder moved {old_env_dir} -> {new_env_dir}; "
+                    f"rendering PR side against the new location's value-file chain")
         try:
             moved_pr_vals = _fetch_value_files(pr_value_files, pr_sha)
         except Exception as e:
@@ -6802,10 +6766,10 @@ def _run_one_diff(app, pr_sha, main_sha, chart_revision=None, changed_paths=None
                         if baseline is None:
                             baseline = _main_render_disk_load(content_key)
                         if baseline is not None and shadow_yaml != baseline:
-                            log(f"[main-render-cache] SHADOW MISMATCH for "
-                                f"{app} key={content_key[:12]}… "
-                                f"(source={cache_source}); discarding entry",
-                                "ERROR")
+                            logsink.log(f"[main-render-cache] SHADOW MISMATCH for "
+                                        f"{app} key={content_key[:12]}… "
+                                        f"(source={cache_source}); discarding entry",
+                                        "ERROR")
                             with _diff_stats_lock:
                                 _diff_stats["main_render_cache_shadow_mismatches"] = (
                                     _diff_stats.get("main_render_cache_shadow_mismatches", 0) + 1)
@@ -6816,8 +6780,8 @@ def _run_one_diff(app, pr_sha, main_sha, chart_revision=None, changed_paths=None
                             main_resources = _parse_manifest_resources(shadow_yaml)
                             _main_render_cache_put(content_key, shadow_yaml, main_resources)
                 except Exception as e:
-                    log(f"[main-render-cache] shadow audit failed (non-fatal): {e}",
-                        "WARNING")
+                    logsink.log(f"[main-render-cache] shadow audit failed (non-fatal): {e}",
+                                "WARNING")
 
     except (subprocess.TimeoutExpired, concurrent.futures.TimeoutError):
         _cancel_futs()   # S4: never leave zombies in the shared pool
@@ -6907,10 +6871,10 @@ def argocd_diff(app, pr_sha, main_sha, chart_revision=None, changed_paths=None, 
                 delay = _diff_backoff(attempt)
                 with _diff_stats_lock:
                     _diff_stats["diff_retries"] += 1
-                log(f"[{app}] {reason} (attempt {attempt + 1}/"
-                    f"{DIFF_RETRIES}), retrying in {delay:.0f}s: "
-                    f"{(detail or '')[:80]}", app=app, reason=reason,
-                    event="diff_retry")
+                logsink.log(f"[{app}] {reason} (attempt {attempt + 1}/"
+                            f"{DIFF_RETRIES}), retrying in {delay:.0f}s: "
+                            f"{(detail or '')[:80]}", app=app, reason=reason,
+                            event="diff_retry")
                 time.sleep(delay)
                 continue
             # Non-retryable soft failure (e.g. render_failed) or retries spent.
@@ -6992,7 +6956,7 @@ def post_build_status(pr_sha, state, description, pr_id=None, repo=None):
             "description": description[:255],
         })
     except Exception as e:
-        log(f"[build status] failed to set {state}: {e}", "WARNING")
+        logsink.log(f"[build status] failed to set {state}: {e}", "WARNING")
 
 def _bb_api_base(repo=None):
     """Per-repo Bitbucket API base URL (COPS-2507 multi-repo)."""
@@ -7013,8 +6977,8 @@ def get_open_prs(repo=None):
         nxt  = data.get("next")
         pages += 1
     if pages >= _BB_MAX_PAGES:
-        log(f"get_open_prs[{repo or BB_REPO}]: hit page limit ({_BB_MAX_PAGES}), "
-            f"results may be incomplete", "WARNING")
+        logsink.log(f"get_open_prs[{repo or BB_REPO}]: hit page limit ({_BB_MAX_PAGES}), "
+                    f"results may be incomplete", "WARNING")
     return prs
 
 
@@ -7049,10 +7013,10 @@ def get_pr_changed_files(pr_id, repo=None):
     if pages >= _BB_MAX_PAGES and path:
         # Page limit hit and more pages exist — affected app list is INCOMPLETE.
         # Missing changed files → apps appear unaffected → potential false no_diff.
-        log(f"PR #{pr_id}: diffstat page limit ({_BB_MAX_PAGES}) hit with more pages "
-            f"remaining — {len(files)} files captured; PR has >10k changed files. "
-            f"App detection is incomplete for this PR.",
-            "WARNING", pr=pr_id)
+        logsink.log(f"PR #{pr_id}: diffstat page limit ({_BB_MAX_PAGES}) hit with more pages "
+                    f"remaining — {len(files)} files captured; PR has >10k changed files. "
+                    f"App detection is incomplete for this PR.",
+                    "WARNING", pr=pr_id)
     return files, renames
 
 def find_existing_comment(pr_id, repo=None):
@@ -7183,8 +7147,8 @@ def _record_comment_stats(body, profile, fallback_inline=False):
         _diff_stats["comment_fences"] = n_fences
         if fallback_inline:
             _diff_stats["comment_fallback_inline"] += 1
-    log(f"[comment] profile={profile.name} bytes={n_bytes} "
-        f"fences={n_fences} fallback_inline={bool(fallback_inline)}")
+    logsink.log(f"[comment] profile={profile.name} bytes={n_bytes} "
+                f"fences={n_fences} fallback_inline={bool(fallback_inline)}")
     return n_bytes, n_fences
 
 
@@ -7211,9 +7175,9 @@ def _save_diff_ui_artifact(repo, pr_id, pr_sha, body, base_sha=None,
     if not _still_leader():
         # COPS-2654: the bucket is last-write-wins, so a demoted pod can
         # overwrite the new leader's artifact with its own older render.
-        log(f"Lease lost mid-iteration; skipping artifact write for PR "
-            f"#{pr_id}", "WARNING", pr=pr_id,
-            event="artifact_skipped_not_leader")
+        logsink.log(f"Lease lost mid-iteration; skipping artifact write for PR "
+                    f"#{pr_id}", "WARNING", pr=pr_id,
+                    event="artifact_skipped_not_leader")
         return False
     try:
         _t0 = time.perf_counter()
@@ -7228,7 +7192,7 @@ def _save_diff_ui_artifact(repo, pr_id, pr_sha, body, base_sha=None,
         _record_stage("store", time.perf_counter() - _t0)
         return True
     except Exception as e:
-        log(f"[diff-ui] artifact save failed (non-fatal): {e}", "WARNING")
+        logsink.log(f"[diff-ui] artifact save failed (non-fatal): {e}", "WARNING")
         return False
 
 def upsert_comment(pr_id, body, existing_id=None, repo=None, artifact_url=""):
@@ -7240,16 +7204,16 @@ def upsert_comment(pr_id, body, existing_id=None, repo=None, artifact_url=""):
         # COPS-2654: the standby took the lease while this iteration was
         # running. It is now computing the same PRs, so writing here would
         # fight it for the same comment.
-        log(f"Lease lost mid-iteration; skipping comment write on PR "
-            f"#{pr_id}", "WARNING", pr=pr_id, event="write_skipped_not_leader")
+        logsink.log(f"Lease lost mid-iteration; skipping comment write on PR "
+                    f"#{pr_id}", "WARNING", pr=pr_id, event="write_skipped_not_leader")
         return
     orig_bytes = len(body.encode("utf-8"))
     if orig_bytes > MAX_COMMENT_BYTES:
         body = _truncate_comment(body, artifact_url=artifact_url)
         with _diff_stats_lock:
             _diff_stats["comments_truncated"] += 1
-        log(f"[comment] truncated: {orig_bytes//1024}KB -> "
-            f"{MAX_COMMENT_BYTES//1024}KB (footer/tokens preserved)", "WARNING")
+        logsink.log(f"[comment] truncated: {orig_bytes//1024}KB -> "
+                    f"{MAX_COMMENT_BYTES//1024}KB (footer/tokens preserved)", "WARNING")
     payload = {"content": {"raw": body}}
     ck = (repo or BB_REPO, pr_id)
     try:
@@ -7273,10 +7237,10 @@ def upsert_comment(pr_id, body, existing_id=None, repo=None, artifact_url=""):
         was_deleted = (existing_id and isinstance(e, urllib.error.HTTPError)
                        and e.code == 404)
         if not was_deleted:
-            log(f"[comment] upsert failed ({e}); NOT posting a fallback "
-                f"(comment likely still exists — would duplicate)", "ERROR")
+            logsink.log(f"[comment] upsert failed ({e}); NOT posting a fallback "
+                        f"(comment likely still exists — would duplicate)", "ERROR")
             return
-        log(f"[comment] comment {existing_id} was deleted; re-creating", "WARNING")
+        logsink.log(f"[comment] comment {existing_id} was deleted; re-creating", "WARNING")
         with _comment_id_cache_lock:
             _comment_id_cache.pop(ck, None)
         try:
@@ -7284,9 +7248,9 @@ def upsert_comment(pr_id, body, existing_id=None, repo=None, artifact_url=""):
             if isinstance(c, dict) and c.get("id"):
                 with _comment_id_cache_lock:
                     _comment_id_cache[ck] = c["id"]
-            log("[comment] fallback POST succeeded", "INFO")
+            logsink.log("[comment] fallback POST succeeded", "INFO")
         except Exception as e2:
-            log(f"[comment] fallback POST also failed: {e2}", "ERROR")
+            logsink.log(f"[comment] fallback POST also failed: {e2}", "ERROR")
 
 def fix_stuck_inprogress(pr_sha, pr_id, comment_raw, repo=None):
     """If build status is stuck INPROGRESS but comment is current, fix the status.
@@ -7342,10 +7306,10 @@ def fix_stuck_inprogress(pr_sha, pr_id, comment_raw, repo=None):
         else:
             state, desc = "SUCCESSFUL", "No manifest changes"
         post_build_status(pr_sha, state, desc, pr_id=pr_id)
-        log(f"Fixed stuck INPROGRESS for PR #{pr_id} -> {state}",
-            pr=pr_id, event="stuck_inprogress_fixed")
+        logsink.log(f"Fixed stuck INPROGRESS for PR #{pr_id} -> {state}",
+                    pr=pr_id, event="stuck_inprogress_fixed")
     except Exception as e:
-        log(f"[fix_stuck_inprogress] PR #{pr_id}: {e}", "WARNING")
+        logsink.log(f"[fix_stuck_inprogress] PR #{pr_id}: {e}", "WARNING")
 
 # ── Vertex AI (Gemini) summary ─────────────────────────────────────────
 # AI-powered diff summary using Vertex AI Gemini.
@@ -7382,181 +7346,6 @@ LARGE_PR_DIFF_BYTES      = 40_000  # total diff bytes above this -> large mode
 # Limits for what we send to the model.
 AI_MAX_SECTIONS_PER_APP  = 10
 AI_MAX_BODY_CHARS        = 1500
-# COPS-2579: DiffResult.sections used to be hard-capped to
-# AI_MAX_SECTIONS_PER_APP (10) at diff time -- a cap meant for the AI
-# prompt (see the independent re-slice at generate_ai_summary's
-# `sections[:AI_MAX_SECTIONS_PER_APP]`) that got reused as the STORAGE cap
-# too, so any resource past #10 was discarded before the comment or the
-# diff-UI page could ever show it (measured: 60 of 16616 sections shown on
-# acme-config-prod PR #3837).
-# COPS-2610 raised the bound again, 400 to 5,000. This is MEMORY safety,
-# not display policy: the full list already exists in memory when
-# _package_sections runs (every safety fact and the fingerprint are
-# computed on it pre-cap), so the cap only bounds what is RETAINED in
-# DiffResult across the whole run's app_results (the COPS-2543 OOM
-# lesson). At 400 it silently amputated the artifact of any app past it --
-# and the comment's note then claimed the remainder was "only in the full
-# diff view", which was exactly where it was not. If an app ever exceeds
-# 5,000, the trim is counted (section_cap_trims) and the FULL page says so
-# instead of pretending completeness.
-FULL_SECTIONS_MAX_PER_APP = _env_int("FULL_SECTIONS_MAX_PER_APP", 5000)
-
-
-# ── Render profiles (COPS-2609, phase B of COPS-2607) ────────────────────
-# This service renders two surfaces with one function: the PR comment and
-# the full-diff page behind the ACME Diff Preview build status. Until now
-# the only thing separating them was `readable_budget`, and that integer's
-# truthiness had quietly accumulated four more jobs: whether byte-identical
-# apps are grouped, whether version-transition noise folds, whether the
-# overview table is row-capped, and whether the appendix collapses into a
-# pointer. A call site could not read any of that, and the later phases of
-# COPS-2607 need to say things the integer cannot express at all -- no body
-# cap, no fences, no input panel.
-#
-# So the difference between the two surfaces becomes a value. The point is
-# that phases C, D and E change a profile rather than the renderer.
-@dataclass(frozen=True)
-class RenderProfile:
-    """How much of the truth a given surface shows.
-
-    Frozen on purpose: these are module-level constants shared across every
-    PR and every worker thread. A render able to mutate one would leak the
-    change into unrelated PRs, and the symptom (a comment that folds
-    differently depending on what was rendered before it) is close to
-    impossible to reproduce. Use replace() for a variant.
-    """
-    name: str
-    # Bulk-region readability budget in bytes. 0 renders everything.
-    # None means "COMMENT_READABLE_BYTES, read at render time" -- see
-    # resolved(). Do NOT bake the constant in as a default here: it is an
-    # _env_int, so a snapshot taken at import silently ignores both the env
-    # var and any runtime override, and the symptom is a comment that stops
-    # honouring its own configured budget.
-    readable_budget: int = None
-    # Render the YAML hunks inline. Phase E (COPS-2612) turns this off for
-    # the comment, which is only safe because phase C proved the page holds
-    # everything and phase D made it navigable.
-    # None = COMMENT_INLINE_DIFFS at render time. Never bake the env value
-    # in as a default here, for the reason spelled out under
-    # readable_budget: an import-time snapshot makes the switch decorative,
-    # and this one is the phase E rollback.
-    inline_diffs: bool = None
-    # Render the "why this changed" input panel. Phase E moves it to the
-    # page. None = COMMENT_INPUT_PANEL at render time.
-    input_panel: bool = None
-    # Collapse byte-identical apps into one representative (COPS-2579).
-    group_repeats: bool = True
-    # Fold version-transition noise so needles stay visible (COPS-2606).
-    version_fold: bool = True
-    # Evidence lines to show per app when inline_diffs is off. Phase E
-    # renders these for BLOCK-severity apps only, so a reviewer never has
-    # to leave the comment to see WHY something is dangerous, only to see
-    # the rest. None = COMMENT_INLINE_EVIDENCE_LINES at render time; 0 (the
-    # default) means the comment ships with no fences at all.
-    inline_evidence_lines: int = None
-    # This surface IS the complete record, not a summary pointing at one
-    # (COPS-2611). Two consequences, both about not lying to the reader:
-    # it never renders a pointer to the full-diff page (it would be a link
-    # to itself, and with no URL to hand it degrades to "the page could not
-    # be produced" -- which the page then said about itself, live on 2.32.0
-    # and 2.33.0), and when the storage cap trims an app it owns the
-    # shortfall instead of directing the reader elsewhere.
-    # A behaviour field rather than a check on name: a profile derived with
-    # replace() under another name must keep behaving like the page.
-    is_complete_record: bool = False
-    # Hard cap per resource body. 0 = never cut (COPS-2610, the FULL page);
-    # the sentinel is resolved through the FULL_PAGE_UNCAPPED hatch below.
-    # None = DISPLAY_BODY_MAX_CHARS at render time (see readable_budget).
-    body_max_chars: int = None
-    # Sections kept per app. Applied when the diff is computed, not when it
-    # is rendered, so phase C has to lift it there; carried here so the
-    # value a surface wants is stated in one place.
-    # None = FULL_SECTIONS_MAX_PER_APP at render time.
-    section_cap: int = None
-
-    def replace(self, **kw):
-        return dataclasses.replace(self, **kw)
-
-    def resolved(self):
-        """Fill in every field that means "the module constant, right now".
-
-        Called once per render. Idempotent, so a caller that hands in an
-        already-resolved profile gets it back unchanged.
-
-        body_max_chars: None means the module default; 0 means "never cut"
-        and passes through the FULL_PAGE_UNCAPPED escape hatch, so flipping
-        that env var back restores the pre-2.33.0 capped page without
-        touching a profile (COPS-2610). Checked at render time for the same
-        reason the constants are: an import-time snapshot would make the
-        hatch decorative.
-        """
-        body_cap = self.body_max_chars
-        if body_cap is None:
-            body_cap = DISPLAY_BODY_MAX_CHARS
-        elif body_cap == 0 and not FULL_PAGE_UNCAPPED:
-            body_cap = DISPLAY_BODY_MAX_CHARS
-        return dataclasses.replace(
-            self,
-            readable_budget=(COMMENT_READABLE_BYTES
-                             if self.readable_budget is None
-                             else self.readable_budget),
-            inline_diffs=(COMMENT_INLINE_DIFFS
-                          if self.inline_diffs is None
-                          else self.inline_diffs),
-            input_panel=(COMMENT_INPUT_PANEL
-                         if self.input_panel is None
-                         else self.input_panel),
-            inline_evidence_lines=(COMMENT_INLINE_EVIDENCE_LINES
-                                   if self.inline_evidence_lines is None
-                                   else self.inline_evidence_lines),
-            body_max_chars=body_cap,
-            section_cap=(FULL_SECTIONS_MAX_PER_APP
-                         if self.section_cap is None
-                         else self.section_cap))
-
-    @classmethod
-    def from_readable_budget(cls, readable_budget):
-        """Map the deprecated keyword onto a profile.
-
-        None is the comment with the module default. 0 is the page: it is
-        how process_pr and eleven existing tests ask for the complete
-        render. Any other number is still the comment, just tighter -- the
-        fold tests drive it with 8000/6000/2500 and must keep grouping and
-        folding, which is exactly what the old `if budget:` did.
-        """
-        if readable_budget is None:
-            return COMMENT_PROFILE
-        if not readable_budget:
-            return FULL_PROFILE
-        return COMMENT_PROFILE.replace(readable_budget=readable_budget)
-
-
-COMMENT_PROFILE = RenderProfile(name="COMMENT")
-FULL_PROFILE = RenderProfile(
-    name="FULL",
-    readable_budget=0,
-    group_repeats=False,
-    version_fold=False,
-    is_complete_record=True,
-    # Pinned True, never resolved from the env: the page is the complete
-    # record, so the phase E switches must not be able to empty it. Flipping
-    # COMMENT_INLINE_DIFFS is a comment-shape decision; if it could also
-    # reach the page, the rollback switch would delete the very thing it
-    # exists to fall back on.
-    inline_diffs=True,
-    input_panel=True,
-    inline_evidence_lines=0,
-    # COPS-2610 (phase C): the page never cuts a resource body. Measured
-    # before the change: acme-config-prod #3887's stored artifact carried
-    # 981 "diff truncated for display" markers, 981 places where the
-    # complete record told the reader to go somewhere else. 0 resolves
-    # through the FULL_PAGE_UNCAPPED hatch, see resolved().
-    body_max_chars=0,
-    # section_cap stays live (None -> FULL_SECTIONS_MAX_PER_APP): the trim
-    # happens at STORAGE time in _package_sections, shared by both
-    # surfaces, and is a memory bound, not display policy. Raised to 5,000
-    # and made loud in the same change.
-)
 # v2.5.18 (FINDINGS_SCALE S1): cap how many APPS go into the prompt. The two
 # caps above bound each app's contribution but not the number of apps, so a
 # mass version bump built an unbounded prompt: measured 4.3MB (~1.08M tokens)
@@ -7590,7 +7379,7 @@ def _gcp_access_token() -> str:
     with _gcp_token_lock:
         if _gcp_token and time.monotonic() < (_gcp_token_exp - 60):
             return _gcp_token
-        log("[AI] Fetching GCP token from metadata server...", "DEBUG")
+        logsink.log("[AI] Fetching GCP token from metadata server...", "DEBUG")
         resp           = http(
             "GET",
             "http://metadata.google.internal/computeMetadata/v1"
@@ -7600,7 +7389,7 @@ def _gcp_access_token() -> str:
         _gcp_token     = resp["access_token"]
         _gcp_token_exp = time.monotonic() + resp.get("expires_in", 3600)
         exp = resp.get("expires_in", "?")
-        log(f"[AI] Token refreshed (valid for {exp}s)", "DEBUG")
+        logsink.log(f"[AI] Token refreshed (valid for {exp}s)", "DEBUG")
         return _gcp_token
 
 
@@ -7642,8 +7431,8 @@ def generate_ai_summary(app_results: dict) -> str | None:
         # COPS-2555: disabled by operator request. Short-circuits before any
         # prompt building or Vertex AI call, not just before rendering, so
         # disabling this also removes its cost/latency, not only its output.
-        log("[AI] AI_SUMMARY_ENABLED=false — skipping AI call", "DEBUG",
-            event="ai_disabled")
+        logsink.log("[AI] AI_SUMMARY_ENABLED=false — skipping AI call", "DEBUG",
+                    event="ai_disabled")
         return None
     try:
         results = {app: _result(v) for app, v in app_results.items()}
@@ -7660,11 +7449,11 @@ def generate_ai_summary(app_results: dict) -> str | None:
             if r.outcome in (OUT_INDETERMINATE, OUT_ERROR)
         }
         if not changed and not errors:
-            log("[AI] No changed apps — skipping AI call", "DEBUG",
-                event="ai_no_changes")
+            logsink.log("[AI] No changed apps — skipping AI call", "DEBUG",
+                        event="ai_no_changes")
             return None
-        log(f"[AI] Preparing prompt: {len(changed)} changed app(s), "
-            f"{sum(len(s) for s in changed.values())} section(s)", "DEBUG")
+        logsink.log(f"[AI] Preparing prompt: {len(changed)} changed app(s), "
+                    f"{sum(len(s) for s in changed.values())} section(s)", "DEBUG")
 
         # FIX B2 (v2.5.1): the top summary line must use the REAL resource
         # count (DiffResult.n_res), not len(sections) which is truncated to
@@ -7689,9 +7478,9 @@ def generate_ai_summary(app_results: dict) -> str | None:
             omitted = len(changed) - AI_MAX_APPS
             with _diff_stats_lock:
                 _diff_stats["ai_prompt_capped"] += 1
-            log(f"[AI] Prompt capped to {AI_MAX_APPS} of "
-                f"{len(changed)} changed apps ({omitted} omitted)",
-                "WARNING", event="ai_prompt_capped", omitted=omitted)
+            logsink.log(f"[AI] Prompt capped to {AI_MAX_APPS} of "
+                        f"{len(changed)} changed apps ({omitted} omitted)",
+                        "WARNING", event="ai_prompt_capped", omitted=omitted)
 
         sections_parts = []
         for app in prompt_apps:
@@ -7791,8 +7580,8 @@ def generate_ai_summary(app_results: dict) -> str | None:
             f"/publishers/google/models/{VERTEX_MODEL}:generateContent"
         )
         prompt_chars = len(prompt)
-        log(f"[AI] Calling {VERTEX_MODEL} | prompt={prompt_chars} chars | "
-            f"maxTokens={2000}", "DEBUG")
+        logsink.log(f"[AI] Calling {VERTEX_MODEL} | prompt={prompt_chars} chars | "
+                    f"maxTokens={2000}", "DEBUG")
         _t0 = time.monotonic()
         resp = http(
             "POST",
@@ -7821,13 +7610,13 @@ def generate_ai_summary(app_results: dict) -> str | None:
         usage     = resp.get("usageMetadata", {})
         in_tok    = usage.get("promptTokenCount", "?")
         out_tok   = usage.get("candidatesTokenCount", "?")
-        log(f"[AI] Response OK | finish={finish} | "
-            f"tokens in={in_tok} out={out_tok} | "
-            f"output={len(ai_text)} chars | elapsed={elapsed}ms", "DEBUG",
-            finish=finish, elapsed_ms=elapsed)
+        logsink.log(f"[AI] Response OK | finish={finish} | "
+                    f"tokens in={in_tok} out={out_tok} | "
+                    f"output={len(ai_text)} chars | elapsed={elapsed}ms", "DEBUG",
+                    finish=finish, elapsed_ms=elapsed)
         if finish == "MAX_TOKENS":
-            log("AI response truncated (MAX_TOKENS) — increase maxOutputTokens or shorten prompt",
-                "WARNING")
+            logsink.log("AI response truncated (MAX_TOKENS) — increase maxOutputTokens or shorten prompt",
+                        "WARNING")
         # The environments line is deterministic (built from app names in
         # code). Strip any such line the model may still emit, then prepend
         # the code-built header so facts never depend on the model.
@@ -7844,11 +7633,11 @@ def generate_ai_summary(app_results: dict) -> str | None:
     except Exception as e:
         err_str = str(e)
         if "404" in err_str and "does not have access" in err_str:
-            log("Vertex AI Model Garden not enabled. Accept Gemini terms: "
-                "https://console.cloud.google.com/vertex-ai/model-garden?project=appspace-devops",
-                "WARNING")
+            logsink.log("Vertex AI Model Garden not enabled. Accept Gemini terms: "
+                        "https://console.cloud.google.com/vertex-ai/model-garden?project=appspace-devops",
+                        "WARNING")
         else:
-            log(f"[AI] Vertex AI call failed: {e}", "WARNING")
+            logsink.log(f"[AI] Vertex AI call failed: {e}", "WARNING")
         return None
 
 # ── Comment format ────────────────────────────────────────────────────
@@ -7876,234 +7665,6 @@ def _result(value):
 # whole review value; the other 363 copies are scroll.
 
 
-def _format_app_diff_block(app, sections, diff_text, show_diff=True, n_res=None,
-                           risk_headers=None, version_fold=None,
-                           artifact_url="", size_budget=None,
-                           group_repeats=False, profile=None,
-                           row_pointer=True):
-    """Return a list of markdown lines for one app's diff block.
-
-    sections is DiffResult.sections — already truncated to display budget.
-    n_res is the REAL total resource count (DiffResult.n_res); the header must
-    report this, not len(sections), which is capped at AI_MAX_SECTIONS_PER_APP.
-    Before v2.4.9 the header used len(sections), so an app that changed e.g.
-    103 resources showed "10 resource(s) changed" and only 10 diffs, with no
-    hint that 93 more changed silently (FIX B). show_diff=False outputs just
-    the header line (large-mode table overflow).
-    risk_headers (COPS-2567) is the set of deleted/zeroed headers for this app.
-    When one of them is on display the sections are no longer a plain prefix,
-    so the truncation note must not keep saying "first".
-    Bitbucket does NOT render HTML <details>/<summary>, so we never use them.
-    """
-    profile = (profile or COMMENT_PROFILE).resolved()
-    shown = len(sections) if sections else 0
-    total = n_res if n_res is not None else shown
-    n = total if total else 1
-    out = [f"\u26a0\ufe0f **`{app}`** \u2014 {n} resource(s) changed", ""]
-    if not show_diff:
-        return out
-    # profile.inline_diffs (COPS-2609): the mechanism phase E flips. Both
-    # profiles keep it on today, so this branch is inert -- it exists so E
-    # is a profile change rather than another surgery on this function.
-    # What it must never do is drop the app: the header above still names
-    # it and states how many resources changed, and the pointer says where
-    # the hunks are. That is a relocation, not a loss.
-    # Version-transition fold. Computed BEFORE the inline_diffs gate below,
-    # because its summary line is a CONCLUSION, not evidence: "6 of 7
-    # changed resources are the version transition 2602 -> 2603 only" is
-    # exactly the sentence a reviewer needs to decide, and it contains no
-    # YAML. Phase E moves the hunks to the page; dropping this line with
-    # them would break umbrella rule 2 (never lose information) while
-    # claiming to only relocate it.
-    folded = set()
-    _fold_lines = []
-    if version_fold and version_fold.get("n_foldable"):
-        folded = set(version_fold.get("headers") or ())
-        _lbl = version_fold.get("label")
-        _are = (f"are the version transition `{_lbl}` only"
-                if _lbl else "are version-only updates")
-        # Two short paragraphs inside the quote, never one long line: a
-        # prose wall past ~350 chars wraps into something nobody reads
-        # (measured on the last 50 merged prod comments, COPS-2605).
-        # The link is appended here only when the hunks stay inline. With
-        # phase E the block emits its own pointer immediately below, and
-        # the same URL twice in adjacent lines reads like a rendering bug.
-        _fold_link = (f" {_full_hunks_link(artifact_url, app=app)}"
-                      if profile.inline_diffs else "")
-        _fold_lines += [f"> \u2b06\ufe0f **{version_fold['n_foldable']} of "
-                        f"{total} changed resource(s)** {_are}.{_fold_link}"]
-        _what = ", ".join(version_fold.get("classes") or ())
-        if _what:
-            _fold_lines += [">", f"> Folded lines: {_what}."]
-        # Name the needles. The fold line says "6 of 7 are version-only",
-        # which leaves the reader knowing one resource changed for another
-        # reason and not which one. With the hunks inline that was answered
-        # by reading on; with phase E moving them to the page it would not
-        # be answered at all, so the names come up into the comment. Names
-        # are not evidence, and umbrella rule 2 is about information, not
-        # about bytes.
-        _needles = [h for h, _ in (sections or []) if h not in folded]
-        if _needles and not profile.inline_diffs:
-            _shown = ", ".join(f"`{_section_name(h)}`" for h in _needles[:5])
-            _extra = (f" *(+{len(_needles) - 5} more)*"
-                      if len(_needles) > 5 else "")
-            _fold_lines += [">", f"> Changed for another reason: "
-                                 f"{_shown}{_extra}"]
-        _fold_lines += [""]
-    if not profile.inline_diffs:
-        # COPS-2612: the block keeps its header (the app and its REAL
-        # resource count) and points at the page. Narrow exception: with
-        # COMMENT_INLINE_EVIDENCE_LINES > 0, a risk-flagged app still shows
-        # that many lines from its offending resources, so a reviewer never
-        # has to leave the comment to see WHY something is dangerous -- only
-        # to see the rest. Routine apps stay fence-free.
-        out += _fold_lines
-        _n = profile.inline_evidence_lines
-        if _n and risk_headers:
-            for hdr, body in (sections or []):
-                if hdr not in risk_headers:
-                    continue
-                _ev = _redact_for_display(hdr, _show_cr(body)).rstrip()
-                _ev = "\n".join(_ev.split("\n")[:_n])
-                out += [f"**`{_fence_safe(hdr)}`**", "", "```diff",
-                        _fence_safe(_ev), "```", ""]
-        if row_pointer:
-            return out + [_full_hunks_link(artifact_url, app=app), ""]
-        # COPS-2640: the app's Changeset overview row already carries this
-        # exact link, and Bitbucket rendered the duplicate broken anyway
-        # (link text "Full hunks for " with the app name outside the
-        # anchor, audited on acme-config-prod #4095). The conclusions
-        # above are the block's value; the pointer is the row's job.
-        return out + [""]
-    out += _fold_lines
-    inline = [(h, b) for h, b in (sections or []) if h not in folded]
-    # Identical changes collapse to one hunk plus a count. Off on the
-    # full-diff page (the caller leaves group_repeats False there), which
-    # must stay the complete record.
-    dups = {}
-    if group_repeats:
-        inline, dups = _group_repeated_sections(inline, risk_headers)
-    if sections:
-        if total > shown:
-            # COPS-2567: only claim a plain prefix when it still is one.
-            # COPS-2610: total > shown means the STORAGE cap trimmed this
-            # app -- the remainder is gone from both surfaces, so on the
-            # FULL page (the self-described complete record) the note must
-            # own the shortfall instead of pointing at itself.
-            if not profile.inline_diffs or profile.is_complete_record:
-                note = (f"> \u26a0\ufe0f **Storage cap reached: showing "
-                        f"{shown} of {total} changed resources.** The "
-                        f"remainder was not retained "
-                        f"(FULL_SECTIONS_MAX_PER_APP). See ArgoCD for the "
-                        f"live state.")
-            elif folded:
-                # With the fold active "showing first N of M" would be
-                # false; say what the storage cap left out instead.
-                note = (f"> \U0001f50d {total - shown} more changed "
-                        f"resource(s) beyond the storage cap are only in "
-                        f"the full diff view.")
-            else:
-                n_risk = sum(1 for hdr, _ in sections
-                             if hdr in (risk_headers or ()))
-                if n_risk:
-                    note = (f"> \U0001f50d Showing {shown} of {total} changed "
-                            f"resources, the {n_risk} highest-risk one(s) "
-                            f"first. See ArgoCD for the full set.")
-                else:
-                    note = (f"> \U0001f50d Showing first {shown} of {total} "
-                            f"changed resources. See ArgoCD for the full set.")
-            out += [note, ""]
-        omitted = []
-        used = sum(len(_l.encode("utf-8")) + 1 for _l in out)
-        rendered_one = False
-        for hdr, body in inline:
-            if (size_budget is not None and rendered_one
-                    and hdr not in (risk_headers or ())
-                    and used > size_budget):
-                # Intra-app readable budget (see format_comment): ordinary
-                # sections past the budget fold into one pointer below.
-                # Risk sections are exempt, and the first section always
-                # renders so the block is never headline-only.
-                omitted.append(hdr)
-                omitted.extend(dups.get(hdr) or ())
-                continue
-            # Redaction happens here, at display time, so the diff engine
-            # still compares real values and detects Secret changes.
-            # v2.5.8: sections bodies are NOT pre-truncated (only
-            # DiffResult.text is) — this docstring used to claim otherwise.
-            # A single giant resource diff (huge ConfigMap rewrite) could
-            # push the whole comment past MAX_COMMENT_BYTES, whose blunt
-            # global cut chops off the footer and its status token. Cap
-            # each body here WITH an explicit marker. Redact BEFORE the
-            # cut so truncation can never split a value a redaction rule
-            # would have caught.
-            # v2.5.19 E3: make CR visible BEFORE redaction — the redaction
-            # helpers use splitlines(), which silently eats a trailing \r, so
-            # a CRLF<->LF-only change would otherwise collapse to "no visible
-            # change". Convert first, then redact, then neutralize fences.
-            body_disp = _redact_for_display(hdr, _show_cr(body)).rstrip()
-            # profile.body_max_chars (COPS-2609/2610): a COMMENT protection
-            # (one giant ConfigMap rewrite must not push the comment past
-            # MAX_COMMENT_BYTES and chop the status token off). 0 = never
-            # cut: the FULL page is the complete record and a cut there is
-            # a lie, not a protection.
-            if profile.body_max_chars and \
-                    len(body_disp) > profile.body_max_chars:
-                body_disp = (body_disp[:profile.body_max_chars].rstrip()
-                             + "\n... (diff truncated for display \u2014 see "
-                               "ArgoCD for the full resource diff)")
-            body_disp = _fence_safe(body_disp)
-            chunk = [f"**`{_fence_safe(hdr)}`**", "", "```diff", body_disp,
-                     "```", ""]
-            _same = dups.get(hdr) or []
-            if _same:
-                chunk += [f"> \u267b\ufe0f **{len(_same)} more resource(s) "
-                          f"change exactly the same lines.**"]
-                _also = _name_list(_same)
-                if _also:
-                    chunk += [">", f"> Same change: {_also}"]
-                chunk += [""]
-            for _l in chunk:
-                used += len(_l.encode("utf-8")) + 1
-            out += chunk
-            rendered_one = True
-        if omitted:
-            out += [f"> \u2702\ufe0f **{len(omitted)} more changed "
-                    f"resource(s) omitted** here to keep the comment "
-                    f"scannable. None is a deletion, zeroed replica or "
-                    f"VM change. {_full_hunks_link(artifact_url, app=app)}"]
-            _names = _name_list(omitted)
-            if _names:
-                out += [">", f"> Omitted: {_names}"]
-            out += [""]
-    elif diff_text:
-        # v2.5.17: this fallback (sections not supplied -- reachable through
-        # _result()'s legacy 3-tuple coercion, which rebuilds sections with
-        # parse_diff_sections() but skips _filter_diff_sections(), and can
-        # end up with an empty section list for non-empty text) used to run
-        # only the flat _redact_sensitive() pass. That pass is not kind-aware
-        # and only catches keys matching _SENSITIVE_KEYS, so a `kind: Secret`
-        # body reaching this branch was never whole-masked, and any Secret
-        # data key not in that list (tls.crt, ca.bundle, .dockerconfigjson,
-        # ...) leaked verbatim. Confirmed live with a probe. Not reachable
-        # through the real diff pipeline today (argocd_diff always keeps
-        # diff_text and sections in lockstep), but a real landmine for the
-        # legacy path or a future refactor that breaks that invariant.
-        #
-        # Fix: recover the same (hdr, body) sections the primary path above
-        # would have had and redact each one the same way. Only fall back
-        # further to the flat pass when the text has no "===== hdr ====="
-        # markers at all to key off (truly unstructured legacy diff text).
-        legacy_secs = parse_diff_sections(diff_text)
-        if legacy_secs:
-            redacted = "\n".join(
-                f"===== {hdr} =====\n{_redact_for_display(hdr, _show_cr(body)).rstrip()}"
-                for hdr, body in legacy_secs
-            )
-        else:
-            redacted = _redact_sensitive(_show_cr(diff_text)).rstrip()
-        out += ["```diff", _fence_safe(redacted), "```", ""]
-    return out
 
 
 _SENSITIVE_KEY_RE = re.compile(r"password|secret|token|credential|apikey|api_key|privatekey", re.I)
@@ -8876,7 +8437,7 @@ def format_comment(pr_sha, app_results, skipped_apps=None, base_sha="",
     if profile is not None and readable_budget is not None:
         raise TypeError("format_comment(): pass profile= or readable_budget=, "
                         "not both")
-    profile = (profile or RenderProfile.from_readable_budget(
+    profile = (profile or render_profile.RenderProfile.from_readable_budget(
         readable_budget)).resolved()
     # NON-NEGOTIABLE (COPS-2612): dropping the YAML from the comment is only
     # ever safe when the page exists to hold it. No artifact_url means the
@@ -8967,13 +8528,13 @@ def format_comment(pr_sha, app_results, skipped_apps=None, base_sha="",
                 rolled_apps.update(_members)
 
     mode_label = "large" if is_large else "small"
-    log(f"[comment] mode={mode_label} | changed_apps={len(changed_apps)} | "
-        f"diff_bytes={total_diff_bytes}", "DEBUG", mode=mode_label,
-        changed_apps=len(changed_apps), diff_bytes=total_diff_bytes)
+    logsink.log(f"[comment] mode={mode_label} | changed_apps={len(changed_apps)} | "
+                f"diff_bytes={total_diff_bytes}", "DEBUG", mode=mode_label,
+                changed_apps=len(changed_apps), diff_bytes=total_diff_bytes)
     ai_summary = generate_ai_summary(app_results)
     if ai_summary:
-        log(f"[comment] AI summary included ({len(ai_summary)} chars)",
-            "DEBUG")
+        logsink.log(f"[comment] AI summary included ({len(ai_summary)} chars)",
+                    "DEBUG")
     elif not AI_SUMMARY_ENABLED:
         # COPS-2657: the feature is switched off, so a missing summary is
         # the expected outcome, not a failure. Without this branch every PR
@@ -8983,19 +8544,19 @@ def format_comment(pr_sha, app_results, skipped_apps=None, base_sha="",
         # filtering severity>=WARNING (which COPS-2652 exists to enable)
         # saw nothing but this false alarm, which is how a warning channel
         # stops being read.
-        log("[comment] AI summary absent (AI_SUMMARY_ENABLED=false)",
-            "DEBUG", event="ai_summary_disabled")
+        logsink.log("[comment] AI summary absent (AI_SUMMARY_ENABLED=false)",
+                    "DEBUG", event="ai_summary_disabled")
     elif not any(_result(v).outcome == OUT_DIFF for v in app_results.values()):
         # Nothing changed, so there was nothing to summarise. Routine.
-        log("[comment] AI summary absent (no changes to summarise)",
-            "DEBUG")
+        logsink.log("[comment] AI summary absent (no changes to summarise)",
+                    "DEBUG")
     else:
         # COPS-2617 secondary finding: this and the line above used to share
         # one INFO message, so a Vertex call failing on every PR looked
         # exactly like a quiet day. Changes exist and the summary is missing,
         # which means the call failed -- say so, and at a level that shows up.
-        log("[comment] AI summary absent despite changed apps: the Vertex "
-            "call failed or returned nothing", "WARNING")
+        logsink.log("[comment] AI summary absent despite changed apps: the Vertex "
+                    "call failed or returned nothing", "WARNING")
 
     # ── Header ──────────────────────────────────────────────────────
     large_label = f" | \U0001f4e6 Large changeset ({len(changed_apps)} apps)" if is_large else ""
@@ -9516,7 +9077,7 @@ def format_comment(pr_sha, app_results, skipped_apps=None, base_sha="",
                           | set(rep_r.replicas_zeroed or [])
                           | {f["header"]
                              for f in (getattr(rep_r, "vm_changes", None) or [])})
-            lines += _format_app_diff_block(
+            lines += render_profile._format_app_diff_block(
                 rep_app, rep_r.sections, rep_r.text, show_diff=True,
                 n_res=rep_r.n_res, risk_headers=_risk_hdrs,
                 version_fold=_fold, artifact_url=artifact_url,
@@ -9720,9 +9281,9 @@ def process_pr(pr, path_map, base_sha="", repo=None):
     # has not started yet is skipped outright. The new leader is already
     # processing it.
     if not _still_leader():
-        log(f"Lease lost mid-iteration; skipping PR #{pr_id} (the new "
-            f"leader owns it)", "WARNING", pr=pr_id, repo=repo,
-            event="pr_skipped_not_leader")
+        logsink.log(f"Lease lost mid-iteration; skipping PR #{pr_id} (the new "
+                    f"leader owns it)", "WARNING", pr=pr_id, repo=repo,
+                    event="pr_skipped_not_leader")
         return
     # COPS-2564: attribute Bitbucket cost to THIS PR. A delta, not a private
     # counter: the cache is shared, so what this measures is the calls the PR
@@ -9736,8 +9297,8 @@ def process_pr(pr, path_map, base_sha="", repo=None):
     dest   = pr["destination"]["branch"]["name"]
     _title = pr['title']
     _title_disp = _title if len(_title) <= 80 else _title[:80] + "..."
-    log(f"PR {repo}#{pr_id}: {_title_disp!r} -> {dest} ({pr_sha[:8]})",
-        pr=pr_id, repo=repo, event="pr_considered")
+    logsink.log(f"PR {repo}#{pr_id}: {_title_disp!r} -> {dest} ({pr_sha[:8]})",
+                pr=pr_id, repo=repo, event="pr_considered")
 
     if dest != "main":
         return
@@ -9751,10 +9312,10 @@ def process_pr(pr, path_map, base_sha="", repo=None):
     _armed_newer = _arm_supersede(sk, pr_sha)
     if _armed_newer:
         _n = _note_supersede_abort(sk)
-        log(f"PR #{pr_id}: superseded before render started "
-            f"({pr_sha[:8]} -> {_armed_newer[:8]}), skipping "
-            f"(consecutive={_n})", pr=pr_id, event="superseded",
-            old_sha=pr_sha[:12], new_sha=_armed_newer[:12], stage="entry")
+        logsink.log(f"PR #{pr_id}: superseded before render started "
+                    f"({pr_sha[:8]} -> {_armed_newer[:8]}), skipping "
+                    f"(consecutive={_n})", pr=pr_id, event="superseded",
+                    old_sha=pr_sha[:12], new_sha=_armed_newer[:12], stage="entry")
         return  # _seen NOT set → the newer sha is rendered on the next pass
 
     # COPS-2617: the same check for the DESTINATION branch. A merge on main
@@ -9771,11 +9332,11 @@ def process_pr(pr, path_map, base_sha="", repo=None):
     _newer_base = _base_superseded_by(repo, dest, base_sha, sk=sk)
     if _newer_base:
         _n = _note_supersede_abort(sk)
-        log(f"PR #{pr_id}: base branch advanced before render started "
-            f"({(base_sha or '')[:8]} -> {_newer_base[:8]}), skipping "
-            f"(consecutive={_n})", pr=pr_id, event="base_superseded",
-            old_sha=(base_sha or "")[:12], new_sha=_newer_base[:12],
-            stage="entry")
+        logsink.log(f"PR #{pr_id}: base branch advanced before render started "
+                    f"({(base_sha or '')[:8]} -> {_newer_base[:8]}), skipping "
+                    f"(consecutive={_n})", pr=pr_id, event="base_superseded",
+                    old_sha=(base_sha or "")[:12], new_sha=_newer_base[:12],
+                    stage="entry")
         return  # _seen NOT set → rendered against the new base next pass
 
     # A chart republish (JFrog webhook) can force this PR to recompute once,
@@ -9785,13 +9346,13 @@ def process_pr(pr, path_map, base_sha="", repo=None):
         forced = sk in _force_recompute
         if forced:
             _force_recompute.discard(sk)
-            log("Forced recompute: a chart this PR renders with was republished",
-                pr=pr_id, repo=repo, event="forced_recompute")
+            logsink.log("Forced recompute: a chart this PR renders with was republished",
+                        pr=pr_id, repo=repo, event="forced_recompute")
 
     # In-memory dedup: skip same SHA already processed in this pod run
     with _seen_lock:
         if not forced and _seen.get(sk) == (pr_sha, base_sha):
-            log(f"Skipping: SHA {pr_sha[:8]} "
+            logsink.log(f"Skipping: SHA {pr_sha[:8]} "
             f"(base {base_sha[:8] if base_sha else '?'}) already processed "
             f"in this run", "DEBUG", pr=pr_id, repo=repo,
             event="skip_already_processed")
@@ -9802,9 +9363,9 @@ def process_pr(pr, path_map, base_sha="", repo=None):
     # so a quota exhaustion cannot turn into a retry storm. A new push
     # bypasses and resets it (handled inside the helper).
     if not forced and _backoff_should_skip(sk, pr_sha):
-        log(f"Skipping: transient-failure backoff active for SHA "
-            f"{pr_sha[:8]} (will retry)", pr=pr_id, repo=repo,
-            event="backoff_skip")
+        logsink.log(f"Skipping: transient-failure backoff active for SHA "
+                    f"{pr_sha[:8]} (will retry)", pr=pr_id, repo=repo,
+                    event="backoff_skip")
         return
 
     # Cross-pod dedup: existing comment already covers this exact SHA
@@ -9839,19 +9400,19 @@ def process_pr(pr, path_map, base_sha="", repo=None):
                 # Structured (not just print): this is the F1 fix actually
                 # firing — worth counting/alerting on, unlike the narrative
                 # trace lines around it (bughunt N7).
-                log(f"PR #{pr_id}: recompute triggered by main advancing "
-                    f"({base_m.group(1) if base_m else 'legacy'} -> {base_sha[:8]})",
-                    pr=pr_id, event="main_advanced_recompute")
+                logsink.log(f"PR #{pr_id}: recompute triggered by main advancing "
+                            f"({base_m.group(1) if base_m else 'legacy'} -> {base_sha[:8]})",
+                            pr=pr_id, event="main_advanced_recompute")
         if rerun:
-            log(f"Re-running: previous comment for SHA {pr_sha[:8]} was "
-                f"not clean, retrying diff", pr=pr_id, repo=repo,
-                event="rerun_not_clean")
+            logsink.log(f"Re-running: previous comment for SHA {pr_sha[:8]} was "
+                        f"not clean, retrying diff", pr=pr_id, repo=repo,
+                        event="rerun_not_clean")
             # existing_id is kept — the comment will be updated in place, not duplicated.
         else:
             with _seen_lock:
                 _seen[sk] = (pr_sha, base_sha)
-            log(f"Skipping: comment up to date for SHA {pr_sha[:8]}",
-                "DEBUG", pr=pr_id, repo=repo, event="skip_up_to_date")
+            logsink.log(f"Skipping: comment up to date for SHA {pr_sha[:8]}",
+                        "DEBUG", pr=pr_id, repo=repo, event="skip_up_to_date")
             # Fix potential stuck INPROGRESS from a previously killed pod
             fix_stuck_inprogress(pr_sha, pr_id, comment_raw, repo=repo)
             return
@@ -9877,9 +9438,9 @@ def process_pr(pr, path_map, base_sha="", repo=None):
             renames  = {o: n for o, n in renames.items()
                         if any(o.startswith(s) or n.startswith(s) for s in scopes)}
             if n_before != len(changed):
-                log(f"Scope filter [{'|'.join(scopes)}]: "
-                    f"{n_before} -> {len(changed)} files in scope", "DEBUG",
-                    pr=pr_id, repo=repo)
+                logsink.log(f"Scope filter [{'|'.join(scopes)}]: "
+                            f"{n_before} -> {len(changed)} files in scope", "DEBUG",
+                            pr=pr_id, repo=repo)
             if n_before > 0 and not changed and not renames:
                 # ENTIRELY out-of-scope PR (e.g. aws/-only in stage): full
                 # silence — no comment, no build status. These PRs belong to
@@ -9888,7 +9449,7 @@ def process_pr(pr, path_map, base_sha="", repo=None):
                 # misread as ArgoCD validation. PRs with in-scope files (even
                 # if they match no app) keep the historical "No ArgoCD apps
                 # affected" comment+status behavior.
-                log(f"Entirely out of scope for {repo} — skipping silently",
+                logsink.log(f"Entirely out of scope for {repo} — skipping silently",
                 "DEBUG", pr=pr_id, repo=repo, event="skip_out_of_scope")
                 with _seen_lock:
                     _seen[sk] = (pr_sha, base_sha)
@@ -9897,9 +9458,9 @@ def process_pr(pr, path_map, base_sha="", repo=None):
         # _app_to_files is reused below for the version-bump detection pass
         # instead of every app independently rescanning changed x path_map.
         affected, _app_to_files = _match_files_to_apps(changed, path_map)
-        log(f"Changed files: {len(changed)} | Affected apps: {len(affected)}",
-            "DEBUG", pr=pr_id, repo=repo,
-            changed_files=len(changed), affected_apps=len(affected))
+        logsink.log(f"Changed files: {len(changed)} | Affected apps: {len(affected)}",
+                    "DEBUG", pr=pr_id, repo=repo,
+                    changed_files=len(changed), affected_apps=len(affected))
 
         # v2.12.0 (COPR-31637): hard guard. A value file that sets
         # appspace.microservices.definitions to null/empty wipes every
@@ -9960,8 +9521,8 @@ def process_pr(pr, path_map, base_sha="", repo=None):
             changed, renames, path_map, base_sha, pr_sha, repo=repo)
         new_env_candidates = _detect_new_env_candidates(changed, path_map, renames, pr_sha=pr_sha, repo=repo)
         if new_env_candidates:
-            log(f"PR #{pr_id}: {len(new_env_candidates)} new env candidate(s): "
-                f"{[e['name'] for e in new_env_candidates]}", pr=pr_id)
+            logsink.log(f"PR #{pr_id}: {len(new_env_candidates)} new env candidate(s): "
+                        f"{[e['name'] for e in new_env_candidates]}", pr=pr_id)
 
         # v2.5.10 (explicit request): detect FULL environment decommissions
         # (identity file deleted, no successor anywhere — distinct from a
@@ -9979,8 +9540,8 @@ def process_pr(pr, path_map, base_sha="", repo=None):
                 _evaluate_env_decommissions(decommission_candidates, pr_sha,
                                             base_sha, with_full_output=True)
             if decommissioned_envs:
-                log(f"PR #{pr_id}: environment decommission detected: "
-                    f"{decommissioned_envs}", "WARNING", pr=pr_id)
+                logsink.log(f"PR #{pr_id}: environment decommission detected: "
+                            f"{decommissioned_envs}", "WARNING", pr=pr_id)
 
         if not affected:
             # No existing ArgoCD app matched the changed files.
@@ -10036,8 +9597,8 @@ def process_pr(pr, path_map, base_sha="", repo=None):
                 return
 
             # No apps affected and no new env pattern found.
-            log("No ArgoCD apps affected - posting SUCCESSFUL",
-                pr=pr_id, repo=repo, event="no_apps_affected")
+            logsink.log("No ArgoCD apps affected - posting SUCCESSFUL",
+                        pr=pr_id, repo=repo, event="no_apps_affected")
             post_build_status(pr_sha, "SUCCESSFUL",
                 "No ArgoCD apps affected by this PR", pr_id=pr_id)
             no_apps_body = (
@@ -10055,7 +9616,7 @@ def process_pr(pr, path_map, base_sha="", repo=None):
                 _seen[sk] = (pr_sha, base_sha)
             return
 
-        log(f"Apps: {affected}", "DEBUG", pr=pr_id, repo=repo)
+        logsink.log(f"Apps: {affected}", "DEBUG", pr=pr_id, repo=repo)
         post_build_status(pr_sha, "INPROGRESS", "Running ArgoCD diff...", pr_id=pr_id)
 
         # v2.5.11 (live PR #6677): apps whose environment was CONFIRMED
@@ -10071,9 +9632,9 @@ def process_pr(pr, path_map, base_sha="", repo=None):
             decommission_candidates, decommissioned_envs)
         app_results = {}
         if decommissioned_apps:
-            log(f"PR #{pr_id}: skipping normal diff for {len(decommissioned_apps)} "
-                f"confirmed-decommissioned app(s): {sorted(decommissioned_apps)}",
-                pr=pr_id)
+            logsink.log(f"PR #{pr_id}: skipping normal diff for {len(decommissioned_apps)} "
+                        f"confirmed-decommissioned app(s): {sorted(decommissioned_apps)}",
+                        pr=pr_id)
             for app in decommissioned_apps:
                 app_results[app] = DiffResult(
                     "", [], 0, False, None, OUT_DECOMMISSIONED, "confirmed_decommission")
@@ -10084,10 +9645,10 @@ def process_pr(pr, path_map, base_sha="", repo=None):
         if len(affected) > MAX_APPS_PER_RUN:
             skipped_apps = affected[MAX_APPS_PER_RUN:]
             affected    = affected[:MAX_APPS_PER_RUN]
-            log(f"Capped to {MAX_APPS_PER_RUN} apps "
-                f"({len(skipped_apps)} skipped)", "WARNING",
-                pr=pr_id, repo=repo, event="app_cap_applied",
-                skipped=len(skipped_apps))
+            logsink.log(f"Capped to {MAX_APPS_PER_RUN} apps "
+                        f"({len(skipped_apps)} skipped)", "WARNING",
+                        pr=pr_id, repo=repo, event="app_cap_applied",
+                        skipped=len(skipped_apps))
         # v2.5.11: total app count this run is actually responsible for,
         # for the SIGTERM-drain safety check below — affected was reduced by
         # decommissioned_apps above, but those already have a final result
@@ -10140,9 +9701,9 @@ def process_pr(pr, path_map, base_sha="", repo=None):
                 if new_rev:
                     pr_chart_revisions[app] = new_rev
         if invalid_version_apps:
-            log(f"PR #{pr_id}: appspace.version rejected as unsafe/invalid for "
-                f"{len(invalid_version_apps)} app(s): "
-                f"{', '.join(sorted(invalid_version_apps))}", "WARNING", pr=pr_id)
+            logsink.log(f"PR #{pr_id}: appspace.version rejected as unsafe/invalid for "
+                        f"{len(invalid_version_apps)} app(s): "
+                        f"{', '.join(sorted(invalid_version_apps))}", "WARNING", pr=pr_id)
 
         # COPS-2562: the name check is now O(changed identity files), not
         # O(apps x chain x 2 shas). It reads only the files this PR actually
@@ -10159,14 +9720,14 @@ def process_pr(pr, path_map, base_sha="", repo=None):
                     if _f in bad_name_files:
                         gsa_invalid_apps[_app] = bad_name_files[_f]
                         break
-            log(f"PR #{pr_id}: appspace.customerName too long/invalid in "
-                f"{len(bad_name_files)} file(s), blocking "
-                f"{len(gsa_invalid_apps)} app(s)", "WARNING", pr=pr_id)
+            logsink.log(f"PR #{pr_id}: appspace.customerName too long/invalid in "
+                        f"{len(bad_name_files)} file(s), blocking "
+                        f"{len(gsa_invalid_apps)} app(s)", "WARNING", pr=pr_id)
         if pr_chart_revisions:
             unique_bumps = sorted(set(pr_chart_revisions.values()))
-            log(f"PR #{pr_id}: chart version bumps detected for "
-                f"{len(pr_chart_revisions)} app(s) -> {unique_bumps}",
-                pr=pr_id)
+            logsink.log(f"PR #{pr_id}: chart version bumps detected for "
+                        f"{len(pr_chart_revisions)} app(s) -> {unique_bumps}",
+                        pr=pr_id)
 
         # Record which chart builds this PR renders with, so a republish of
         # any of them (JFrog webhook) can force this PR to recompute. Covers
@@ -10240,18 +9801,18 @@ def process_pr(pr, path_map, base_sha="", repo=None):
                         _newer = _superseded(sk, pr_sha)
                         if _newer:
                             _superseded_sha = _newer
-                            log(f"PR #{pr_id}: superseded mid-render "
-                                f"({pr_sha[:8]} -> {_newer[:8]}), cancelling "
-                                f"{sum(1 for f in futures if not f.done())} queued diff(s)",
-                                pr=pr_id, event="superseded",
-                                old_sha=pr_sha[:12], new_sha=_newer[:12],
-                                stage="batch", apps_done=len(app_results))
+                            logsink.log(f"PR #{pr_id}: superseded mid-render "
+                                        f"({pr_sha[:8]} -> {_newer[:8]}), cancelling "
+                                        f"{sum(1 for f in futures if not f.done())} queued diff(s)",
+                                        pr=pr_id, event="superseded",
+                                        old_sha=pr_sha[:12], new_sha=_newer[:12],
+                                        stage="batch", apps_done=len(app_results))
                             for f in futures:
                                 f.cancel()
                             break
                     if _shutdown:
-                        log(f"SIGTERM received mid-batch — draining remaining futures",
-                            "WARNING")
+                        logsink.log(f"SIGTERM received mid-batch — draining remaining futures",
+                                    "WARNING")
                         # v2.5.19 (M4): cancel the still-queued diffs instead of
                         # letting the `with` exit block on shutdown(wait=True)
                         # for the whole queue — on a mass PR that overran
@@ -10274,7 +9835,7 @@ def process_pr(pr, path_map, base_sha="", repo=None):
                         # JFrog refresh) already isolates per-item failures;
                         # this one did not. Record it as OUT_ERROR and keep
                         # processing the rest of the batch.
-                        log(f"diff crashed for {app}: {exc}", "ERROR", pr=pr_id, app=app)
+                        logsink.log(f"diff crashed for {app}: {exc}", "ERROR", pr=pr_id, app=app)
                         result = DiffResult("", [], 0, False, str(exc)[:300],
                                             OUT_ERROR, REASON_UNEXPECTED)
                         elapsed = 0.0
@@ -10289,11 +9850,11 @@ def process_pr(pr, path_map, base_sha="", repo=None):
                         reason_counts[result.reason] += 1
                     n_sections = result.n_res if result.outcome == OUT_DIFF else 0
                     # Structured per-app line so failures are queryable in logs.
-                    log(f"diff {result.outcome}/{result.reason} for {app} [{elapsed}s]"
-                        + (f" | {result.error[:120]}" if result.error else ""),
-                        severity=("WARNING" if result.outcome in (OUT_INDETERMINATE, OUT_ERROR) else "INFO"),
-                        pr=pr_id, app=app, outcome=result.outcome, reason=result.reason,
-                        elapsed_s=elapsed, resources=n_sections)
+                    logsink.log(f"diff {result.outcome}/{result.reason} for {app} [{elapsed}s]"
+                                + (f" | {result.error[:120]}" if result.error else ""),
+                                severity=("WARNING" if result.outcome in (OUT_INDETERMINATE, OUT_ERROR) else "INFO"),
+                                pr=pr_id, app=app, outcome=result.outcome, reason=result.reason,
+                                elapsed_s=elapsed, resources=n_sections)
 
         # Helm chart pre-warm: pull all needed chart versions before diffing.
         # Skip versions that are already in the on-disk HELM_CACHE_DIR to avoid
@@ -10331,7 +9892,7 @@ def process_pr(pr, path_map, base_sha="", repo=None):
                 msg = f"    Helm pre-warm: {len(pulls_needed)} to pull"
                 if already_cached:
                     msg += f", {already_cached} already cached"
-                log(msg, "DEBUG", event="helm_prewarm")
+                logsink.log(msg, "DEBUG", event="helm_prewarm")
             if pulls_needed:
                 with ThreadPoolExecutor(max_workers=max(1, min(WARM_WORKERS, len(pulls_needed)))) as ex:
                     futures = [ex.submit(_ensure_chart, reg, chart, ver)
@@ -10340,7 +9901,7 @@ def process_pr(pr, path_map, base_sha="", repo=None):
                         try:
                             fut.result()
                         except OciChartNotFound as e:
-                            log(str(e), "WARNING")
+                            logsink.log(str(e), "WARNING")
                         except Exception as e:
                             # Pre-warm is an optimisation: _run_one_diff pulls
                             # the chart itself if it is not on disk, so a
@@ -10369,13 +9930,13 @@ def process_pr(pr, path_map, base_sha="", repo=None):
         _late_supersede = _superseded_sha or _superseded(sk, pr_sha)
         if _late_supersede:
             _n = _note_supersede_abort(sk)
-            log(f"PR #{pr_id}: superseded ({pr_sha[:8]} -> {_late_supersede[:8]}) "
-                f"after {len(app_results)}/{total_apps_this_run} app(s), "
-                f"discarding this render, no comment and no status "
-                f"(consecutive={_n})",
-                pr=pr_id, event="superseded", old_sha=pr_sha[:12],
-                new_sha=_late_supersede[:12], stage="post_batch",
-                apps_done=len(app_results), apps_total=total_apps_this_run)
+            logsink.log(f"PR #{pr_id}: superseded ({pr_sha[:8]} -> {_late_supersede[:8]}) "
+                        f"after {len(app_results)}/{total_apps_this_run} app(s), "
+                        f"discarding this render, no comment and no status "
+                        f"(consecutive={_n})",
+                        pr=pr_id, event="superseded", old_sha=pr_sha[:12],
+                        new_sha=_late_supersede[:12], stage="post_batch",
+                        apps_done=len(app_results), apps_total=total_apps_this_run)
             return  # _seen NOT set → the newer sha renders on the next pass
 
         # If SIGTERM arrived mid-batch, results are incomplete — do NOT post them
@@ -10384,8 +9945,8 @@ def process_pr(pr, path_map, base_sha="", repo=None):
         if _shutdown and len(app_results) < total_apps_this_run:
             n_done  = len(app_results)
             n_total = total_apps_this_run
-            log(f"PR #{pr_id}: SIGTERM mid-diff ({n_done}/{n_total} apps evaluated) "
-                f"— skipping comment/status to avoid false result", "WARNING", pr=pr_id)
+            logsink.log(f"PR #{pr_id}: SIGTERM mid-diff ({n_done}/{n_total} apps evaluated) "
+                        f"— skipping comment/status to avoid false result", "WARNING", pr=pr_id)
             return  # _seen NOT set → will retry next iteration or pod
 
         # Per-PR breakdown — at a glance, how many apps failed and why.
@@ -10395,15 +9956,15 @@ def process_pr(pr, path_map, base_sha="", repo=None):
         _bb_pr_files = _bb_now["file_fetches"] - _bb_at_pr_start["file_fetches"]
         _bb_pr_rest  = _bb_now["rest_calls"]   - _bb_at_pr_start["rest_calls"]
         _bb_pr_429   = _bb_now["rate_limited"] - _bb_at_pr_start["rate_limited"]
-        log(f"PR #{pr_id} diff summary: {breakdown}"
-            + (f" | reasons: {reasons}" if reasons else "")
-            + f" | bitbucket: {_bb_pr_files + _bb_pr_rest} call(s) "
-              f"({_bb_pr_files} file, {_bb_pr_rest} rest)"
-            + (f", {_bb_pr_429} rate limited" if _bb_pr_429 else ""),
-            pr=pr_id, bb_calls=_bb_pr_files + _bb_pr_rest,
-            bb_file_fetches=_bb_pr_files, bb_rest_calls=_bb_pr_rest,
-            bb_rate_limited=_bb_pr_429,
-            **{f"n_{k}": v for k, v in outcome_counts.items()})
+        logsink.log(f"PR #{pr_id} diff summary: {breakdown}"
+                    + (f" | reasons: {reasons}" if reasons else "")
+                    + f" | bitbucket: {_bb_pr_files + _bb_pr_rest} call(s) "
+                      f"({_bb_pr_files} file, {_bb_pr_rest} rest)"
+                    + (f", {_bb_pr_429} rate limited" if _bb_pr_429 else ""),
+                    pr=pr_id, bb_calls=_bb_pr_files + _bb_pr_rest,
+                    bb_file_fetches=_bb_pr_files, bb_rest_calls=_bb_pr_rest,
+                    bb_rate_limited=_bb_pr_429,
+                    **{f"n_{k}": v for k, v in outcome_counts.items()})
 
         # v2.5.4 (Finding 4): render any new-env candidates bundled with this
         # PR's existing-app changes, using the same path a new-env-only PR
@@ -10426,8 +9987,8 @@ def process_pr(pr, path_map, base_sha="", repo=None):
         moves_missing_cohort = _moves_missing_cohort(renames, pr_sha, repo=repo)
         if moves_missing_cohort:
             envs = ", ".join(b["env"] for b in moves_missing_cohort)
-            log(f"PR #{pr_id}: move(s) with no cohort config.yaml at the "
-                f"destination: {envs}", "WARNING")
+            logsink.log(f"PR #{pr_id}: move(s) with no cohort config.yaml at the "
+                        f"destination: {envs}", "WARNING")
             new_env_lines = _moves_missing_cohort_lines(moves_missing_cohort) + \
                 (new_env_lines or [])
             new_env_desc = (f"{len(moves_missing_cohort)} moved environment(s) "
@@ -10437,19 +9998,19 @@ def process_pr(pr, path_map, base_sha="", repo=None):
         try:
             input_change_lines = _summarize_input_changes(changed, pr_sha, base_sha, repo=repo)
         except Exception as e:  # cause panel must never break the comment
-            log(f"    [comment] input-changes panel failed: {e}", "WARNING")
+            logsink.log(f"    [comment] input-changes panel failed: {e}", "WARNING")
             input_change_lines = []
         try:
             appspace_state_lines = _summarize_appspace_state_changes(
                 changed, pr_sha, base_sha, path_map, repo=repo)
         except Exception as e:  # state-flag panel must never break the comment
-            log(f"    [comment] appspace-state panel failed: {e}", "WARNING")
+            logsink.log(f"    [comment] appspace-state panel failed: {e}", "WARNING")
             appspace_state_lines = []
         try:
             vm_change_lines = _summarize_vm_changes(
                 changed, pr_sha, base_sha, path_map, app_results, repo=repo)
         except Exception as e:  # VM panel must never break the comment
-            log(f"    [comment] vm-changes panel failed: {e}", "WARNING")
+            logsink.log(f"    [comment] vm-changes panel failed: {e}", "WARNING")
             vm_change_lines = []
         # Direct permalink into the full-diff view for this exact commit.
         # Only built when the view is reachable from outside the cluster
@@ -10479,8 +10040,8 @@ def process_pr(pr, path_map, base_sha="", repo=None):
         except Exception as e:
             # Never let this cost a comment. Silence here is the behaviour
             # every release before this one had.
-            log(f"autosync check failed (non-fatal): {e}", "WARNING",
-                pr=pr_id, repo=repo, event="autosync_check_failed")
+            logsink.log(f"autosync check failed (non-fatal): {e}", "WARNING",
+                        pr=pr_id, repo=repo, event="autosync_check_failed")
         body = format_comment(pr_sha, app_results,
                               artifact_url=artifact_url, **_comment_kwargs)
         comment_kb = round(len(body.encode()) / 1024, 1)
@@ -10502,9 +10063,9 @@ def process_pr(pr, path_map, base_sha="", repo=None):
             _full_kwargs["input_change_lines"] = _summarize_input_changes(
                 changed, pr_sha, base_sha, repo=repo, full=True) or None
         except Exception as e:
-            log(f"    [comment] full input panel failed: {e}", "WARNING")
+            logsink.log(f"    [comment] full input panel failed: {e}", "WARNING")
         full_body = format_comment(pr_sha, app_results,
-                                   profile=FULL_PROFILE, **_full_kwargs)
+                                   profile=render_profile.FULL_PROFILE, **_full_kwargs)
         saved = _save_diff_ui_artifact(
             repo, pr_id, pr_sha, full_body, base_sha=base_sha,
             outcome_counts=dict(outcome_counts),
@@ -10520,19 +10081,19 @@ def process_pr(pr, path_map, base_sha="", repo=None):
         # before the comment stops carrying YAML.
         fallback_inline = bool(artifact_url) and not saved
         if fallback_inline:
-            log(f"PR #{pr_id}: full-diff page unavailable, re-rendering the "
-                f"comment with hunks inline", "WARNING")
+            logsink.log(f"PR #{pr_id}: full-diff page unavailable, re-rendering the "
+                        f"comment with hunks inline", "WARNING")
             artifact_url = ""
             body = format_comment(pr_sha, app_results, artifact_url="",
                                   **_comment_kwargs)
             comment_kb = round(len(body.encode()) / 1024, 1)
-        _record_comment_stats(body, COMMENT_PROFILE,
+        _record_comment_stats(body, render_profile.COMMENT_PROFILE,
                               fallback_inline=fallback_inline)
         upsert_comment(pr_id, body, existing_id, repo=repo,
                        artifact_url=artifact_url)
         action = "updated" if existing_id else "posted"
-        log(f"Comment {action} on PR #{pr_id} ({comment_kb}KB)",
-            pr=pr_id, event="comment_posted", comment_kb=comment_kb)
+        logsink.log(f"Comment {action} on PR #{pr_id} ({comment_kb}KB)",
+                    pr=pr_id, event="comment_posted", comment_kb=comment_kb)
 
         # Count changed resources and classify indeterminate reasons FIRST,
         # then update stats and build status (oci_not_found_count must be defined
@@ -10693,12 +10254,12 @@ def process_pr(pr, path_map, base_sha="", repo=None):
             # COPS-2546: still unseen (so it retries), but with escalating
             # spacing instead of every iteration.
             delay = _backoff_register_transient(sk, pr_sha)
-            log(f"PR #{pr_id}: transient failure, backing off {delay} "
-                f"iteration(s) before the next retry")
+            logsink.log(f"PR #{pr_id}: transient failure, backing off {delay} "
+                        f"iteration(s) before the next retry")
         return outcome_counts
 
     except Exception as e:
-        log(f"[ERROR] PR #{pr_id}: {e}", "ERROR")
+        logsink.log(f"[ERROR] PR #{pr_id}: {e}", "ERROR")
         try:
             post_build_status(pr_sha, "FAILED", f"Diff error: {str(e)[:200]}", pr_id=pr_id)
         except Exception:
@@ -10722,7 +10283,7 @@ def main_iteration():
     # COPS-2564: per-iteration, not since pod start, so the number in the
     # closing log answers "what did THIS iteration cost the shared token".
     reset_bb_call_stats()
-    log("ACME diff preview iteration starting")
+    logsink.log("ACME diff preview iteration starting")
     _touch_progress()  # C2 checkpoint: iteration is alive and beginning work
 
     # Trim the on-disk chart cache before any diffs so it never races a pull.
@@ -10738,9 +10299,9 @@ def main_iteration():
     try:
         healed = diff_ui.retry_pending_uploads()
         if healed:
-            log(f"Re-uploaded {healed} artifact(s) that had failed earlier")
+            logsink.log(f"Re-uploaded {healed} artifact(s) that had failed earlier")
     except Exception as e:
-        log(f"Artifact upload reconcile failed (non-fatal): {e}", "WARNING")
+        logsink.log(f"Artifact upload reconcile failed (non-fatal): {e}", "WARNING")
 
     # Proactively refresh the ArgoCD JWT before it expires so a busy iteration
     # never hits a mid-run 401. ARGOCD_TOKEN_TTL default=12h (well under the
@@ -10748,15 +10309,15 @@ def main_iteration():
     if _argocd_token and (time.monotonic() - _argocd_token_ts) > ARGOCD_TOKEN_TTL:
         try:
             argocd_login()
-            log(f"ArgoCD JWT proactively refreshed (TTL={ARGOCD_TOKEN_TTL}s)")
+            logsink.log(f"ArgoCD JWT proactively refreshed (TTL={ARGOCD_TOKEN_TTL}s)")
         except Exception as e:
-            log(f"Proactive JWT refresh failed: {e} — continuing with existing token",
-                "WARNING")
+            logsink.log(f"Proactive JWT refresh failed: {e} — continuing with existing token",
+                        "WARNING")
 
     try:
         path_map = discover_path_app_map()
     except Exception as e:
-        log(f"Cannot discover ArgoCD apps: {e}", "ERROR")
+        logsink.log(f"Cannot discover ArgoCD apps: {e}", "ERROR")
         # Re-login in case the ArgoCD session expired — next iteration will retry.
         # Do NOT mass-FAILED all open PRs: a brief ArgoCD blip would flood every
         # PR with spurious FAILED statuses. Leave existing statuses intact and
@@ -10768,9 +10329,9 @@ def main_iteration():
         return
     _touch_progress()  # C2 checkpoint: app discovery succeeded
     cache_age = round(time.monotonic() - _path_map_ts, 0) if _path_map_ts else -1
-    log(f"Discovered {len(path_map)} unique paths across "
-        f"{sum(len(v) for v in path_map.values())} app refs "
-        f"({'cached' if cache_age >= 0 and cache_age < PATH_MAP_TTL else 'fresh'})")
+    logsink.log(f"Discovered {len(path_map)} unique paths across "
+                f"{sum(len(v) for v in path_map.values())} app refs "
+                f"({'cached' if cache_age >= 0 and cache_age < PATH_MAP_TTL else 'fresh'})")
 
     # ── COPS-2507 multi-repo scan: per-repo main sha, PR list and path-map
     # partition. A Bitbucket failure on one repo must not starve the others,
@@ -10791,7 +10352,7 @@ def main_iteration():
             # processed, on purpose: the snapshot every PR below is given IS
             # this sha, and a hint older than it must not abort them.
             _note_base_observed(repo, "main", base_sha)
-            log(f"[{repo}] Base SHA (main): {base_sha[:8]}")
+            logsink.log(f"[{repo}] Base SHA (main): {base_sha[:8]}")
             # COPS-2564: one fetch per repo per iteration replaces hundreds of
             # per-file API calls. Inside this try on purpose: a git problem
             # must not starve the other repos, and reads fall back anyway.
@@ -10810,18 +10371,18 @@ def main_iteration():
             per_repo.append((repo, prs, base_sha))
         except Exception as e:
             poll_failures += 1
-            log(f"[{repo}] Bitbucket API error: {e}", "ERROR")
+            logsink.log(f"[{repo}] Bitbucket API error: {e}", "ERROR")
     if poll_failures == len(REPOS):
         _last_poll_ok = False
         _consecutive_poll_fails += 1
-        log(f"Bitbucket poll failed for ALL repos (poll_fails={_consecutive_poll_fails})",
-            "ERROR")
+        logsink.log(f"Bitbucket poll failed for ALL repos (poll_fails={_consecutive_poll_fails})",
+                    "ERROR")
         return
     # Mark poll as healthy after at least one successful repo fetch.
     _last_poll_ok = True
     _consecutive_poll_fails = 0
     _touch_progress()  # C2 checkpoint: Bitbucket poll succeeded
-    log("Open PRs: " + ", ".join(f"{repo}={len(prs)}" for repo, prs, _ in per_repo))
+    logsink.log("Open PRs: " + ", ".join(f"{repo}={len(prs)}" for repo, prs, _ in per_repo))
 
     # Evict _seen entries for PRs no longer open. Without this, a PR that
     # is declined and immediately reopened with the same SHA would be silently
@@ -10866,7 +10427,7 @@ def main_iteration():
                         totals.update(counts)
                 except Exception as exc:
                     pr, repo = futs[fut]
-                    log(f"Unhandled error processing PR {repo}#{pr['id']}: {exc}", "ERROR")
+                    logsink.log(f"Unhandled error processing PR {repo}#{pr['id']}: {exc}", "ERROR")
                 _touch_progress()  # C2 checkpoint: one PR finished processing
 
     # Iteration-level rollup across all PRs: a single line that shows whether
@@ -10887,29 +10448,29 @@ def main_iteration():
     if totals:
         rollup = ", ".join(f"{k}={v}" for k, v in sorted(totals.items()))
         unhealthy = totals.get(OUT_INDETERMINATE, 0) + totals.get(OUT_ERROR, 0)
-        log(f"Iteration done [{elapsed_s}s] — diff outcomes: {rollup}"
-            + (f" | {unhealthy} app diff(s) could not be computed" if unhealthy else "")
-            + bb_note,
-            severity=("WARNING" if unhealthy else "INFO"),
-            bb_calls=bb_total, bb_file_fetches=bbs["file_fetches"],
-            bb_rest_calls=bbs["rest_calls"], bb_rate_limited=bbs["rate_limited"],
-            **{f"n_{k}": v for k, v in totals.items()})
+        logsink.log(f"Iteration done [{elapsed_s}s] — diff outcomes: {rollup}"
+                    + (f" | {unhealthy} app diff(s) could not be computed" if unhealthy else "")
+                    + bb_note,
+                    severity=("WARNING" if unhealthy else "INFO"),
+                    bb_calls=bb_total, bb_file_fetches=bbs["file_fetches"],
+                    bb_rest_calls=bbs["rest_calls"], bb_rate_limited=bbs["rate_limited"],
+                    **{f"n_{k}": v for k, v in totals.items()})
     else:
-        log(f"Iteration done [{elapsed_s}s]" + bb_note,
-            bb_calls=bb_total, bb_rate_limited=bbs["rate_limited"])
+        logsink.log(f"Iteration done [{elapsed_s}s]" + bb_note,
+                    bb_calls=bb_total, bb_rate_limited=bbs["rate_limited"])
 
 # ── Main entry point (long-running Deployment mode) ───────────────────
 def main():
     """Start health server, login to ArgoCD, then run poll loop until SIGTERM."""
     global _last_ok, _loop_idle, _leader
-    log("acme-diff-preview starting (Deployment mode, helm-template diff)",
-        version=APP_VERSION,
-        argocd_server=ARGOCD_SERVER, argocd_user=ARGOCD_USER,
-        bb_repos=";".join(f"{r}:{'|'.join(c['scopes']) or '*'}" for r, c in REPOS.items()),
-        diff_workers=DIFF_WORKERS, pr_workers=MAX_PR_WORKERS,
-        max_apps_per_run=MAX_APPS_PER_RUN, diff_timeout=DIFF_TIMEOUT,
-        diff_retries=DIFF_RETRIES, warm_workers=WARM_WORKERS,
-        kube_version=KUBE_VERSION, log_level=LOG_LEVEL, vertex_model=VERTEX_MODEL)
+    logsink.log("acme-diff-preview starting (Deployment mode, helm-template diff)",
+                version=APP_VERSION,
+                argocd_server=ARGOCD_SERVER, argocd_user=ARGOCD_USER,
+                bb_repos=";".join(f"{r}:{'|'.join(c['scopes']) or '*'}" for r, c in REPOS.items()),
+                diff_workers=DIFF_WORKERS, pr_workers=MAX_PR_WORKERS,
+                max_apps_per_run=MAX_APPS_PER_RUN, diff_timeout=DIFF_TIMEOUT,
+                diff_retries=DIFF_RETRIES, warm_workers=WARM_WORKERS,
+                kube_version=KUBE_VERSION, log_level=LOG_LEVEL, vertex_model=VERTEX_MODEL)
 
     # COPS-2575 self-check: a silently permissive pod after a secret-mount
     # problem is worth one log line. Never logs the value, only whether strict
@@ -10917,22 +10478,22 @@ def main():
     # trusted at all (an unauthenticated POST that can abort in-flight renders
     # would be a cheap denial of service, so hints need a verified sender).
     if BB_WEBHOOK_SECRET:
-        log("Bitbucket webhook: HMAC strict mode active",
-            hmac_strict=True, supersede_abort=SUPERSEDE_ABORT_ENABLED)
+        logsink.log("Bitbucket webhook: HMAC strict mode active",
+                    hmac_strict=True, supersede_abort=SUPERSEDE_ABORT_ENABLED)
     else:
-        log("Bitbucket webhook: BB_WEBHOOK_SECRET is EMPTY, permissive mode, "
-            "any unsigned POST is accepted and supersede hints are ignored",
-            "WARNING", hmac_strict=False, supersede_abort=False)
+        logsink.log("Bitbucket webhook: BB_WEBHOOK_SECRET is EMPTY, permissive mode, "
+                    "any unsigned POST is accepted and supersede hints are ignored",
+                    "WARNING", hmac_strict=False, supersede_abort=False)
 
     # Self-check: the entire diff engine depends on an OCI pull, which needs
     # OCI_PASS. Without it _helm_login fails and EVERY diff returns "diff
     # unavailable". Fail loudly at startup instead of silently degrading.
     if not OCI_PASS:
-        log("OCI_PASS is empty — helm OCI pulls will fail and every diff will be "
-            "unavailable. Set secrets.ociPassKey/ociUserKey in the chart values.",
-            "ERROR")
+        logsink.log("OCI_PASS is empty — helm OCI pulls will fail and every diff will be "
+                    "unavailable. Set secrets.ociPassKey/ociUserKey in the chart values.",
+                    "ERROR")
     else:
-        log(f"OCI credentials present (user={OCI_USER})")
+        logsink.log(f"OCI credentials present (user={OCI_USER})")
         # v2.5.25: periodic authenticated self-check of the OCI-pull path —
         # first run ~60s after start, so a deploy that breaks pulls (like the
         # 403 incident) turns into an ERROR log within a minute.
@@ -10948,22 +10509,22 @@ def main():
     # away secret would silently reopen the webhook to unsigned requests
     # with zero visibility. Log it the same way OCI_PASS is logged.
     if not BB_WEBHOOK_SECRET:
-        log("BB_WEBHOOK_SECRET is empty — the Bitbucket webhook is running in "
-            "PERMISSIVE mode and will accept unsigned requests. Set "
-            "secrets.bbWebhookSecretKey in the chart values.", "WARNING")
+        logsink.log("BB_WEBHOOK_SECRET is empty — the Bitbucket webhook is running in "
+                    "PERMISSIVE mode and will accept unsigned requests. Set "
+                    "secrets.bbWebhookSecretKey in the chart values.", "WARNING")
     else:
-        log("Bitbucket webhook HMAC verification is active")
+        logsink.log("Bitbucket webhook HMAC verification is active")
 
     _start_health_server()
     _start_heartbeat()    # keep /healthz alive during long PR processing
     _get_subtask_pool()   # warm the shared thread pool before the first iteration
-    log(f"Sub-task pool ready ({_SUBTASK_POOL_WORKERS} workers)")
+    logsink.log(f"Sub-task pool ready ({_SUBTASK_POOL_WORKERS} workers)")
 
     # Initial login. Transient failures (DNS not ready on a fresh node,
     # connection reset, ArgoCD restarting) get a bounded retry; a permanent
     # one still raises so the container restarts immediately and loudly.
     _startup_argocd_login()
-    log("ArgoCD login OK")
+    logsink.log("ArgoCD login OK")
 
     # HA (leader election): the poll loop below runs only on the replica
     # holding the lease; everything already started above (health server,
@@ -10976,17 +10537,17 @@ def main():
     while not _shutdown:
         if _should_run_iteration(_leader):
             if _standby_logged:
-                log("[leader] this replica now owns the poll loop")
+                logsink.log("[leader] this replica now owns the poll loop")
                 _standby_logged = False
             try:
                 main_iteration()
                 _last_ok = time.monotonic()  # only bumped on a clean iteration
             except Exception as e:
-                log(f"Unhandled error in main loop: {e}", "ERROR")
+                logsink.log(f"Unhandled error in main loop: {e}", "ERROR")
                 # Do NOT bump _last_ok here — /healthz must reflect real staleness.
         elif not _standby_logged:
-            log("[leader] standby: another replica owns the poll loop; "
-                "serving HTTP only")
+            logsink.log("[leader] standby: another replica owns the poll loop; "
+                        "serving HTTP only")
             _standby_logged = True
         if not _shutdown:
             # Webhook wakes the loop instantly (<1s). The 60s timeout is
@@ -11043,7 +10604,7 @@ def main():
                     _diff_stats["last_iteration_trigger"] = "safety_net"
             _wake.clear()
 
-    log("Shutdown complete", "WARNING")
+    logsink.log("Shutdown complete", "WARNING")
 
 if __name__ == "__main__":
     main()

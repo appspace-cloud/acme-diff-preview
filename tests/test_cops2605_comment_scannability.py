@@ -30,6 +30,7 @@ os.environ.setdefault("ARGOCD_PASS", "t")
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
 
 import diff_preview as m
+import render_profile
 
 GOLDEN_DIR = os.path.join(os.path.dirname(__file__), "golden")
 FIXED_TS = "2026-01-01 00:00 UTC"
@@ -414,7 +415,7 @@ def test_truncate_comment_links_artifact():
 
 
 def test_golden_readable_budget_collapse(monkeypatch):
-    monkeypatch.setattr(m, "COMMENT_READABLE_BYTES", 2_500)
+    monkeypatch.setattr(render_profile, "COMMENT_READABLE_BYTES", 2_500)
     results = {}
     for i in range(6):
         # Each block must be big enough that the running body crosses the

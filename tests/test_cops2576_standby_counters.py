@@ -24,6 +24,7 @@ os.environ.setdefault("BB_USER", "t")
 os.environ.setdefault("BB_TOKEN", "t")
 os.environ.setdefault("ARGOCD_PASS", "t")
 import diff_preview as m  # noqa: E402
+import logsink
 
 COUNTERS = ("iters_webhook_triggered", "iters_safetynet_triggered",
             "iters_standby_wait")
@@ -70,7 +71,7 @@ def _run_one_pass(monkeypatch, leading, woken):
     monkeypatch.setattr(m, "OCI_USER", "user")
     monkeypatch.setattr(m, "OCI_PASS", "secret")
     monkeypatch.setattr(m, "_start_oci_selfcheck_loop", lambda: None)
-    monkeypatch.setattr(m, "log", lambda *a, **k: None)
+    monkeypatch.setattr(logsink, "log", lambda *a, **k: None)
     monkeypatch.setattr(m, "_make_leader_elector", lambda: _Elector(leading))
     wake = _Wake(woken)
     monkeypatch.setattr(m, "_wake", wake)

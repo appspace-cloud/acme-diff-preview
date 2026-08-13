@@ -21,6 +21,7 @@ os.environ.setdefault("BB_USER", "t")
 os.environ.setdefault("BB_TOKEN", "t")
 os.environ.setdefault("ARGOCD_PASS", "t")
 import diff_preview as m  # noqa: E402
+import logsink
 
 from test_coverage_orchestration import world, _mk_pr, PATH_MAP, BASE_SHA  # noqa: E402,F401
 
@@ -217,7 +218,7 @@ def test_generate_ai_summary_model_garden_not_enabled_logs_hint(monkeypatch, fre
         raise urllib.error.HTTPError("u", 404, "does not have access to the model", None, None)
     monkeypatch.setattr(m, "http", fake_http)
     logs = []
-    monkeypatch.setattr(m, "log", lambda msg, *a, **k: logs.append(str(msg)))
+    monkeypatch.setattr(logsink, "log", lambda msg, *a, **k: logs.append(str(msg)))
     diff = m.DiffResult("===== Deployment/webx =====\n+ x\n",
                         [("Deployment/webx", "+ x\n")], 1, True, None, m.OUT_DIFF, "changes")
     out = m.generate_ai_summary({"pv-x-a-ms": diff})
@@ -260,7 +261,7 @@ def test_process_pr_invalid_version_is_logged_but_does_not_crash(world, monkeypa
     monkeypatch.setattr(m, "_pr_chart_revision_checked",
                         lambda app, files, pr_sha, main_sha=None, renames=None: (None, True))
     logs = []
-    monkeypatch.setattr(m, "log", lambda msg, *a, **k: logs.append(str(msg)))
+    monkeypatch.setattr(logsink, "log", lambda msg, *a, **k: logs.append(str(msg)))
     m.process_pr(_mk_pr(pr_id=503), PATH_MAP, base_sha=BASE_SHA)
     assert any("rejected as unsafe" in l for l in logs)
 

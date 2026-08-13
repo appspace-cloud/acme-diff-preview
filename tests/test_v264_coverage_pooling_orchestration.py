@@ -18,6 +18,7 @@ os.environ.setdefault("BB_USER", "t")
 os.environ.setdefault("BB_TOKEN", "t")
 os.environ.setdefault("ARGOCD_PASS", "t")
 import diff_preview as m  # noqa: E402
+import logsink
 
 
 # ── _proxy_for_host: NO_PROXY="*" wildcard disables proxying entirely ────
@@ -186,7 +187,7 @@ def test_ensure_chart_login_failure_logs_error_at_threshold(monkeypatch, tmp_pat
         prior = m._diff_stats["oci_consecutive_pull_failures"]
         m._diff_stats["oci_consecutive_pull_failures"] = m.OCI_FAIL_ERROR_THRESHOLD - 1
     logged = []
-    monkeypatch.setattr(m, "log",
+    monkeypatch.setattr(logsink, "log",
                         lambda msg, severity="INFO", **k: logged.append((severity, msg)))
     try:
         assert m._ensure_chart("registry.example.com", "appspace-ms", "9.0.0") is None

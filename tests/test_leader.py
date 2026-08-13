@@ -368,6 +368,7 @@ def test_non_conflict_http_errors_hit_the_tick_guard(tmp_path, monkeypatch,
 # ── wiring into diff_preview ────────────────────────────────────────────────
 
 import diff_preview as m  # noqa: E402
+import logsink
 
 
 class _FakeElector:
@@ -478,7 +479,7 @@ def test_main_standby_waits_short_then_takes_over(monkeypatch):
     monkeypatch.setattr(m, "OCI_PASS", "secret")
     monkeypatch.setattr(m, "_start_oci_selfcheck_loop", lambda: None)
     logs = []
-    monkeypatch.setattr(m, "log", lambda msg, *a, **k: logs.append(str(msg)))
+    monkeypatch.setattr(logsink, "log", lambda msg, *a, **k: logs.append(str(msg)))
 
     answers = iter([False, True])
     fake = _FakeElector(False)

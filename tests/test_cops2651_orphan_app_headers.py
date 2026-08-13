@@ -41,6 +41,7 @@ os.environ.setdefault("BB_TOKEN", "t")
 os.environ.setdefault("ARGOCD_PASS", "t")
 
 import diff_preview as dp  # noqa: E402
+import render_profile
 
 URL = "https://argocd.appspace.com/diff/acme-config-prod/4115/f6e34781d10e"
 
@@ -91,8 +92,8 @@ def _header_lines(text):
 def test_no_app_header_survives_with_an_empty_body(monkeypatch):
     """THE gate. Every remaining per-app header must be followed by
     something; a header with nothing under it is the defect."""
-    monkeypatch.setattr(dp, "COMMENT_INLINE_DIFFS", False)
-    monkeypatch.setattr(dp, "COMMENT_INLINE_EVIDENCE_LINES", 0)
+    monkeypatch.setattr(render_profile, "COMMENT_INLINE_DIFFS", False)
+    monkeypatch.setattr(render_profile, "COMMENT_INLINE_EVIDENCE_LINES", 0)
     out = _comment()
     lines = out.splitlines()
     for i, ln in enumerate(lines):
@@ -107,8 +108,8 @@ def test_no_app_header_survives_with_an_empty_body(monkeypatch):
 
 def test_the_pr4115_shape_emits_no_orphan_headers(monkeypatch):
     """The table already names all three apps with counts and links."""
-    monkeypatch.setattr(dp, "COMMENT_INLINE_DIFFS", False)
-    monkeypatch.setattr(dp, "COMMENT_INLINE_EVIDENCE_LINES", 0)
+    monkeypatch.setattr(render_profile, "COMMENT_INLINE_DIFFS", False)
+    monkeypatch.setattr(render_profile, "COMMENT_INLINE_EVIDENCE_LINES", 0)
     out = _comment()
     assert "Changeset overview" in out, "precondition: the table renders"
     for app in ("pv-ubp-a-glb", "pv-ubp-a-ms", "pv-ubp-a-ss"):
@@ -121,8 +122,8 @@ def test_the_pr4115_shape_emits_no_orphan_headers(monkeypatch):
 def test_risky_no_longer_buys_a_bare_header(monkeypatch):
     """vm_changes made these apps 'risky', which kept the block, but with
     zero evidence lines the block had nothing to keep."""
-    monkeypatch.setattr(dp, "COMMENT_INLINE_DIFFS", False)
-    monkeypatch.setattr(dp, "COMMENT_INLINE_EVIDENCE_LINES", 0)
+    monkeypatch.setattr(render_profile, "COMMENT_INLINE_DIFFS", False)
+    monkeypatch.setattr(render_profile, "COMMENT_INLINE_EVIDENCE_LINES", 0)
     out = _comment()
     for app in ("pv-ubp-a-glb", "pv-ubp-a-ss"):
         assert f"**`{app}`** \u2014 " not in out, (
@@ -135,8 +136,8 @@ def test_risky_no_longer_buys_a_bare_header(monkeypatch):
 def test_a_block_with_evidence_keeps_its_header(monkeypatch):
     """The header is what evidence hangs from. Never drop it when the
     block actually says something."""
-    monkeypatch.setattr(dp, "COMMENT_INLINE_DIFFS", False)
-    monkeypatch.setattr(dp, "COMMENT_INLINE_EVIDENCE_LINES", 3)
+    monkeypatch.setattr(render_profile, "COMMENT_INLINE_DIFFS", False)
+    monkeypatch.setattr(render_profile, "COMMENT_INLINE_EVIDENCE_LINES", 3)
     results = _pr4115()
     results["pv-ubp-a-ss"] = _changed("ss", 10, vm=results["pv-ubp-a-ss"].vm_changes,
                                       deleted=["/apps/Deployment d0"])
@@ -148,8 +149,8 @@ def test_a_block_with_evidence_keeps_its_header(monkeypatch):
 def test_a_version_fold_conclusion_keeps_its_header(monkeypatch):
     """COPS-2612 kept the fold sentence in the comment on purpose: it is a
     conclusion no table cell states."""
-    monkeypatch.setattr(dp, "COMMENT_INLINE_DIFFS", False)
-    monkeypatch.setattr(dp, "COMMENT_INLINE_EVIDENCE_LINES", 0)
+    monkeypatch.setattr(render_profile, "COMMENT_INLINE_DIFFS", False)
+    monkeypatch.setattr(render_profile, "COMMENT_INLINE_EVIDENCE_LINES", 0)
     results = _pr4115()
     _r = results["pv-ubp-a-glb"]
     results["pv-ubp-a-glb"] = _changed(
@@ -165,7 +166,7 @@ def test_a_version_fold_conclusion_keeps_its_header(monkeypatch):
 def test_inline_diffs_on_keeps_every_header(monkeypatch):
     """The rollback shape (COMMENT_INLINE_DIFFS=true) renders hunks inside
     each block, so every block has a body and every header stays."""
-    monkeypatch.setattr(dp, "COMMENT_INLINE_DIFFS", True)
+    monkeypatch.setattr(render_profile, "COMMENT_INLINE_DIFFS", True)
     out = _comment()
     assert len(_header_lines(out)) >= 1, (
         "with inline diffs the blocks carry hunks and keep their headers")
@@ -183,8 +184,8 @@ def test_the_page_still_renders_every_block():
 def test_without_a_table_every_app_is_still_named(monkeypatch):
     """The whole argument for dropping a header is that the table states
     the same facts. With no table there is no such argument."""
-    monkeypatch.setattr(dp, "COMMENT_INLINE_DIFFS", False)
-    monkeypatch.setattr(dp, "COMMENT_INLINE_EVIDENCE_LINES", 0)
+    monkeypatch.setattr(render_profile, "COMMENT_INLINE_DIFFS", False)
+    monkeypatch.setattr(render_profile, "COMMENT_INLINE_EVIDENCE_LINES", 0)
     out = dp.format_comment("f" * 40, _pr4115(), base_sha="d" * 40,
                             artifact_url="")
     for app in ("pv-ubp-a-glb", "pv-ubp-a-ms", "pv-ubp-a-ss"):

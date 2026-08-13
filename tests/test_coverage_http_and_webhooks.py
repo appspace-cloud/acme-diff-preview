@@ -28,6 +28,7 @@ os.environ.setdefault("BB_USER", "t")
 os.environ.setdefault("BB_TOKEN", "t")
 os.environ.setdefault("ARGOCD_PASS", "t")
 import diff_preview as m  # noqa: E402
+import logsink
 
 
 # ── local HTTP stub ──────────────────────────────────────────────────────
@@ -283,7 +284,7 @@ def test_jfrog_hard_refresh_matches_by_chart_and_revision(tmp_path, monkeypatch,
     fake = _mk_fake_argocd(tmp_path, APPS_JSON)
     monkeypatch.setattr(m, "ARGOCD_BIN", fake)
     logs = []
-    monkeypatch.setattr(m, "log", lambda msg, *a, **k: logs.append(str(msg)))
+    monkeypatch.setattr(logsink, "log", lambda msg, *a, **k: logs.append(str(msg)))
     m._jfrog_hard_refresh("appspace-ms", "2603.0.1-dev")
     joined = "\n".join(logs)
     assert "pv-synth-a-ms" in joined
@@ -294,7 +295,7 @@ def test_jfrog_hard_refresh_no_match_logs_and_returns(tmp_path, monkeypatch):
     fake = _mk_fake_argocd(tmp_path, APPS_JSON)
     monkeypatch.setattr(m, "ARGOCD_BIN", fake)
     logs = []
-    monkeypatch.setattr(m, "log", lambda msg, *a, **k: logs.append(str(msg)))
+    monkeypatch.setattr(logsink, "log", lambda msg, *a, **k: logs.append(str(msg)))
     m._jfrog_hard_refresh("appspace-ms", "9.9.9-nope")
     assert any("no apps found" in l for l in logs)
 
@@ -305,6 +306,6 @@ def test_jfrog_hard_refresh_survives_cli_failure(tmp_path, monkeypatch):
     p.chmod(p.stat().st_mode | stat.S_IEXEC)
     monkeypatch.setattr(m, "ARGOCD_BIN", str(p))
     logs = []
-    monkeypatch.setattr(m, "log", lambda msg, *a, **k: logs.append(str(msg)))
+    monkeypatch.setattr(logsink, "log", lambda msg, *a, **k: logs.append(str(msg)))
     m._jfrog_hard_refresh("appspace-ms", "1.0.0")  # must not raise
     assert any("app list failed" in l for l in logs)

@@ -30,6 +30,7 @@ os.environ.setdefault("ARGOCD_PASS", "t")
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
 
 import diff_preview as m
+import render_profile
 
 SHA = "a2e6383e7c1d4f5a6b7c8d9e0f1a2b3c4d5e6f70"
 URL = "https://argocd.appspace.com/diff/acme-config-prod/3899/abc123def456"
@@ -132,12 +133,12 @@ def test_the_budget_is_read_at_render_time_not_at_import(monkeypatch):
     operator raising it -- was silently ignored. Caught by the
     readable_budget_collapse golden, which patches it to 2500 and expects
     the fold to move."""
-    monkeypatch.setattr(m, "COMMENT_READABLE_BYTES", 2_500)
+    monkeypatch.setattr(render_profile, "COMMENT_READABLE_BYTES", 2_500)
     assert m.RenderProfile.from_readable_budget(
         None).resolved().readable_budget == 2_500
     results = _bulky()
     tight = _render(results)
-    monkeypatch.setattr(m, "COMMENT_READABLE_BYTES", 500_000)
+    monkeypatch.setattr(render_profile, "COMMENT_READABLE_BYTES", 500_000)
     assert len(_render(results)) > len(tight), \
         "a bigger budget must fold less, or the constant is being ignored"
 

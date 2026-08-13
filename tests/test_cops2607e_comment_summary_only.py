@@ -18,6 +18,7 @@ os.environ.setdefault("ARGOCD_PASS", "t")
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
 
 import diff_preview as m
+import render_profile
 
 SHA = "a2e6383e7c1d4f5a6b7c8d9e0f1a2b3c4d5e6f70"
 URL = "https://argocd.appspace.com/diff/acme-config-dev/1/a2e6383e"
@@ -102,7 +103,7 @@ def test_200_clean_apps_collapse_to_one_line_in_the_comment():
 # 7: the escape hatch restores today's shape --------------------------------
 
 def test_inline_diffs_true_restores_the_old_comment(monkeypatch):
-    monkeypatch.setattr(m, "COMMENT_INLINE_DIFFS", True)
+    monkeypatch.setattr(render_profile, "COMMENT_INLINE_DIFFS", True)
     out = _comment({"pv-a-a-ms": _changed()})
     assert (FENCE + "diff") in out
 
@@ -110,7 +111,7 @@ def test_inline_diffs_true_restores_the_old_comment(monkeypatch):
 # 8: the narrow evidence hatch ----------------------------------------------
 
 def test_evidence_lines_show_for_a_risk_app_only(monkeypatch):
-    monkeypatch.setattr(m, "COMMENT_INLINE_EVIDENCE_LINES", 8)
+    monkeypatch.setattr(render_profile, "COMMENT_INLINE_EVIDENCE_LINES", 8)
     # the deleted resource must BE one of the sections, or there is no
     # evidence body to excerpt
     risky = {"pv-a-a-ms": m.DiffResult(

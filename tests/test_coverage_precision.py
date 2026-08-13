@@ -23,6 +23,7 @@ os.environ.setdefault("BB_USER", "t")
 os.environ.setdefault("BB_TOKEN", "t")
 os.environ.setdefault("ARGOCD_PASS", "t")
 import diff_preview as m  # noqa: E402
+import logsink
 
 # COPS-2612: these cases exercise the INLINE diff-block rendering
 # path. The comment stopped using it by default when phase E flipped
@@ -44,7 +45,7 @@ def test_do_refresh_timeout_is_caught_and_counted(monkeypatch):
     monkeypatch.setattr(m, "_auth_flags", lambda: [])
     monkeypatch.setattr(m, "_argocd_subprocess_env", lambda: {})
     logs = []
-    monkeypatch.setattr(m, "log", lambda msg, *a, **k: logs.append(str(msg)))
+    monkeypatch.setattr(logsink, "log", lambda msg, *a, **k: logs.append(str(msg)))
     fake_argo_list = '[{"metadata":{"name":"pv-timeout-a-ms"},"spec":{"sources":[{"chart":"c","targetRevision":"1.0.0"}]}}]'
 
     def fake_run(cmd, **k):
@@ -460,7 +461,7 @@ def test_argocd_diff_zero_retries_hits_the_post_loop_fallback(monkeypatch):
 def test_get_pr_changed_files_page_limit_hit_logs_warning(monkeypatch):
     monkeypatch.setattr(m, "_BB_MAX_PAGES", 2)
     logs = []
-    monkeypatch.setattr(m, "log", lambda msg, *a, **k: logs.append(str(msg)))
+    monkeypatch.setattr(logsink, "log", lambda msg, *a, **k: logs.append(str(msg)))
 
     def fake_bb(method, path, **kw):
         return {"values": [{"old": None, "new": {"path": "x.yaml"}}],
@@ -537,7 +538,7 @@ def _mk_single_iteration_main_harness(monkeypatch):
     monkeypatch.setattr(m, "OCI_USER", "user")
     monkeypatch.setattr(m, "OCI_PASS", "secret")
     logs: list = []
-    monkeypatch.setattr(m, "log", lambda msg, severity="INFO", **k: logs.append((str(msg), severity)))
+    monkeypatch.setattr(logsink, "log", lambda msg, severity="INFO", **k: logs.append((str(msg), severity)))
 
     def one_pass():
         m._shutdown = True

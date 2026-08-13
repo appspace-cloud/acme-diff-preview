@@ -341,3 +341,25 @@ def _flatten_yaml(node, prefix=""):
             else:
                 out[p] = v
     return out
+
+
+def _section_kind(header: str) -> str:
+    """'/external-secrets.io/ExternalSecret card-deployment-key' -> 'ExternalSecret'.
+
+    Headers are built as "/{type_key} {ns}/{name}" or "/{type_key} {name}"
+    (see _diff_resources). The kind therefore lives on the LEFT of the first
+    space, and must be read from there.
+
+    COPS-2594: the previous implementation split on the last slash first, so
+    for any namespaced resource it returned the resource NAME instead of the
+    kind -- "/v1/Secret my-ns/db-credentials" gave "db-credentials". That
+    silently made _is_sensitive_kind False for every namespaced Secret,
+    ExternalSecret, RoleBinding and so on, so a deleted namespaced Secret
+    was listed without the sensitive-kind flag and never got a reserved
+    display slot in _prioritise_risk_sections. Exactly the class of miss the
+    deleted-resources block exists to prevent (PR 6773)."""
+    try:
+        left = header.split(" ", 1)[0]
+        return left.rsplit("/", 1)[-1]
+    except Exception:
+        return ""
