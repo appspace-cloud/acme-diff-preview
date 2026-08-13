@@ -22,6 +22,7 @@ os.environ.setdefault("BB_USER", "t")
 os.environ.setdefault("BB_TOKEN", "t")
 os.environ.setdefault("ARGOCD_PASS", "t")
 import diff_preview as m  # noqa: E402
+import logsink
 
 from test_coverage_orchestration import world, _mk_pr, PATH_MAP, BASE_SHA  # noqa: E402,F401
 from test_coverage_helm_layer import (  # noqa: E402
@@ -74,7 +75,7 @@ def test_filter_diff_sections_drops_ignored_and_checksum_only():
 
 def test_debug_logs_only_in_debug_mode(monkeypatch):
     logs = []
-    monkeypatch.setattr(m, "log", lambda msg, *a, **k: logs.append(msg))
+    monkeypatch.setattr(logsink, "log", lambda msg, *a, **k: logs.append(msg))
     monkeypatch.setattr(m, "DEBUG", True)
     m.debug("visible now")
     assert logs == ["visible now"]
@@ -91,7 +92,7 @@ def test_post_build_status_swallows_bb_errors(monkeypatch):
         raise RuntimeError("bb down")
     monkeypatch.setattr(m, "bb", boom)
     logs = []
-    monkeypatch.setattr(m, "log", lambda msg, *a, **k: logs.append(str(msg)))
+    monkeypatch.setattr(logsink, "log", lambda msg, *a, **k: logs.append(str(msg)))
     m.post_build_status("a" * 40, "SUCCESSFUL", "desc", pr_id=1)  # must not raise
     assert any("failed to set" in l for l in logs)
 
@@ -187,7 +188,7 @@ def test_upsert_comment_survives_fallback_post_failure(monkeypatch):
         raise RuntimeError("POST also down")
     monkeypatch.setattr(m, "bb", fake_bb)
     logs = []
-    monkeypatch.setattr(m, "log", lambda msg, *a, **k: logs.append(str(msg)))
+    monkeypatch.setattr(logsink, "log", lambda msg, *a, **k: logs.append(str(msg)))
     m.upsert_comment(78, "body", existing_id=124)  # must not raise
     assert any("fallback POST also failed" in l for l in logs)
 
@@ -638,7 +639,7 @@ def test_process_pr_prewarm_not_found_is_warning_not_crash(world, monkeypatch, t
     monkeypatch.setitem(m._app_chart_registry_map, "pv-orch-a-ms", REG)
     monkeypatch.setitem(m._app_chart_registry_map, "pv-orch-a-ss", REG)
     logs = []
-    monkeypatch.setattr(m, "log", lambda msg, *a, **k: logs.append(str(msg)))
+    monkeypatch.setattr(logsink, "log", lambda msg, *a, **k: logs.append(str(msg)))
     with m._helm_cache_lock:
         m._helm_chart_cache.clear()
     m.process_pr(_mk_pr(pr_id=603), PATH_MAP, base_sha=BASE_SHA)
@@ -782,7 +783,7 @@ def test_main_iteration_prunes_stale_state_and_logs_rollup(monkeypatch):
     with m._comment_id_cache_lock:
         m._comment_id_cache[("acme-config-dev", 99999)] = 1
     logs = []
-    monkeypatch.setattr(m, "log", lambda msg, *a, **k: logs.append(str(msg)))
+    monkeypatch.setattr(logsink, "log", lambda msg, *a, **k: logs.append(str(msg)))
     m.main_iteration()
     with m._seen_lock:
         pruned = ("acme-config-dev", 99999) not in m._seen

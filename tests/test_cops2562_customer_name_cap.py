@@ -29,6 +29,7 @@ os.environ.setdefault("BB_USER", "t")
 os.environ.setdefault("BB_TOKEN", "t")
 os.environ.setdefault("ARGOCD_PASS", "t")
 import diff_preview as m
+import logsink
 
 
 @pytest.fixture(autouse=True)
@@ -159,7 +160,7 @@ def test_invariant_is_documented_and_warns_when_broken(monkeypatch):
     convention changes that, it must surface loudly instead of silently
     making the cap wrong."""
     warned = []
-    monkeypatch.setattr(m, "log", lambda msg, *a, **k: warned.append(msg))
+    monkeypatch.setattr(logsink, "log", lambda msg, *a, **k: warned.append(msg))
     m._warn_if_name_invariant_broken({"appspace.prefix": "cloud",
                                        "appspace.suffix": "prod"})
     assert warned, "a longer prefix/suffix must produce a warning"
@@ -168,7 +169,7 @@ def test_invariant_is_documented_and_warns_when_broken(monkeypatch):
 
 def test_invariant_silent_for_the_normal_case(monkeypatch):
     warned = []
-    monkeypatch.setattr(m, "log", lambda msg, *a, **k: warned.append(msg))
+    monkeypatch.setattr(logsink, "log", lambda msg, *a, **k: warned.append(msg))
     m._warn_if_name_invariant_broken({"appspace.prefix": "pv",
                                        "appspace.suffix": "a"})
     assert warned == []
@@ -460,7 +461,7 @@ def test_invariant_warning_fires_for_a_tier_file_without_a_name(monkeypatch):
                         lambda path, sha, repo=None:
                         ("---\nappspace:\n  prefix: cloud\n", m.BB_OK))
     warned = []
-    monkeypatch.setattr(m, "log", lambda msg, *a, **k: warned.append(msg))
+    monkeypatch.setattr(logsink, "log", lambda msg, *a, **k: warned.append(msg))
     assert m._changed_files_with_bad_names([tier], "prsha", "mainsha") == {}
     assert any("prefix" in w for w in warned), (
         "a 3+ char prefix in a changed tier file must warn even when the "
@@ -478,7 +479,7 @@ def test_one_broken_file_does_not_kill_the_whole_check(monkeypatch):
         return (LONG, m.BB_OK) if sha == "prsha" else (GOOD, m.BB_OK)
     monkeypatch.setattr(m, "_bb_fetch_status", fake)
     warned = []
-    monkeypatch.setattr(m, "log", lambda msg, *a, **k: warned.append(msg))
+    monkeypatch.setattr(logsink, "log", lambda msg, *a, **k: warned.append(msg))
     bad = m._changed_files_with_bad_names([broken, CUST], "prsha", "mainsha")
     assert CUST in bad and broken not in bad
     assert any("fail-open" in w for w in warned)

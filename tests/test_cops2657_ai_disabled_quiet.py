@@ -32,6 +32,7 @@ os.environ.setdefault("BB_TOKEN", "t")
 os.environ.setdefault("ARGOCD_PASS", "t")
 
 import diff_preview as dp  # noqa: E402
+import logsink
 
 URL = "https://argocd.appspace.com/diff/acme-config-dev/1/abc12345"
 
@@ -52,17 +53,17 @@ def _unchanged():
 def _logs(monkeypatch, results, enabled, summary):
     """Render a comment and collect (severity, message) pairs."""
     seen = []
-    real = dp.log
+    real = logsink.log
 
     def spy(msg, sev="INFO", **kw):
         seen.append((sev, msg))
         return None
 
-    monkeypatch.setattr(dp, "log", spy)
+    monkeypatch.setattr(logsink, "log", spy)
     monkeypatch.setattr(dp, "AI_SUMMARY_ENABLED", enabled)
     monkeypatch.setattr(dp, "generate_ai_summary", lambda *a, **k: summary)
     dp.format_comment("f" * 40, results, base_sha="b" * 40, artifact_url=URL)
-    monkeypatch.setattr(dp, "log", real)
+    monkeypatch.setattr(logsink, "log", real)
     return seen
 
 

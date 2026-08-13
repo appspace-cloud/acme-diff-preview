@@ -24,6 +24,7 @@ os.environ.setdefault("BB_USER", "t")
 os.environ.setdefault("BB_TOKEN", "t")
 os.environ.setdefault("ARGOCD_PASS", "t")
 import diff_preview as m  # noqa: E402
+import logsink
 
 from test_coverage_orchestration import world, _mk_pr, PATH_MAP, BASE_SHA  # noqa: E402,F401
 from test_coverage_helm_layer import _mk_fake_helm, _calls, helm_world  # noqa: E402,F401
@@ -105,7 +106,7 @@ def test_jfrog_hard_refresh_malformed_app_list_and_failure_count(tmp_path, monke
     bad.write_text('#!/bin/bash\ncase "$*" in *"app list"*) printf "not json"; exit 0;; *) exit 0;; esac\n')
     bad.chmod(bad.stat().st_mode | stat_mod.S_IEXEC)
     logs = []
-    monkeypatch.setattr(m, "log", lambda msg, *a, **k: logs.append(str(msg)))
+    monkeypatch.setattr(logsink, "log", lambda msg, *a, **k: logs.append(str(msg)))
     monkeypatch.setattr(m, "ARGOCD_BIN", str(bad))
     m._jfrog_hard_refresh("some-chart", "1.0.0")
     assert any("malformed app list JSON" in l for l in logs)
@@ -280,7 +281,7 @@ def test_generate_ai_summary_trims_oversized_diffs_and_logs_max_tokens(monkeypat
     saved = (getattr(m, "_gcp_token", None), getattr(m, "_gcp_token_exp", 0))
     m._gcp_token, m._gcp_token_exp = None, 0
     logs = []
-    monkeypatch.setattr(m, "log", lambda msg, *a, **k: logs.append(str(msg)))
+    monkeypatch.setattr(logsink, "log", lambda msg, *a, **k: logs.append(str(msg)))
     diff = m.DiffResult("===== Deployment/webx =====\n" + "+ x\n" * 200,
                         [("Deployment/webx", "+ x\n" * 200)], 1, True, None,
                         m.OUT_DIFF, "changes")
@@ -379,7 +380,7 @@ def test_main_single_iteration_and_unhandled_error_survival(monkeypatch):
     monkeypatch.setattr(m, "OCI_USER", "user")
     monkeypatch.setattr(m, "OCI_PASS", "secret")
     logs = []
-    monkeypatch.setattr(m, "log", lambda msg, *a, **k: logs.append(str(msg)))
+    monkeypatch.setattr(logsink, "log", lambda msg, *a, **k: logs.append(str(msg)))
     iterations = {"n": 0}
 
     def one_crashing_iteration():

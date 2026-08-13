@@ -21,6 +21,7 @@ os.environ.setdefault("BB_USER", "t")
 os.environ.setdefault("BB_TOKEN", "t")
 os.environ.setdefault("ARGOCD_PASS", "t")
 import diff_preview as m  # noqa: E402
+import logsink
 
 
 # ── _oci_selfcheck: login failure short-circuits before any helm call ────
@@ -32,7 +33,7 @@ def test_oci_selfcheck_login_failure_short_circuits(monkeypatch):
     calls = []
     monkeypatch.setattr(m.subprocess, "run", lambda *a, **k: calls.append(a))
     logged = []
-    monkeypatch.setattr(m, "log",
+    monkeypatch.setattr(logsink, "log",
                         lambda msg, sev="INFO", **k: logged.append((sev, msg)))
     assert m._oci_selfcheck() is False
     assert calls == [], "a failed login must never reach `helm show chart`"

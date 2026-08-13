@@ -24,6 +24,7 @@ os.environ.setdefault("ARGOCD_PASS", "test-pass")
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
 
 import diff_preview as m
+import logsink
 
 
 @pytest.fixture(autouse=True)
@@ -110,7 +111,7 @@ def test_selfcheck_failure_sets_stats_and_logs_error(monkeypatch):
     monkeypatch.delenv("DIFF_OCI_SELFCHECK_REF", raising=False)
     m._record_pull_success("reg.example.com", "appspace-ms", "1.2.3")
     logged = []
-    monkeypatch.setattr(m, "log",
+    monkeypatch.setattr(logsink, "log",
                         lambda msg, sev="INFO", **kw: logged.append((sev, msg)))
 
     def fake_run(cmd, **kw):
