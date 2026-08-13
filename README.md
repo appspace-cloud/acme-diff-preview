@@ -269,6 +269,8 @@ acme-diff-preview/
 ├── src/
 │   ├── diff_preview.py        Main service (Deployment)
 │   ├── diff_ui.py             Full-diff artifact store + web UI (stdlib only)
+│   ├── leader.py              Lease-based leader election (stdlib only)
+│   ├── redact.py              Display-time redaction of sensitive values (stdlib only)
 │   └── dev_hard_refresh.py    Full sweep of the mutable-tag projects (opt-in CronJob)
 ├── tests/                     Full pytest suite, 100% coverage of src/ — see "Tests" below
 ├── charts/
@@ -295,8 +297,29 @@ acme-diff-preview/
     └── docker.yml             Push of v* tag: build + push image to JFrog
 ```
 
----
+### Splitting the service module
 
+`diff_preview.py` is being reduced from one large file into cohesive
+sibling modules, one extraction per release. Two rules hold for every step:
+
+- **The arrow points one way.** An extracted module never imports
+  `diff_preview` back. `tests/test_module_surface.py` fails the build if one
+  does.
+- **The hub keeps the name.** Whatever moves out is imported straight back
+  in, so `diff_preview.<name>` still resolves for the roughly a thousand
+  `monkeypatch.setattr` calls in the suite and for anything else addressing
+  the service through that module.
+
+The second rule matters more than it looks. Patching a name only affects
+callers that resolve it through the same namespace, so moving a *caller*
+into a new module silently disconnects the patch: the test stays green and
+stops testing anything. `scripts/audit_seams.py` compares every patched
+name against the modules that read it and fails when a patch can no longer
+reach a caller. It runs in the suite, and standalone for a readable report:
+
+```bash
+python3 scripts/audit_seams.py
+```
 
 ---
 
