@@ -63,6 +63,8 @@ jobs:
           python3 -m py_compile src/diff_preview.py && echo "diff_preview.py OK"
           python3 -m py_compile src/diff_ui.py && echo "diff_ui.py OK"
           python3 -m py_compile src/redact.py && echo "redact.py OK"
+          python3 -m py_compile src/vocabulary.py && echo "vocabulary.py OK"
+          python3 -m py_compile src/comment_render.py && echo "comment_render.py OK"
           python3 -m py_compile src/dev_hard_refresh.py && echo "dev_hard_refresh.py OK"
 
       - name: Regenerate badges

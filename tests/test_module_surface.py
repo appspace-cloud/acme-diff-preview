@@ -190,7 +190,7 @@ def test_seam_audit_detects_a_cut_seam(tmp_path):
 # imports them, they never import the hub. A back-import would create a
 # cycle, and worse, it would let a leaf reach into service state and undo
 # the reason for extracting it.
-EXTRACTED_LEAVES = ("redact",)
+EXTRACTED_LEAVES = ("redact", "vocabulary", "comment_render")
 
 # Modules that predate the split and are allowed to be reached from the hub
 # without being leaves themselves.

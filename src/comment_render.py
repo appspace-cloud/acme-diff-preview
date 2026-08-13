@@ -1,0 +1,506 @@
+"""Comment rendering helpers (COPS-2658 phase 2).
+
+The pieces that turn analysed results into the Markdown a reviewer reads:
+the merge summary and its severity verdicts, section and environment name
+formatting, repeated-section grouping, and the full-diff page link.
+Extracted verbatim from diff_preview.py; no logic changed in the move.
+
+A leaf on the hub, though it may use the other leaves. It imports nothing
+from the service and must stay that way.
+"""
+import re
+
+import diff_ui
+from vocabulary import (
+    OUT_DIFF,
+    OUT_ERROR,
+    OUT_INDETERMINATE,
+    PERMANENT_REASONS,
+)
+
+
+def _section_name(header: str) -> str:
+    """'/batch/Job acme-secret-generator/pv-x-job-cb71f3d8' -> 'pv-x-job-cb71f3d8'.
+
+    The name is the last path component to the RIGHT of the first space, so
+    a namespace prefix is stripped."""
+    try:
+        right = header.split(" ", 1)[1]
+    except Exception:
+        return ""
+    return right.rsplit("/", 1)[-1].strip().strip('"')
+
+
+def _parse_version_tuple(version: str):
+    """Leading dotted-numeric part of a chart version as an int tuple.
+
+    '2602.4.9-dev' -> (2602, 4, 9). Returns None when the version does not
+    start with a number (unparseable — comparisons are skipped)."""
+    if not version:
+        return None
+    mnum = re.match(r"^(\d+(?:\.\d+)*)", version.strip())
+    if not mnum:
+        return None
+    return tuple(int(x) for x in mnum.group(1).split("."))
+
+
+def _is_version_downgrade(current: str, new: str) -> bool:
+    """True when `new` is a strictly LOWER chart version than `current`.
+
+    v2.5.8: downgrades are legal but dangerous (schema regressions, data
+    migrations that do not run backwards), so the PR comment must shout.
+    Unparseable versions return False — never block on noise."""
+    cur_t = _parse_version_tuple(current)
+    new_t = _parse_version_tuple(new)
+    if cur_t is None or new_t is None:
+        return False
+    # Pad to equal length so 2602.4 vs 2602.4.1 compares sanely.
+    length = max(len(cur_t), len(new_t))
+    cur_t += (0,) * (length - len(cur_t))
+    new_t += (0,) * (length - len(new_t))
+    return new_t < cur_t
+
+
+def parse_diff_sections(diff_text):
+    """Parse ArgoCD diff output into [(header, body)] list.
+
+    Returns empty list if no '=====' separators found in the output.
+    """
+    sections, hdr, lines = [], None, []
+    for line in diff_text.splitlines(keepends=True):
+        if line.startswith("====="):
+            if hdr and lines:
+                sections.append((hdr, "".join(lines)))
+            hdr   = line.strip().strip("=").strip()
+            lines = []
+        elif hdr is not None:
+            lines.append(line)
+    if hdr and lines:
+        sections.append((hdr, "".join(lines)))
+    return sections
+
+
+_APP_COMPONENT_SUFFIX = re.compile(r"-(ss|ms|glb)$")
+
+def _envs_from_apps(apps) -> list:
+    """Derive environment names deterministically from ArgoCD app names.
+
+    Apps follow \'<env>-<component>\' (e.g. pv-qa88-a-ss -> pv-qa88-a).
+    Unknown suffixes fall back to the app name itself, so a new component
+    type degrades to a slightly verbose but always-true environment list.
+    The AI model is never asked for environment names - before v2.4.2 it
+    copied literal example values straight from the prompt template.
+    """
+    return sorted({_APP_COMPONENT_SUFFIX.sub("", a.split("/")[-1]) for a in apps})
+
+
+_REPEAT_GROUP_MIN = 3
+
+
+def _changed_lines_signature(body: str) -> str:
+    """Only the added/removed lines. Context is deliberately ignored: two
+    resources take "the same change" even when the surrounding manifest
+    differs, which is exactly the KCC-annotation case."""
+    return "\n".join(l for l in body.splitlines()
+                      if l[:1] in "+-" and not l.startswith(("---", "+++")))
+
+
+def _group_repeated_sections(sections: list, risk_headers=None):
+    """(representatives, duplicates_by_header).
+
+    Order of first occurrence is preserved, so the reordering that puts
+    risk sections and needles first still decides what a reviewer reads
+    first. Risk sections are never grouped: a deletion always gets its
+    own hunk, however many identical siblings it has.
+    """
+    risky = set(risk_headers or ())
+    groups, order = {}, []
+    for hdr, body in sections:
+        if hdr in risky:
+            order.append((hdr, body, None))
+            continue
+        sig = _changed_lines_signature(body)
+        if sig in groups:
+            groups[sig].append(hdr)
+            continue
+        groups[sig] = []
+        order.append((hdr, body, sig))
+    reps, dups = [], {}
+    for hdr, body, sig in order:
+        reps.append((hdr, body))
+        if sig is None:
+            continue
+        others = groups[sig]
+        if len(others) + 1 >= _REPEAT_GROUP_MIN:
+            dups[hdr] = others
+        else:
+            reps.extend((h, body) for h in others)
+    return reps, dups
+
+
+def _name_list(headers, room: int = 240):
+    """As many resource names as fit in a readable line, then "...".
+
+    Naming them matters: a reviewer scanning for one specific resource
+    needs to see whether it is in the group. Naming ALL of them defeats
+    the point of grouping in the first place.
+    """
+    names = []
+    for h in headers:
+        piece = f"`{h}`"
+        if room - len(piece) - 2 < 0:
+            break
+        names.append(piece)
+        room -= len(piece) + 2
+    if not names:
+        return ""
+    return ", ".join(names) + (", ..." if len(names) < len(headers) else "")
+
+
+def _full_hunks_link(artifact_url: str, app: str = "") -> str:
+    """One phrase for "the complete diff lives over there".
+
+    Every place the comment folds content away has to point somewhere,
+    and a reviewer must never have to guess whether the missing hunks
+    are lost or just elsewhere.
+
+    app (COPS-2622): deep-link straight to that application's section on
+    the page instead of to the top of it. Before this, every per-app
+    pointer carried the identical bare URL -- 8 copies on a 6-app comment,
+    ~42 on a fleet bump -- which on a comment phase E had just shrunk to a
+    decision summary was most of what remained. The anchor shape comes
+    from diff_ui.app_anchor and is NOT rebuilt here: two copies of that
+    logic would drift and every deep link would 404 in silence.
+    """
+    if artifact_url:
+        if app:
+            return (f"[Full hunks for `{app}`]"
+                    f"({artifact_url}#{diff_ui.app_anchor(app)})")
+        return f"[Full hunks in the full diff view]({artifact_url})"
+    return ("Full hunks are in the diff-preview full-diff view, linked "
+            "from the build status.")
+
+
+def _fmt_service_list(services: list, shown: int = 8) -> str:
+    head = ", ".join(services[:shown])
+    more = f" (+{len(services) - shown} more)" if len(services) > shown else ""
+    return f"{head}{more}"
+
+
+def _routine_bump_label(sig) -> str:
+    """One human line naming the transition a rollup group shares."""
+    old_rev, new_rev, items = sig
+    if old_rev or new_rev:
+        label = f"chart `{old_rev}` \u2192 `{new_rev}`"
+        extra = len(items)
+    elif items:
+        key, olds, news = items[0]
+        label = f"`{key}`: `{olds}` \u2192 `{news}`"
+        extra = len(items) - 1
+    else:
+        return "version-only change"
+    if extra > 0:
+        label += f" (+{extra} more field(s))"
+    return label
+
+
+_VM_PANEL_DANGER_HDR = ("## \U0001f5a5\ufe0f VM INFRASTRUCTURE "
+                        "CHANGES")
+_VM_PANEL_ROUTINE_HDR = "### \U0001f5a5\ufe0f VM INFRASTRUCTURE CHANGES (routine)"
+
+
+_SEV_ROUTINE, _SEV_REVIEW, _SEV_BLOCK = 0, 1, 2
+_VERDICTS = {
+    _SEV_BLOCK: "\u26d4 **DO NOT MERGE** without checking the item(s) below",
+    _SEV_REVIEW: "\u26a0\ufe0f **Review before merging**",
+    _SEV_ROUTINE: "\u2705 **Routine** \u2014 nothing dangerous detected",
+}
+
+
+def _fmt_env_list(apps, shown=8) -> str:
+    """Environment names, the way operators say them (no -ms/-ss/-glb)."""
+    envs = sorted(set(_envs_from_apps(sorted(apps))))
+    return _fmt_service_list(envs, shown=shown)
+
+
+def _build_merge_summary(results, rollup_by_sig, vm_change_lines,
+                         decommission_lines, appspace_state_lines,
+                         new_env_lines, new_env_structural,
+                         paused_changing=None, paused_envs=None) -> list:
+    """The verdict block that opens every comment.
+
+    Reads the same deterministic facts the panels below use, so the
+    summary can never disagree with the detail. Text panels built
+    elsewhere are recognised by their own header constants rather than
+    re-derived, for the same reason.
+    """
+    findings = []          # (severity, line)
+    sev = _SEV_ROUTINE
+
+    # COPS-2655. The pause finding below this one only fires when the PR
+    # touches an identity file. This one fires whenever a CHANGED app sits
+    # in a frozen environment, which is the case the pv-qa88-a probe
+    # exposed: a cicd-versions.yaml bump rendered "Routine -- nothing
+    # dangerous detected" for a change that would not be applied at all.
+    #
+    # _SEV_REVIEW, not _SEV_BLOCK: nothing dangerous is happening. The
+    # danger is the reviewer believing something happened when it did not,
+    # so the verdict must stop saying "Routine" and name the environments.
+    if paused_changing:
+        _envs = paused_envs or []
+        findings.append((_SEV_REVIEW,
+                         f"\u23f8\ufe0f **{len(_envs)} environment(s) are "
+                         f"PAUSED** (`appspace.autosync: false`) \u2014 their "
+                         f"changes below will NOT be applied on merge: "
+                         f"{_fmt_env_list(_envs)}"))
+
+    if decommission_lines:
+        txt = "\n".join(decommission_lines)
+        purge = "PURGE" in txt.upper()
+        findings.append((_SEV_BLOCK,
+                         "\U0001f5d1\ufe0f **Environment decommission** \u2014 "
+                         + ("data purge is ARMED: buckets/datasets are "
+                            "destroyed, not abandoned"
+                            if purge else
+                            "resources are deleted; data is abandoned, "
+                            "not purged")))
+    if vm_change_lines:
+        hdr = vm_change_lines[0]
+        if hdr == _VM_PANEL_DANGER_HDR:
+            # COPS-2635: when every dangerous bullet is a provision group,
+            # the headline says what is actually happening in the
+            # operator's words — "N environment(s) provision a NEW linux
+            # VM" — instead of the generic danger flag. Any other danger
+            # in the section (a resize, an armed deletion) keeps the
+            # generic wording, because then "see the VM section" must not
+            # sound like it is only about new machines.
+            _dang = [l for l in vm_change_lines
+                     if l.startswith("- \U0001f6a8")]
+            _prov = [re.match(
+                r"- \U0001f6a8 \*\*(\d+) environments? provisions? a new",
+                l) for l in _dang]
+            if _dang and all(_prov):
+                _n = sum(int(m.group(1)) for m in _prov)
+                findings.append((_SEV_BLOCK,
+                                 f"\U0001f5a5\ufe0f **{_n} environment(s) "
+                                 f"provision a NEW linux VM** \u2014 see "
+                                 f"the VM section"))
+            else:
+                findings.append((_SEV_BLOCK,
+                                 "\U0001f5a5\ufe0f **VM infrastructure change "
+                                 "flagged dangerous** \u2014 see the VM section"))
+        elif hdr == _VM_PANEL_ROUTINE_HDR:
+            findings.append((_SEV_ROUTINE,
+                             "\U0001f5a5\ufe0f VM infrastructure changed "
+                             "(routine)"))
+
+    deleted_apps = sorted(a for a, r in results.items() if r.deleted_resources)
+    if deleted_apps:
+        n = sum(len(results[a].deleted_resources) for a in deleted_apps)
+        findings.append((_SEV_BLOCK,
+                         f"\u274c **{n} resource(s) deleted** in "
+                         f"{len(deleted_apps)} app(s): "
+                         f"{_fmt_env_list(deleted_apps)}"))
+    renamed_apps = sorted(a for a, r in results.items()
+                          if getattr(r, "renamed_resources", None))
+    if renamed_apps:
+        findings.append((_SEV_ROUTINE,
+                         "\u267b\ufe0f resources renamed/recreated (not a "
+                         f"deletion): {_fmt_env_list(renamed_apps)}"))
+
+    downgraded = sorted(a for a, r in results.items()
+                        if r.version_change
+                        and _is_version_downgrade(*r.version_change))
+    if downgraded:
+        # COPS-2638: name the version pair, not just the fact. "Chart
+        # version downgrade in pv-x" left the reviewer opening the app
+        # block to learn FROM and TO what -- the same gap the bump line
+        # closes for the routine direction.
+        _dg = ", ".join(f"`{o}` \u2192 `{n}`" for o, n in
+                        sorted({results[a].version_change
+                                for a in downgraded}))
+        findings.append((_SEV_REVIEW,
+                         f"\u2b07\ufe0f **Chart version downgrade** {_dg} in "
+                         f"{_fmt_env_list(downgraded)}"))
+    # COPS-2632: a rendered `%!s(<nil>)` or `<no value>` is a value the chart
+    # read and this environment does not set. Live proof: pv-stage1-a shipped
+    # `hosting-id: hst-%!s(<nil>)` and KCC rejected every Compute* resource
+    # afterwards, while this summary called the PR routine.
+    #
+    # Reported, NOT blocking, and the distinction is deliberate. The chart is
+    # the authority on what a value must be: `required` means the author
+    # decided the render cannot proceed without it, and that already blocks
+    # through REASON_MISSING_REQUIRED / PERMANENT_REASONS. A field left with
+    # `| default` or with no guard at all is the author saying the opposite,
+    # and a tool that overrides that judgement blocks merges the chart is
+    # happy to render. The reviewer still needs to see it, because helm exits
+    # 0 and the diff otherwise looks ordinary - so it is a REVIEW item that
+    # names the resources, not a verdict of its own.
+    artifact_apps = sorted(a for a, r in results.items()
+                           if getattr(r, "template_artifacts", None))
+    if artifact_apps:
+        n_res = sum(len(results[a].template_artifacts) for a in artifact_apps)
+        findings.append((_SEV_REVIEW,
+                         "\U0001f9ec **Unresolved chart value** \u2014 "
+                         f"{n_res} resource(s) render `%!s(<nil>)` or "
+                         f"`<no value>` in {_fmt_env_list(artifact_apps)}. "
+                         "The chart read a value this environment does not "
+                         "set. Check it is intended: the chart does not mark "
+                         "it `required`, so nothing failed the render."))
+
+    # An environment going fully dark and a single service being scaled down
+    # are different events. Both used to render as "Replicas scaled to zero",
+    # and on acme-config-dev PR #7063 the whole-environment case did not
+    # render at all (see _replicas_end_state). A reviewer needs the shutdown
+    # stated as a shutdown, in the summary, not inferred from a resource count.
+    zeroed_apps = sorted(a for a, r in results.items() if r.replicas_zeroed)
+    shutdown_apps = [a for a in zeroed_apps
+                     if _is_env_shutdown(results[a])]
+    partial_apps = [a for a in zeroed_apps if a not in set(shutdown_apps)]
+    if shutdown_apps:
+        n_workloads = sum(results[a].shutdown_stats["workloads"]
+                          for a in shutdown_apps)
+        findings.append((_SEV_REVIEW,
+                         "\U0001f6d1 **Environment shutting down** \u2014 "
+                         f"every workload ({n_workloads}) scaled to 0 in "
+                         f"{_fmt_env_list(shutdown_apps)}. `appspace.zeroPods` "
+                         "hibernates the environment: nothing will be running "
+                         "after this merges."))
+    if partial_apps:
+        findings.append((_SEV_REVIEW,
+                         "\U0001f9ca **Replicas scaled to zero** in "
+                         f"{_fmt_env_list(partial_apps)}"))
+
+    if appspace_state_lines:
+        txt = "\n".join(appspace_state_lines)
+        # Arming destruction is the highest-severity thing a config-only PR
+        # can do, and it is invisible in the manifest diff: the footer still
+        # reads "No manifest changes". Live proof, acme-config-dev PR #7024:
+        # the body shouted DECOMMISSION ARMED while this summary said
+        # "Routine - nothing dangerous detected". A verdict that contradicts
+        # the panel below it is worse than no verdict at all.
+        if "PURGE ARMED" in txt:
+            findings.append((_SEV_BLOCK,
+                             "\U0001f6a8 **Data purge ARMED** \u2014 the "
+                             "cascade will permanently destroy the BigQuery "
+                             "dataset and the user content bucket"))
+        elif "DECOMMISSION ARMED" in txt:
+            findings.append((_SEV_BLOCK,
+                             "\U0001f512 **Decommission ARMED** \u2014 this "
+                             "environment becomes eligible for cascade "
+                             "deletion when its folder is removed"))
+        elif "DISARMED" in txt.upper():
+            findings.append((_SEV_ROUTINE,
+                             "\U0001f513 decommission disarmed (safe "
+                             "direction)"))
+        if "PAUSED" in txt.upper():
+            findings.append((_SEV_REVIEW,
+                             "\u23f8\ufe0f **ArgoCD auto-sync paused** for an "
+                             "environment \u2014 changes stop being applied"))
+        elif "RESUMED" in txt.upper():
+            findings.append((_SEV_REVIEW,
+                             "\u25b6\ufe0f **ArgoCD auto-sync resumed** \u2014 "
+                             "pending drift will be applied"))
+    if new_env_lines:
+        findings.append((_SEV_REVIEW if new_env_structural else _SEV_ROUTINE,
+                         "\U0001f195 **New environment** in this PR"
+                         + (" \u2014 its configuration did not validate"
+                            if new_env_structural else "")))
+
+    # The 50% case: fleets jumping from one version to another. Named the
+    # way operations talks about it -- environments and versions.
+    for _sig in sorted(rollup_by_sig or {}):
+        apps = [a for _rep, _mem, _r in rollup_by_sig[_sig] for a in _mem]
+        findings.append((_SEV_ROUTINE,
+                         f"\u2b06\ufe0f **{len(set(_envs_from_apps(apps)))} "
+                         f"environment(s) jumping** "
+                         f"{_routine_bump_label(_sig)}: "
+                         f"{_fmt_env_list(apps)}"))
+
+    # COPS-2638: the line above only fires for PURE bumps (the rollup only
+    # forms when an app's entire diff is the transition). A bump mixed
+    # with any other change -- acme-config-prod #4037, where 31 resources
+    # moved for other reasons -- lost the line entirely, and the single
+    # most common PR shape became invisible in the verdict. version_change
+    # is the general fact: the chart targetRevision ArgoCD currently has
+    # versus the one the PR pins, set whenever they differ. Transitions a
+    # fleet-jump line already names are skipped, as are downgrades (their
+    # REVIEW finding below names them); this line is ROUTINE because a
+    # bump is these PRs' normal business.
+    _named = {(s[0], s[1]) for s in (rollup_by_sig or {}) if s[0] or s[1]}
+    _bumps = {}
+    for a, r in results.items():
+        if (r.outcome == OUT_DIFF and r.version_change
+                and r.version_change not in _named
+                and not _is_version_downgrade(*r.version_change)):
+            _bumps.setdefault(r.version_change, []).append(a)
+    for (_old, _new), apps in sorted(_bumps.items()):
+        findings.append((_SEV_ROUTINE,
+                         f"\u2b06\ufe0f **{len(set(_envs_from_apps(apps)))} "
+                         f"environment(s) bump** `{_old}` \u2192 `{_new}`: "
+                         f"{_fmt_env_list(sorted(apps))}"))
+
+    changed = [a for a, r in results.items() if r.outcome == OUT_DIFF]
+    errored = [a for a, r in results.items() if r.outcome == OUT_ERROR]
+    unknown = [a for a, r in results.items() if r.outcome == OUT_INDETERMINATE]
+    # COPS-2629 point 4: split by whether the failure is PERMANENT.
+    #
+    # Escalating every undiffable app to BLOCK would be wrong. One
+    # transient timeout among 200 apps is not a reason to stop a
+    # maintenance window, and a verdict that cries wolf is one people learn
+    # to scroll past -- the same failure this umbrella keeps guarding
+    # against, arriving from the other direction.
+    #
+    # PERMANENT_REASONS is already defined as "the deployer would fail the
+    # same way", which is exactly the condition that makes merging unsafe:
+    # helm could not render it here and it will not render in the cluster
+    # either. Reusing that set rather than inventing a second opinion means
+    # the verdict and the retry logic can never disagree about what is
+    # broken.
+    blocked = [a for a in unknown
+               if results[a].reason in PERMANENT_REASONS]
+    soft = [a for a in unknown if a not in set(blocked)]
+    if blocked:
+        findings.append((_SEV_BLOCK,
+                         f"\u26d4 **{len(blocked)} environment(s) cannot "
+                         f"render** \u2014 helm failed here and the "
+                         f"deployer will fail the same way: "
+                         f"{_fmt_env_list(blocked)}"))
+    if errored or soft:
+        findings.append((_SEV_REVIEW,
+                         f"\u2754 **{len(errored) + len(soft)} app(s) "
+                         f"could not be diffed** \u2014 the comment below "
+                         f"cannot prove they are safe"))
+    if not findings:
+        findings.append((
+            _SEV_ROUTINE,
+            (f"\u2705 {len(changed)} app(s) change, nothing risk-flagged"
+             if changed else
+             "\u2705 No manifest changes and no risky configuration change")))
+
+    sev = max(s for s, _ in findings)
+    n_check = sum(1 for s, _ in findings if s >= _SEV_REVIEW)
+    verdict = _VERDICTS[sev]
+    if sev >= _SEV_REVIEW:
+        verdict += f" ({n_check} item(s))"
+    order = {_SEV_BLOCK: 0, _SEV_REVIEW: 1, _SEV_ROUTINE: 2}
+    findings.sort(key=lambda f: order[f[0]])
+    return ["## \u2139\ufe0f Merge summary", "", verdict, ""] + \
+           [f"- {line}" for _s, line in findings] + [""]
+
+
+_SHUTDOWN_MIN_WORKLOADS = 2
+
+
+def _is_env_shutdown(r) -> bool:
+    """True when every workload in this app ends at zero replicas.
+
+    The floor of two workloads is deliberate: a one-workload app dropping to
+    zero is a scale-down, and calling that an environment shutdown on every
+    small app is how a warning trains people to skip it (the same reasoning
+    as COPS-2605's three-group rollup floor).
+    """
+    stats = getattr(r, "shutdown_stats", None) or {}
+    total = stats.get("workloads") or 0
+    return (total >= _SHUTDOWN_MIN_WORKLOADS
+            and stats.get("zeroed") == total)
