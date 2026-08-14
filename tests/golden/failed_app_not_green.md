@@ -21,6 +21,7 @@
 | *(+1 more)* | ✅ no changes | — | — |
 
 ❔ **`pv-acme-a-ss`** — diff unavailable (could not pull the OCI chart (registry login or network))
+> `OCI pull failed: connection reset`
 
 ✅ **`pv-acme-a-ms`** — no manifest changes
 

@@ -321,6 +321,34 @@ def _vm_deletion_armed_flat(flat: dict) -> bool:
     return str(val).strip().lower() == "true"
 
 
+_VM_FLAT_PREFIX = "appspace.infra.deployLinuxServicesK8s."
+
+
+def _vm_config_stripped(old_flat: dict, new_flat: dict) -> list:
+    """Keys under deployLinuxServicesK8s this diff removes or switches off.
+
+    COPS-2660: `allowDeletion` only takes effect through resources helm still
+    renders. Strip the role blocks or flip an `enabled` to false in the same
+    PR that arms deletion, and the chart stops emitting the VM CRs, ArgoCD
+    prunes them, and the live objects go out under their current
+    `deletion-policy: abandon` -- the real VM, disk and IP are orphaned in
+    the cloud, not deleted. acme-config-prod PR #4247 shipped exactly that
+    shape while its comment read "Phase 1 done".
+
+    Removal and `true -> false` are the same event to the chart (both end
+    the render), so both are reported. Returned keys are the evidence the
+    warning shows the reviewer; empty list means the VM config survived the
+    diff intact.
+    """
+    removed = [k for k in old_flat
+               if k.startswith(_VM_FLAT_PREFIX) and k not in new_flat]
+    disabled = [k for k in old_flat
+                if k.startswith(_VM_FLAT_PREFIX) and k.endswith(".enabled")
+                and str(old_flat.get(k)).strip().lower() == "true"
+                and str(new_flat.get(k, "")).strip().lower() == "false"]
+    return sorted(set(removed) | set(disabled))
+
+
 # Disk-size keys differ between the legacy and KCC value schemas.
 _VM_DISK_SIZE_KEYS = ("dataDiskSizeGb", "bootDiskSizeGb",
                       "dataDiskSize", "bootDiskSize", "diskSize")

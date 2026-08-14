@@ -34,10 +34,13 @@ REASON_NAME_TOO_LONG   = "name_too_long"      # COPS-2552: derived GCP service a
 REASON_INVALID_YAML  = "invalid_yaml"
 REASON_MISSING_REQUIRED = "missing_required"  # v2.6.2: helm `required`/nil-deref on absent value
 REASON_SCHEMA_INVALID   = "schema_invalid"     # COPS-2554: values.schema.json validation failed
+REASON_TEMPLATE      = "template_failed"       # COPS-2661: template EXECUTION failed on these
+                                               # values — deterministic, never resolves on retry
 
 
 RETRYABLE_REASONS = {REASON_OCI_PULL, REASON_METADATA, REASON_TIMEOUT, REASON_RENDER}
 # Reasons that permanently block the PR (the deployer would fail the same way).
 PERMANENT_REASONS = {REASON_OCI_NOT_FOUND, REASON_INVALID_VERSION,
                      REASON_INVALID_YAML, REASON_MISSING_REQUIRED,
-                     REASON_SCHEMA_INVALID, REASON_NAME_TOO_LONG}
+                     REASON_SCHEMA_INVALID, REASON_NAME_TOO_LONG,
+                     REASON_TEMPLATE}

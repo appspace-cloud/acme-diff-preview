@@ -131,6 +131,9 @@ def _decommission_armed_flat(flat: dict) -> bool:
 _PH_THIS_PR = "\u2705 **this PR**"
 _PH_PENDING = "\u2b1c pending"
 _PH_NA = "\u2014 not applicable"
+# COPS-2660: the arming flag is present but the same PR removed the VM config
+# it acts through, so the phase can never complete as written.
+_PH_BROKEN = "\u26d4 **broken by this PR**"
 
 
 def _decommission_phase_table(vm_state, cascade_state, removal_state,

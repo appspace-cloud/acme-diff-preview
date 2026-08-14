@@ -208,6 +208,12 @@ _VM_PANEL_DANGER_HDR = ("## \U0001f5a5\ufe0f VM INFRASTRUCTURE "
                         "CHANGES")
 _VM_PANEL_ROUTINE_HDR = "### \U0001f5a5\ufe0f VM INFRASTRUCTURE CHANGES (routine)"
 
+# COPS-2660: the arming PR itself removed the VM config that allowDeletion
+# acts through. Recognised here by the summary, rendered by the hub's
+# appspace-state panel -- one constant so the two can never drift apart.
+_DECOM_VM_STRIP_HDR = ("## \U0001f5a5\u26d4 VM CONFIG STRIPPED WHILE "
+                       "ARMING DECOMMISSION")
+
 
 _SEV_ROUTINE, _SEV_REVIEW, _SEV_BLOCK = 0, 1, 2
 _VERDICTS = {
@@ -373,6 +379,22 @@ def _build_merge_summary(results, rollup_by_sig, vm_change_lines,
 
     if appspace_state_lines:
         txt = "\n".join(appspace_state_lines)
+        # COPS-2660: its own finding ON TOP of the arming one below, because
+        # they answer different questions. "Decommission ARMED" says what the
+        # PR intends; this says the same PR broke the mechanism that intent
+        # relies on. acme-config-prod #4247 shipped the shape: allowDeletion
+        # added while the role blocks were stripped, so helm stops rendering
+        # the VM CRs and ArgoCD prunes them still carrying
+        # `deletion-policy: abandon` -- the cloud VM is orphaned, not deleted.
+        if _DECOM_VM_STRIP_HDR in txt:
+            findings.append((_SEV_BLOCK,
+                             "\U0001f5a5⛔ **Decommission arming is BROKEN** "
+                             "— this PR strips the Linux VM config in "
+                             "the same change that arms deletion, so the "
+                             "live VM, disk and IP would be pruned under "
+                             "`abandon` and ORPHANED in the cloud, not "
+                             "deleted. Keep the VM block and only add "
+                             "`allowDeletion`."))
         # Arming destruction is the highest-severity thing a config-only PR
         # can do, and it is invisible in the manifest diff: the footer still
         # reads "No manifest changes". Live proof, acme-config-dev PR #7024:
