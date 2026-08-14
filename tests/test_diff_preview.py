@@ -15,6 +15,22 @@ def _source():
         return f.read()
 
 
+def _all_sources():
+    """Every module the service ships, concatenated.
+
+    For invariants that are about the service rather than about one file.
+    A guard written when everything lived in the hub reads the hub alone and
+    silently stops checking once the thing it guards moves out.
+    """
+    src_dir = os.path.dirname(SRC)
+    out = []
+    for fn in sorted(os.listdir(src_dir)):
+        if fn.endswith(".py"):
+            with open(os.path.join(src_dir, fn)) as f:
+                out.append(f.read())
+    return "\n".join(out)
+
+
 def _tree():
     return ast.parse(_source())
 
@@ -840,8 +856,16 @@ def test_bb_fetch_status_constants():
 # ── helm --kube-version, OCI startup self-check, cache eviction ──────────────
 
 def test_kube_version_passed_to_helm_template():
+    """The knob and the flag that uses it, now one file apart.
+
+    KUBE_VERSION moved to envcfg.py when the render cache was extracted: the
+    cache keys on it and the hub renders with it, so it needed a home neither
+    of them owns. The invariant is unchanged and was always service-wide --
+    it is read across every module the service ships rather than the hub
+    alone, the same widening the comment-marker guard needed in phase 6.
+    """
     mod = _import_module()
-    src = _source()
+    src = _all_sources()
     assert 'KUBE_VERSION    = os.environ.get("KUBE_VERSION"' in src
     assert '"--kube-version", KUBE_VERSION' in src, (
         "helm template must pin --kube-version for capability-stable renders"

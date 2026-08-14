@@ -32,13 +32,14 @@ os.environ.setdefault("BB_TOKEN", "t")
 os.environ.setdefault("ARGOCD_PASS", "t")
 
 import diff_preview as m  # noqa: E402
+import render_cache
 import diff_ui  # noqa: E402
 
 
 def _reset(tmp_path, monkeypatch, bucket=""):
     """Isolate every cache tier onto tmp_path and a fake bucket."""
-    monkeypatch.setattr(m, "MAIN_RENDER_CACHE_DIR", str(tmp_path / "renders"))
-    monkeypatch.setattr(m, "MAIN_RENDER_GCS_BUCKET", bucket, raising=False)
+    monkeypatch.setattr(render_cache, "MAIN_RENDER_CACHE_DIR", str(tmp_path / "renders"))
+    monkeypatch.setattr(render_cache, "MAIN_RENDER_GCS_BUCKET", bucket, raising=False)
     with m._main_render_lock:
         m._main_render_cache.clear()
     return {}
@@ -94,7 +95,7 @@ def test_memory_eviction_keeps_the_disk_entry(tmp_path, monkeypatch):
     stage-3 design. Disk has its own count and byte caps and prunes itself.
     """
     _reset(tmp_path, monkeypatch)
-    monkeypatch.setattr(m, "MAIN_RENDER_CACHE_MAX", 4)
+    monkeypatch.setattr(render_cache, "MAIN_RENDER_CACHE_MAX", 4)
     keys = [f"k{i:02d}" for i in range(12)]
     for k in keys:
         m._main_render_cache_put(k, RAW + k, _parsed())
@@ -110,7 +111,7 @@ def test_memory_eviction_keeps_the_disk_entry(tmp_path, monkeypatch):
 
 def test_an_evicted_key_is_still_a_hit_from_disk(tmp_path, monkeypatch):
     _reset(tmp_path, monkeypatch)
-    monkeypatch.setattr(m, "MAIN_RENDER_CACHE_MAX", 2)
+    monkeypatch.setattr(render_cache, "MAIN_RENDER_CACHE_MAX", 2)
     for k in ("a", "b", "c", "d", "e"):
         m._main_render_cache_put(k, RAW + k, _parsed())
     resources, raw, source = m._main_render_cache_get("a")
@@ -127,7 +128,7 @@ def test_a_hit_protects_a_key_from_eviction(tmp_path, monkeypatch):
     and keeps the ones nobody asked for again.
     """
     _reset(tmp_path, monkeypatch)
-    monkeypatch.setattr(m, "MAIN_RENDER_CACHE_MAX", 3)
+    monkeypatch.setattr(render_cache, "MAIN_RENDER_CACHE_MAX", 3)
     for k in ("old", "mid", "new"):
         m._main_render_cache_put(k, RAW + k, _parsed())
     # "old" is the hot key: touch it, then push past the cap.
@@ -174,13 +175,13 @@ def test_a_salt_bump_does_not_serve_the_old_object(tmp_path, monkeypatch):
     change must orphan every existing object, not reuse it."""
     fake = _FakeBucket().install(monkeypatch)
     _reset(tmp_path, monkeypatch, bucket="b")
-    monkeypatch.setattr(m, "MAIN_RENDER_CACHE_SALT", "salt-v1")
+    monkeypatch.setattr(render_cache, "MAIN_RENDER_CACHE_SALT", "salt-v1")
     m._main_render_cache_put("key1", RAW, _parsed())
     m._main_render_gcs_flush()
     old_names = set(fake.objects)
 
     _reset(tmp_path / "fresh", monkeypatch, bucket="b")
-    monkeypatch.setattr(m, "MAIN_RENDER_CACHE_SALT", "salt-v2")
+    monkeypatch.setattr(render_cache, "MAIN_RENDER_CACHE_SALT", "salt-v2")
     resources, _raw, source = m._main_render_cache_get("key1")
     assert resources is None and source == "miss", (
         "a salt bump must not resolve to an object written under the old salt")
@@ -293,7 +294,7 @@ def test_racing_threads_never_see_a_torn_entry(tmp_path, monkeypatch):
     race is harmless; a half-written entry is a wrong diff."""
     _FakeBucket().install(monkeypatch)
     _reset(tmp_path, monkeypatch, bucket="b")
-    monkeypatch.setattr(m, "MAIN_RENDER_CACHE_MAX", 8)
+    monkeypatch.setattr(render_cache, "MAIN_RENDER_CACHE_MAX", 8)
     errors = []
 
     def worker(n):

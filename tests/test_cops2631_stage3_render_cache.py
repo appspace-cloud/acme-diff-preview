@@ -18,6 +18,7 @@ os.environ.setdefault("BB_TOKEN", "t")
 os.environ.setdefault("ARGOCD_PASS", "t")
 
 import diff_preview as m  # noqa: E402
+import render_cache
 
 
 def _vals(a="1", b="2"):
@@ -69,7 +70,7 @@ def test_content_key_ignores_main_sha(tmp_path):
 
 
 def test_disk_cache_roundtrip_raw_text(tmp_path, monkeypatch):
-    monkeypatch.setattr(m, "MAIN_RENDER_CACHE_DIR", str(tmp_path))
+    monkeypatch.setattr(render_cache, "MAIN_RENDER_CACHE_DIR", str(tmp_path))
     key = "a" * 64
     raw = "apiVersion: v1\nkind: ConfigMap\nmetadata:\n  name: x\n"
     assert m._main_render_disk_load(key) is None
@@ -78,7 +79,7 @@ def test_disk_cache_roundtrip_raw_text(tmp_path, monkeypatch):
 
 
 def test_cache_get_put_memory_and_disk(tmp_path, monkeypatch):
-    monkeypatch.setattr(m, "MAIN_RENDER_CACHE_DIR", str(tmp_path))
+    monkeypatch.setattr(render_cache, "MAIN_RENDER_CACHE_DIR", str(tmp_path))
     m._main_render_cache.clear()
     key = "b" * 64
     raw = ("apiVersion: v1\nkind: ConfigMap\nmetadata:\n  name: demo\n"
@@ -109,9 +110,9 @@ def test_main_sha_advance_does_not_wipe_content_cache(monkeypatch):
 
 
 def test_disk_prune_enforces_count_cap(tmp_path, monkeypatch):
-    monkeypatch.setattr(m, "MAIN_RENDER_CACHE_DIR", str(tmp_path))
-    monkeypatch.setattr(m, "MAIN_RENDER_DISK_MAX", 3)
-    monkeypatch.setattr(m, "MAIN_RENDER_DISK_MAX_BYTES", 10 ** 9)
+    monkeypatch.setattr(render_cache, "MAIN_RENDER_CACHE_DIR", str(tmp_path))
+    monkeypatch.setattr(render_cache, "MAIN_RENDER_DISK_MAX", 3)
+    monkeypatch.setattr(render_cache, "MAIN_RENDER_DISK_MAX_BYTES", 10 ** 9)
     for i in range(5):
         m._main_render_disk_store(f"key-{i}", "raw-" + ("x" * 100))
     kept = [n for n in os.listdir(str(tmp_path)) if n.endswith(".yaml")]

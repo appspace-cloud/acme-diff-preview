@@ -22,6 +22,7 @@ os.environ.setdefault("BB_USER", "t")
 os.environ.setdefault("BB_TOKEN", "t")
 os.environ.setdefault("ARGOCD_PASS", "t")
 import diff_preview as m  # noqa: E402
+import render_cache
 import logsink
 
 from test_coverage_orchestration import world, _mk_pr, PATH_MAP, BASE_SHA  # noqa: E402,F401
@@ -371,7 +372,7 @@ def test_run_one_diff_main_side_render_failure(diff_world, monkeypatch):
 def test_run_one_diff_prunes_main_render_cache(diff_world, monkeypatch):
     helm, _ = _mk_fake_helm(diff_world)
     monkeypatch.setattr(m, "HELM_BIN", helm)
-    monkeypatch.setattr(m, "MAIN_RENDER_CACHE_MAX", 1)
+    monkeypatch.setattr(render_cache, "MAIN_RENDER_CACHE_MAX", 1)
     monkeypatch.setattr(m, "_fetch_value_files",
                         _values_by_sha("replicas_marker: 2", "replicas_marker: 2"))
     m._run_one_diff(APP, "prsha0000001", "mainsha00019")
