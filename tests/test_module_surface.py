@@ -366,7 +366,8 @@ def test_a_local_that_shares_a_module_name_is_not_a_qualified_read(tmp_path):
 EXTRACTED_LEAVES = ("redact", "vocabulary", "comment_render", "version_fold",
                     "grouping", "vm_analysis", "decommission", "manifest",
                     "identity", "envcfg", "schema_errors", "chart_identity",
-                    "app_meta", "ai_summary", "logsink", "render_profile")
+                    "app_meta", "ai_summary", "logsink", "render_profile",
+                    "concurrency")
 
 # Modules that predate the split and are allowed to be reached from the hub
 # without being leaves themselves.

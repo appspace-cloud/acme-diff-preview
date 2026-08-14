@@ -35,6 +35,7 @@ os.environ.setdefault("ARGOCD_PASS", "test-pass")
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
 
 import diff_preview as m
+import concurrency
 
 
 def _mass_results(n_apps, sections_per_app=10, body_chars=1500):
@@ -238,7 +239,7 @@ def test_s4_render_timeout_cancels_abandoned_futures(monkeypatch):
     monkeypatch.setattr(m, "_helm_template", slow_template)
     real_pool = concurrent.futures.ThreadPoolExecutor(max_workers=4)
     rec = _RecordingPool(real_pool)
-    monkeypatch.setattr(m, "_get_subtask_pool", lambda: rec)
+    monkeypatch.setattr(concurrency, "_get_subtask_pool", lambda: rec)
     try:
         res = m._run_one_diff(app, "c" * 40, "d" * 40)
         assert res[1] == m.REASON_TIMEOUT

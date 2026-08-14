@@ -21,6 +21,7 @@ os.environ.setdefault("BB_USER", "t")
 os.environ.setdefault("BB_TOKEN", "t")
 os.environ.setdefault("ARGOCD_PASS", "t")
 import diff_preview as m  # noqa: E402
+import concurrency
 import logsink
 
 
@@ -78,7 +79,7 @@ def test_run_one_diff_timeout_cancels_a_still_queued_future(monkeypatch):
     # blocks past DIFF_TIMEOUT; the main-side render submitted right after
     # it must sit PENDING (genuinely cancellable) the whole time.
     small_pool = concurrent.futures.ThreadPoolExecutor(max_workers=1)
-    monkeypatch.setattr(m, "_subtask_pool", small_pool)
+    monkeypatch.setattr(concurrency, "_subtask_pool", small_pool)
     monkeypatch.setattr(m, "DIFF_TIMEOUT", 0.3)
 
     def slow_template(chart_path, release, namespace, value_files_content):

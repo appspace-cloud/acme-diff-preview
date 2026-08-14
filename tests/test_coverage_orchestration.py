@@ -19,6 +19,7 @@ os.environ.setdefault("BB_USER", "t")
 os.environ.setdefault("BB_TOKEN", "t")
 os.environ.setdefault("ARGOCD_PASS", "t")
 import diff_preview as m  # noqa: E402
+import concurrency
 
 
 ENV_DIR   = "gcp/dev/private-cloud/ap1/custom/pv-orch-a"
@@ -219,7 +220,7 @@ def test_main_runs_iterations_until_interrupted(monkeypatch):
     monkeypatch.setattr(m, "_start_health_server", lambda port=8080: None)
     monkeypatch.setattr(m, "_start_heartbeat", lambda: None)
     monkeypatch.setattr(m, "argocd_login", lambda: None)
-    monkeypatch.setattr(m, "_get_subtask_pool", lambda: None, raising=False)
+    monkeypatch.setattr(concurrency, "_get_subtask_pool", lambda: None, raising=False)
     monkeypatch.setattr(m, "main_iteration", lambda: iterations.append(1))
 
     waits = {"n": 0}

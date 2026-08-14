@@ -59,6 +59,7 @@ import yaml  # PyYAML (requirements.txt) - input root-cause panel only, v2.6.2
 import diff_ui  # full-diff web UI (same-dir module, stdlib only)
 import leader  # Lease-based leader election (same-dir module, stdlib only)
 import logsink  # structured logging seam (same-dir module, stdlib only)
+import concurrency  # shared sub-task pool and its sizing (same-dir module)
 import render_profile  # render profiles + app diff block (same-dir module)
 from render_profile import (  # re-exported: the suite reaches these on the hub
     DISPLAY_BODY_MAX_CHARS,
@@ -379,8 +380,8 @@ RISK_SECTION_RESERVE = 5
 # so the client can fan out wide: the only shared limit is the Bitbucket API
 # (BB_API_CONCURRENCY) used to fetch value files.
 MAX_APPS_PER_RUN   = _env_int("MAX_APPS_PER_RUN", 1500)  # ~1.7x the largest fleet (see README)
-DIFF_WORKERS       = _env_int("DIFF_WORKERS", 16)        # parallel per-app helm-template diffs
 DIFF_TIMEOUT       = _env_int("DIFF_TIMEOUT", 120)       # seconds per diff (OCI cache-miss pulls are slow)
+DIFF_WORKERS       = _env_int("DIFF_WORKERS", 16)      # parallel helm-template renders
 WARM_WORKERS       = _env_int("WARM_WORKERS", 4)         # parallel chart-cache warm-up pulls
 WARM_THRESHOLD     = _env_int("WARM_THRESHOLD", 8)       # only warm when a PR fans out to more apps than this
 MAX_COMMENT_BYTES  = 245_000 # Bitbucket ~256KB limit; leave headroom
@@ -3196,24 +3197,6 @@ _helm_cache_lock        = threading.Lock()
 _helm_pull_locks: dict  = {}
 _helm_pull_locks_lock   = threading.Lock()
 
-# ── Shared thread pool for sub-tasks inside _run_one_diff (#6) ───────────────
-# Creating/destroying a ThreadPoolExecutor per diff call (3× per call) causes
-# hundreds of thread spawns per PR. A module-level pool is cheaper: workers are
-# reused and the pool lives for the pod lifetime.
-# Size: enough for concurrent (pull PR + pull main + fetch PR vf + fetch main vf
-# + render PR + render main) across DIFF_WORKERS parallel diffs.
-_SUBTASK_POOL_WORKERS = max(8, DIFF_WORKERS * 2)  # default 32
-_subtask_pool: ThreadPoolExecutor = None           # created lazily in main()
-
-def _get_subtask_pool() -> ThreadPoolExecutor:
-    """Return (or create) the module-level sub-task pool."""
-    global _subtask_pool
-    if _subtask_pool is None:
-        _subtask_pool = ThreadPoolExecutor(
-            max_workers=_SUBTASK_POOL_WORKERS,
-            thread_name_prefix="diff-subtask")
-    return _subtask_pool
-
 # ── Singleflight for value-file fetches (#1) ─────────────────────────────────
 # Prevents N concurrent diffs from all fetching the same (sha, path) when the
 # cache is cold (the common case at the start of a PR burst).
@@ -3428,7 +3411,7 @@ def _main_render_gcs_store(key: str, raw: str) -> None:
                         "WARNING")
 
     try:
-        fut = _get_subtask_pool().submit(_upload)
+        fut = concurrency._get_subtask_pool().submit(_upload)
         with _main_render_gcs_futs_lock:
             # Drop settled futures on every append. Without this the list
             # grows by one entry per cache write for the life of the pod,
@@ -6523,7 +6506,7 @@ def _run_one_diff(app, pr_sha, main_sha, chart_revision=None, changed_paths=None
         # the PR side. Only files that appear in the PR's changed_paths need a
         # fresh fetch at pr_sha. This halves Bitbucket API calls for the common
         # case of a version-only bump where a single config.yaml changes.
-        pool = _get_subtask_pool()
+        pool = concurrency._get_subtask_pool()
         main_vf_fut = pool.submit(_fetch_value_files, value_files, main_sha)
         _diff_futs.append(main_vf_fut)
 
@@ -6623,7 +6606,7 @@ def _run_one_diff(app, pr_sha, main_sha, chart_revision=None, changed_paths=None
             _diff_stats["main_render_cache_misses" if needs_main_render
                         else "main_render_cache_hits"] += 1
 
-        pool     = _get_subtask_pool()
+        pool     = concurrency._get_subtask_pool()
         _t_render0 = time.perf_counter()
         pr_fut   = pool.submit(_helm_template, pr_chart, release, namespace, pr_vals)
         _diff_futs.append(pr_fut)
@@ -10412,8 +10395,8 @@ def main():
 
     _start_health_server()
     _start_heartbeat()    # keep /healthz alive during long PR processing
-    _get_subtask_pool()   # warm the shared thread pool before the first iteration
-    logsink.log(f"Sub-task pool ready ({_SUBTASK_POOL_WORKERS} workers)")
+    concurrency._get_subtask_pool()   # warm the shared thread pool before the first iteration
+    logsink.log(f"Sub-task pool ready ({concurrency._SUBTASK_POOL_WORKERS} workers)")
 
     # Initial login. Transient failures (DNS not ready on a fresh node,
     # connection reset, ArgoCD restarting) get a bounded retry; a permanent
