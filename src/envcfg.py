@@ -3,7 +3,10 @@
 Sliced out of diff_preview.py unchanged (COPS-2658 phase 6).
 
 Three readers that turn an environment variable into a typed value with a
-default, and one that refuses to start without a required variable. Pure
+default, and one that refuses to start without a required variable. It also
+holds the handful of raw environment values that more than one module needs,
+so those have one home rather than a copy of the same os.environ.get in each
+reader -- which is how defaults drift apart. Pure
 stdlib, no repo dependencies -- the most foundational leaf in the tree, and
 deliberately so: nearly every module-level constant in the service is built
 from one of these, so anything that needs a constant can import this without
@@ -64,3 +67,20 @@ def _require_env(*names):
         print(msg, file=sys.stderr, flush=True)
         raise SystemExit(msg)
     return None
+
+
+# Durable artifact store: name of a GCS bucket. Empty keeps the old
+# behavior (local dir only, artifacts die with the pod). When set, saves
+# are mirrored to the bucket and local read misses fall back to it, so
+# permalinks survive restarts and any replica can serve any artifact.
+DIFF_UI_GCS_BUCKET    = os.environ.get("DIFF_UI_GCS_BUCKET", "").strip()
+
+# Pin the Kubernetes version helm renders against so charts that branch on
+# .Capabilities.KubeVersion produce stable, cluster-representative output. Both
+# the main and PR renders use the same value, so the diff stays consistent.
+# COPS-2565: verified 2026-07-31 that every GKE cluster in appspace-cloud and
+# appspace-devops runs 1.35.x, so rendering against 1.30.0 was five minors
+# behind. One constant is enough precisely because they all share a version,
+# and because no chart branches on Helm .Capabilities today (guarded by a test).
+# If either of those stops being true, this needs to become per-cluster.
+KUBE_VERSION    = os.environ.get("KUBE_VERSION", "1.35.5")

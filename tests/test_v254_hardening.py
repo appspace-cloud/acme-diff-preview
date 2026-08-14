@@ -11,6 +11,7 @@ os.environ.setdefault("BB_USER", "t")
 os.environ.setdefault("BB_TOKEN", "t")
 os.environ.setdefault("ARGOCD_PASS", "t")
 import diff_preview as m
+import render_cache
 
 # ── Finding 5: _new_env_status defaults to RED now, allow-list for green ──
 def test_new_env_missing_required_value_stays_green():
@@ -292,7 +293,7 @@ def test_run_one_diff_follows_renamed_value_file_into_render(monkeypatch):
     m._vf_cache.clear()
     m._vf_inflight.clear()
     import tempfile
-    monkeypatch.setattr(m, "MAIN_RENDER_CACHE_DIR",
+    monkeypatch.setattr(render_cache, "MAIN_RENDER_CACHE_DIR",
                         tempfile.mkdtemp(prefix="main-render-test-"))
     m._main_render_cache.clear()
 
@@ -342,7 +343,7 @@ def test_run_one_diff_genuine_deletion_still_omitted(monkeypatch):
     # COPS-2631: content-keyed cache (memory + disk) survives across tests
     # that share the same fake chart path; isolate so both sides render.
     import tempfile
-    monkeypatch.setattr(m, "MAIN_RENDER_CACHE_DIR",
+    monkeypatch.setattr(render_cache, "MAIN_RENDER_CACHE_DIR",
                         tempfile.mkdtemp(prefix="main-render-test-"))
     m._main_render_cache.clear()
 
