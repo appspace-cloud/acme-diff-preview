@@ -124,6 +124,7 @@ from vocabulary import (  # diff outcome vocabulary (same-dir module, stdlib onl
     REASON_INVALID_VERSION,
     REASON_NAME_TOO_LONG,
     REASON_INVALID_YAML,
+    REASON_TEMPLATE,
     REASON_MISSING_REQUIRED,
     REASON_SCHEMA_INVALID,
     RETRYABLE_REASONS,
@@ -284,6 +285,7 @@ from schema_errors import (  # render-failure explanation
     _SCHEMA_ERROR_MAX_LINES,
     _cap_helm_error,
     _render_reason,
+    _quote_helm_error,
     _explain_schema_error,
     _SCHEMA_VIOLATIONS_SHOWN,
     _NULL_VIOLATION_RE,
@@ -2660,6 +2662,7 @@ _REASON_HINTS = {
     REASON_UNEXPECTED:    "an unexpected error occurred while computing the diff",
     REASON_INVALID_VERSION: "appspace.version was rejected as unsafe/invalid — not a valid OCI tag",
     REASON_INVALID_YAML:  "a changed value file is not valid YAML — fix the YAML syntax",
+    REASON_TEMPLATE:      "the chart's templates failed executing with these values",
     "retry_exhausted":    "still failing after retries",
     "legacy":             "diff could not be computed",
 }
@@ -8464,12 +8467,35 @@ def format_comment(pr_sha, app_results, skipped_apps=None, base_sha="",
                     f"> **{r.error}**",
                     "",
                 ]
+            elif r.reason == REASON_TEMPLATE:
+                # COPS-2661: the stderr was captured all along; the author
+                # just never saw it. Quote it and say where the fix goes --
+                # the same clarity contract MISSING_REQUIRED and SCHEMA
+                # already honour, for the bucket the rest of the template
+                # failures land in.
+                lines += [
+                    f"\u274c **`{app}`** \u2014 \U0001f9e8 **TEMPLATE "
+                    f"EXECUTION FAILED \u2014 helm cannot render this "
+                    f"environment**",
+                ]
+                lines += _quote_helm_error(r.error)
+                lines += [
+                    "> **Fix:** correct the value the error names in this "
+                    "environment's `customer.yaml` (or the `config.yaml` of "
+                    "its cohort or ring). The template path above says which "
+                    "chart template reads it.",
+                    "",
+                ]
             else:
                 hint = _REASON_HINTS.get(r.reason, "diff could not be computed")
                 lines += [
                     f"\u2754 **`{app}`** \u2014 diff unavailable ({hint})",
-                    "",
                 ]
+                # COPS-2661: even the genuinely-unclassified bucket shows
+                # what it has. The hint stays as the headline; the captured
+                # stderr stops being discarded.
+                lines += _quote_helm_error(r.error)
+                lines += [""]
 
         elif r.outcome == OUT_DIFF:
             rep_app, members, rep_r = diff_group_for_app[app]

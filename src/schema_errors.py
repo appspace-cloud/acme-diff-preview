@@ -18,6 +18,7 @@ from vocabulary import (
     REASON_MISSING_REQUIRED,
     REASON_RENDER,
     REASON_SCHEMA_INVALID,
+    REASON_TEMPLATE,
 )
 
 
@@ -80,6 +81,17 @@ def _render_reason(render_err: str) -> str:
             or "yaml: line" in e or "found character that cannot start" in e
             or "yaml:" in e and "unmarshal" in e):
         return REASON_INVALID_YAML
+    # COPS-2661: Go's text/template failing on the values it was given --
+    # "template: <path>:<line>:<col>: executing ...". Same message-independent
+    # signature philosophy as the required() match above, and checked AFTER
+    # it so required/nil-pointer keep their dedicated clarity path (their
+    # stderr carries this phrasing too on some helm versions). `helm
+    # template` is a pure local computation, so this shape can never succeed
+    # on retry: acme-config-prod #4244 (rabbit `instances` as a string where
+    # the chart ranges over a list) was retried with backoff five times to
+    # arrive at the same one-line generic hint.
+    if "template:" in e and "executing" in e:
+        return REASON_TEMPLATE
     return REASON_RENDER
 
 
@@ -140,6 +152,31 @@ def _schema_fix_hints(err: str) -> list:
             "`microservices.definitions`, so removing it deletes that "
             "microservice from the environment.")
     return hints
+
+
+_STDERR_QUOTE_LINES = 6
+
+
+def _quote_helm_error(err: str) -> list:
+    """The captured stderr, quoted for the comment.
+
+    COPS-2661: `DiffResult.error` already held the actionable text for every
+    render failure -- `_helm_template` captures and caps it -- and the
+    comment path for the generic bucket threw it away, printing only the
+    one-line hint. Whatever else the comment says, the words helm actually
+    produced are the one thing the author can act on, so they are quoted
+    verbatim (backticks swapped so a stray one cannot break the span).
+    """
+    lines = [l.rstrip() for l in (err or "").splitlines() if l.strip()]
+    if not lines:
+        return []
+    out = [f"> `{l[:300].replace(chr(96), chr(39))}`"
+           for l in lines[:_STDERR_QUOTE_LINES]]
+    extra = len(lines) - _STDERR_QUOTE_LINES
+    if extra > 0:
+        out.append(f"> *... and {extra} more line(s) — full stderr in the "
+                   f"pod logs*")
+    return out
 
 
 def _missing_value_remedies() -> list:
