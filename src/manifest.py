@@ -38,7 +38,14 @@ def _is_checksum_only_section(body: str) -> bool:
         "kubectl.kubernetes.io/last-applied-configuration",
         "deployment.kubernetes.io/revision",
         "meta.helm.sh/release-",
-        "helm.sh/resource-policy",
+        # COPS-2668: `helm.sh/resource-policy` is deliberately NOT here. It is
+        # not cosmetic like its neighbours: `keep` is what carries a resource
+        # through an Argo cascade, so `keep` -> absent is the difference
+        # between a Namespace surviving a decommission and being deleted with
+        # everything inside it. This filter runs upstream of every safety
+        # detector, so listing it here did not merely hide the line from the
+        # comment -- it hid the change from the code that decides whether the
+        # PR is dangerous.
         "helm.sh/chart",
     )
     changed = []

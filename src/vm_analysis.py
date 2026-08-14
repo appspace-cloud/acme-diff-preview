@@ -293,7 +293,16 @@ def _detect_vm_changes(sections: list) -> list:
                     # or one carrying a unit suffix) cannot be compared, so
                     # the shrink check is skipped on purpose. The field is
                     # still reported above as an ordinary changed field.
-                    continue
+                    #
+                    # COPS-2668: this used to `continue`, which targets the
+                    # OUTER `for header, body in sections` loop -- there is no
+                    # loop in between -- so one unparseable size discarded the
+                    # whole section: the untracked-keys note and the
+                    # facts.append below both went with it, and the panel fell
+                    # silent about a disk it could see changing. `pass` skips
+                    # only the comparison, which is what the comment above
+                    # always claimed.
+                    pass
         # COPS-2618: a change the tracked list cannot describe is still a
         # change. Naming the keys keeps the line actionable -- a reviewer can
         # tell a taxonomy-label rollout from something worth opening the diff

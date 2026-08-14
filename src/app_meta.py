@@ -94,8 +94,17 @@ def _extract_status_token(raw: str) -> str:
     Bitbucket status instead of "FAILED". Confirmed empirically against
     real format_comment() output across all 5 outcome scenarios before
     fixing (clean, clean-with-diff, permanent, transient, error).
+
+    COPS-2668: `blocked` was missing from this list while process_pr emits it
+    (the empty `microservices.definitions` guard, COPR-31637). An unrecognised
+    token returns "" and falls through every branch of fix_stuck_inprogress to
+    its final `else: SUCCESSFUL`, so a pod killed mid-flight resolved a
+    correctly-blocked PR to a green merge gate, directly contradicting the
+    blocking comment sitting next to it. Any token the writer emits must be
+    readable here.
     """
-    m = re.search(re.escape(COMMENT_MARKER) + r'\s+\[(clean|permanent|transient)\]', raw)
+    m = re.search(re.escape(COMMENT_MARKER)
+                  + r'\s+\[(clean|permanent|transient|blocked)\]', raw)
     return m.group(1) if m else ""
 
 
