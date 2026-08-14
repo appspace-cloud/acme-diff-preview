@@ -192,7 +192,6 @@ from vm_analysis import (  # VM/KCC infrastructure analysis (same-dir module)
 )
 from decommission import (  # environment teardown and creation analysis
     _new_env_status,
-    _strip_trailing_comment,
     _CASCADE_KEEP_CRD_REASON,
     _CASCADE_KEEP_POLICY_REASON,
     _CASCADE_KEEP_DELETE_FALSE_REASON,
@@ -205,6 +204,8 @@ from decommission import (  # environment teardown and creation analysis
     _decommission_phase_table,
 )
 from manifest import (  # rendered-manifest parsing and resource diffing
+    _parse_manifest_resources,
+    _strip_trailing_comment,
     _section_kind,
     _is_checksum_only_section,
     _summarize_rendered_manifest,
@@ -5346,99 +5347,6 @@ def _pr_chart_revision_checked(app, candidate_files, pr_sha, main_sha=None, rena
 
 
 
-
-
-def _parse_manifest_resources(yaml_text):
-    """Split a multi-document YAML string into a dict keyed by (group/Kind, ns/name).
-
-    Each value is the normalized document text (stripped, consistent trailing newline).
-    Documents without kind/metadata are skipped.
-    """
-    resources = {}
-    for doc in _split_yaml_docs(yaml_text):
-        doc = doc.strip()
-        if not doc:   # pragma: no cover - _split_yaml_docs never yields blank
-            continue
-        kind = ns = name = api = ""
-        in_meta = False
-        meta_child_indent = None  # indent of metadata's direct children,
-                                   # determined dynamically instead of the
-                                   # hardcoded "exactly 2 spaces" this used to
-                                   # assume. Real `helm template` output is
-                                   # always 2-space, so this never triggered
-                                   # in production, but hardcoding it was
-                                   # fragile (v2.5.3 defensive hardening).
-                                   # Still required (not "any indent") to
-                                   # avoid matching a deeper nested `name:`,
-                                   # e.g. metadata.ownerReferences[].name.
-        for line in doc.splitlines():
-            if line.startswith("apiVersion:"):
-                api = line.split(":", 1)[1].strip()
-            elif line.startswith("kind:"):
-                kind = line.split(":", 1)[1].strip()
-            elif line.startswith("metadata:"):
-                in_meta = True
-                meta_child_indent = None
-            elif in_meta:
-                stripped = line.lstrip()
-                if not stripped:
-                    continue
-                indent = len(line) - len(stripped)
-                if indent == 0:
-                    in_meta = False
-                    continue
-                if meta_child_indent is None:
-                    meta_child_indent = indent
-                if indent == meta_child_indent:
-                    if stripped.startswith("namespace:"):
-                        ns = _strip_trailing_comment(
-                            stripped.split(":", 1)[1].strip())
-                    elif stripped.startswith("name:"):
-                        name = _strip_trailing_comment(
-                            stripped.split(":", 1)[1].strip())
-        if kind and not name:
-            # Fallback for flow-style metadata (e.g. `metadata: {name: x}`),
-            # valid YAML that the block-style line scan above cannot see.
-            # Without this the whole resource was skipped on BOTH sides and
-            # a real change reported as no-diff (bughunt F5a).
-            m = re.search(r"^metadata:\s*\{(.*)\}\s*$", doc, re.MULTILINE)
-            if m:
-                flow = m.group(1)
-                def _flow_val(field):
-                    fm = re.search(
-                        r"\b" + field + r":\s*(\"([^\"]*)\"|'([^']*)'|([^,}\s]+))",
-                        flow)
-                    return (fm.group(2) or fm.group(3) or fm.group(4)) if fm else ""
-                name = name or _flow_val("name")
-                ns   = ns or _flow_val("namespace")
-        if not (kind and name):
-            if kind or name or "apiVersion:" in doc:
-                # A K8s-looking document we could not identify: say so instead
-                # of dropping it silently (diagnosability for future parser gaps).
-                logsink.debug(f"manifest parser: skipping unidentifiable document "
-                              f"(kind={kind!r} name={name!r}): {doc[:120]!r}")
-            continue
-        # Use ArgoCD-style key: /Kind ns/name (group prefix for non-core).
-        # Strip matching surrounding quotes from name/namespace so a change
-        # that only re-quotes the name (name: x vs name: "x") is seen as the
-        # SAME resource, not a phantom add+delete (v2.5.0 H1).
-        name = _unquote(name)
-        ns   = _unquote(ns)
-        grp = api.split("/")[0] if "/" in api else ""
-        type_key = f"{grp}/{kind}" if grp and grp not in ("v1", "") else kind
-        key = (type_key, ns or "", name)
-        if key in resources and resources[key] != doc + "\n":
-            # Same (kind, ns, name) emitted twice with different content
-            # (umbrella charts merging subchart output). Keep both diffable
-            # instead of silently overwriting the first (bughunt F5b).
-            n2 = 2
-            while (key[0], key[1], f"{name}#{n2}") in resources:
-                n2 += 1
-            logsink.log(f"manifest parser: duplicate resource {key} in render "
-                        f"\u2014 keeping both as '#{n2}' variant", "WARNING")
-            key = (key[0], key[1], f"{name}#{n2}")
-        resources[key] = doc + "\n"
-    return resources
 
 
 # ── Deterministic risk detection (v2.5.26) ──────────────────────────
