@@ -184,3 +184,96 @@ def test_plain_arming_summary_is_unchanged():
     assert "DO NOT MERGE" in out, "arming already blocks, and must keep doing so"
     assert "orphan" not in out.lower(), \
         "the orphaning finding must only fire on the broken shape"
+
+
+# ── the build status and the honest panel (follow-up fix) ───────────────────
+#
+# The first fix blocked in the COMMENT. Live-verified on acme-config-dev
+# PR #7113, Bitbucket showed "1 of 1 build passed / No failed builds": the
+# build status stayed SUCCESSFUL with footer token [clean], so a PR that
+# orphans a production VM sat one rubber-stamp approval away from merging.
+# The comment's DO-NOT-MERGE is decoration; the build status is the check.
+#
+# The same read-through showed the panel CONTRADICTING the warning: the
+# armed banner said "This PR deletes nothing by itself" and "Nothing changes
+# until Phase 3" -- both false in this shape, where merging prunes the VM
+# CRs immediately -- and the summary said the same story four times.
+
+def _res_diff(n=3):
+    secs = [(f"/v1/ConfigMap cfg-{i}", "  key: value") for i in range(n)]
+    return m.DiffResult("--- a\n+++ b\n", secs, n, True, None, m.OUT_DIFF, None)
+
+
+def _full_comment(appspace_state_lines):
+    return m.format_comment(
+        "a" * 40, {"pv-dev-07-a-ss": _res_diff()}, base_sha="b" * 40,
+        appspace_state_lines=appspace_state_lines)
+
+
+BROKEN_PANEL = [comment_render._DECOM_VM_STRIP_HDR, "",
+                "## \U0001f512⚠️ DECOMMISSION ARMED for `pv-dev-07-a` ⚠️\U0001f512"]
+HAPPY_PANEL = ["## \U0001f512⚠️ DECOMMISSION ARMED for `pv-dev-07-a` ⚠️\U0001f512"]
+
+
+def test_broken_arming_makes_the_footer_token_permanent():
+    """[clean] is what lets fix_stuck_inprogress and the reader call this
+    mergeable. The broken shape is deterministic until a new commit, which
+    is exactly what [permanent] means everywhere else."""
+    out = _full_comment(BROKEN_PANEL)
+    assert "[permanent]" in out, "footer must carry the blocking token"
+    assert "[clean]" not in out
+
+
+def test_broken_arming_is_named_in_the_status_line():
+    out = _full_comment(BROKEN_PANEL)
+    status = out.split("**Status:**")[-1].splitlines()[0]
+    assert "ARMING BROKEN" in status.upper(), status
+
+
+def test_happy_arming_footer_stays_clean():
+    out = _full_comment(HAPPY_PANEL)
+    assert "[clean]" in out
+    assert "[permanent]" not in out
+
+
+def test_summary_tells_the_story_once_when_broken():
+    """Four findings for one event buried the message. The BROKEN finding
+    already states the arming, so the plain ARMED line must stand down."""
+    out = _summary(BROKEN_PANEL)
+    assert "arming is BROKEN" in out
+    assert "becomes eligible for cascade deletion" not in out, \
+        "the generic ARMED finding duplicates the BROKEN one"
+
+
+def test_summary_keeps_the_armed_finding_when_healthy():
+    out = _summary(HAPPY_PANEL)
+    assert "becomes eligible for cascade deletion" in out
+
+
+def test_broken_panel_does_not_say_the_pr_is_harmless(monkeypatch):
+    """'This PR deletes nothing by itself' and 'Nothing changes until
+    Phase 3' are TRUE for a healthy arming and FALSE here: merging prunes
+    the VM CRs immediately. A panel must never contradict its own warning."""
+    out = _panel(monkeypatch, OLD_YAML, STRIPPED_YAML)
+    assert "deletes nothing by itself" not in out, \
+        "the armed banner must not reassure in the broken shape"
+    assert "Nothing changes for" not in out
+    assert "does NOT follow the decommission flow" in out
+
+
+def test_happy_panel_keeps_its_reassurance(monkeypatch):
+    out = _panel(monkeypatch, OLD_YAML, HAPPY_YAML)
+    assert "deletes nothing by itself" in out
+    assert "Nothing changes for" in out
+
+
+def test_the_build_status_path_is_wired():
+    """COPS-2552 pattern: the guard must feed the status decision, not just
+    exist. `broken_arming` has to appear in the FAILED condition AND in
+    is_permanent_failure, or the status stays green / the PR retries."""
+    src = open(os.path.join(os.path.dirname(__file__), "..", "src",
+                            "diff_preview.py")).read()
+    assert src.count("or broken_arming") >= 2, \
+        "broken_arming must gate both the FAILED status and permanence"
+    assert "_DECOM_VM_STRIP_HDR in appspace_state_lines" in src, \
+        "the status path must read the same header constant the panel renders"

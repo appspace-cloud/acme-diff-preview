@@ -406,7 +406,12 @@ def _build_merge_summary(results, rollup_by_sig, vm_change_lines,
                              "\U0001f6a8 **Data purge ARMED** \u2014 the "
                              "cascade will permanently destroy the BigQuery "
                              "dataset and the user content bucket"))
-        elif "DECOMMISSION ARMED" in txt:
+        elif "DECOMMISSION ARMED" in txt and _DECOM_VM_STRIP_HDR not in txt:
+            # COPS-2660 follow-up: when the arming is broken, the BROKEN
+            # finding above already states the arming and its consequence.
+            # Read live on PR #7113, the summary told one event four ways;
+            # the generic line adds nothing next to the specific one, so it
+            # stands down and the story is told once.
             findings.append((_SEV_BLOCK,
                              "\U0001f512 **Decommission ARMED** \u2014 this "
                              "environment becomes eligible for cascade "
