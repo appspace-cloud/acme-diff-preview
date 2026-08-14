@@ -280,6 +280,44 @@ def test_a_qualified_read_through_the_patched_module_is_not_a_break(tmp_path):
     assert audit_seams.bypassed_seams(src=str(src), tests=str(tests)) == []
 
 
+def test_the_audit_reads_SRC_and_TESTS_at_call_time(tmp_path, monkeypatch):
+    """Pointing the module at another tree must actually redirect the audit.
+
+    `def broken_seams(src=SRC, ...)` binds SRC once, when the function is
+    defined. Reassigning `audit_seams.SRC` afterwards therefore changed
+    nothing, and the audit went on reporting the real tree while looking
+    like it had been redirected -- a clean tree answering a question about
+    a dirty one, which is the failure mode this whole module exists to
+    prevent. Anything scripting against the module hits it; the guards in
+    this file were only immune because they pass src=/tests= explicitly.
+    """
+    src = tmp_path / "src"
+    tests = tmp_path / "tests"
+    src.mkdir()
+    tests.mkdir()
+
+    (src / "hub.py").write_text("from helper import fetch, render\n")
+    (src / "helper.py").write_text(
+        "def fetch():\n"
+        "    return 'real'\n"
+        "\n"
+        "def render():\n"
+        "    return fetch()\n"
+    )
+    (tests / "test_thing.py").write_text(
+        "import hub as m\n"
+        "\n"
+        "def test_render(monkeypatch):\n"
+        "    monkeypatch.setattr(m, 'fetch', lambda: 'fake')\n"
+    )
+
+    monkeypatch.setattr(audit_seams, "SRC", str(src))
+    monkeypatch.setattr(audit_seams, "TESTS", str(tests))
+
+    assert audit_seams.patched_names() == {("hub", "fetch")}
+    assert audit_seams.broken_seams() == [("hub", "fetch", ["helper"])]
+
+
 def test_a_local_that_shares_a_module_name_is_not_a_qualified_read(tmp_path):
     """Do not mistake `local.get(...)` for a read through a module.
 

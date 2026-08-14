@@ -59,8 +59,9 @@ TESTS = os.path.join(REPO, "tests")
 # nicknames has to be kept in sync here.
 
 
-def _src_modules(src=SRC):
+def _src_modules(src=None):
     """Every module the service ships, keyed by module name."""
+    src = SRC if src is None else src
     out = {}
     for fn in sorted(os.listdir(src)):
         if fn.endswith(".py"):
@@ -68,7 +69,7 @@ def _src_modules(src=SRC):
     return out
 
 
-def _aliases(tree, src=SRC):
+def _aliases(tree, src=None):
     """Map local name -> source module name, for `import X [as Y]` forms.
 
     Used on test files to learn what `m` refers to, and on source files to
@@ -86,8 +87,9 @@ def _aliases(tree, src=SRC):
     return out
 
 
-def patched_names(src=SRC, tests=TESTS):
+def patched_names(src=None, tests=None):
     """(module, name) pairs the suite replaces via monkeypatch.setattr."""
+    tests = TESTS if tests is None else tests
     found = set()
     for root, _dirs, files in os.walk(tests):
         for fn in files:
@@ -122,7 +124,7 @@ def patched_names(src=SRC, tests=TESTS):
     return found
 
 
-def _referencing_modules(name, src=SRC):
+def _referencing_modules(name, src=None):
     """Modules whose code reads the bare global `name`.
 
     Only unqualified reads count here. Qualified reads are a separate
@@ -154,7 +156,7 @@ def _referencing_modules(name, src=SRC):
     return hits
 
 
-def _qualified_reads(src=SRC):
+def _qualified_reads(src=None):
     """Reads of the form `X.attr` where X names a source module.
 
     Returns {(module_X, attr): {modules containing such a read}}.
@@ -187,7 +189,7 @@ def _qualified_reads(src=SRC):
     return out
 
 
-def broken_seams(src=SRC, tests=TESTS):
+def broken_seams(src=None, tests=None):
     """Seams where a bare-name read escapes the patch.
 
     Half the audit. bypassed_seams() covers the qualified-read half; both
@@ -202,7 +204,7 @@ def broken_seams(src=SRC, tests=TESTS):
     return problems
 
 
-def bypassed_seams(src=SRC, tests=TESTS):
+def bypassed_seams(src=None, tests=None):
     """Seams a qualified read routes around.
 
     The suite patches M.N, but somewhere the code says X.N with X a
