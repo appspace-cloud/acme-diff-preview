@@ -151,6 +151,7 @@ from comment_render import (  # comment rendering (same-dir module, stdlib only)
     _VERDICTS,
     _fmt_env_list,
     _build_merge_summary,
+    _DECOM_VM_STRIP_HDR,
     _SHUTDOWN_MIN_WORKLOADS,
     _is_env_shutdown,
 )
@@ -210,6 +211,7 @@ from vm_analysis import (  # VM/KCC infrastructure analysis (same-dir module)
     _vm_unquote,
     _detect_vm_changes,
     _vm_deletion_armed_flat,
+    _vm_config_stripped,
     _VM_DISK_SIZE_KEYS,
     _VM_ROLE_NAMES,
     _LEGACY_PREFIX,
@@ -235,6 +237,7 @@ from decommission import (  # environment teardown and creation analysis
     _split_resources_by_cascade_fate,
     _decommission_armed_flat,
     _PH_THIS_PR,
+    _PH_BROKEN,
     _PH_PENDING,
     _PH_NA,
     _decommission_phase_table,
@@ -7436,6 +7439,40 @@ def _summarize_appspace_state_changes(changed_files, pr_sha, base_sha, path_map,
         # -- decommission / decommissionPurgeData (COPS-2539/COPS-2572) --
         was_armed, is_armed = _decommission_armed_flat(old_flat), _decommission_armed_flat(new_flat)
         was_purge, is_purge = _purge_armed_flat(old_flat), _purge_armed_flat(new_flat)
+
+        # -- COPS-2660: arming while stripping the config it acts through --
+        # allowDeletion only works through VM CRs helm still renders. A PR
+        # that arms teardown AND removes the role blocks (or flips an
+        # `enabled` off) in the same diff makes ArgoCD prune the CRs while
+        # the live objects still carry `deletion-policy: abandon`: the cloud
+        # VM is orphaned, not deleted. acme-config-prod #4247 shipped exactly
+        # that while this panel read "Phase 1 done" -- reassurance from git
+        # flags without verifying the arming path can take effect, the same
+        # failure class as COPS-2656.
+        _stripped = _vm_config_stripped(old_flat, new_flat)
+        _vm_broken = bool(_stripped) and (
+            is_armed or _vm_deletion_armed_flat(new_flat))
+        _strip_warning = [] if not _vm_broken else [
+            _DECOM_VM_STRIP_HDR,
+            "",
+            f"**This PR removes the Linux VM config for `{env_name}` in the "
+            f"same change that arms its deletion.** Helm stops rendering the "
+            f"VM resources the moment this merges, ArgoCD prunes them, and "
+            f"the live objects go out under their current "
+            f"`deletion-policy: abandon` — the real VM, its data disk and "
+            f"its reserved IP are **orphaned in the cloud, not deleted**.",
+            "",
+            "Stripped in this PR: " + ", ".join(
+                f"`{k[len('appspace.infra.'):]}`" for k in _stripped[:6])
+            + (f" (+{len(_stripped) - 6} more)" if len(_stripped) > 6 else ""),
+            "",
+            "**Fix:** keep the existing `deployLinuxServicesK8s` block "
+            "exactly as it is and only add `defaults.allowDeletion: true`. "
+            "The block can be removed after the cascade has actually "
+            "deleted the VM (Phase 3).",
+            "",
+        ]
+
         if not was_armed and is_armed:
             # The phase table is shared with the arm-purge and folder-removal
             # panels (_decommission_phase_table), so a reviewer sees the same
@@ -7451,10 +7488,14 @@ def _summarize_appspace_state_changes(changed_files, pr_sha, base_sha, path_map,
                 f"environment's folder is removed in a later PR.",
                 "",
             ] + _decommission_phase_table(
-                vm_state=(_PH_DONE if _vm_deletion_armed_flat(new_flat) else None),
+                # COPS-2660: a stripped VM config outranks the flag. The flag
+                # says armed; the same diff removed what it arms.
+                vm_state=(_PH_BROKEN if _vm_broken else
+                          (_PH_DONE if _vm_deletion_armed_flat(new_flat) else None)),
                 cascade_state=_PH_THIS_PR,
                 removal_state=None,
-                declares_vms=_declares_vms_flat(new_flat),
+                declares_vms=(_declares_vms_flat(new_flat)
+                              or _declares_vms_flat(old_flat)),
                 purge=is_purge,
             ) + [
                 "",
@@ -7466,7 +7507,7 @@ def _summarize_appspace_state_changes(changed_files, pr_sha, base_sha, path_map,
                 f"some namespace-level leftovers behind. Full procedure: see "
                 f"`acme-components` `documentation/`.",
                 "",
-            ]
+            ] + _strip_warning
         elif was_armed and not is_armed:
             lines += [
                 f"### \U0001f513 Decommission DISARMED for `{env_name}`",
@@ -7489,19 +7530,36 @@ def _summarize_appspace_state_changes(changed_files, pr_sha, base_sha, path_map,
                 # The cascade is already armed at base -- that is this
                 # branch's own condition -- so Phase 2 reads done, and this
                 # PR is the purge qualifier on it.
-                vm_state=(_PH_DONE if _vm_deletion_armed_flat(new_flat) else None),
+                vm_state=(_PH_BROKEN if _vm_broken else
+                          (_PH_DONE if _vm_deletion_armed_flat(new_flat) else None)),
                 cascade_state=_PH_THIS_PR,
                 removal_state=None,
-                declares_vms=_declares_vms_flat(new_flat),
+                declares_vms=(_declares_vms_flat(new_flat)
+                              or _declares_vms_flat(old_flat)),
                 purge=True,
             ) + [
                 "",
-            ]
+            ] + _strip_warning
         elif is_armed and was_purge and not is_purge:
             lines += [
                 f"*`{env_name}` decommission remains armed, but " +
                 f"`appspace.decommissionPurgeData` was removed \u2014 data is no " +
                 f"longer purged by the cascade.*",
+                "",
+            ]
+        elif _vm_broken:
+            # COPS-2660, standalone: arming happened in an earlier PR and
+            # THIS one only strips the VM config. No transition fires above,
+            # so without this branch the panel would say nothing at all on
+            # the PR that actually breaks the teardown. The phase table
+            # keeps the sequence visible, with the break where it happened.
+            lines += _strip_warning + _decommission_phase_table(
+                vm_state=_PH_BROKEN,
+                cascade_state=(_PH_DONE if is_armed else None),
+                removal_state=None,
+                declares_vms=True,
+                purge=is_purge,
+            ) + [
                 "",
             ]
 
