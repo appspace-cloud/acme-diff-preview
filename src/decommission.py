@@ -8,7 +8,7 @@ rather than to one resource inside it.
 
 `_decommission_phase_table` and `_cascade_retention_reason` cover the
 teardown -- which phase a decommission is in, and why a resource survives a
-cascade delete. `_new_env_status` covers the other end. `_strip_trailing_comment`
+cascade delete. `_new_env_status` covers the other end. `_strip_trailing_comment` (now in manifest.py)
 comes along as the only in-repo helper they depend on.
 
 `_apps_to_skip_for_decommission` and `_moves_missing_cohort_lines` were left
@@ -18,6 +18,8 @@ rule refuses to move a member the suite patches. Their only reader is
 relaxing the rule is worth its own decision rather than 40 quiet lines.
 """
 import re
+
+from manifest import _strip_trailing_comment
 
 
 def _new_env_status(render_error: str):
@@ -64,19 +66,6 @@ def _new_env_status(render_error: str):
     # not found, a generic chart-pull exception, a registry-login failure,
     # or any other render_failed error — is FAILED by default now.
     return "FAILED", False
-
-
-def _strip_trailing_comment(value: str) -> str:
-    """Strip a trailing ` # comment` from an unquoted YAML scalar (v2.5.3).
-
-    A quoted value ('...' or "...") is left untouched -- a '#' inside quotes
-    is literal data, not a comment, and k8s resource names can't legally
-    contain one anyway (DNS-1123), so this only ever affects the defensive
-    unquoted-scalar case.
-    """
-    if value[:1] in ("'", '"'):
-        return value
-    return re.sub(r'\s+#.*$', '', value).strip()
 
 
 _CASCADE_KEEP_CRD_REASON = "CRD (shared with other environments)"
