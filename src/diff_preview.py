@@ -362,9 +362,6 @@ _COMMENT_MARKERS   = ("acme-diff-preview", "argocd-diff-preview")
 # orphaned and create a second row on every existing PR. Only STATUS_NAME (the
 # display label) changes for the rename.
 BUILD_KEY          = "argocd-diff-preview"
-# Verbose per-app / full-stderr logging. Set LOG_LEVEL=DEBUG to enable.
-LOG_LEVEL          = os.environ.get("LOG_LEVEL", "INFO").upper()
-DEBUG              = LOG_LEVEL == "DEBUG"
 MAX_RESOURCES_FULL = 5       # resources shown with full diff block
 MAX_DIFF_CHARS     = 2000    # chars per resource diff block
 # COPS-2567: slots inside the display budget kept for the risk sections we
@@ -1291,16 +1288,6 @@ _path_map_app_count: int = 0
 _gcp_token:     str   = ""
 _gcp_token_exp: float = 0.0
 _gcp_token_lock       = threading.Lock()
-
-def debug(msg: str, **labels) -> None:
-    """Emit a DEBUG log line only when LOG_LEVEL=DEBUG.
-
-    Used for the verbose diagnostics that help explain *why* a diff failed:
-    full ArgoCD stderr, per-attempt classification, repo-server error category,
-    etc. Kept off by default so normal INFO logs stay readable.
-    """
-    if DEBUG:
-        logsink.log(msg, "DEBUG", **labels)
 
 def _handle_sigterm(signum, frame) -> None:
     """Mark shutdown so the main loop exits after the current iteration."""
@@ -2377,8 +2364,8 @@ def discover_path_app_map():
             app_repo_map[full_name] = app_repo
             if app_repo not in repo_maps and app_repo not in unknown_repos_seen:
                 unknown_repos_seen.add(app_repo)
-                debug(f"path map: app {full_name} uses unconfigured repo "
-                      f"{app_repo} — visible only if added to DIFF_REPOS")
+                logsink.debug(f"path map: app {full_name} uses unconfigured repo "
+                              f"{app_repo} — visible only if added to DIFF_REPOS")
         ann  = app.get("metadata", {}).get("annotations", {})
         raw  = ann.get("argocd.argoproj.io/manifest-generate-paths", "")
         if not raw:
@@ -2850,7 +2837,7 @@ def _git_run(args, cwd=None, timeout=None, auth_header=None):
                               text=True, env=_git_env(auth_header),
                               timeout=timeout or GIT_MIRROR_TIMEOUT)
     except Exception as e:
-        debug(f"[mirror] git {' '.join(args[:2])} failed to run: {e}")
+        logsink.debug(f"[mirror] git {' '.join(args[:2])} failed to run: {e}")
         return None
 
 
@@ -2923,7 +2910,7 @@ def mirror_sync(repo: str):
         # repo has to go. Keeping it would pin a miss for the whole pod life.
         for k in [k for k in _mirror_sha_seen if k[0] == repo]:
             _mirror_sha_seen.pop(k, None)
-        debug(f"[mirror] {repo} fetched in {time.monotonic() - t0:.1f}s")
+        logsink.debug(f"[mirror] {repo} fetched in {time.monotonic() - t0:.1f}s")
 
 
 def _mirror_has_sha(repo: str, sha: str) -> bool:
@@ -3042,7 +3029,7 @@ def _bb_fetch_status(filepath, sha, repo=None):
                     _bb_ratelimit_hold(wait)
                     continue   # the gate above does the sleeping, for everyone
                 wait = (attempt + 1) * 2  # 2s, 4s — one sick request, not a budget
-                debug(f"Bitbucket API {e.code} for {filepath}, retry {attempt+1}/2 in {wait}s")
+                logsink.debug(f"Bitbucket API {e.code} for {filepath}, retry {attempt+1}/2 in {wait}s")
                 time.sleep(wait)
                 continue
             return None, BB_ERROR   # other / exhausted HTTP error — transient
@@ -3706,7 +3693,7 @@ def _oci_selfcheck():
                     shutil.rmtree(_home2, ignore_errors=True)
             except Exception as exc:
                 # The fallback is a second opinion, never a new failure mode.
-                debug(f"OCI self-check fallback probe failed: {exc}")
+                logsink.debug(f"OCI self-check fallback probe failed: {exc}")
 
     _diff_stats["oci_selfcheck"] = "ok" if ok else "failed"
     _diff_stats["oci_selfcheck_at"] = datetime.now(timezone.utc).isoformat()
@@ -3793,7 +3780,7 @@ def _ensure_chart(registry: str, chart: str, version: str) -> str:
                 return _helm_chart_cache[key]
             # Dev chart in memory is past its TTL: evict and fall through so
             # the pull section below fetches the current build of this tag.
-            debug(f"Dev chart memory cache stale ({version} in {registry}) — evicting")
+            logsink.debug(f"Dev chart memory cache stale ({version} in {registry}) — evicting")
             _helm_chart_cache.pop(key, None)
 
     chart_dir = os.path.join(HELM_CACHE_DIR, registry, chart, version)
@@ -3810,8 +3797,8 @@ def _ensure_chart(registry: str, chart: str, version: str) -> str:
         # into chart_dir and could fail mid-read if we delete it from under them.
         # _prune_helm_cache() runs at iteration START before any diffs and is the
         # safe cleanup point (no active readers at that time).
-        debug(f"Dev chart cache stale ({version} in {registry}) — "
-              f"evicting from cache; dir removed on next _prune_helm_cache")
+        logsink.debug(f"Dev chart cache stale ({version} in {registry}) — "
+                      f"evicting from cache; dir removed on next _prune_helm_cache")
         with _helm_cache_lock:
             _helm_chart_cache.pop(key, None)
         with _helm_pull_locks_lock:
@@ -4463,7 +4450,7 @@ def _fetch_value_files(value_files: list, sha: str) -> dict:
                 # Fetcher did not complete within 30s (slow Bitbucket). Return
                 # None but do not cache it — the caller treats None as a missing
                 # file which may be correct. Logged so diff stats show the miss.
-                debug(f"Singleflight timeout for ({sha[:8]}, {clean})")
+                logsink.debug(f"Singleflight timeout for ({sha[:8]}, {clean})")
             return vf, val
 
         # We are the fetcher for this cache key.
@@ -4506,7 +4493,7 @@ def _fetch_value_files(value_files: list, sha: str) -> dict:
     absent = [v for v in missing if v not in
               {u.replace("$config/", "") for u in unreadable}]
     if absent:
-        debug(f"value files absent at sha {sha[:8]}: {absent}")
+        logsink.debug(f"value files absent at sha {sha[:8]}: {absent}")
     return result
 
 
@@ -4692,8 +4679,8 @@ def _detect_new_env_candidates(changed_files: list, path_map: dict, renames: dic
             try:
                 content, _st = _bb_fetch_cached(cf, pr_sha, repo=repo)
             except Exception as e:
-                debug(f"new-env identity fetch failed for {cf}: {e}; "
-                      f"keeping candidate")
+                logsink.debug(f"new-env identity fetch failed for {cf}: {e}; "
+                              f"keeping candidate")
                 continue
             cname, _suffix = _extract_appspace_identity(content or "")
             if cname is None:
@@ -5066,8 +5053,8 @@ def _render_new_env_diff(env_info: dict, pr_sha: str) -> tuple:
                 v = _extract_chart_version(raw_anc)
                 if v:
                     version, version_src = v, anc
-                    debug(f"new env {env_name}: version {version} inherited "
-                          f"from {anc}")
+                    logsink.debug(f"new env {env_name}: version {version} inherited "
+                                  f"from {anc}")
                     break
     if not version:
         return None, ("no appspace.version found in config file or any "
@@ -5196,8 +5183,8 @@ def _resolve_effective_pr_chart_revision(app, pr_sha, main_sha=None, renames=Non
     for vf in pr_value_files:
         base = vf.rsplit("/", 1)[-1]
         if base == "customer.yaml" and vf not in vals:
-            debug(f"effective chart revision skipped: customer.yaml unread for {app}",
-                  app=app)
+            logsink.debug(f"effective chart revision skipped: customer.yaml unread for {app}",
+                          app=app)
             return None
     return _effective_chart_version(pr_value_files, vals)
 
@@ -5305,8 +5292,8 @@ def _pr_chart_revision_checked(app, candidate_files, pr_sha, main_sha=None, rena
             saw_version = True
             if new_rev != current_rev and fallback_rev is None:
                 fallback_rev = new_rev
-                debug(f"chart version candidate: {current_rev} -> {new_rev}",
-                      app=app, file=filepath)
+                logsink.debug(f"chart version candidate: {current_rev} -> {new_rev}",
+                              app=app, file=filepath)
 
     if not saw_version:
         # COPR-31756: a customer.yaml edit that REMOVES appspace.version does
@@ -5344,16 +5331,16 @@ def _pr_chart_revision_checked(app, candidate_files, pr_sha, main_sha=None, rena
         effective = _resolve_effective_pr_chart_revision(
             app, pr_sha, main_sha=main_sha, renames=renames)
         if effective and effective != current_rev:
-            debug(f"chart version override (effective): {current_rev} -> {effective}",
-                  app=app)
+            logsink.debug(f"chart version override (effective): {current_rev} -> {effective}",
+                          app=app)
             return effective, invalid
         return None, invalid
 
     # No live valueFiles cached for this app yet — keep the pre-COPR-31756
     # fallback so unit tests and early-cache races still see a bump.
     if fallback_rev:
-        debug(f"chart version override (fallback): {current_rev} -> {fallback_rev}",
-              app=app)
+        logsink.debug(f"chart version override (fallback): {current_rev} -> {fallback_rev}",
+                      app=app)
         return fallback_rev, invalid
     return None, invalid
 
@@ -5428,8 +5415,8 @@ def _parse_manifest_resources(yaml_text):
             if kind or name or "apiVersion:" in doc:
                 # A K8s-looking document we could not identify: say so instead
                 # of dropping it silently (diagnosability for future parser gaps).
-                debug(f"manifest parser: skipping unidentifiable document "
-                      f"(kind={kind!r} name={name!r}): {doc[:120]!r}")
+                logsink.debug(f"manifest parser: skipping unidentifiable document "
+                              f"(kind={kind!r} name={name!r}): {doc[:120]!r}")
             continue
         # Use ArgoCD-style key: /Kind ns/name (group prefix for non-core).
         # Strip matching surrounding quotes from name/namespace so a change
@@ -5653,7 +5640,7 @@ def _rename_identity_confirmed(old_clean: str, new_clean: str,
         old_content, _old_status = _bb_fetch_cached(old_clean, main_sha)
         new_content, _new_status = _bb_fetch_cached(new_clean, pr_sha)
     except Exception as e:
-        debug(f"identity check fetch failed for {old_clean} -> {new_clean}: {e}")
+        logsink.debug(f"identity check fetch failed for {old_clean} -> {new_clean}: {e}")
         old_content = new_content = None
     old_identity = _extract_appspace_identity(old_content or "")
     new_identity = _extract_appspace_identity(new_content or "")
@@ -5905,7 +5892,7 @@ def _augment_renames_with_identity_moves(changed_files: list, renames: dict,
                             f"(Bitbucket did not pair the rename; matched by "
                             f"declared identity {old_id})")
     except Exception as e:
-        debug(f"identity move augmentation skipped: {e}")
+        logsink.debug(f"identity move augmentation skipped: {e}")
         return dict(renames or {})
     return out
 
@@ -6048,12 +6035,12 @@ def _cascade_finalizer_live(apps):
                 capture_output=True, text=True, timeout=30,
                 env=_argocd_subprocess_env())
             if r.returncode != 0:
-                debug(f"cascade finalizer check: argocd app get {name} "
-                      f"failed: {(r.stderr or '')[:120]}")
+                logsink.debug(f"cascade finalizer check: argocd app get {name} "
+                              f"failed: {(r.stderr or '')[:120]}")
                 return None
             meta = (json.loads(r.stdout or "{}") or {}).get("metadata") or {}
         except Exception as e:
-            debug(f"cascade finalizer check failed for {name}: {e}")
+            logsink.debug(f"cascade finalizer check failed for {name}: {e}")
             return None
         seen_any = True
         if _ARGOCD_CASCADE_FINALIZER not in (meta.get("finalizers") or []):
@@ -6139,7 +6126,7 @@ def _paused_apps_for(apps, path_map, sha, repo=None) -> set:
             # Fail toward today's behaviour. Wrongly claiming an environment
             # is frozen sends someone chasing a pause that does not exist,
             # which is worse than the silence this ticket is fixing.
-            debug(f"could not read {ident} for the autosync check: {e}")
+            logsink.debug(f"could not read {ident} for the autosync check: {e}")
             continue
         if _autosync_paused(flat or {}):
             paused.update(members)
@@ -6272,8 +6259,8 @@ def _evaluate_env_decommissions(candidates: list, pr_sha: str, main_sha: str,
                 # file renders Phase 1 as pending instead of claiming it is
                 # done. Logged so the reason is visible rather than guessed
                 # at from a phase table that looks wrong (COPS-2650).
-                debug(f"VM arming state unreadable for "
-                      f"{c['identity_file']}, failing closed: {e}")
+                logsink.debug(f"VM arming state unreadable for "
+                              f"{c['identity_file']}, failing closed: {e}")
         collect_full = (with_full_output and cascade
                         and _decommission_fully_phased(c["identity_file"], main_sha))
         app_deleted_docs: dict = {}
@@ -6281,7 +6268,7 @@ def _evaluate_env_decommissions(candidates: list, pr_sha: str, main_sha: str,
             try:
                 resources = _render_main_side_resources(app, main_sha)
             except Exception as e:
-                debug(f"decommission resource listing failed for {app}: {e}")
+                logsink.debug(f"decommission resource listing failed for {app}: {e}")
                 continue
             any_rendered = True
             n, kc, wl = _summarize_resources_dict(resources)
@@ -6861,8 +6848,8 @@ def argocd_diff(app, pr_sha, main_sha, chart_revision=None, changed_paths=None, 
 
         if reason is not None:
             last_detail, last_reason = detail or reason, reason
-            debug(f"diff step failed: {reason}", app=app,
-                  attempt=attempt + 1, detail=(detail or "")[:800])
+            logsink.debug(f"diff step failed: {reason}", app=app,
+                          attempt=attempt + 1, detail=(detail or "")[:800])
             # Permanent: the chart version does not exist. Never retry; block PR.
             if reason in PERMANENT_REASONS:
                 return _indeterminate(reason, detail or reason)
@@ -7059,7 +7046,7 @@ def find_existing_comment(pr_id, repo=None):
         except Exception as e:
             # Transient Bitbucket error: raise so process_pr skips this PR
             # rather than posting a duplicate comment (new ID, no update in place).
-            debug(f"find_existing_comment page {pages} error: {e}")
+            logsink.debug(f"find_existing_comment page {pages} error: {e}")
             raise
         for c in data.get("values", []):
             raw = c.get("content", {}).get("raw", "")
@@ -9908,8 +9895,8 @@ def process_pr(pr, path_map, base_sha="", repo=None):
                             # failure here costs latency, never correctness.
                             # Logged because "every diff is slow" is otherwise
                             # invisible from here (COPS-2650).
-                            debug(f"chart pre-warm failed, the diff will pull "
-                                  f"it instead: {e}")
+                            logsink.debug(f"chart pre-warm failed, the diff will pull "
+                                          f"it instead: {e}")
 
         # Fan-out: diff all affected apps. The chart pre-pull phase above already
         # has the tarball for every needed version on disk, so _run_one_diff will
@@ -10470,7 +10457,7 @@ def main():
                 diff_workers=DIFF_WORKERS, pr_workers=MAX_PR_WORKERS,
                 max_apps_per_run=MAX_APPS_PER_RUN, diff_timeout=DIFF_TIMEOUT,
                 diff_retries=DIFF_RETRIES, warm_workers=WARM_WORKERS,
-                kube_version=KUBE_VERSION, log_level=LOG_LEVEL, vertex_model=VERTEX_MODEL)
+                kube_version=KUBE_VERSION, log_level=logsink.LOG_LEVEL, vertex_model=VERTEX_MODEL)
 
     # COPS-2575 self-check: a silently permissive pod after a secret-mount
     # problem is worth one log line. Never logs the value, only whether strict

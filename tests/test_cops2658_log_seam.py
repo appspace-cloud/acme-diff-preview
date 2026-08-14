@@ -21,6 +21,8 @@ import ast
 import os
 import sys
 
+import pytest
+
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
 os.environ.setdefault("BB_USER", "t")
 os.environ.setdefault("BB_TOKEN", "t")
@@ -35,19 +37,40 @@ SRC = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "src")
 def test_patching_logsink_intercepts_the_hub_own_logging(monkeypatch):
     """The seam a hundred tests depend on, exercised end to end.
 
-    `debug()` lives in the hub and logs. If the hub resolved `log` through
-    its own namespace, this patch would not reach it and the capture would
-    stay empty while the test still passed -- the exact silent green this
-    phase had to avoid.
+    `_record_affected_apps` lives in the hub and logs when the app cap is
+    exceeded. If the hub resolved `log` through its own namespace, this
+    patch would not reach it and the capture would stay empty while the
+    test still passed -- the exact silent green this phase had to avoid.
+    """
+    captured = []
+    monkeypatch.setattr(logsink, "log",
+                        lambda msg, severity="INFO", **kw: captured.append(msg))
+
+    diff_preview._record_affected_apps(diff_preview.MAX_APPS_PER_RUN + 1)
+
+    assert captured, "the hub's log call did not route through logsink"
+    assert "app cap exceeded" in captured[0], captured
+
+
+def test_debug_routes_through_the_same_seam(monkeypatch):
+    """`debug` is a logging function, so it lives with `log` and its switch.
+
+    It used to sit in the hub reading a hub-level DEBUG, which put both
+    names in the closure of every cluster that logs verbosely -- the render
+    cache among them. Moving the pair here removes that from every closure
+    and leaves one place where "should this be emitted" is decided.
     """
     captured = []
     monkeypatch.setattr(logsink, "log",
                         lambda msg, severity="INFO", **kw: captured.append((msg, severity)))
-    monkeypatch.setattr(diff_preview, "DEBUG", True)
 
-    diff_preview.debug("phase 7 seam check", pr="1")
+    monkeypatch.setattr(logsink, "DEBUG", False)
+    logsink.debug("suppressed")
+    assert captured == [], "DEBUG=False must emit nothing"
 
-    assert captured == [("phase 7 seam check", "DEBUG")], captured
+    monkeypatch.setattr(logsink, "DEBUG", True)
+    logsink.debug("emitted", pr="1")
+    assert captured == [("emitted", "DEBUG")], captured
 
 
 def test_the_hub_keeps_no_second_binding_for_log():
@@ -57,13 +80,15 @@ def test_the_hub_keeps_no_second_binding_for_log():
     bare `log(...)` in the hub then fails loudly with NameError instead of
     quietly writing past whatever the suite patched.
     """
-    assert not hasattr(diff_preview, "log"), (
-        "diff_preview still carries a `log` binding; callers resolving "
-        "through it would escape a patch applied to logsink"
-    )
+    for name in ("log", "debug", "DEBUG"):
+        assert not hasattr(diff_preview, name), (
+            f"diff_preview still carries a `{name}` binding; callers "
+            "resolving through it would escape a patch applied to logsink"
+        )
 
 
-def test_log_is_defined_exactly_once_across_the_service():
+@pytest.mark.parametrize("name", ["log", "debug"])
+def test_defined_exactly_once_across_the_service(name):
     """One definition, one seam. A duplicate is how this class of bug returns."""
     definitions = []
     for fn in sorted(os.listdir(SRC)):
@@ -71,12 +96,13 @@ def test_log_is_defined_exactly_once_across_the_service():
             continue
         tree = ast.parse(open(os.path.join(SRC, fn), encoding="utf-8").read())
         for node in tree.body:
-            if isinstance(node, ast.FunctionDef) and node.name == "log":
+            if isinstance(node, ast.FunctionDef) and node.name == name:
                 definitions.append(fn)
     assert definitions == ["logsink.py"], definitions
 
 
-def test_no_module_reads_log_as_a_bare_global():
+@pytest.mark.parametrize("name", ["log", "debug", "DEBUG"])
+def test_no_module_reads_the_logging_names_as_bare_globals(name):
     """Every reader must go through the module object the suite patches.
 
     This is the invariant the qualified-read guard protects from the other
@@ -89,8 +115,8 @@ def test_no_module_reads_log_as_a_bare_global():
             continue
         tree = ast.parse(open(os.path.join(SRC, fn), encoding="utf-8").read())
         bare = [n.lineno for n in ast.walk(tree)
-                if isinstance(n, ast.Name) and n.id == "log"
+                if isinstance(n, ast.Name) and n.id == name
                 and isinstance(n.ctx, ast.Load)]
         if bare:
             offenders[fn] = bare
-    assert not offenders, f"bare `log` reads outside logsink.py: {offenders}"
+    assert not offenders, f"bare `{name}` reads outside logsink.py: {offenders}"

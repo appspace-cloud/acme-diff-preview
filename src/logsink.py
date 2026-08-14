@@ -13,6 +13,7 @@ scripts/audit_seams.py enforces both halves of that -- a bare read from
 another namespace, and a qualified read routed through some *other*
 module -- and tests/test_cops2658_log_seam.py pins the end state.
 """
+import os
 import json
 from datetime import datetime, timezone
 
@@ -28,3 +29,19 @@ def log(msg: str, severity: str = "INFO", **labels) -> None:
     if labels:
         entry["labels"] = {k: str(v) for k, v in labels.items()}
     print(json.dumps(entry), flush=True)
+
+
+# Verbose per-app / full-stderr logging. Set LOG_LEVEL=DEBUG to enable.
+LOG_LEVEL          = os.environ.get("LOG_LEVEL", "INFO").upper()
+DEBUG              = LOG_LEVEL == "DEBUG"
+
+
+def debug(msg: str, **labels) -> None:
+    """Emit a DEBUG log line only when LOG_LEVEL=DEBUG.
+
+    Used for the verbose diagnostics that help explain *why* a diff failed:
+    full ArgoCD stderr, per-attempt classification, repo-server error category,
+    etc. Kept off by default so normal INFO logs stay readable.
+    """
+    if DEBUG:
+        log(msg, "DEBUG", **labels)

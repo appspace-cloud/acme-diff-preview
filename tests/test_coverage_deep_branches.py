@@ -76,8 +76,8 @@ def test_filter_diff_sections_drops_ignored_and_checksum_only():
 def test_debug_logs_only_in_debug_mode(monkeypatch):
     logs = []
     monkeypatch.setattr(logsink, "log", lambda msg, *a, **k: logs.append(msg))
-    monkeypatch.setattr(m, "DEBUG", True)
-    m.debug("visible now")
+    monkeypatch.setattr(logsink, "DEBUG", True)
+    logsink.debug("visible now")
     assert logs == ["visible now"]
 
 
