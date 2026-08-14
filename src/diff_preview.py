@@ -7482,13 +7482,25 @@ def _summarize_appspace_state_changes(changed_files, pr_sha, base_sha, path_map,
             # three rows on every PR of the sequence with only the marks
             # moving. Numbering follows delete.md, not the old panel-local
             # numbering (COPS-2616).
+            # COPS-2660 follow-up: the reassuring sentences are TRUE for a
+            # healthy arming and FALSE for the broken shape -- merging it
+            # prunes the VM CRs immediately. Read live on PR #7113, the old
+            # text ("deletes nothing by itself", "Nothing changes until
+            # Phase 3") sat two paragraphs above the orphaning warning,
+            # contradicting it. A panel must never argue with its own
+            # warning, so the broken shape gets the truthful intro and none
+            # of the reassurance.
             lines += [
                 f"## \U0001f512\u26a0\ufe0f DECOMMISSION ARMED for `{env_name}` \u26a0\ufe0f\U0001f512",
                 "",
-                f"**`appspace.decommission: true` was added. This PR deletes "
-                f"nothing by itself.** {app_list} become eligible for the "
-                f"cascade-delete finalizer, which only acts when this "
-                f"environment's folder is removed in a later PR.",
+                (f"**`appspace.decommission: true` was added \u2014 but this PR "
+                 f"does NOT follow the decommission flow: it strips the VM "
+                 f"config it is arming.** See the warning below the table."
+                 if _vm_broken else
+                 f"**`appspace.decommission: true` was added. This PR deletes "
+                 f"nothing by itself.** {app_list} become eligible for the "
+                 f"cascade-delete finalizer, which only acts when this "
+                 f"environment's folder is removed in a later PR."),
                 "",
             ] + _decommission_phase_table(
                 # COPS-2660: a stripped VM config outranks the flag. The flag
@@ -7500,7 +7512,9 @@ def _summarize_appspace_state_changes(changed_files, pr_sha, base_sha, path_map,
                 declares_vms=(_declares_vms_flat(new_flat)
                               or _declares_vms_flat(old_flat)),
                 purge=is_purge,
-            ) + [
+            ) + ([
+                "",
+            ] if _vm_broken else [
                 "",
                 f"**Nothing changes for `{env_name}` until Phase 3:** every "
                 f"workload keeps running, disks stay held, costs keep accruing "
@@ -7510,7 +7524,7 @@ def _summarize_appspace_state_changes(changed_files, pr_sha, base_sha, path_map,
                 f"some namespace-level leftovers behind. Full procedure: see "
                 f"`acme-components` `documentation/`.",
                 "",
-            ] + _strip_warning
+            ]) + _strip_warning
         elif was_armed and not is_armed:
             lines += [
                 f"### \U0001f513 Decommission DISARMED for `{env_name}`",
@@ -8756,13 +8770,26 @@ def format_comment(pr_sha, app_results, skipped_apps=None, base_sha="",
     if downgrades:
         status += " | \U0001f53b CHART DOWNGRADE \u2014 verify intentional"
 
+    # COPS-2660 follow-up: the broken-arming shape diffs "successfully" (the
+    # VM CRs simply disappear), so every branch above happily says clean or
+    # "N resource(s) will change". Live proof on acme-config-dev PR #7113:
+    # footer [clean], build SUCCESSFUL, one rubber-stamp approval away from
+    # orphaning the VM. Whatever else the status line says, it must carry
+    # the blocker, and the token must be permanent -- deterministic until a
+    # new commit, like every other permanent reason.
+    _arming_broken = bool(appspace_state_lines) and \
+        _DECOM_VM_STRIP_HDR in appspace_state_lines
+    if _arming_broken:
+        status += (" | \u26d4 DECOMMISSION ARMING BROKEN \u2014 the VM would "
+                   "be orphaned, see comment")
+
     # Machine-readable token embedded in the footer. Used by process_pr to decide
     # whether to re-run without parsing the human-readable status string.
     # Tokens: clean | permanent | transient
     # - clean     : all apps diffed successfully (no retry, mark seen)
     # - permanent : oci_not_found or hard error (no retry, mark seen)
     # - transient : diff unavailable on transient blip (retry next loop)
-    if any_error or new_env_structural:
+    if any_error or new_env_structural or _arming_broken:
         _status_token = "permanent"
     elif any_unknown:
         # Distinguish oci_not_found (permanent) from soft indeterminate (transient)
@@ -9694,8 +9721,16 @@ def process_pr(pr, path_map, base_sha="", repo=None):
         # transient error still gets retried automatically on the next
         # iteration (see is_transient_failure below) — only the COLOR changes,
         # never the retry behavior.
+        # COPS-2660 follow-up: the broken-arming shape diffs CLEANLY -- the
+        # VM CRs just vanish from the render -- so without this the chain
+        # below lands in "N resource(s) will change" and posts SUCCESSFUL.
+        # Live proof on acme-config-dev PR #7113: comment said DO NOT MERGE,
+        # Bitbucket said "1 of 1 build passed", and only a missing approval
+        # stood between that PR and an orphaned VM. Same single source as
+        # the panel and the summary: the header constant.
+        broken_arming = _DECOM_VM_STRIP_HDR in appspace_state_lines
         if (any_hard_error or has_blocking_indet or structural_envs
-                or moves_missing_cohort):
+                or moves_missing_cohort or broken_arming):
             # COPS-2552: a move whose destination has no cohort config.yaml
             # must never post green. Merging it removes the environment from
             # ArgoCD instead of moving it, and the apps themselves diff clean,
@@ -9706,6 +9741,12 @@ def process_pr(pr, path_map, base_sha="", repo=None):
                              f"have no cohort config.yaml at the destination "
                              f"({envs}) - merging would remove them from ArgoCD")
                 post_build_status(pr_sha, "FAILED", _mmc_desc, pr_id=pr_id)
+            elif broken_arming:
+                _ba_desc = ("Decommission arming broken - this PR strips the "
+                            "Linux VM config while arming deletion; the cloud "
+                            "VM would be orphaned, not deleted. Keep the VM "
+                            "block (see PR comment)")
+                post_build_status(pr_sha, "FAILED", _ba_desc, pr_id=pr_id)
             elif structural_envs:
                 base_desc = (f"{len(structural_envs)} new environment(s) have a "
                              f"structural config problem: {', '.join(structural_envs)}")
@@ -9779,7 +9820,8 @@ def process_pr(pr, path_map, base_sha="", repo=None):
         #   resolve itself.
         is_permanent_failure = (any_hard_error or has_blocking_indet
                                 or bool(structural_envs)
-                                or bool(moves_missing_cohort))
+                                or bool(moves_missing_cohort)
+                                or broken_arming)
         is_transient_failure = any_unknown and not is_permanent_failure
         if not is_transient_failure:
             # Mark seen for both clean runs AND permanent failures so we don't
