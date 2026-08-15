@@ -187,24 +187,29 @@ same as testing it.
 ## What "100%" excludes, and why
 
 `src/` reports 100% statement coverage. Read that as "100% of what is
-measured": there are 20 `pragma: no cover` sites, and coverage.py does not
+measured": there are 19 `pragma: no cover` sites, and coverage.py does not
 count them. Most long predate COPS-2671 and carry their reason inline — the
 zstandard import fallback the production image never takes, TLS paths that
 need a real cluster, `os.replace` failure arms. Each is a one-line
 justification at the point of exclusion; that is the convention, keep it.
 
-COPS-2671 added two, and they are worth knowing about because neither is a
-routine "cannot happen in a test" exclusion:
+COPS-2671 added two. One is still here and worth knowing about, because it is
+not a routine "cannot happen in a test" exclusion:
 
 | Site | Why it is excluded |
 |---|---|
 | `diff_ui.py` — the path-traversal `raise` at the GCS write site | Cannot fire. An identical guard forty lines earlier walks the same `names` tuple and raises first. Kept because CodeQL wants the idiom at *each* write site, and a guard that relies on a caller upstream is one refactor from being the only one left. The contract that does the protecting is tested: weaken `_validate` and a `../` name is still refused with nothing written. |
-| `diff_preview.py` — the capped deep-link roster in `format_comment` | Dead rather than untested. It needs a shape group **and** no changeset table, but shape groups are built only from `OUT_DIFF` results and any `OUT_DIFF` result renders the table; on the complete-record page — where its own comment says the bullets should survive — `shape_group_for_app` is emptied outright. Left in place because those bullets may be behaviour COPS-2640 lost rather than made redundant. |
 
-The second is the reason this section exists. Chasing the last seven
-statements found dead code that a `pragma` added without reading would have
-buried for good. Before excluding a line, work out *why* nothing reaches it —
-the answer is occasionally that the feature stopped working.
+The other one is the reason this section exists, and it is gone now. The capped
+deep-link roster in `format_comment` turned out to be **dead code, not untested
+code**: its guard required a shape group *and* no changeset table, and neither
+is reachable. It was excluded first, tracked as COPS-2672, and deleted there
+once the product call was made.
+
+That is the lesson to keep: chasing the last seven statements found a feature
+that had silently stopped rendering, and a `pragma` added without reading would
+have buried it for good. **Before excluding a line, work out *why* nothing
+reaches it** — the answer is occasionally that the feature stopped working.
 
 ---
 

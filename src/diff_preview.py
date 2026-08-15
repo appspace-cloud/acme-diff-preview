@@ -8810,38 +8810,21 @@ def format_comment(pr_sha, app_results, skipped_apps=None, base_sha="",
                 # above (audited on acme-config-prod #4095). The group
                 # keeps its statement; members list as the one-line
                 # roster the failure groups already use, and COPS-2622
-                # holds through the table. Bullets survive only where the
-                # table does not carry the links: no table, or the
-                # complete-record page.
-                # COPS-2671: this condition can no longer be satisfied, and
-                # the comment above is what gives it away. "No table" cannot
-                # co-occur with a shape group -- the group is built only from
-                # OUT_DIFF results (8217) and any OUT_DIFF result sets
-                # _table_rendered (8515). "The complete-record page" cannot
-                # either: shape_group_for_app is {} outright when
-                # is_complete_record (8258). So both arms are dead and the
-                # roster below has not rendered since COPS-2640 narrowed the
-                # guard. Excluded rather than deleted: the bullets may be
-                # behaviour that was lost rather than behaviour made
-                # redundant, and restoring them on the full-diff page is a
-                # product call, not a coverage one.
-                if (artifact_url and not (_table_rendered  # pragma: no cover
-                                          and not profile.is_complete_record)):
-                    _shown = _members[:8]
-                    # One per line, not one long line. Deep links carry the
-                    # full page URL, so six of them joined with commas came
-                    # to 582 characters and the markdown hazard guard
-                    # rejected it: a line that wraps into a block is not
-                    # more readable than the 24 lines this replaced.
-                    lines += [
-                        f"- [{m}]({artifact_url}#{diff_ui.app_anchor(m)})"
-                        for m in _shown]
-                    if len(_members) > len(_shown):
-                        lines += [f"- (+{len(_members) - len(_shown)} more "
-                                  f"on the full-diff page)"]
-                    lines += [""]
-                else:
-                    lines += [f"> {_fmt_service_list(_members)}", ""]
+                # holds through the table.
+                #
+                # COPS-2672: a second branch used to sit here, printing one
+                # deep-link bullet per member (capped at eight, with a
+                # "+N more" pointer). Its guard said the bullets survive
+                # "where the table does not carry the links: no table, or the
+                # complete-record page" -- and neither is reachable. A shape
+                # group is built only from OUT_DIFF results, and any OUT_DIFF
+                # result renders the table; on the complete-record page
+                # shape_group_for_app is {} outright. So it had not rendered
+                # since COPS-2640 narrowed the guard, and it is deleted rather
+                # than carried as an exclusion. If per-app links are ever
+                # wanted on the full-diff page, that is a page-side change --
+                # this was never the code doing it.
+                lines += [f"> {_fmt_service_list(_members)}", ""]
                 continue
             _risky = _is_risky_result(rep_r)
             # COPS-2635/2636: the Changeset overview row for this app
