@@ -113,7 +113,74 @@ def test_disk_prune_enforces_count_cap(tmp_path, monkeypatch):
     monkeypatch.setattr(render_cache, "MAIN_RENDER_CACHE_DIR", str(tmp_path))
     monkeypatch.setattr(render_cache, "MAIN_RENDER_DISK_MAX", 3)
     monkeypatch.setattr(render_cache, "MAIN_RENDER_DISK_MAX_BYTES", 10 ** 9)
+    # Isolated from the store-path throttle below: this test is about cap
+    # enforcement, not about how often a store triggers it.
+    monkeypatch.setattr(render_cache, "MAIN_RENDER_DISK_PRUNE_EVERY", 1)
     for i in range(5):
         m._main_render_disk_store(f"key-{i}", "raw-" + ("x" * 100))
     kept = [n for n in os.listdir(str(tmp_path)) if n.endswith(".yaml")]
     assert len(kept) == 3
+
+
+def test_disk_store_throttles_the_prune_scan(tmp_path, monkeypatch):
+    """COPS-2676: a full prune scan is O(entries on disk), so running it on
+    every single store turned a large PR's flood of cache-miss writes into a
+    flood of full-directory rescans of the same cache. The scan must run
+    only once every MAIN_RENDER_DISK_PRUNE_EVERY stores, not on every one."""
+    monkeypatch.setattr(render_cache, "MAIN_RENDER_CACHE_DIR", str(tmp_path))
+    monkeypatch.setattr(render_cache, "MAIN_RENDER_DISK_PRUNE_EVERY", 4)
+    render_cache._main_render_disk_prune_counter = 0
+    # Simulate steady-state (past the always-prune first call of a fresh
+    # process), which is a separate guarantee covered by the test below.
+    monkeypatch.setattr(render_cache, "_main_render_disk_prune_started", True)
+    calls = []
+    monkeypatch.setattr(render_cache, "_main_render_disk_prune",
+                         lambda: calls.append(1))
+    for i in range(10):
+        m._main_render_disk_store(f"key-{i}", "raw")
+    # 10 stores at a threshold of 4: due on the 4th and the 8th call.
+    assert len(calls) == 2, calls
+
+
+def test_disk_store_always_prunes_the_first_call_of_a_process(tmp_path, monkeypatch):
+    """COPS-2676 follow-up (adversarial review finding): the throttle counter
+    is in-process state, but the emptyDir it protects survives a container
+    restart within the same pod. A restart loop landing fewer than
+    MAIN_RENDER_DISK_PRUNE_EVERY stores per cycle must not defer cap
+    enforcement forever -- unlike the pre-throttle code (which re-derived
+    the real directory state on every call), the counter alone could do
+    exactly that. The first store of every process lifetime must force a
+    real prune regardless of the counter, so every restart gets at least
+    one true reconciliation."""
+    monkeypatch.setattr(render_cache, "MAIN_RENDER_CACHE_DIR", str(tmp_path))
+    monkeypatch.setattr(render_cache, "MAIN_RENDER_DISK_PRUNE_EVERY", 1000)
+    render_cache._main_render_disk_prune_counter = 0
+    monkeypatch.setattr(render_cache, "_main_render_disk_prune_started", False)
+    calls = []
+    monkeypatch.setattr(render_cache, "_main_render_disk_prune",
+                         lambda: calls.append(1))
+    m._main_render_disk_store("key-0", "raw")
+    assert len(calls) == 1, "the first store of a fresh process must prune"
+    m._main_render_disk_store("key-1", "raw")
+    assert len(calls) == 1, "the second store must go back to throttling"
+
+
+def test_disk_prune_scans_each_file_once(tmp_path, monkeypatch):
+    """The count/byte caps need one fact per file (mtime for ordering, size
+    for the byte budget). Fetching them with getmtime() then getsize() stats
+    the same path twice; a single os.stat() gives both for the cost of one."""
+    monkeypatch.setattr(render_cache, "MAIN_RENDER_CACHE_DIR", str(tmp_path))
+    monkeypatch.setattr(render_cache, "MAIN_RENDER_DISK_MAX", 10 ** 9)
+    monkeypatch.setattr(render_cache, "MAIN_RENDER_DISK_MAX_BYTES", 10 ** 9)
+    for i in range(5):
+        (tmp_path / f"key-{i}.yaml").write_text("x")
+    calls = []
+    real_stat = os.stat
+
+    def _counting_stat(path, *a, **kw):
+        calls.append(path)
+        return real_stat(path, *a, **kw)
+
+    monkeypatch.setattr(render_cache, "_main_render_stat", _counting_stat)
+    render_cache._main_render_disk_prune()
+    assert len(calls) == 5, "expected exactly one stat() per file, got %r" % calls

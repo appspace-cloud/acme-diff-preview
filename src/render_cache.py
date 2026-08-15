@@ -60,6 +60,32 @@ MAIN_RENDER_CACHE_DIR = os.environ.get(
 MAIN_RENDER_DISK_MAX = _env_int("MAIN_RENDER_DISK_MAX", MAIN_RENDER_CACHE_MAX * 2)
 MAIN_RENDER_DISK_MAX_BYTES = _env_int(
     "MAIN_RENDER_DISK_MAX_BYTES", 400 * 1024 * 1024)
+# COPS-2676: prune is O(entries on disk), not O(this write). Running it after
+# every single store turned a large PR's flood of cache-miss writes into a
+# flood of full-directory rescans of the SAME up-to-4096-entry cache -- a live
+# profile of a 405-app render caught getmtime/getsize among the hottest leaf
+# frames, and a local replay at the production disk cap measured ~23ms per
+# scan. One store every 25 calls keeps the on-disk count within
+# MAIN_RENDER_DISK_PRUNE_EVERY - 1 of the cap between prunes (a bounded,
+# harmless overshoot on an already best-effort cap) while cutting a
+# large-PR's prune overhead by the same factor.
+#
+# The counter is in-process state; the disk it gates is not -- an emptyDir
+# outlives a container restart within the same pod (only pod deletion wipes
+# it), and this cache shares that emptyDir with helm scratch, which the
+# kubelet enforces its own sizeLimit on by EVICTING THE POD. A restart loop
+# that lands fewer than MAIN_RENDER_DISK_PRUNE_EVERY stores per cycle (an
+# OOMKill, a liveness-probe bounce) would otherwise never reach the
+# threshold in any single process lifetime and defer cap enforcement
+# indefinitely, which the unconditional pre-throttle code could never do (it
+# re-derived the real directory state on every call). _main_render_disk_store
+# forces the FIRST store of every process lifetime through unthrottled, so
+# every restart gets at least one real reconciliation against the actual
+# on-disk state no matter how short-lived the process is.
+MAIN_RENDER_DISK_PRUNE_EVERY = _env_int("MAIN_RENDER_DISK_PRUNE_EVERY", 25)
+_main_render_disk_prune_counter = 0
+_main_render_disk_prune_started = False
+_main_render_disk_prune_lock = threading.Lock()
 # Salt bumped when render-affecting code changes (same idea as ArgoCD
 # CacheVersion). Part of every content key AND of every bucket object name,
 # so a bump orphans the durable copies instead of serving them.
@@ -183,6 +209,23 @@ def _main_render_disk_path(key: str) -> str:
     return os.path.join(MAIN_RENDER_CACHE_DIR, f"{key}.yaml")
 
 
+def _main_render_stat(path: str) -> os.stat_result:
+    """Indirection point for _main_render_disk_prune's per-file stat.
+
+    A test simulating a file vanishing mid-scan has to replace this call
+    with something that raises. Patching os.stat itself works too, but it
+    patches the process-wide os module -- pytest's own traceback formatter
+    calls os.stat via pathlib, so a raising fake collides with it and turns
+    a clean assertion failure into an opaque INTERNALERROR (COPS-2676).
+    A private, single-purpose seam has no other caller to collide with.
+    Named with the module's _main_render_* prefix, not the generic _stat --
+    diff_ui.py already has an unrelated _stat() (a metrics counter), and the
+    seam audit (test_module_surface.py) flags same-named symbols across
+    modules on sight.
+    """
+    return os.stat(path)
+
+
 def _main_render_disk_prune() -> None:
     """Drop oldest on-disk render entries past count/byte caps. Best-effort.
 
@@ -190,13 +233,16 @@ def _main_render_disk_prune() -> None:
     republish, and live under the same 1Gi emptyDir as helm scratch.
     """
     try:
-        entries = [
+        names = [
             os.path.join(MAIN_RENDER_CACHE_DIR, n)
             for n in os.listdir(MAIN_RENDER_CACHE_DIR)
             if n.endswith(".yaml") and not n.endswith(".tmp")
         ]
-        entries.sort(key=lambda p: os.path.getmtime(p))
-        sizes = {p: os.path.getsize(p) for p in entries}
+        # One stat() per file, not two (getmtime then getsize each re-stat
+        # the same path): halves the syscalls a full-directory scan costs.
+        stats = {p: _main_render_stat(p) for p in names}
+        entries = sorted(stats, key=lambda p: stats[p].st_mtime)
+        sizes = {p: stats[p].st_size for p in entries}
     except OSError:
         return
     total = sum(sizes.values())
@@ -244,7 +290,16 @@ def _main_render_disk_store(key: str, raw: str) -> None:
                 # harmless; a failed cleanup must not poison the cache write.
                 logsink.log(f"[main-render-cache] tmp cleanup failed (non-fatal): {e}",
                             "WARNING")
-    _main_render_disk_prune()
+    global _main_render_disk_prune_counter, _main_render_disk_prune_started
+    with _main_render_disk_prune_lock:
+        _main_render_disk_prune_counter += 1
+        due = (not _main_render_disk_prune_started
+               or _main_render_disk_prune_counter >= MAIN_RENDER_DISK_PRUNE_EVERY)
+        if due:
+            _main_render_disk_prune_counter = 0
+            _main_render_disk_prune_started = True
+    if due:
+        _main_render_disk_prune()
 
 
 _ZSTD_MAGIC = b"\x28\xb5\x2f\xfd"

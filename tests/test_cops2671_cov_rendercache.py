@@ -243,14 +243,18 @@ def test_a_file_vanishing_mid_prune_aborts_it_instead_of_guessing(
     incomplete picture is how a prune evicts the wrong renders."""
     paths = _files(str(tiers), 6)
     monkeypatch.setattr(render_cache, "MAIN_RENDER_DISK_MAX", 2)
-    real_getsize = os.path.getsize
+    real_stat = render_cache._main_render_stat
 
-    def _getsize(p):
+    def _stat(p, *a, **kw):
         if p.endswith("e03.yaml"):
             raise FileNotFoundError(2, "vanished", p)
-        return real_getsize(p)
+        return real_stat(p, *a, **kw)
 
-    monkeypatch.setattr(os.path, "getsize", _getsize)
+    # Patched on the private _main_render_stat seam, not os.stat itself:
+    # os.stat is process-wide, and pytest's own traceback formatter calls it
+    # via pathlib -- a raising fake there turns a clean assertion failure
+    # into an opaque INTERNALERROR (COPS-2676 review finding).
+    monkeypatch.setattr(render_cache, "_main_render_stat", _stat)
     render_cache._main_render_disk_prune()
 
     assert all(os.path.exists(p) for p in paths if not p.endswith("e03.yaml")), (
