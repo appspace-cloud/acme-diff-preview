@@ -86,21 +86,37 @@ def test_chart_version_accepts_the_entire_safe_grammar(s):
     # pinned one by one (hypothesis found '0\x1e\x85' on 2026-08-06).
     blacklist_characters="\x0b\x0c\x1c\x1d\x1e\x85\u2028\u2029"),
     max_size=2000))
-@example("\r")   # CI's hypothesis run caught this: splitlines() sees one
-                 # (empty) line in a lone terminator, but the redactor
-                 # joins with "\n", so a round-trip line COUNT comparison
-                 # was the wrong spec at the boundary. The real invariant
-                 # is below; this pins the counterexample.
+@example("\r")     # CI's hypothesis run caught this: splitlines() sees one
+                   # (empty) line in a lone terminator, but the redactor
+                   # joins with "\n", so a round-trip line COUNT comparison
+                   # was the wrong spec at the boundary. The real invariant
+                   # is below; this pins the counterexample.
+@example("0\r\r")  # Found 2026-08-15. Same family, and the spec above was
+@example("a\n\n")  # still measuring the wrong thing: it counted the lines of
+                   # the RAW input, but _redact_sensitive drops every trailing
+                   # terminator up front -- deliberately, as its "Idempotence
+                   # guard" comment says, so that redacting twice is a fixed
+                   # point. '0\r\r' is named in that very comment. The plain-
+                   # newline form 'a\n\n' fails identically, so this was never
+                   # about \r; the old assertion just had not been updated when
+                   # the guard landed. Both pinned so the boundary is a
+                   # decision on record instead of a rediscovery every few runs.
 def test_redact_never_raises_and_preserves_line_structure(text):
     out = m._redact_sensitive(text)
-    # One output line per input line: redaction must never merge, drop or
-    # invent lines, or the diff context shown to the AI stops matching
-    # the real diff. Stated precisely: the output is exactly the input's
-    # splitlines() sequence re-joined with "\n" (line endings normalized,
-    # trailing terminator dropped — intended, harmless for the AI prompt),
-    # so its "\n"-split length equals the input's line count, except that
-    # joining zero-or-one lines both yield a single "" segment.
-    assert len(out.split("\n")) == max(len(text.splitlines()), 1)
+    # Redaction must never merge, drop or invent an INTERIOR line, or the diff
+    # context shown to the AI stops matching the real diff. Trailing blank
+    # lines are outside that contract: the redactor strips all trailing
+    # terminators up front to stay idempotent, which is documented in
+    # src/redact.py and harmless in an AI prompt. So the count is compared
+    # against the terminator-stripped body, not the raw input.
+    body = text.rstrip("\n\r\x0b\x0c\x1c\x1d\x1e\x85\u2028\u2029")
+    if not body:
+        # Terminator-only input shrinks by one per pass, by the same rule.
+        # That edge has its own explicit test, so it is not re-specified here:
+        # test_cops2562_customer_name_cap.py::
+        #     test_terminator_only_input_shrinks_by_design
+        return
+    assert len(out.split("\n")) == len(body.splitlines())
 
 
 _SECRET_KEYS = st.sampled_from(
@@ -135,8 +151,9 @@ def test_redact_is_idempotent(text):
     # splitlines() + join() and join only puts separators BETWEEN lines. That
     # drop is deliberate and asserted by
     # test_redact_never_raises_and_preserves_line_structure, whose contract
-    # (len(out.split("\n")) == max(len(text.splitlines()), 1)) production
-    # really depends on: redaction must never merge, drop or invent lines.
+    # (len(out.split("\n")) == len(body.splitlines()), over the input with its
+    # trailing terminators stripped) is what production really depends on:
+    # redaction must never merge, drop or invent an INTERIOR line.
     # The two properties are incompatible for terminator-only input, and the
     # line-structure one wins, so this property is narrowed rather than the
     # function changed. _redact_sensitive is never applied twice anywhere in
