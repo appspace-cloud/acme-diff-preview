@@ -1361,6 +1361,22 @@ class _HealthHandler(BaseHTTPRequestHandler):
                 bucket=DIFF_UI_GCS_BUCKET)
             self.send_response(code)
             self.send_header("Content-Type", ctype)
+            # COPS-2673 (XSS-02): the page reflects PR-controlled app/resource
+            # names and diff text. The output is fully html.escape'd, but that is
+            # the only layer -- one missed escape becomes live script. These
+            # headers are the second layer: nosniff stops content-type games,
+            # DENY/frame-ancestors stop clickjacking, and the CSP blocks inline
+            # script and any external load, so an injected "<script>" cannot run.
+            # The page ships inline styles and no JavaScript, hence style-src
+            # 'unsafe-inline' with script-src implicitly 'none' via default-src.
+            self.send_header("X-Content-Type-Options", "nosniff")
+            self.send_header("X-Frame-Options", "DENY")
+            self.send_header("Referrer-Policy", "no-referrer")
+            if ctype.startswith("text/html"):
+                self.send_header(
+                    "Content-Security-Policy",
+                    "default-src 'none'; style-src 'unsafe-inline'; "
+                    "img-src data:; base-uri 'none'; frame-ancestors 'none'")
             # Explicit Content-Length, matching every other route on this
             # handler (/healthz, /diff-preview/stats, ...). Harmless under
             # the current HTTP/1.0 (connection close marks the body end
@@ -3380,6 +3396,14 @@ def _ensure_chart(registry: str, chart: str, version: str) -> str:
     if "/" in chart or ".." in chart:
         logsink.log(f"_ensure_chart: refusing unsafe chart name {chart!r}", "ERROR")
         return None
+    # COPS-2673 (PT-1): registry comes from the ArgoCD app spec repoURL (A3) and
+    # is joined into the on-disk cache path at chart_dir below. chart and version
+    # are anchored above but registry was not, so `oci://..` -> registry `..`
+    # escaped one directory above HELM_CACHE_DIR. Anchor it to a host[:port]
+    # shape (leading alphanumeric forbids `..` and a leading dash; no `/`).
+    if not re.match(r'^[A-Za-z0-9][A-Za-z0-9.\-]*(:[0-9]{1,5})?$', registry):
+        logsink.log(f"_ensure_chart: refusing unsafe registry {registry!r}", "ERROR")
+        return None
     key = f"{registry}/{chart}:{version}"
     # Dev registries can republish charts under the same tag. Treat any cached
     # copy (memory or disk) as stale after DEV_CHART_TTL seconds and re-pull.
@@ -4179,10 +4203,19 @@ def _helm_template(chart_path: str, release: str, namespace: str,
                 f.write(content)
             value_args += ["-f", fname]
 
-        cmd = ([HELM_BIN, "template", release, chart_path,
+        # COPS-2673 (CAI-1): `release` can be a fully PR-controlled new-env
+        # folder name, and as a bare positional a leading-dash value is parsed
+        # by helm/cobra as a FLAG (argument injection). Harmless on helm 4
+        # (unknown flag -> failed render), but `--post-renderer=<bin>` was RCE
+        # on helm 3, so a downgrade must not re-open it. The `--` terminator
+        # forces every following token to be a positional; all real options
+        # go before it. Verified: `template ... -- --x /chart` treats `--x` as
+        # the release name, not a flag.
+        cmd = ([HELM_BIN, "template",
                 "--namespace", namespace or release,
                 "--kube-version", KUBE_VERSION,
-                "--include-crds"] + value_args)
+                "--include-crds"] + value_args
+               + ["--", release, chart_path])
         r = subprocess.run(cmd, capture_output=True, text=True, timeout=DIFF_TIMEOUT)
         if r.returncode != 0:
             return None, _cap_helm_error(r.stderr or r.stdout or "helm template failed")
@@ -6615,6 +6648,16 @@ def get_open_prs(repo=None):
         data = http("GET", nxt, auth=(BB_USER, BB_TOKEN))
         prs += data.get("values", [])
         nxt  = data.get("next")
+        # COPS-2673 (SSRF-1): `next` is echoed by the Bitbucket API (A3) and is
+        # followed with the pod's BB credentials attached. The other paginators
+        # re-anchor to the API host; this one did not, so a malicious/compromised
+        # response could point it at an internal host for a blind in-cluster GET.
+        # Refuse any off-host link (exact netloc match, same as _is_bb_url).
+        if nxt and not _is_bb_url(nxt):
+            logsink.log(f"get_open_prs[{repo or BB_REPO}]: refusing off-host "
+                        f"pagination link to {urllib.parse.urlsplit(nxt).netloc!r}",
+                        "WARNING")
+            nxt = None
         pages += 1
     if pages >= _BB_MAX_PAGES:
         logsink.log(f"get_open_prs[{repo or BB_REPO}]: hit page limit ({_BB_MAX_PAGES}), "

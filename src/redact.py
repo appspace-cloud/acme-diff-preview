@@ -61,6 +61,40 @@ def _is_scheduling_field(key_part: str) -> bool:
     name = key_part.strip().lstrip("-").strip().rstrip(":=").strip().strip('"\'')
     return name.lower() in _SCHEDULING_FIELD_EXEMPT
 
+
+# COPS-2673 (SL-1/SL-3): key-name redaction misses a secret embedded in the
+# VALUE under a benign key. A security pentest confirmed two shapes leaking in
+# cleartext to Vertex AI, the PR comment and the render cache, because neither
+# the block/env passes nor the sensitive-key match reaches them:
+#   * credentials in a URL's userinfo -- scheme://user:PASS@host -- the common
+#     DATABASE_URL / SERVICE_URL / connection-string shape under a plain key;
+#   * a sensitive key nested inside a YAML flow mapping -- {password: PASS, ...}
+#     -- on a non-Secret resource, where the line's own key ("data") is benign.
+# The username is left intact (rarely secret, useful diff context); only the
+# password after the ':' is masked, the same way git/docker sanitise a URL.
+_URL_CRED_RE = re.compile(
+    r'(?i)([a-z][a-z0-9+.\-]*://[^/\s:@]+:)[^/\s@]+(@)')
+_FLOW_PAIR_RE = re.compile(r'([{,]\s*)([\w.\-]+)(\s*:\s*)([^,}]+)')
+
+
+def _mask_inline_secrets(line: str) -> str:
+    """Mask secrets that hide in a value under a non-sensitive key.
+
+    Applied on the fall-through path of _redact_sensitive, so it only ever
+    sees lines the key-name redactor decided were safe. Both substitutions are
+    value-shape based and independent of the key, which is exactly the gap
+    they close.
+    """
+    line = _URL_CRED_RE.sub(r'\1[REDACTED]\2', line)
+    if "{" in line and _SENSITIVE_KEYS.search(line):
+        def _pair(m):
+            if (_SENSITIVE_KEYS.search(m.group(2))
+                    and not _is_scheduling_field(m.group(2) + ":")):
+                return f"{m.group(1)}{m.group(2)}{m.group(3)}[REDACTED]"
+            return m.group(0)
+        line = _FLOW_PAIR_RE.sub(_pair, line)
+    return line
+
 # v2.5.21 (F1): hard cap on the helm-error text fed to _redact_error_detail's
 # regex, applied BEFORE matching to kill the quadratic backtracking. Far above
 # the caller's own [:400] so error diagnostics keep full context.
@@ -382,5 +416,5 @@ def _redact_sensitive(text: str) -> str:
                 block_indent = len(rest) - len(rest.lstrip())
                 in_block = True
         else:
-            redacted_lines.append(line)
+            redacted_lines.append(_mask_inline_secrets(line))
     return "\n".join(redacted_lines)

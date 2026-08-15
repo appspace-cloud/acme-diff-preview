@@ -50,6 +50,7 @@ from __future__ import annotations
 
 import collections
 import html
+import io
 import json
 import os
 import re
@@ -175,6 +176,34 @@ def _encode_artifact_bytes(payload_utf8: bytes):
     return zstd.ZstdCompressor(level=_ZSTD_LEVEL).compress(payload_utf8), ".json.zst"
 
 
+# COPS-2673 (DOS-1): a zstd frame is attacker-influenced (a GCS object), and an
+# unbounded decompress OOM-kills the pod on a decompression bomb. max_output_size
+# is NOT a reliable cap -- zstandard 0.25 honours a frame's embedded content size
+# over it, so a bomb that advertises a large size still expands in full (verified).
+# Streaming with a byte budget bounds memory in every case: embedded size, unknown
+# size, or a lying header. Generous over any legitimate artifact/render; env-tunable
+# for an exceptionally large fleet.
+_ZSTD_MAX_DECOMPRESS_BYTES = int(
+    os.environ.get("ZSTD_MAX_DECOMPRESS_BYTES", str(128 * 1024 * 1024)))
+
+
+def _zstd_decompress_capped(zstd, data: bytes) -> bytes:
+    """Stream-decompress `data`, aborting past _ZSTD_MAX_DECOMPRESS_BYTES."""
+    dctx = zstd.ZstdDecompressor()
+    out = io.BytesIO()
+    with dctx.stream_reader(io.BytesIO(data)) as reader:
+        while True:
+            chunk = reader.read(1 << 16)
+            if not chunk:
+                break
+            out.write(chunk)
+            if out.tell() > _ZSTD_MAX_DECOMPRESS_BYTES:
+                raise ValueError(
+                    "zstd output exceeds %d-byte cap (decompression bomb?)"
+                    % _ZSTD_MAX_DECOMPRESS_BYTES)
+    return out.getvalue()
+
+
 def _decode_artifact_bytes(data: bytes):
     """Decode raw JSON UTF-8 or a zstd frame into an artifact dict.
 
@@ -186,7 +215,7 @@ def _decode_artifact_bytes(data: bytes):
             import zstandard as zstd
         except ImportError as e:  # pragma: no cover - production has the wheel
             raise ValueError("zstd payload but zstandard wheel missing") from e
-        data = zstd.ZstdDecompressor().decompress(data)
+        data = _zstd_decompress_capped(zstd, data)
     return json.loads(data.decode("utf-8"))
 
 
@@ -1101,8 +1130,15 @@ def render_html(artifact, requested_sha=None):
     base_sha = html.escape(str(artifact.get("base_sha", "") or ""))
     created = html.escape(str(artifact.get("created_utc", "")))
     pr_url = str(artifact.get("pr_url", ""))
+    # COPS-2673 (XSS-01): emit an href only for an http/https URL -- the same
+    # positive scheme allow-list the markdown link renderer uses (_MD_LINK_RE).
+    # pr_url is server-built today, so this is defence-in-depth: it keeps the
+    # "no javascript:/data: href" guarantee local to this sink, surviving any
+    # future change that lets pr_url become attacker-influenced.
+    _pr_scheme_ok = (pr_url[:7].lower() == "http://"
+                     or pr_url[:8].lower() == "https://")
     pr_link = (f'<a href="{html.escape(pr_url, quote=True)}">PR #{pr_id}</a>'
-               if pr_url else f"PR #{pr_id}")
+               if pr_url and _pr_scheme_ok else f"PR #{pr_id}")
     raw_href = html.escape(f"/diff/{artifact.get('repo','')}"
                            f"/{artifact.get('pr_id','')}"
                            f"/{artifact.get('sha','')}/raw", quote=True)
