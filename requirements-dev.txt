@@ -8,12 +8,12 @@
 # To update: pip install pytest --upgrade && pip freeze > requirements-dev.txt
 pytest==9.1.1
 pytest-cov==7.1.0
-coverage==7.15.0
+coverage==7.15.4
 PyYAML==6.0.3
 cydifflib==1.2.0
 zstandard==0.25.0
 # Property-based tests (tests/test_property_based.py) run in CI's `test` job.
-hypothesis==6.161.0
+hypothesis==6.165.3
 # Mutation testing (local, opt-in): `mutmut run` — config in pyproject.toml.
 mutmut==3.6.0
 # COPS-2595: suite speed and safety.
