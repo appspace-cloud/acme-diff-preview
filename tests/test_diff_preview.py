@@ -446,7 +446,11 @@ def test_dedup_logic():
     idx_dedup  = src.find('dedup_key = f"')
     # v2.4.4: thread-per-event replaced by a bounded pool (bughunt F3);
     # the dispatch point is now the pool submit call.
-    idx_thread = src.find('_jfrog_refresh_pool.submit(_jfrog_hard_refresh')
+    # COPS-2668: match the submit call, not the callee. The dispatch target
+    # is now _jfrog_refresh_guarded (a wrapper that gives the worker's
+    # exceptions somewhere to go), and this assertion is about ORDER — 202,
+    # then dedup, then dispatch — not about which function is dispatched.
+    idx_thread = src.find('_jfrog_refresh_pool.submit(')
     assert idx_202 > 0 and idx_dedup > 0 and idx_thread > 0
     assert idx_202 < idx_dedup < idx_thread, \
         "Order must be: 202 response -> dedup check -> pool dispatch"
