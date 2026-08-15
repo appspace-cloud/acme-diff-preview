@@ -214,6 +214,13 @@ _VM_PANEL_ROUTINE_HDR = "### \U0001f5a5\ufe0f VM INFRASTRUCTURE CHANGES (routine
 _DECOM_VM_STRIP_HDR = ("## \U0001f5a5\u26d4 VM CONFIG STRIPPED WHILE "
                        "ARMING DECOMMISSION")
 
+# COPS-2668: same contract for the data purge, and for the same reason. The
+# summary used to detect it by searching the panel for "PURGE", which matched
+# the denial as readily as the warning: both branches name
+# `appspace.decommissionPurgeData`. This sentence is emitted ONLY when the
+# purge is genuinely armed, so matching it cannot confuse the two.
+_DECOM_PURGE_HDR = "**DATA WILL BE PERMANENTLY DESTROYED.**"
+
 
 _SEV_ROUTINE, _SEV_REVIEW, _SEV_BLOCK = 0, 1, 2
 _VERDICTS = {
@@ -262,7 +269,18 @@ def _build_merge_summary(results, rollup_by_sig, vm_change_lines,
 
     if decommission_lines:
         txt = "\n".join(decommission_lines)
-        purge = "PURGE" in txt.upper()
+        # COPS-2668: this was `"PURGE" in txt.upper()`, and it matched every
+        # decommission there is. Both purge branches name
+        # `appspace.decommissionPurgeData` — including the one whose entire
+        # job is to say the purge is NOT armed — and uppercased that string
+        # contains "PURGE". So the verdict announced "buckets/datasets are
+        # destroyed" directly above a panel reading "Data is not purged".
+        #
+        # The module docstring already prescribes the remedy ("panels built
+        # elsewhere are recognised by their own header constants"), which is
+        # also how COPS-2660 wired the VM-strip finding. One constant, written
+        # by the producer, matched here.
+        purge = _DECOM_PURGE_HDR in txt
         findings.append((_SEV_BLOCK,
                          "\U0001f5d1\ufe0f **Environment decommission** \u2014 "
                          + ("data purge is ARMED: buckets/datasets are "

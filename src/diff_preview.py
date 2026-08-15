@@ -152,6 +152,7 @@ from comment_render import (  # comment rendering (same-dir module, stdlib only)
     _VERDICTS,
     _fmt_env_list,
     _build_merge_summary,
+    _DECOM_PURGE_HDR,
     _DECOM_VM_STRIP_HDR,
     _SHUTDOWN_MIN_WORKLOADS,
     _is_env_shutdown,
@@ -5956,7 +5957,10 @@ def _evaluate_env_decommissions(candidates: list, pr_sha: str, main_sha: str,
             # customer data is destroyed, so it cannot read like the ordinary
             # destructive-but-recoverable case above.
             lines += [
-                "\U0001f6a8 **DATA WILL BE PERMANENTLY DESTROYED.** This environment "
+                # COPS-2668: the sentinel the merge summary matches on. Keep
+                # it verbatim -- _DECOM_PURGE_HDR is what stops the verdict
+                # from confusing this branch with the denial below it.
+                "\U0001f6a8 " + _DECOM_PURGE_HDR + " This environment "
                 + "also has `appspace.decommissionPurgeData: true`, so Config Connector "
                 + "empties and deletes the BigQuery dataset and the user content bucket "
                 + "as part of the cascade. **That data is not recoverable afterwards.** "
@@ -6003,7 +6007,13 @@ def _evaluate_env_decommissions(candidates: list, pr_sha: str, main_sha: str,
                                               key=lambda kv: (-kv[1], kv[0])))
             lines.append(
                 f"- **Retained (ArgoCD will NOT delete these):** {retained_str}")
-        else:
+        if not (any_rendered and total):
+            # COPS-2668: this used to be an `else` on `if cascade and
+            # retained_counts`, two blocks above the one that decides whether
+            # a preview exists at all. So every orphan decommission -- and any
+            # cascade with nothing retained -- printed "preview unavailable"
+            # directly underneath its own complete inventory. The notice
+            # belongs to the inventory, so it asks the inventory's question.
             lines.append("- *(resource preview unavailable \u2014 the deletion itself is confirmed)*")
         lines.append("")
         envs_reported.append(c["env_name"])
@@ -7691,6 +7701,12 @@ def _summarize_appspace_state_changes(changed_files, pr_sha, base_sha, path_map,
                 "",
             ]) + _strip_warning
         elif was_armed and not is_armed:
+            # COPS-2668: this branch dropped _strip_warning too (appended at
+            # the end of the block). Backing the cascade out does not undo a
+            # stripped VM block: helm stops rendering the VM CRs either way,
+            # and `allowDeletion: true` can survive the disarm, so ArgoCD can
+            # still prune them. The warning belongs on this path as much as
+            # on the arming one.
             lines += [
                 f"### \U0001f513 Decommission DISARMED for `{env_name}`",
                 "",
@@ -7712,6 +7728,19 @@ def _summarize_appspace_state_changes(changed_files, pr_sha, base_sha, path_map,
                 # The cascade is already armed at base -- that is this
                 # branch's own condition -- so Phase 2 reads done, and this
                 # PR is the purge qualifier on it.
+                #
+                # COPS-2668 looked at changing this to _PH_DONE and did NOT,
+                # deliberately. The comment above is right that the cascade
+                # was armed at base, so _PH_THIS_PR is inaccurate about which
+                # PR did it. But this branch also passes removal_state=None,
+                # so marking Phase 2 as done leaves NO row marked "this PR" --
+                # and the table's whole job is to show the reviewer where the
+                # change they are reading sits in the sequence. Trading a
+                # small inaccuracy for a table that locates nothing is not
+                # obviously an improvement, and test_cops2616 pins the current
+                # wording. Needs a product call on how a purge-only PR should
+                # appear in a three-phase model it does not fit; raised in
+                # COPS-2668 rather than decided here.
                 vm_state=(_PH_BROKEN if _vm_broken else
                           (_PH_DONE if _vm_deletion_armed_flat(new_flat) else None)),
                 cascade_state=_PH_THIS_PR,
@@ -7728,7 +7757,13 @@ def _summarize_appspace_state_changes(changed_files, pr_sha, base_sha, path_map,
                 f"`appspace.decommissionPurgeData` was removed \u2014 data is no " +
                 f"longer purged by the cascade.*",
                 "",
-            ]
+            # COPS-2668: `+ _strip_warning` was missing here. The warning is
+            # computed for every branch, but this one dropped it AND, by
+            # matching, made the `elif _vm_broken` fallback below unreachable
+            # -- so a PR that softened the purge while stripping the VM block
+            # said nothing about the VM at all. The cascade is still armed on
+            # this path; the VM is still the thing that gets orphaned.
+            ] + _strip_warning
         elif _vm_broken:
             # COPS-2660, standalone: arming happened in an earlier PR and
             # THIS one only strips the VM config. No transition fires above,
