@@ -73,10 +73,79 @@ MAIN_RENDER_CACHE_SALT = os.environ.get("MAIN_RENDER_CACHE_SALT", "cops2631-v1")
 # the leader renders. A bucket read of a ~850KB object costs tens of ms
 # against a ~500ms render, so even a slow read is an order of magnitude
 # cheaper. Defaults to the artifact bucket; empty disables the tier entirely.
-MAIN_RENDER_GCS_BUCKET = os.environ.get(
-    "MAIN_RENDER_GCS_BUCKET", DIFF_UI_GCS_BUCKET).strip()
+def _resolve_render_cache_bucket(configured: str, artifact_bucket: str) -> str:
+    """Where durable main-side renders may be persisted, or "" for nowhere.
+
+    COPS-2668. This tier stores the RAW `helm template` output — redaction is
+    display-time only by design (redact.py: "the diff engine compares the real
+    values"), the shadow audit byte-compares persisted bytes against a fresh
+    render, and a cold-tier hit rebuilds diff inputs from the stored text. So
+    redacting before persist is not available as a fix: it would poison every
+    cached main side and fabricate a diff on every Secret. The control has to
+    be WHERE the bytes go.
+
+    It used to default to DIFF_UI_GCS_BUCKET, whose documented contract is
+    "only ever holds already-redacted content". Any deployment setting
+    `diffUi.gcsBucket` therefore opted, silently and undocumented, into
+    shipping plaintext Secret values to a bucket other people reasonably treat
+    as safe to grant read on. Measured in production before this change: 1,748
+    such objects, in a bucket where `projectViewer` already carried
+    `legacyObjectReader`.
+
+    Two rules, both enforced here rather than in a comment someone can miss:
+
+    1. No inheritance. Unset means the durable tier is OFF. Persisting
+       unredacted fleet-wide renders is a decision an operator makes by naming
+       a bucket, never one they arrive at by configuring something else.
+    2. The artifact bucket is refused outright, because that is precisely the
+       configuration this removes.
+
+    The memory and disk tiers are unaffected; only cross-pod warming is lost
+    when this returns "".
+    """
+    configured = (configured or "").strip()
+    artifact_bucket = (artifact_bucket or "").strip()
+    if not configured:
+        return ""
+    if configured == artifact_bucket:
+        logsink.log(
+            f"MAIN_RENDER_GCS_BUCKET is set to the diff-UI artifact bucket "
+            f"({configured}). That bucket is documented as holding "
+            f"already-redacted content, and durable renders are NOT redacted "
+            f"— refusing, durable render cache disabled. Provision a separate "
+            f"bucket with its own IAM (COPS-2668).", "ERROR")
+        return ""
+    return configured
+
+
+MAIN_RENDER_GCS_BUCKET = _resolve_render_cache_bucket(
+    os.environ.get("MAIN_RENDER_GCS_BUCKET", ""), DIFF_UI_GCS_BUCKET)
 MAIN_RENDER_GCS_PREFIX = os.environ.get(
     "MAIN_RENDER_GCS_PREFIX", "render-cache").strip("/")
+
+
+_helm_version_cache: list = []
+
+
+def _helm_binary_version() -> str:
+    """`helm version --short`, resolved once per process.
+
+    Part of the content key (COPS-2668). Resolved lazily and memoised because
+    it costs a subprocess and never changes within a pod's life; an
+    unresolvable binary yields a distinct marker rather than an empty string,
+    so "we could not tell" never silently equals "same as before".
+    """
+    if _helm_version_cache:
+        return _helm_version_cache[0]
+    import subprocess as _sp
+    try:
+        out = _sp.run([os.environ.get("HELM_BIN", "helm"), "version", "--short"],
+                      capture_output=True, text=True, timeout=15)
+        ver = (out.stdout or "").strip() or "unknown"
+    except Exception:
+        ver = "unresolved"
+    _helm_version_cache.append(ver)
+    return ver
 
 
 def _main_render_content_key(chart_path, release, namespace, vals) -> str:
@@ -95,6 +164,16 @@ def _main_render_content_key(chart_path, release, namespace, vals) -> str:
     h.update(str(namespace or "").encode("utf-8"))
     h.update(b"\0")
     h.update(str(KUBE_VERSION).encode("utf-8"))
+    h.update(b"\0")
+    # COPS-2668: the renderer itself is a render input. Everything else here
+    # can be identical across a helm upgrade whose output differs (ordering,
+    # label emission, a template-function fix), and the durable tier outlives
+    # pods by design — so without this a routine Dockerfile bump serves
+    # old-binary renders to every PR until the entries age out, with the 1%
+    # shadow audit healing them one at a time after the wrong comments are
+    # already posted. The salt would also cover it, but only if someone
+    # remembers; this cannot be forgotten.
+    h.update(_helm_binary_version().encode("utf-8"))
     h.update(b"\0")
     h.update(b"include-crds=1")  # _helm_template always passes --include-crds
     h.update(b"\0")
@@ -325,7 +404,14 @@ def _main_render_memory_put(key: str, resources: dict) -> None:
 
 
 def _main_render_cache_put(key: str, raw: str, resources: dict) -> None:
-    """Write through every tier: disk, memory front cache, and the bucket."""
+    """Write through every tier: disk, memory front cache, and the bucket.
+
+    A None key means the content key could not be computed honestly (an
+    unreadable chart file, COPS-2668). Storing under a fabricated key is how
+    a wrong render gets served later, so there is nothing to write.
+    """
+    if not key:
+        return
     try:
         _main_render_disk_store(key, raw)
     except OSError as e:
@@ -343,7 +429,12 @@ def _main_render_cache_get(key: str):
 
     raw is returned whenever this call actually read the bytes, because
     the shadow audit byte-compares against exactly what was served.
+
+    A None key (COPS-2668: the chart tree could not be hashed honestly) is a
+    guaranteed miss — there is no key to look anything up by.
     """
+    if not key:
+        return None, None, "miss"
     with _main_render_lock:
         cached = _main_render_cache.get(key)
         if cached is not None:

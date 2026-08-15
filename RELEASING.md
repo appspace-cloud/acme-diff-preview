@@ -57,6 +57,23 @@ If the tag already exists, bump `appVersion` in `Chart.yaml` and
 | `charts/acme-diff-preview/Chart.yaml` | `appVersion` | `"1.3.4"` (Docker image) |
 | `charts/acme-diff-preview/values.yaml` | `image.tag` | `"1.3.4"` |
 
+### Did this release change render output?
+
+If the change can alter what `helm template` produces — a helm binary bump in
+the `Dockerfile`, a change to how value files are resolved or ordered, new
+render flags — **bump `MAIN_RENDER_CACHE_SALT` in `src/render_cache.py`** in
+the same PR.
+
+The durable render cache is content-keyed and outlives pods on purpose, so
+without a bump a fresh pod happily serves renders produced by the old code
+until the entries age out, and the 1% shadow audit only heals them one at a
+time, after the wrong comments and build statuses have already been posted.
+The helm binary version is folded into the key automatically (COPS-2668), so
+that one case is covered without you remembering; everything else is not.
+
+It has never been bumped since it was introduced (`git log -S cops2631-v1`),
+which is either luck or an untested guard — treat it as the latter.
+
 Chart version and appVersion are bumped independently.
 Chart version bumps when the chart templates or values change.
 appVersion bumps when the Docker image changes.
@@ -89,6 +106,45 @@ proxy manifest as described below until it answers `200` and re-run the apply.
 Do not force anything, and do not push the image manually: that would collide
 with the tag build (see below). Always test with a known-good tag as a control,
 otherwise a broken check looks exactly like a missing image.
+
+## Rolling back a bad release
+
+There was no written procedure for this until COPS-2668, which meant the one
+thing you need under pressure had to be reconstructed from memory. It is
+simpler than it looks, because **the image tag is the rollback**.
+
+**1. Roll back the running workload first.** Point `image.tag` (and the chart
+version, if the chart itself changed) at the previous release in
+`acme-infrastructure` and apply. The old tag is already in JFrog and already
+cached by the Artifact Registry proxy, so the pull is immediate — none of the
+negative-cache trap above applies to a tag that has been pulled before.
+
+Faster still, if infra apply is not available to you and the service is
+actively doing damage:
+
+```bash
+kubectl -n argocd set image deploy/acme-diff-preview \
+  diff-preview=us-central1-docker.pkg.dev/appspace-devops/artifact/acme-diff-preview:<previous-tag>
+```
+
+That is a stopgap, not the fix: the periodic reconciler will restore the
+tag from `main` within the hour, so the infra change still has to land.
+
+**2. Do not delete or re-push the bad tag.** JFrog cannot overwrite tags, and
+a deleted tag makes the incident harder to reconstruct afterwards. Leave it.
+
+**3. Consider whether the render cache is holding bad output.** If the bad
+release changed render behaviour, the durable tier can still be serving its
+results after the rollback. Bump `MAIN_RENDER_CACHE_SALT` in the rollback
+release, or the fix ships and the wrong renders keep being served.
+
+**4. Revert the code on `main` with a normal PR.** `git revert` the merge
+commit rather than force-pushing. `release.yml` republishes the chart, and
+the next release proceeds normally from a clean history.
+
+**What NOT to do:** do not force-push `main`, do not push an image by hand
+(it collides with the tag build — see below), and do not reuse the bad
+version number. Roll forward to `N+1` with the revert in it.
 
 ## Where the image actually lives: JFrog, then GKE pulls it through a proxy
 

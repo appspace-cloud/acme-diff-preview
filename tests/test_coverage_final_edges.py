@@ -71,7 +71,14 @@ def test_fetch_value_files_never_caches_a_transient_error(monkeypatch, clean_vf_
 
     monkeypatch.setattr(m, "_bb_fetch_status", flaky)
     vf = ["$config/gcp/dev/x/customer.yaml"]
-    assert m._fetch_value_files(vf, "b" * 12) == {}
+    # COPS-2668: the first call now RAISES rather than returning {}. The rule
+    # this test exists for is unchanged and is what the second half proves:
+    # the failure must not be remembered, so the retry sees the recovery.
+    # (It used to return {} here, which is precisely how an unreadable file
+    # reached helm as an absent one.)
+    import pytest as _pytest
+    with _pytest.raises(m.ValueFileUnreadable):
+        m._fetch_value_files(vf, "b" * 12)
     out = m._fetch_value_files(vf, "b" * 12)
     assert out and "recovered" in next(iter(out.values())), \
         "a transient error must be retried on the next call, not cached"
@@ -165,7 +172,11 @@ def test_invalidate_for_republish_evicts_forces_and_wakes(monkeypatch):
 
 def test_main_iteration_prunes_force_flags_of_closed_prs(monkeypatch):
     monkeypatch.setattr(m, "argocd_login", lambda: None)
-    monkeypatch.setattr(m, "discover_path_app_map", lambda: {})
+    monkeypatch.setattr(m, "discover_path_app_map",
+                        # COPS-2668: an EMPTY inventory now means "discovery
+                        # failed" and stops the iteration, so a test whose
+                        # subject is elsewhere must supply a populated one.
+                        lambda: {"gcp/dev/x/customer.yaml": ["argocd/pv-x-a"]})
     monkeypatch.setattr(m, "_prune_helm_cache", lambda *a, **k: None)
     monkeypatch.setattr(m, "_touch_progress", lambda: None)
     monkeypatch.setattr(m, "http", lambda *a, **kw: {"target": {"hash": "c" * 12}})

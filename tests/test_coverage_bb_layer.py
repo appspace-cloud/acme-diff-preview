@@ -279,7 +279,11 @@ def test_format_comment_many_apps_renders_summary_table():
 
 def test_main_iteration_survives_bitbucket_outage(monkeypatch):
     monkeypatch.setattr(m, "argocd_login", lambda: None)
-    monkeypatch.setattr(m, "discover_path_app_map", lambda: {})
+    monkeypatch.setattr(m, "discover_path_app_map",
+                        # COPS-2668: an EMPTY inventory now means "discovery
+                        # failed" and stops the iteration, so a test whose
+                        # subject is elsewhere must supply a populated one.
+                        lambda: {"gcp/dev/x/customer.yaml": ["argocd/pv-x-a"]})
     monkeypatch.setattr(m, "_prune_helm_cache", lambda *a, **k: None)
     monkeypatch.setattr(m, "_touch_progress", lambda: None)
 
