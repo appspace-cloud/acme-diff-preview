@@ -30,7 +30,6 @@ alternative used elsewhere in the suite is a per-test sha suffix; clearing is
 less error-prone because forgetting it fails loudly rather than quietly.
 """
 import os
-import posixpath
 import sys
 
 import pytest
@@ -108,7 +107,8 @@ def _assert_golden(name: str, body: str):
     if not os.path.exists(path):
         pytest.fail(f"no golden for {name!r}. Review it, then commit with "
                     f"UPDATE_GOLDEN=1:\n\n{body}")
-    expected = open(path).read()
+    with open(path) as f:
+        expected = f.read()
     if body != expected:
         import difflib
         pytest.fail(

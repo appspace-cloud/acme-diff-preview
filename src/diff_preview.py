@@ -5949,11 +5949,11 @@ def _evaluate_env_decommissions(candidates: list, pr_sha: str, main_sha: str,
                 # 350-char prose-wall threshold the golden corpus guard
                 # enforces from 50 measured production comments -- and it
                 # was the newly-pinned orphan golden that surfaced it.
-                "This environment has not opted into cascade deletion, and "
-                "the ApplicationSet sets `preserveResourcesOnDeletion: true`, "
-                "so every workload below is left orphaned in the cluster: "
-                "still running, still costing money, still holding IPs and "
-                "disks, and no longer managed by ArgoCD.",
+                ("This environment has not opted into cascade deletion, and "
+                 + "the ApplicationSet sets `preserveResourcesOnDeletion: true`, "
+                 + "so every workload below is left orphaned in the cluster: "
+                 + "still running, still costing money, still holding IPs and "
+                 + "disks, and no longer managed by ArgoCD."),
                 "",
                 "To delete them together with the Application, set "
                 "`appspace.decommission: true` in the environment's `customer.yaml` "
@@ -7662,11 +7662,11 @@ def _summarize_appspace_state_changes(changed_files, pr_sha, base_sha, path_map,
             f"**This PR removes the Linux VM config for `{env_name}` in the "
             f"same change that arms its deletion.**",
             "",
-            f"Helm stops rendering the VM resources the moment this merges, "
-            f"ArgoCD prunes them, and the live objects go out under their "
-            f"current `deletion-policy: abandon` — the real VM, its data "
-            f"disk and its reserved IP are **orphaned in the cloud, not "
-            f"deleted**.",
+            ("Helm stops rendering the VM resources the moment this merges, "
+             + "ArgoCD prunes them, and the live objects go out under their "
+             + "current `deletion-policy: abandon` — the real VM, its data "
+             + "disk and its reserved IP are **orphaned in the cloud, not "
+             + "deleted**."),
             "",
             "Stripped in this PR: " + ", ".join(
                 f"`{k[len('appspace.infra.'):]}`" for k in _stripped[:6])
