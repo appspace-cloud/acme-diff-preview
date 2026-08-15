@@ -315,17 +315,25 @@ def test_fetch_value_files_singleflight_join_times_out(monkeypatch):
     with m._vf_cache_lock:
         m._vf_cache.pop(cache_key, None)
     never_set = threading.Event()
-    with m._vf_inflight_lock:
+    with m._vf_cache_lock:
         m._vf_inflight[cache_key] = never_set
     # Make the 30s wait return instantly (still a real timeout, just not a
     # real 30-second one) -- same technique as everywhere else time.sleep
     # is mocked in this suite.
     monkeypatch.setattr(threading.Event, "wait", lambda self, timeout=None: False)
     try:
-        result = m._fetch_value_files([vf], sha)
-        assert result == {}, "a singleflight join timeout with no value yet must omit the file, not raise"
+        # COPS-2668: this assertion used to read "must omit the file, not
+        # raise" -- and that was the defect, written down. Omitting the file
+        # hands helm a value set the author never wrote: either a permanent
+        # "missing required value" blamed on them, or a clean render of
+        # different inputs published as fact. The shared 429 pause runs to 60s
+        # by design, so this path is reached by an ordinary rate limit, not an
+        # exotic one. No answer must mean no render.
+        import pytest as _pytest
+        with _pytest.raises(m.ValueFileUnreadable):
+            m._fetch_value_files([vf], sha)
     finally:
-        with m._vf_inflight_lock:
+        with m._vf_cache_lock:
             m._vf_inflight.pop(cache_key, None)
 
 
