@@ -71,13 +71,29 @@ def test_stat_is_a_silent_no_op_when_no_host_installed_a_callback():
 
 
 def test_stat_swallows_a_failing_callback():
-    """A broken metrics sink must not take the request down with it."""
+    """A broken metrics sink must not take the request down with it.
+
+    Asserted with a witness rather than by "it did not raise": a bare call
+    would also pass if `_stat` had stopped invoking the callback at all,
+    which is the opposite of what this guarantees. The sink must be reached,
+    must blow up, and the caller must not notice -- and the next call must
+    still get through, so one failure does not latch observability off.
+    """
+    calls = []
     old = diff_ui.on_stat
     try:
         def _boom(key, n):
+            calls.append((key, n))
             raise RuntimeError("statsd is down")
+
         diff_ui.on_stat = _boom
-        diff_ui._stat("renders")             # must not propagate
+        diff_ui._stat("renders")
+        assert calls == [("renders", 1)], (
+            "the sink was never reached, so nothing was swallowed: %r" % calls)
+
+        diff_ui._stat("errors", 2)
+        assert calls == [("renders", 1), ("errors", 2)], (
+            "one failing call latched the sink off: %r" % calls)
     finally:
         diff_ui.on_stat = old
 
