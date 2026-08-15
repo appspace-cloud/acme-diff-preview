@@ -33,11 +33,14 @@ updates:
     groups:
       # Runtime and dev pins move separately: a runtime bump ships to the
       # cluster and deserves its own review, a dev-only bump does not.
+      # requirements-dev.txt is a SUPERSET of requirements.txt, so grouping by
+      # package name is the only split available. Everything not named here
+      # ships to the cluster and gets its own review.
       runtime:
         patterns: ["*"]
-        exclude-patterns: ["pytest*", "coverage*", "hypothesis"]
+        exclude-patterns: ["pytest*", "coverage*", "hypothesis", "mutmut"]
       dev:
-        patterns: ["pytest*", "coverage*", "hypothesis"]
+        patterns: ["pytest*", "coverage*", "hypothesis", "mutmut"]
     commit-message:
       prefix: "[deps] "
 
@@ -49,3 +52,17 @@ updates:
     open-pull-requests-limit: 2
     commit-message:
       prefix: "[deps] "
+    ignore:
+      # Moving the interpreter is a platform migration, not a dependency bump,
+      # and it cannot succeed as an isolated one-line change: requirements.txt
+      # is installed with --require-hashes and pins hashes for the CURRENT
+      # interpreter's wheels only. PR #157 (3.12 -> 3.14) proved it — pip found
+      # no hash-allowed zstandard wheel for cp314, fell back to the sdist, and
+      # the slim image has no gcc. That failure is the guardrail working.
+      # A real upgrade regenerates the hash set and re-runs the suite on the new
+      # interpreter, under its own ticket. Digest/patch rebuilds still flow, so
+      # base-image CVE fixes are not blocked.
+      - dependency-name: "python"
+        update-types:
+          - "version-update:semver-major"
+          - "version-update:semver-minor"
