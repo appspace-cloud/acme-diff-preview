@@ -83,6 +83,33 @@ def test_no_purge_panel_does_not_claim_a_purge():
     assert "abandoned" in out or "not purged" in out
 
 
+ORPHAN_PANEL = [
+    "# 🗑️⚠️ ENVIRONMENT DECOMMISSION ⚠️🗑️",
+    "",
+    "⚠️ " + comment_render._DECOM_ORPHAN_HDR + " — they keep running.** This "
+    "environment has not opted into cascade deletion, and the ApplicationSet "
+    "sets `preserveResourcesOnDeletion: true`.",
+]
+
+
+def test_orphan_panel_verdict_does_not_claim_deletion():
+    """Found by reading the rendered orphan comment while preparing its
+    golden. There are THREE states, and the summary knew two: an environment
+    with no cascade armed was announced as "resources are deleted" directly
+    above a panel saying they are NOT deleted and keep running."""
+    out = _summary(ORPHAN_PANEL)
+    assert "resources are deleted" not in out, (
+        "no cascade is armed here — the workloads survive:\n" + out)
+    assert "orphaned" in out or "keep running" in out
+
+
+def test_orphan_is_still_a_block():
+    """Leaving a fleet of unmanaged workloads behind is a different outcome,
+    not a safer one."""
+    out = _summary(ORPHAN_PANEL)
+    assert "DO NOT MERGE" in out
+
+
 def test_purge_armed_panel_still_reports_the_purge():
     """The genuine case must keep shouting — this is the whole point."""
     out = _summary(PURGE_ARMED_PANEL)
