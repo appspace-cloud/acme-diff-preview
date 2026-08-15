@@ -283,7 +283,9 @@ def _main_render_gcs_encode(raw: str) -> bytes:
 def _main_render_gcs_decode(data: bytes) -> str:
     if data.startswith(_ZSTD_MAGIC):
         import zstandard as zstd
-        data = zstd.ZstdDecompressor().decompress(data)
+        # COPS-2673 (DOS-1): bounded stream-decompress, shared with diff_ui, so a
+        # crafted render object cannot OOM the pod. See _zstd_decompress_capped.
+        data = diff_ui._zstd_decompress_capped(zstd, data)
     return data.decode("utf-8", "surrogateescape")
 
 
