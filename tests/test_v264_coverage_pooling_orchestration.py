@@ -337,7 +337,11 @@ def test_summarize_input_changes_stops_once_budget_exhausted(monkeypatch):
 
 def _quiet_iteration_edges(monkeypatch, prs, base_sha="deadbeefcafe"):
     monkeypatch.setattr(m, "argocd_login", lambda: None)
-    monkeypatch.setattr(m, "discover_path_app_map", lambda: {})
+    monkeypatch.setattr(m, "discover_path_app_map",
+                        # COPS-2668: an EMPTY inventory now means "discovery
+                        # failed" and stops the iteration, so a test whose
+                        # subject is elsewhere must supply a populated one.
+                        lambda: {"gcp/dev/x/customer.yaml": ["argocd/pv-x-a"]})
     monkeypatch.setattr(m, "get_open_prs", lambda repo=None: prs)
     monkeypatch.setattr(m, "_prune_helm_cache", lambda *a, **k: None, raising=False)
     monkeypatch.setattr(m, "_touch_progress", lambda: None)

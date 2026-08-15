@@ -228,7 +228,14 @@ def test_unreadable_value_file_is_reported_at_warning_and_not_called_missing(
     # A 429 that exhausted its retries is NOT "file not found". Reporting it as
     # such at debug level is why we could not tell rate limiting apart from a
     # real gap in the values hierarchy.
-    _fetch_with_status(monkeypatch, m.BB_ERROR)
+    # COPS-2668 took this one step further: reporting it at WARNING was the
+    # right diagnosis but only half the remedy, because the render still went
+    # ahead with the file treated as absent. It now refuses to render. The
+    # visibility assertions below are unchanged -- the WARNING is still what
+    # tells an operator rate limiting from a real gap in the hierarchy.
+    import pytest as _pytest
+    with _pytest.raises(m.ValueFileUnreadable):
+        _fetch_with_status(monkeypatch, m.BB_ERROR)
     out = capsys.readouterr().out
     assert '"severity": "WARNING"' in out, (
         f"an unreadable value file must be visible at INFO, got:\n{out}")
