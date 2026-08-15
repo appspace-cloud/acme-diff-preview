@@ -57,6 +57,23 @@ If the tag already exists, bump `appVersion` in `Chart.yaml` and
 | `charts/acme-diff-preview/Chart.yaml` | `appVersion` | `"1.3.4"` (Docker image) |
 | `charts/acme-diff-preview/values.yaml` | `image.tag` | `"1.3.4"` |
 
+### Did this release change render output?
+
+If the change can alter what `helm template` produces — a helm binary bump in
+the `Dockerfile`, a change to how value files are resolved or ordered, new
+render flags — **bump `MAIN_RENDER_CACHE_SALT` in `src/render_cache.py`** in
+the same PR.
+
+The durable render cache is content-keyed and outlives pods on purpose, so
+without a bump a fresh pod happily serves renders produced by the old code
+until the entries age out, and the 1% shadow audit only heals them one at a
+time, after the wrong comments and build statuses have already been posted.
+The helm binary version is folded into the key automatically (COPS-2668), so
+that one case is covered without you remembering; everything else is not.
+
+It has never been bumped since it was introduced (`git log -S cops2631-v1`),
+which is either luck or an untested guard — treat it as the latter.
+
 Chart version and appVersion are bumped independently.
 Chart version bumps when the chart templates or values change.
 appVersion bumps when the Docker image changes.
