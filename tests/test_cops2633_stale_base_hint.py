@@ -253,7 +253,11 @@ def test_the_poll_loop_reports_every_tip_it_reads(monkeypatch):
     monkeypatch.setattr(m, "_note_base_observed",
                         lambda repo, branch, sha: seen.append((repo, branch, sha)))
     monkeypatch.setattr(m, "REPOS", {WH_REPO: {"scopes": []}})
-    monkeypatch.setattr(m, "discover_path_app_map", lambda: {})
+    monkeypatch.setattr(m, "discover_path_app_map",
+                        # COPS-2668: an EMPTY inventory now means "discovery
+                        # failed" and stops the iteration, so a test whose
+                        # subject is elsewhere must supply a populated one.
+                        lambda: {"gcp/dev/x/customer.yaml": ["argocd/pv-x-a"]})
     monkeypatch.setattr(m, "mirror_sync", lambda repo: None)
     monkeypatch.setattr(m, "get_open_prs", lambda repo: [])
     monkeypatch.setattr(m, "http",
