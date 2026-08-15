@@ -175,6 +175,37 @@ passes: it is slow, flaky, and dependent on someone else's uptime.
 concurrency (leader election, locks). Do not add `pytest-rerunfailures` or
 retry-until-green: that discards exactly the signal we most need.
 
+**Coverage is the measure, not the goal.** A test that cannot fail is worse
+than an uncovered line, because it reports a safety that does not exist. When
+COPS-2671 took `src/` from 97% to 100%, every new test was attacked before it
+was kept: the source was mutated underneath it, and anything that stayed green
+was rewritten until it went red. Keep that bar. Reaching a line is not the
+same as testing it.
+
+---
+
+## What "100%" excludes, and why
+
+`src/` reports 100% statement coverage. Read that as "100% of what is
+measured": there are 20 `pragma: no cover` sites, and coverage.py does not
+count them. Most long predate COPS-2671 and carry their reason inline — the
+zstandard import fallback the production image never takes, TLS paths that
+need a real cluster, `os.replace` failure arms. Each is a one-line
+justification at the point of exclusion; that is the convention, keep it.
+
+COPS-2671 added two, and they are worth knowing about because neither is a
+routine "cannot happen in a test" exclusion:
+
+| Site | Why it is excluded |
+|---|---|
+| `diff_ui.py` — the path-traversal `raise` at the GCS write site | Cannot fire. An identical guard forty lines earlier walks the same `names` tuple and raises first. Kept because CodeQL wants the idiom at *each* write site, and a guard that relies on a caller upstream is one refactor from being the only one left. The contract that does the protecting is tested: weaken `_validate` and a `../` name is still refused with nothing written. |
+| `diff_preview.py` — the capped deep-link roster in `format_comment` | Dead rather than untested. It needs a shape group **and** no changeset table, but shape groups are built only from `OUT_DIFF` results and any `OUT_DIFF` result renders the table; on the complete-record page — where its own comment says the bullets should survive — `shape_group_for_app` is emptied outright. Left in place because those bullets may be behaviour COPS-2640 lost rather than made redundant. |
+
+The second is the reason this section exists. Chasing the last seven
+statements found dead code that a `pragma` added without reading would have
+buried for good. Before excluding a line, work out *why* nothing reaches it —
+the answer is occasionally that the feature stopped working.
+
 ---
 
 ## Guidance for AI assistants working in this repo
