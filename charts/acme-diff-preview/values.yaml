@@ -215,8 +215,22 @@ diffUi:
 #
 # Empty (the default) means memory + pod-local disk only: fully functional,
 # just no cross-pod warming, so a fresh pod re-renders instead of downloading.
-# That is the correct default — persisting fleet-wide plaintext is a decision
-# to make deliberately, never one to arrive at by configuring something else.
+#
+# RECOMMENDATION: leave it empty. Measured on the hub, 2026-08-15, over 84 PRs
+# and 623 app diffs:
+#
+#   cache hits 213 total -> memory 180 (84.5%), disk 13 (6.1%), GCS 20 (9.4%)
+#   lookups 1,066 total  -> the GCS tier served 1.9% of them
+#   GCS objects written  -> 853
+#
+# 853 persisted plaintext-secret documents bought 20 avoided re-renders, about
+# ten seconds of work. A 42:1 ratio of secret-bearing writes to useful reads is
+# not a trade worth a permanent fleet-wide secret store with its own IAM
+# boundary to maintain. The memory tier already does 85% of the job for free
+# and dies with the pod, which is the correct lifetime for this data.
+#
+# The knob stays because the capability is sound if someone ever has a genuine
+# need and a properly isolated bucket. It is off because nobody currently does.
 mainRenderCache:
   gcsBucket: ""
 
