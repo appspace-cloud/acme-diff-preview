@@ -523,8 +523,18 @@ def _build_merge_summary(results, rollup_by_sig, vm_change_lines,
                if results[a].reason in PERMANENT_REASONS]
     soft = [a for a in unknown if a not in set(blocked)]
     if blocked:
+        # COPS-2675: `blocked` holds APPS (dict keys like `pv-x-ms`), and an
+        # environment can fail on more than one of its apps at once -- this
+        # exact "Missing Image Tag" class hits every -ms app of a cohort
+        # together. len(blocked) then over-counts relative to the names
+        # _fmt_env_list actually shows (deduped to environments, the same
+        # population used two call sites above for the bump/rollup lines),
+        # so the headline could read "3 environment(s)" over a list of 2
+        # names with no "+more" to account for the gap. Count the same
+        # deduped population the list displays.
+        _blocked_envs = set(_envs_from_apps(blocked))
         findings.append((_SEV_BLOCK,
-                         f"\u26d4 **{len(blocked)} environment(s) cannot "
+                         f"\u26d4 **{len(_blocked_envs)} environment(s) cannot "
                          f"render** \u2014 helm failed here and the "
                          f"deployer will fail the same way: "
                          f"{_fmt_env_list(blocked)}"))

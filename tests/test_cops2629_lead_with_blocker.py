@@ -145,3 +145,32 @@ def test_the_permanent_finding_says_the_deployer_fails_too(monkeypatch):
 def test_a_clean_pr_is_still_routine(monkeypatch):
     monkeypatch.setattr(dp, "generate_ai_summary", lambda *a, **k: None)
     assert _verdict(_comment({"pv-a-glb": _changed()})) == "routine"
+
+
+# -- COPS-2675: the headline count must match the names beside it ----------
+
+def test_two_failing_apps_of_one_environment_count_as_one_environment(
+        monkeypatch):
+    """Live on acme-config-prod #4306 (audit PR): the same "Missing Image
+    Tag" class that motivated this file hit every -ms app of a cohort at
+    once, and a real environment can independently fail on more than one
+    of its apps (its -ms AND its -ss, say). `blocked` is a list of APPS,
+    so counting it directly over-counts against `_fmt_env_list`, which
+    dedupes to the environment names actually shown -- the headline could
+    read "3 environment(s)" over a list of only 2 names, with no "+more"
+    to account for the gap. pv-a fails on one app; pv-b fails on two."""
+    monkeypatch.setattr(dp, "generate_ai_summary", lambda *a, **k: None)
+    results = {
+        "pv-a-ms": _indet(dp.REASON_MISSING_REQUIRED),
+        "pv-a-glb": _changed("a"),
+        "pv-b-ms": _indet(dp.REASON_MISSING_REQUIRED),
+        "pv-b-ss": _indet(dp.REASON_MISSING_REQUIRED),
+    }
+    out = _comment(results)
+    line = next(l for l in out.split("\n") if "cannot render" in l)
+    assert "2 environment(s)" in line, (
+        "3 failing APPS across 2 environments must read '2', not '3':\n"
+        + line)
+    assert "3 environment(s)" not in line, line
+    assert "pv-a" in line and "pv-b" in line
+    assert "+" not in line, "only 2 names exist; there is nothing to fold"
