@@ -12,7 +12,7 @@ you whether it is safe.
 <a href="https://github.com/appspace-cloud/acme-diff-preview/actions/workflows/ci.yml"><img src="https://github.com/appspace-cloud/acme-diff-preview/actions/workflows/ci.yml/badge.svg" alt="CI"></a>
 <a href="https://github.com/appspace-cloud/acme-diff-preview/actions"><img src="https://raw.githubusercontent.com/appspace-cloud/acme-diff-preview/badges/badges/coverage.svg" alt="Coverage"></a>
 <a href="https://github.com/appspace-cloud/acme-diff-preview/releases"><img src="https://raw.githubusercontent.com/appspace-cloud/acme-diff-preview/badges/badges/version.svg" alt="Version"></a>
-<img src="https://img.shields.io/badge/tests-1964%20passing-2ea043" alt="1964 tests passing">
+<img src="https://img.shields.io/badge/tests-2149%20passing-2ea043" alt="2149 tests passing">
 </p>
 
 <p align="center">
@@ -107,4 +107,4 @@ Full configuration, every env var, and the guard-by-guard breakdown live in
 | [Reference](docs/reference.md) | Every knob, endpoint, guard and layout detail |
 | [Internals](docs/internals.md) | How the render, cache and comment budget work |
 | [Releasing](RELEASING.md) | Release flow, rollback, and the traps that bite |
-| [Testing](TESTING.md) | 1964 tests, 22 goldens, and the seam audit |
+| [Testing](TESTING.md) | 2149 tests at 100% coverage, 22 goldens, and the seam audit |

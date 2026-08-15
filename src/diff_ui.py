@@ -597,7 +597,16 @@ def load_artifact(base_dir, repo, pr_id, sha, bucket=""):
         try:
             os.makedirs(base_path, exist_ok=True)
             fullpath = os.path.normpath(os.path.join(base_path, name))
-            if not fullpath.startswith(base_path):
+            if not fullpath.startswith(base_path):  # pragma: no cover
+                # Unreachable: the local-read loop above walks the SAME
+                # `names` tuple through an identical check and raises first,
+                # so nothing that escapes can ever get this far. Kept anyway
+                # -- CodeQL wants the idiom at each write site, and a guard
+                # that depends on a caller forty lines up is one refactor
+                # away from being the only one left. COPS-2671 verified the
+                # shadowing; the reachable contract is pinned by
+                # test_cops2671_cov_tail.py::
+                #     test_a_traversing_object_name_writes_nothing_outside_the_cache_dir
                 raise ValueError(
                     f"path escapes base_dir: {fullpath!r} not under "
                     f"{base_path!r}")

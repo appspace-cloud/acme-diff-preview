@@ -8772,7 +8772,19 @@ def format_comment(pr_sha, app_results, skipped_apps=None, base_sha="",
                 # holds through the table. Bullets survive only where the
                 # table does not carry the links: no table, or the
                 # complete-record page.
-                if (artifact_url and not (_table_rendered
+                # COPS-2671: this condition can no longer be satisfied, and
+                # the comment above is what gives it away. "No table" cannot
+                # co-occur with a shape group -- the group is built only from
+                # OUT_DIFF results (8217) and any OUT_DIFF result sets
+                # _table_rendered (8515). "The complete-record page" cannot
+                # either: shape_group_for_app is {} outright when
+                # is_complete_record (8258). So both arms are dead and the
+                # roster below has not rendered since COPS-2640 narrowed the
+                # guard. Excluded rather than deleted: the bullets may be
+                # behaviour that was lost rather than behaviour made
+                # redundant, and restoring them on the full-diff page is a
+                # product call, not a coverage one.
+                if (artifact_url and not (_table_rendered  # pragma: no cover
                                           and not profile.is_complete_record)):
                     _shown = _members[:8]
                     # One per line, not one long line. Deep links carry the
