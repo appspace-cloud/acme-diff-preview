@@ -51,7 +51,7 @@ SHA dedup:
 - In-memory: skips same PR SHA within this pod's loop iterations
 - Cross-pod: compares comment SHA; skips and fixes stuck INPROGRESS if needed
 """
-import json, os, posixpath, random, re, shutil, signal, socket, ssl, sys, subprocess, time, threading, urllib.error, urllib.parse, urllib.request
+import json, os, posixpath, random, re, shutil, signal, socket, ssl, sys, subprocess, time, threading, traceback, urllib.error, urllib.parse, urllib.request
 import hashlib
 import collections
 import difflib as _difflib
@@ -1521,7 +1521,7 @@ class _HealthHandler(BaseHTTPRequestHandler):
                 _invalidate_for_republish(chart_name, chart_ver)
             except Exception as exc:
                 logsink.log(f"JFrog webhook: local invalidation failed: {exc}", "ERROR")
-            _jfrog_refresh_pool.submit(_jfrog_hard_refresh, chart_name, chart_ver)
+            _jfrog_refresh_pool.submit(_jfrog_refresh_guarded, chart_name, chart_ver)
 
         else:
             self.send_response(404)
@@ -1694,6 +1694,25 @@ def _invalidate_for_republish(chart_name: str, chart_version: str) -> None:
                     f"PR(s): {forced if forced else 'none'}")
     if forced:
         _wake.set()
+
+
+def _jfrog_refresh_guarded(chart_name: str, chart_version: str) -> None:
+    """Run the hard refresh with a destination for its exceptions.
+
+    COPS-2668. The refresh is submitted to a pool and the Future discarded,
+    so anything it raised was swallowed whole: no log, no counter, no retry,
+    while the webhook had already answered 200 for work that never happened.
+    Every other real background worker here wraps its body (leader tick, OCI
+    self-check); this one was the exception, in both senses.
+
+    The traceback matters more than usual: this runs off the request thread,
+    so there is no other record of where it died.
+    """
+    try:
+        _jfrog_hard_refresh(chart_name, chart_version)
+    except Exception as e:
+        logsink.log(f"JFrog hard refresh failed for {chart_name}:"
+                    f"{chart_version}: {e}\n{traceback.format_exc()}", "ERROR")
 
 
 def _jfrog_hard_refresh(chart_name: str, chart_version: str) -> None:
@@ -3177,8 +3196,8 @@ class OciChartNotFound(Exception):
 #      homes isolated, config home inherited), surfaced in /stats and
 #      logged at ERROR on failure. Reference: DIFF_OCI_SELFCHECK_REF
 #      ("registry/chart:version") if set, else the last successful pull.
-OCI_FAIL_ERROR_THRESHOLD = int(os.environ.get("DIFF_OCI_FAIL_ERROR_THRESHOLD", "3"))
-OCI_SELFCHECK_INTERVAL   = int(os.environ.get("DIFF_OCI_SELFCHECK_INTERVAL", "900"))
+OCI_FAIL_ERROR_THRESHOLD = _env_int("DIFF_OCI_FAIL_ERROR_THRESHOLD", 3)
+OCI_SELFCHECK_INTERVAL   = _env_int("DIFF_OCI_SELFCHECK_INTERVAL", 900)
 
 _last_pull_ok_ref = None          # (registry, chart, version) of last success
 _oci_health_lock = threading.Lock()
@@ -6394,8 +6413,8 @@ def _indeterminate(reason, detail):
 # within a few seconds once the chart cache warms. More attempts with growing
 # backoff make the diff transparent to reviewers instead of "diff unavailable".
 DIFF_RETRIES       = _env_int("DIFF_RETRIES", 5)   # total attempts per diff
-DIFF_BACKOFF_BASE  = float(os.environ.get("DIFF_BACKOFF_BASE", "3"))   # seconds
-DIFF_BACKOFF_CAP   = float(os.environ.get("DIFF_BACKOFF_CAP", "30"))   # seconds
+DIFF_BACKOFF_BASE  = _env_float("DIFF_BACKOFF_BASE", 3.0)   # seconds
+DIFF_BACKOFF_CAP   = _env_float("DIFF_BACKOFF_CAP", 30.0)   # seconds
 
 
 def _diff_backoff(attempt):
@@ -9991,9 +10010,16 @@ def process_pr(pr, path_map, base_sha="", repo=None):
         # on the PR \u2014 the token it writes decides whether the service ever
         # looks at this commit again \u2014 so a transport failure must not be
         # recorded as the author's fault.
+        #
+        # It is also the handler that fires for anything nobody anticipated,
+        # which is where str(e) is least sufficient: empty for a bare
+        # KeyError, and naming neither the line nor the call path. The
+        # traceback goes to the log only \u2014 the PR comment keeps the short
+        # message, since a reviewer needs the outcome, not our stack.
         _transient = _is_transient_exception(e)
         _tok = "transient" if _transient else "permanent"
-        logsink.log(f"[ERROR] PR #{pr_id}: {e} ({_tok})", "ERROR")
+        logsink.log(f"[ERROR] PR #{pr_id}: {e} ({_tok})\n"
+                    f"{traceback.format_exc()}", "ERROR")
         try:
             _sdesc = (f"Diff unavailable (infrastructure) - will retry: {str(e)[:150]}"
                       if _transient else f"Diff error: {str(e)[:200]}")
