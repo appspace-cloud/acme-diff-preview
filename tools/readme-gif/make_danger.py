@@ -76,7 +76,7 @@ state_lines = m._summarize_appspace_state_changes([IDENT], PR_SHA, BASE_SHA, PAT
 
 body = m.format_comment(PR_SHA, results, base_sha=BASE_SHA,
                         appspace_state_lines=state_lines, artifact_url=ART)
-import os
 out = os.path.join(os.path.dirname(os.path.abspath(__file__)), "comment.md")
-open(out, "w").write(body)
+with open(out, "w") as f:
+    f.write(body)
 print(f"{len(body.splitlines())} lines -> {out}")

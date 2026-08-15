@@ -5,7 +5,8 @@ import re
 import markdown
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-md_text = open(os.path.join(HERE, "comment.md")).read()
+with open(os.path.join(HERE, "comment.md")) as f:
+    md_text = f.read()
 
 # Colourise the unified-diff bodies before markdown sees them, so added and
 # removed lines read the way they do in a real PR.

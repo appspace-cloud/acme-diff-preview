@@ -1,5 +1,5 @@
 # Intermediates: the build writes these next to the scripts.
-node_modules/
+node_modules
 package-lock.json
 frames/
 comment.md

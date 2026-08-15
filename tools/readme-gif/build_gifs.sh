@@ -3,14 +3,13 @@
 #   ./build_gifs.sh            both
 #   ./build_gifs.sh monthly    just the hero
 set -e
+set -o pipefail          # a generator that dies must abort the build, not be
+                         # swallowed by the `tail` it is piped into
 SP="${0:A:h}"
 REPO="${SP:h:h}"
 PY="${PYTHON:-$REPO/venv/bin/python}"
 ASSETS="$REPO/docs/assets"
 cd "$SP"
-
-# One server for the capture step, reused across both scenarios.
-lsof -ti:8899 >/dev/null 2>&1 || { python3 -m http.server 8899 >/dev/null 2>&1 & sleep 1; }
 
 build() {                      # build <generator.py> <output-name>
   local gen="$1" name="$2"

@@ -23,7 +23,11 @@ fs.mkdirSync(OUT, { recursive: true });
   });
   const page = await browser.newPage();
   await page.setViewport({ width: 1180, height: 720, deviceScaleFactor: 2 });
-  await page.goto("http://localhost:8899/comment.html", {
+  // Loaded straight off disk. The page is self-contained (inline CSS, no
+  // external requests), so there is nothing for a server to add -- and an
+  // earlier version pointed at a fixed localhost port, which silently
+  // captured whatever OTHER directory happened to be served there.
+  await page.goto(`file://${path.join(__dirname, "comment.html")}`, {
     waitUntil: "networkidle0",
   });
 
