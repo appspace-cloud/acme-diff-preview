@@ -5187,12 +5187,14 @@ def _rename_identity_confirmed(old_clean: str, new_clean: str,
         cached = _identity_rename_verdict_cache.get(cache_key)
     if cached is not None:
         return cached
+    fetch_failed = False
     try:
         old_content, _old_status = _bb_fetch_cached(old_clean, main_sha)
         new_content, _new_status = _bb_fetch_cached(new_clean, pr_sha)
     except Exception as e:
         logsink.debug(f"identity check fetch failed for {old_clean} -> {new_clean}: {e}")
         old_content = new_content = None
+        fetch_failed = True
     old_identity = _extract_appspace_identity(old_content or "")
     new_identity = _extract_appspace_identity(new_content or "")
     verdict = _same_env_identity(old_identity, new_identity)
@@ -5200,6 +5202,17 @@ def _rename_identity_confirmed(old_clean: str, new_clean: str,
         logsink.log(f"identity-file rename {old_clean} -> {new_clean} rejected: "
                     f"declared identity changed ({old_identity} -> {new_identity}); "
                     f"treating as unrelated environments, not a move", "WARNING")
+    if fetch_failed:
+        # COPS-2668: degrading to "trust the rename" on a transient blip is
+        # deliberate (see _same_env_identity) and stays. REMEMBERING it is
+        # not: this verdict is what suppresses the decommission warning for
+        # the old environment, so caching a guess pins it for the life of the
+        # pod and every later PR touching the same pair inherits it without
+        # anyone re-asking Bitbucket. Return the permissive answer for this
+        # call only; the next one gets a real fetch.
+        logsink.debug(f"identity verdict for {old_clean} -> {new_clean} came "
+                      f"from a failed fetch; not caching it")
+        return verdict
     with _identity_rename_verdict_lock:
         _identity_rename_verdict_cache[cache_key] = verdict
         if len(_identity_rename_verdict_cache) > _IDENTITY_RENAME_CACHE_MAX:
@@ -5815,11 +5828,21 @@ def _evaluate_env_decommissions(candidates: list, pr_sha: str, main_sha: str,
         collect_full = (with_full_output and cascade
                         and _decommission_fully_phased(c["identity_file"], main_sha))
         app_deleted_docs: dict = {}
+        unrendered: list = []
         for app in c["apps"]:
             try:
                 resources = _render_main_side_resources(app, main_sha)
             except Exception as e:
-                logsink.debug(f"decommission resource listing failed for {app}: {e}")
+                # COPS-2668: this used to `continue` silently, so the totals
+                # below counted only the apps that rendered and the comment
+                # presented that as the inventory of what the cascade is
+                # about to orphan. An undercount is worse than no count here:
+                # a reviewer sizing the blast radius reads a number that is
+                # confidently too small. Record it and say so.
+                logsink.log(f"decommission resource listing failed for {app}: "
+                            f"{str(e)[:150]} — it will be reported as "
+                            f"un-inventoried, not omitted", "WARNING", app=app)
+                unrendered.append(app)
                 continue
             any_rendered = True
             n, kc, wl = _summarize_resources_dict(resources)
@@ -5878,6 +5901,22 @@ def _evaluate_env_decommissions(candidates: list, pr_sha: str, main_sha: str,
         # so the correction goes immediately after the table and before the
         # inventory it would otherwise appear to describe.
         lines += _cascade_mismatch_note(c["env_name"], c["apps"], cascade)
+        if unrendered:
+            # COPS-2668: the counts below cover only the apps that rendered.
+            # Saying so is the difference between an inventory and a guess;
+            # a reviewer sizing a destructive change must not read a number
+            # that is quietly too small.
+            _shown = ", ".join(f"`{a}`" for a in sorted(unrendered)[:5])
+            _more = (f" and {len(unrendered) - 5} more"
+                     if len(unrendered) > 5 else "")
+            lines += [
+                f"⚠️ **{len(unrendered)} of this environment's "
+                f"{len(c['apps'])} application(s) could not be rendered**, so "
+                f"the counts below EXCLUDE them and understate what this "
+                f"change affects: {_shown}{_more}. Re-run once the render "
+                f"succeeds before relying on the inventory.",
+                "",
+            ]
         if not cascade:
             lines += [
                 "\u26a0\ufe0f **The ArgoCD Application is removed, but its resources "
@@ -6399,8 +6438,14 @@ def argocd_diff(app, pr_sha, main_sha, chart_revision=None, changed_paths=None, 
 
         if reason is not None:
             last_detail, last_reason = detail or reason, reason
+            # COPS-2668: helm stderr echoes the offending values-file line, so
+            # a YAML error inside a Secret block put real secret bytes into
+            # Cloud Logging. _redact_error_detail already protects the PR
+            # comment; the redaction control has to be symmetric across every
+            # sink, or the weakest one defines it.
+            _safe_detail = _redact_error_detail(detail or "")
             logsink.debug(f"diff step failed: {reason}", app=app,
-                          attempt=attempt + 1, detail=(detail or "")[:800])
+                          attempt=attempt + 1, detail=_safe_detail[:800])
             # Permanent: the chart version does not exist. Never retry; block PR.
             if reason in PERMANENT_REASONS:
                 return _indeterminate(reason, detail or reason)
@@ -6411,7 +6456,7 @@ def argocd_diff(app, pr_sha, main_sha, chart_revision=None, changed_paths=None, 
                     _diff_stats["diff_retries"] += 1
                 logsink.log(f"[{app}] {reason} (attempt {attempt + 1}/"
                             f"{DIFF_RETRIES}), retrying in {delay:.0f}s: "
-                            f"{(detail or '')[:80]}", app=app, reason=reason,
+                            f"{_safe_detail[:80]}", app=app, reason=reason,
                             event="diff_retry")
                 time.sleep(delay)
                 continue
@@ -6463,6 +6508,16 @@ def post_build_status(pr_sha, state, description, pr_id=None, repo=None):
     back to no meaningful destination (ARGOCD_SERVER), which practically
     never happens in the normal flow.
     """
+    # COPS-2668: the merge gate is a Bitbucket write like any other, and it
+    # was the only one COPS-2654 left ungated. Comment writes, artifact writes
+    # and PR entry all check leadership; this did not, so a demoted leader
+    # finishing an in-flight PR could stamp a verdict the current leader never
+    # reached and will not overwrite. A status is the most consequential thing
+    # this service writes, so it is the last place to skip the check.
+    if not _still_leader():
+        logsink.debug(f"not leader, skipping build status {state} for "
+                      f"{pr_sha[:8]}", pr=pr_id)
+        return
     repo = repo or _repo_for_sha(pr_sha)
     # v2.6.1: Bitbucket REQUIRES a url on build statuses (empirically verified:
     # both a missing and an empty url are rejected). A bare PR link is

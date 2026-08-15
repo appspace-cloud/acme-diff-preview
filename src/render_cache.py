@@ -124,6 +124,30 @@ MAIN_RENDER_GCS_PREFIX = os.environ.get(
     "MAIN_RENDER_GCS_PREFIX", "render-cache").strip("/")
 
 
+_helm_version_cache: list = []
+
+
+def _helm_binary_version() -> str:
+    """`helm version --short`, resolved once per process.
+
+    Part of the content key (COPS-2668). Resolved lazily and memoised because
+    it costs a subprocess and never changes within a pod's life; an
+    unresolvable binary yields a distinct marker rather than an empty string,
+    so "we could not tell" never silently equals "same as before".
+    """
+    if _helm_version_cache:
+        return _helm_version_cache[0]
+    import subprocess as _sp
+    try:
+        out = _sp.run([os.environ.get("HELM_BIN", "helm"), "version", "--short"],
+                      capture_output=True, text=True, timeout=15)
+        ver = (out.stdout or "").strip() or "unknown"
+    except Exception:
+        ver = "unresolved"
+    _helm_version_cache.append(ver)
+    return ver
+
+
 def _main_render_content_key(chart_path, release, namespace, vals) -> str:
     """Content key for a main-side helm render (COPS-2631).
 
@@ -140,6 +164,16 @@ def _main_render_content_key(chart_path, release, namespace, vals) -> str:
     h.update(str(namespace or "").encode("utf-8"))
     h.update(b"\0")
     h.update(str(KUBE_VERSION).encode("utf-8"))
+    h.update(b"\0")
+    # COPS-2668: the renderer itself is a render input. Everything else here
+    # can be identical across a helm upgrade whose output differs (ordering,
+    # label emission, a template-function fix), and the durable tier outlives
+    # pods by design — so without this a routine Dockerfile bump serves
+    # old-binary renders to every PR until the entries age out, with the 1%
+    # shadow audit healing them one at a time after the wrong comments are
+    # already posted. The salt would also cover it, but only if someone
+    # remembers; this cannot be forgotten.
+    h.update(_helm_binary_version().encode("utf-8"))
     h.update(b"\0")
     h.update(b"include-crds=1")  # _helm_template always passes --include-crds
     h.update(b"\0")
@@ -370,7 +404,14 @@ def _main_render_memory_put(key: str, resources: dict) -> None:
 
 
 def _main_render_cache_put(key: str, raw: str, resources: dict) -> None:
-    """Write through every tier: disk, memory front cache, and the bucket."""
+    """Write through every tier: disk, memory front cache, and the bucket.
+
+    A None key means the content key could not be computed honestly (an
+    unreadable chart file, COPS-2668). Storing under a fabricated key is how
+    a wrong render gets served later, so there is nothing to write.
+    """
+    if not key:
+        return
     try:
         _main_render_disk_store(key, raw)
     except OSError as e:
@@ -388,7 +429,12 @@ def _main_render_cache_get(key: str):
 
     raw is returned whenever this call actually read the bytes, because
     the shadow audit byte-compares against exactly what was served.
+
+    A None key (COPS-2668: the chart tree could not be hashed honestly) is a
+    guaranteed miss — there is no key to look anything up by.
     """
+    if not key:
+        return None, None, "miss"
     with _main_render_lock:
         cached = _main_render_cache.get(key)
         if cached is not None:
