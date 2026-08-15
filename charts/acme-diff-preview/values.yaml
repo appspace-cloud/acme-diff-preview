@@ -70,7 +70,7 @@ image:
   # Kept in sync with Chart.yaml appVersion (RELEASING.md). This default had
   # drifted since v2.7.0; it never bit us because acme-infrastructure pins the
   # tag explicitly, but anyone installing the chart as-is got a stale image.
-  tag: "2.78.0"
+  tag: "2.79.0"
   pullPolicy: IfNotPresent
 
 # Log verbosity for the diff-preview service. Set to DEBUG to emit the full
@@ -165,6 +165,13 @@ diffUi:
   # save is mirrored to the bucket and local read misses fall back to it:
   # permalinks survive restarts and any replica can serve any artifact. The
   # pod's Workload Identity service account needs objectAdmin on the bucket.
+  #
+  # CLASSIFICATION: this bucket holds REDACTED content only — the same bodies
+  # posted as PR comments. That is what makes a read grant on it a low-risk
+  # decision, so keep it true: nothing that stores unredacted material may
+  # share it. The durable render cache used to default to this bucket and
+  # persists raw helm output; it now refuses to (COPS-2668) and needs its own
+  # bucket below.
   gcsBucket: ""
   # Externally reachable, Google IAP-gated exposure of the full-diff pages,
   # via a SEPARATE Service + GKE BackendConfig (the webhook Service above is
@@ -184,6 +191,48 @@ diffUi:
   # see the tracking ticket for the full rollout checklist.
   ingress:
     enabled: false
+
+# Durable tier of the main-side render cache (COPS-2631 / COPS-2668).
+#
+# READ THIS BEFORE SETTING IT. Unlike diffUi.gcsBucket, this bucket holds RAW
+# `helm template` output — every rendered `kind: Secret`, in cleartext. The
+# service redacts at DISPLAY time on purpose: the diff engine has to compare
+# real values, the shadow audit byte-compares stored bytes against a fresh
+# render, and a cold-tier hit rebuilds diff inputs from the stored text.
+# Redacting before persist would fabricate a diff on every Secret, so the only
+# available control is where the bytes land.
+#
+# Consequences of setting it:
+#   * the bucket contains plaintext secret material for every app across every
+#     environment this service diffs, for the object lifetime you configure;
+#   * anyone who can read the bucket can read those secrets without any
+#     cluster access, so its IAM is a security boundary in its own right —
+#     note that a project-level `roles/viewer` grants object reads unless the
+#     bucket uses uniform access with its own explicit policy;
+#   * it must NOT be the diffUi bucket. That one is classified redacted-only
+#     so read grants on it stay cheap; sharing them silently broke that. The
+#     service refuses this configuration and disables the tier if it sees it.
+#
+# Empty (the default) means memory + pod-local disk only: fully functional,
+# just no cross-pod warming, so a fresh pod re-renders instead of downloading.
+#
+# RECOMMENDATION: leave it empty. Measured on the hub, 2026-08-15, over 84 PRs
+# and 623 app diffs:
+#
+#   cache hits 213 total -> memory 180 (84.5%), disk 13 (6.1%), GCS 20 (9.4%)
+#   lookups 1,066 total  -> the GCS tier served 1.9% of them
+#   GCS objects written  -> 853
+#
+# 853 persisted plaintext-secret documents bought 20 avoided re-renders, about
+# ten seconds of work. A 42:1 ratio of secret-bearing writes to useful reads is
+# not a trade worth a permanent fleet-wide secret store with its own IAM
+# boundary to maintain. The memory tier already does 85% of the job for free
+# and dies with the pod, which is the correct lifetime for this data.
+#
+# The knob stays because the capability is sound if someone ever has a genuine
+# need and a properly isolated bucket. It is off because nobody currently does.
+mainRenderCache:
+  gcsBucket: ""
 
 # ArgoCD server (hub cluster ingress)
 argocd:

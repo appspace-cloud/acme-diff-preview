@@ -16,8 +16,18 @@ diff_preview passes configuration as arguments.
 
 Storage v1 is a bounded flat directory (one JSON file per artifact, atomic
 write, oldest-by-mtime pruned past max_artifacts). The caller passes the SAME
-body it posts to Bitbucket, so the store only ever holds already-redacted
-content.
+body it posts to Bitbucket, so everything THIS module writes is already
+redacted.
+
+That is a claim about this module's own writes, and COPS-2668 is the reminder
+that it was not a claim about the bucket. The durable render cache used to
+default to this same bucket and persists RAW helm output under a
+`render-cache/` prefix, so the bucket held unredacted Secret values while this
+docstring was read as a guarantee that it did not — which is exactly what
+makes granting read on it look harmless. The render cache now refuses to share
+this bucket (render_cache._resolve_render_cache_bucket). Anything else that
+wants to store here must redact first, and the classification of the bucket
+belongs in values.yaml where the IAM decision is actually made.
 
 Storage v2 adds an optional durable GCS layer behind that directory: when a
 bucket is configured every save is also uploaded, and a local read miss
