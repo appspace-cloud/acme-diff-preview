@@ -134,10 +134,16 @@ _PH_NA = "\u2014 not applicable"
 # COPS-2660: the arming flag is present but the same PR removed the VM config
 # it acts through, so the phase can never complete as written.
 _PH_BROKEN = "\u26d4 **broken by this PR**"
+# COPS-2669: _PH_DONE lived alone in diff_preview.py while its four
+# siblings lived here, so the module that RENDERS the phase table did not
+# own its own vocabulary and a caller had to import the states from two
+# places. The hub re-exports it, so nothing outside changes.
+_PH_DONE = "\u2705 **done**"
 
 
 def _decommission_phase_table(vm_state, cascade_state, removal_state,
-                              declares_vms: bool, purge: bool = False) -> list:
+                              declares_vms: bool, purge: bool = False,
+                              purge_this_pr: bool = False) -> list:
     """The one phase table, rendered identically by all three decommission
     panels. Each *_state is one of the _PH_* constants, or None to fall back
     to pending.
@@ -149,13 +155,26 @@ def _decommission_phase_table(vm_state, cascade_state, removal_state,
     silently started at Phase 2 would just make the reader wonder what they
     were missing.
     """
-    purge_note = (" \u2014 with `decommissionPurgeData` armed the cascade will "
-                  "**permanently destroy** the BigQuery dataset and the user "
-                  "content bucket, not just abandon them"
-                  if purge else
-                  " \u2014 `decommissionPurgeData` is not armed, so the "
-                  "BigQuery dataset and the content bucket are abandoned and "
-                  "stay recoverable")
+    # COPS-2669: purge_this_pr exists because arming the purge is not one of
+    # the three phases -- it is a qualifier on Phase 2, which is where this
+    # note already renders. The purge panel used to claim
+    # cascade_state=_PH_THIS_PR, telling the reviewer this PR armed a cascade
+    # an earlier PR had armed; reporting the phase honestly then left no row
+    # marked "this PR" at all, in a table whose job is to locate the reader.
+    # Marking the qualifier on its own row costs neither.
+    if purge and purge_this_pr:
+        purge_note = (" \u2014 \u2b05 **this PR arms `decommissionPurgeData`**, "
+                      "so the cascade will **permanently destroy** the BigQuery "
+                      "dataset and the user content bucket, not just abandon "
+                      "them")
+    elif purge:
+        purge_note = (" \u2014 with `decommissionPurgeData` armed the cascade "
+                      "will **permanently destroy** the BigQuery dataset and "
+                      "the user content bucket, not just abandon them")
+    else:
+        purge_note = (" \u2014 `decommissionPurgeData` is not armed, so the "
+                      "BigQuery dataset and the content bucket are abandoned "
+                      "and stay recoverable")
     # The pointer to the inventory only makes sense while Phase 3 is still
     # ahead of the reviewer; on the removal PR itself they are already
     # looking at that inventory.

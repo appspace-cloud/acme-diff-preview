@@ -231,7 +231,8 @@ from vm_analysis import (  # VM/KCC infrastructure analysis (same-dir module)
     _collapse_repeated_vm_lines,
     _vm_panel_lines,
 )
-from decommission import (  # environment teardown and creation analysis
+from decommission import (
+    _PH_DONE,  # environment teardown and creation analysis
     _new_env_status,
     _CASCADE_KEEP_CRD_REASON,
     _CASCADE_KEEP_POLICY_REASON,
@@ -7545,7 +7546,6 @@ def _declares_vms_flat(flat: dict) -> bool:
 # arming the cascade "Phase 1", contradicting both, and a reviewer reading
 # the comment and the runbook side by side got two different models
 # (COPS-2616).
-_PH_DONE = "\u2705 **done**"
 
 
 def _summarize_appspace_state_changes(changed_files, pr_sha, base_sha, path_map, repo=None) -> list:
@@ -7757,25 +7757,21 @@ def _summarize_appspace_state_changes(changed_files, pr_sha, base_sha, path_map,
                 # branch's own condition -- so Phase 2 reads done, and this
                 # PR is the purge qualifier on it.
                 #
-                # COPS-2668 looked at changing this to _PH_DONE and did NOT,
-                # deliberately. The comment above is right that the cascade
-                # was armed at base, so _PH_THIS_PR is inaccurate about which
-                # PR did it. But this branch also passes removal_state=None,
-                # so marking Phase 2 as done leaves NO row marked "this PR" --
-                # and the table's whole job is to show the reviewer where the
-                # change they are reading sits in the sequence. Trading a
-                # small inaccuracy for a table that locates nothing is not
-                # obviously an improvement, and test_cops2616 pins the current
-                # wording. Needs a product call on how a purge-only PR should
-                # appear in a three-phase model it does not fit; raised in
-                # COPS-2668 rather than decided here.
+                # COPS-2669 settled the question COPS-2668 left open. Arming
+                # the purge is not one of the three phases, it is a qualifier
+                # on Phase 2 -- so the row can report the cascade honestly as
+                # done (an earlier PR armed it, which is this branch's own
+                # precondition) AND still mark this PR as the change adding
+                # the purge. Every other panel marks the phase it actually
+                # performs; this was the only one claiming a phase it did not.
                 vm_state=(_PH_BROKEN if _vm_broken else
                           (_PH_DONE if _vm_deletion_armed_flat(new_flat) else None)),
-                cascade_state=_PH_THIS_PR,
+                cascade_state=_PH_DONE,
                 removal_state=None,
                 declares_vms=(_declares_vms_flat(new_flat)
                               or _declares_vms_flat(old_flat)),
                 purge=True,
+                purge_this_pr=True,
             ) + [
                 "",
             ] + _strip_warning

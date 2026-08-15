@@ -240,17 +240,14 @@ def test_unavailable_notice_binds_to_the_inventory_not_the_retained_list():
 import pytest
 
 
-@pytest.mark.skip(reason=(
-    "COPS-2668: deliberately NOT fixed. The cascade really was armed at base, "
-    "so _PH_THIS_PR is inaccurate — but this branch passes removal_state=None, "
-    "so marking Phase 2 done leaves no row marked 'this PR' at all, and "
-    "locating the reader in the sequence is the table's entire purpose. "
-    "Trading a small inaccuracy for a table that locates nothing needs a "
-    "product call, not a unilateral one. Kept as executable documentation of "
-    "the open question; test_cops2616 pins the current behaviour."))
 def test_purge_armed_phase_table_reports_cascade_already_done():
     """The branch only fires when the cascade was armed at base, and its own
-    comment says so — the table said THIS PR arms it."""
+    comment says so — the table said THIS PR arms it.
+
+    COPS-2668 left this skipped as a product call, because reporting the
+    phase honestly appeared to cost the table its "you are here" marker.
+    COPS-2669 resolved it: arming the purge is a QUALIFIER on Phase 2, not a
+    fourth phase, so the row carries both facts and neither is sacrificed."""
     import ast
     path = os.path.join(os.path.dirname(__file__), "..", "src", "diff_preview.py")
     tree = ast.parse(open(path).read())
