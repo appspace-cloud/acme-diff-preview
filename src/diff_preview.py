@@ -4728,7 +4728,6 @@ def _render_new_env_diff(env_info: dict, pr_sha: str) -> tuple:
     if status != BB_OK or not raw_config:
         return None, f"could not fetch {config_file} from Bitbucket", 0, None
     version = _extract_chart_version(raw_config)
-    version_src = config_file
     if not version:
         # COPS-2507 (Finding B): most environments do NOT define a version in
         # their own customer.yaml — measured in acme-config-prod, only 12/265
@@ -4751,7 +4750,7 @@ def _render_new_env_diff(env_info: dict, pr_sha: str) -> tuple:
             if st_anc == BB_OK and raw_anc:
                 v = _extract_chart_version(raw_anc)
                 if v:
-                    version, version_src = v, anc
+                    version = v
                     logsink.debug(f"new env {env_name}: version {version} inherited "
                                   f"from {anc}")
                     break
@@ -6304,7 +6303,6 @@ def _run_one_diff(app, pr_sha, main_sha, chart_revision=None, changed_paths=None
                 if posixpath.normpath(vf.replace("$config/", "").lstrip("/"))
                    in changed_clean
             ]
-            unchanged_vf  = [vf for vf in value_files if vf not in pr_changed_vf]
 
             pr_changed_fut = pool.submit(_fetch_value_files, pr_changed_vf, pr_sha) \
                              if pr_changed_vf else None

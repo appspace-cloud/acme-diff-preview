@@ -185,7 +185,8 @@ def from_file(path, comment=None):
     from the same stored string, so check_raw is a tautology here and is
     skipped rather than faked."""
     import diff_ui
-    art = json.load(open(path))
+    with open(path) as f:
+        art = json.load(f)
     page = diff_ui.render_html(art)
     return run(page=page, body=art.get("body", ""), comment=comment)
 
@@ -201,7 +202,11 @@ def main(argv=None):
     p.add_argument("--comment", help="file holding the comment posted for "
                                      "the same artifact, if available")
     a = p.parse_args(argv)
-    comment = open(a.comment).read() if a.comment else None
+    if a.comment:
+        with open(a.comment) as f:
+            comment = f.read()
+    else:
+        comment = None
 
     if a.url:
         if not (a.repo and a.pr and a.sha):

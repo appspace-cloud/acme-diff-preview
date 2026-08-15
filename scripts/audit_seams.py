@@ -97,7 +97,8 @@ def patched_names(src=None, tests=None):
                 continue
             path = os.path.join(root, fn)
             try:
-                tree = ast.parse(open(path, encoding="utf-8").read())
+                with open(path, encoding="utf-8") as _f:
+                    tree = ast.parse(_f.read())
             except SyntaxError:
                 continue
             alias = _aliases(tree, src)
@@ -137,7 +138,8 @@ def _referencing_modules(name, src=None):
     hits = set()
     for mod, path in _src_modules(src).items():
         try:
-            tree = ast.parse(open(path, encoding="utf-8").read())
+            with open(path, encoding="utf-8") as _f:
+                tree = ast.parse(_f.read())
         except SyntaxError:
             continue
         # Names bound by the module's own import statements are re-exports,
@@ -173,7 +175,8 @@ def _qualified_reads(src=None):
     out = {}
     for mod, path in _src_modules(src).items():
         try:
-            tree = ast.parse(open(path, encoding="utf-8").read())
+            with open(path, encoding="utf-8") as _f:
+                tree = ast.parse(_f.read())
         except SyntaxError:
             continue
         bound = _aliases(tree, src)

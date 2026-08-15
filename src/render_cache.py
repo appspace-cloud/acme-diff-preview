@@ -14,10 +14,8 @@ would reach nothing at all.
 """
 import collections
 import hashlib
-import json
 import os
 import threading
-import time
 from concurrent.futures import ThreadPoolExecutor  # noqa: F401
 
 import concurrency

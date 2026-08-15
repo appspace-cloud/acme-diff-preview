@@ -17,7 +17,6 @@ rule refuses to move a member the suite patches. Their only reader is
 `process_pr`, which never moves, so the seam would provably hold -- but
 relaxing the rule is worth its own decision rather than 40 quiet lines.
 """
-import re
 
 from manifest import _strip_trailing_comment
 

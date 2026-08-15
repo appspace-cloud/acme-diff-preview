@@ -1,0 +1,51 @@
+# Dependabot version updates (COPS-2674).
+#
+# Security updates were already on, but without this file Dependabot never
+# proposed ordinary version bumps, so nothing kept the pinned action SHAs or
+# the Python pins moving. That matters more since COPS-2674 pinned every
+# action to a commit SHA: a SHA never floats, so without an updater it silently
+# ages instead. Dependabot understands the `@<sha> # <tag>` convention and
+# bumps both parts together.
+#
+# Grouped and weekly on purpose. This repo gates every production PR, so a
+# stream of individual dependency PRs would compete with real work for review
+# attention; one grouped PR per ecosystem per week is reviewable.
+version: 2
+updates:
+  - package-ecosystem: github-actions
+    directory: "/"
+    schedule:
+      interval: weekly
+      day: monday
+    open-pull-requests-limit: 3
+    groups:
+      actions:
+        patterns: ["*"]
+    commit-message:
+      prefix: "[deps] "
+
+  - package-ecosystem: pip
+    directory: "/"
+    schedule:
+      interval: weekly
+      day: monday
+    open-pull-requests-limit: 3
+    groups:
+      # Runtime and dev pins move separately: a runtime bump ships to the
+      # cluster and deserves its own review, a dev-only bump does not.
+      runtime:
+        patterns: ["*"]
+        exclude-patterns: ["pytest*", "coverage*", "hypothesis"]
+      dev:
+        patterns: ["pytest*", "coverage*", "hypothesis"]
+    commit-message:
+      prefix: "[deps] "
+
+  - package-ecosystem: docker
+    directory: "/"
+    schedule:
+      interval: weekly
+      day: monday
+    open-pull-requests-limit: 2
+    commit-message:
+      prefix: "[deps] "
