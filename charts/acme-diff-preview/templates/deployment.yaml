@@ -195,6 +195,16 @@ spec:
             {{- end }}
             {{- end }}
             {{- end }}
+            {{- with .Values.mainRenderCache }}
+            {{- if .gcsBucket }}
+            # Durable render-cache tier. This bucket receives UNREDACTED helm
+            # renders (see values.yaml) — it is deliberately separate from the
+            # redacted-only diff-UI artifact bucket, and the service refuses to
+            # start the tier if the two are the same (COPS-2668).
+            - name: MAIN_RENDER_GCS_BUCKET
+              value: {{ .gcsBucket | quote }}
+            {{- end }}
+            {{- end }}
             {{- with .Values.leaderElection }}
             # HA: only the Lease holder runs the poll loop; every replica
             # serves HTTP. The lease name must match the RBAC resourceName
