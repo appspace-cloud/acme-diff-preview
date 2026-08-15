@@ -7,8 +7,15 @@ on:
     branches: [main]
   workflow_dispatch:
 
+# COPS-2668: read by default, at the workflow level. This workflow is
+# triggered by `pull_request`, and its `test` job runs the PR's own code
+# (pytest, generate_badges.py) plus third-party dependencies. Handing that
+# job a write-capable GITHUB_TOKEN put an escalation path from "run code in a
+# PR" to "push to the gh-pages branch chart-releaser publishes and ArgoCD
+# consumes". Only the badge publish needs write, so only it gets it — in its
+# own job, below, which never runs PR code.
 permissions:
-  contents: write
+  contents: read
 
 jobs:
   test:
@@ -67,13 +74,48 @@ jobs:
           python3 -m py_compile src/comment_render.py && echo "comment_render.py OK"
           python3 -m py_compile src/dev_hard_refresh.py && echo "dev_hard_refresh.py OK"
 
+      # COPS-2668: coverage.json crosses to the publish job as an artifact
+      # rather than the two sharing a runner. That split is the whole point:
+      # this job runs PR-authored code, so it must not hold a write token.
+      - name: Upload coverage for the badge job
+        if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage-json
+          path: coverage.json
+          retention-days: 1
+
+  # COPS-2668: badge publishing lives in its own job precisely because it is
+  # the only thing here that needs `contents: write`. Keeping it inside `test`
+  # would grant that token to a job that executes PR-authored code and
+  # unpinned dependencies, whatever the step-level `if` says — job
+  # permissions are not scoped per step. This job runs only on push-to-main
+  # and executes nothing from a PR.
+  publish-badges:
+    runs-on: ubuntu-latest
+    needs: test
+    if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v5.0.0
+
+      - name: Set up Python
+        uses: actions/setup-python@v7.0.0
+        with:
+          python-version: '3.13'
+
+      - name: Download coverage from the test job
+        uses: actions/download-artifact@v4
+        with:
+          name: coverage-json
+
       - name: Regenerate badges
         run: |
           git fetch --tags --quiet
           python3 scripts/generate_badges.py
 
-      - name: Publish badges (main only)
-        if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+      - name: Publish badges
         # Badges never touch main. The main-protection ruleset requires
         # status checks on every ref update, which a bot push can never
         # satisfy (the checks would have to pass before they exist), and

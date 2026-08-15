@@ -107,6 +107,45 @@ Do not force anything, and do not push the image manually: that would collide
 with the tag build (see below). Always test with a known-good tag as a control,
 otherwise a broken check looks exactly like a missing image.
 
+## Rolling back a bad release
+
+There was no written procedure for this until COPS-2668, which meant the one
+thing you need under pressure had to be reconstructed from memory. It is
+simpler than it looks, because **the image tag is the rollback**.
+
+**1. Roll back the running workload first.** Point `image.tag` (and the chart
+version, if the chart itself changed) at the previous release in
+`acme-infrastructure` and apply. The old tag is already in JFrog and already
+cached by the Artifact Registry proxy, so the pull is immediate — none of the
+negative-cache trap above applies to a tag that has been pulled before.
+
+Faster still, if infra apply is not available to you and the service is
+actively doing damage:
+
+```bash
+kubectl -n argocd set image deploy/acme-diff-preview \
+  diff-preview=us-central1-docker.pkg.dev/appspace-devops/artifact/acme-diff-preview:<previous-tag>
+```
+
+That is a stopgap, not the fix: the periodic reconciler will restore the
+tag from `main` within the hour, so the infra change still has to land.
+
+**2. Do not delete or re-push the bad tag.** JFrog cannot overwrite tags, and
+a deleted tag makes the incident harder to reconstruct afterwards. Leave it.
+
+**3. Consider whether the render cache is holding bad output.** If the bad
+release changed render behaviour, the durable tier can still be serving its
+results after the rollback. Bump `MAIN_RENDER_CACHE_SALT` in the rollback
+release, or the fix ships and the wrong renders keep being served.
+
+**4. Revert the code on `main` with a normal PR.** `git revert` the merge
+commit rather than force-pushing. `release.yml` republishes the chart, and
+the next release proceeds normally from a clean history.
+
+**What NOT to do:** do not force-push `main`, do not push an image by hand
+(it collides with the tag build — see below), and do not reuse the bad
+version number. Roll forward to `N+1` with the revert in it.
+
 ## Where the image actually lives: JFrog, then GKE pulls it through a proxy
 
 `docker.yml` pushes the image to **JFrog** (`docker-dev.repo.appspace.com`)
