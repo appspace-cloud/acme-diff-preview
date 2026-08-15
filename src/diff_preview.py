@@ -3127,7 +3127,29 @@ _helm_pull_locks_lock   = threading.Lock()
 # cache is cold (the common case at the start of a PR burst).
 # Pattern: first thread to miss cache creates an Event; others wait on it.
 _vf_inflight: dict = {}
+# COPS-2668: `_vf_inflight` is guarded by _vf_cache_lock, the same lock that
+# guards the cache check it is inserted under — the check-and-insert has to be
+# atomic against both. It used to be popped under a second lock, which meant
+# the pair was not actually atomic. Kept defined because it is part of the
+# module surface the suite reaches for.
 _vf_inflight_lock   = threading.Lock()
+
+# How long a singleflight waiter gives the in-flight fetcher before giving up.
+# The shared Bitbucket 429 pause reaches 60s by design, so this WILL be hit
+# during an ordinary rate limit — which is exactly why timing out has to mean
+# "unreadable" and never "absent" (COPS-2668).
+VF_SINGLEFLIGHT_WAIT = _env_int("VF_SINGLEFLIGHT_WAIT", 30)
+
+
+class ValueFileUnreadable(RuntimeError):
+    """A requested value file could not be read, as opposed to being absent.
+
+    COPS-2668. Absence is a fact about the config (a new cluster not yet on
+    main); unreadability is a fact about Bitbucket. Rendering the second as
+    the first silently changes the helm inputs, so the diff that gets
+    published is confidently wrong — the one outcome this service must never
+    produce. Raised so the render fails and the PR is retried instead.
+    """
 
 _main_render_sha: dict   = {}       # per-repo tip tracking (observability only)
 # Fraction of cache hits that re-render and byte-compare (0 disables).
@@ -3664,6 +3686,35 @@ def _backoff_should_skip(sk, pr_sha) -> bool:
         return False
 
 
+def _is_transient_exception(e) -> bool:
+    """True when an exception is an infrastructure hiccup, not a broken PR.
+
+    COPS-2668: process_pr's catch-all used to hardcode `[permanent]` for every
+    exception it caught, so a Bitbucket 429 or a 502 that outlived its retries
+    reached the author as a permanent, PR-blaming verdict. Worse, the token
+    lives in the durable comment: once `_extract_status_token` could read it,
+    `[permanent]` suppressed the retry for every replica and every future pod,
+    so a one-minute rate limit became a verdict that never re-evaluated itself.
+
+    The rule matches the one the rest of the service already uses (see
+    RETRYABLE_REASONS): a failure is transient when it is about the transport,
+    not about the content. Anything unrecognised stays permanent, because
+    retrying our own bugs forever is the failure mode this replaces.
+    """
+    if isinstance(e, ValueFileUnreadable):
+        return True          # Bitbucket could not serve a value file
+    # HTTPError subclasses URLError, so it has to be tested first.
+    if isinstance(e, urllib.error.HTTPError):
+        return e.code == 429 or 500 <= e.code < 600
+    if isinstance(e, urllib.error.URLError):
+        return True          # DNS, refused connection, TLS handshake
+    if isinstance(e, (TimeoutError, ConnectionError, socket.timeout)):
+        return True
+    if isinstance(e, subprocess.TimeoutExpired):
+        return True
+    return False
+
+
 def _backoff_register_transient(sk, pr_sha) -> int:
     """Record a transient failure; returns the delay (iterations) applied."""
     with _seen_lock:
@@ -3857,7 +3908,10 @@ def _bb_fetch_cached(filepath, sha, repo=None):
                 _vf_cache[key] = content
         return content, status
     finally:
-        with _vf_inflight_lock:
+        # COPS-2668: _vf_inflight is inserted under _vf_cache_lock (the same
+        # lock the cache check runs under, so check-and-insert is atomic);
+        # popping under a different lock broke that pairing. One dict, one lock.
+        with _vf_cache_lock:
             _vf_inflight.pop(key, None)
         evt.set()
 
@@ -4011,14 +4065,26 @@ def _fetch_value_files(value_files: list, sha: str) -> dict:
                 fetcher = True
 
         if not fetcher:
-            done = evt.wait(timeout=30)
+            done = evt.wait(timeout=VF_SINGLEFLIGHT_WAIT)
             with _vf_cache_lock:
+                # The cache only gains a key on a DEFINITIVE answer (BB_OK or
+                # BB_NOT_FOUND). Absence of the key therefore means the
+                # fetcher either timed out or failed — in both cases we do not
+                # know whether this file exists.
+                answered = cache_key in _vf_cache
                 val = _vf_cache.get(cache_key)
-            if not done and val is None:
-                # Fetcher did not complete within 30s (slow Bitbucket). Return
-                # None but do not cache it — the caller treats None as a missing
-                # file which may be correct. Logged so diff stats show the miss.
-                logsink.debug(f"Singleflight timeout for ({sha[:8]}, {clean})")
+            if not answered:
+                # COPS-2668: this used to return None, which the caller reads
+                # as "file absent" and feeds to helm as a changed input set.
+                # The shared 429 pause runs to 60s by design, so an ordinary
+                # rate limit put every waiter here at once and the diff that
+                # got published was confidently wrong. No answer means no
+                # render.
+                with unreadable_lock:
+                    unreadable.append(vf)
+                logsink.debug(f"Singleflight gave no answer for ({sha[:8]}, "
+                              f"{clean}) after {VF_SINGLEFLIGHT_WAIT}s "
+                              f"(done={done})")
             return vf, val
 
         # We are the fetcher for this cache key.
@@ -4032,7 +4098,9 @@ def _fetch_value_files(value_files: list, sha: str) -> dict:
                     unreadable.append(vf)
             return vf, content
         finally:
-            with _vf_inflight_lock:
+            # COPS-2668: same lock as the check-and-insert above, so the pair
+            # is actually atomic (this used to pop under _vf_inflight_lock).
+            with _vf_cache_lock:
                 _vf_inflight.pop(cache_key, None)
             evt.set()
 
@@ -4056,8 +4124,16 @@ def _fetch_value_files(value_files: list, sha: str) -> dict:
         shown = [v.replace("$config/", "") for v in unreadable[:5]]
         more = f" (+{len(unreadable) - 5} more)" if len(unreadable) > 5 else ""
         logsink.log(f"[bb] {len(unreadable)} value file(s) UNREADABLE at sha {sha[:8]} "
-                    f"— 429/5xx after retries, NOT absent; the render will look like a "
-                    f"missing required value: {shown}{more}", "WARNING")
+                    f"— 429/5xx after retries or no singleflight answer, NOT absent; "
+                    f"refusing to render: {shown}{more}", "WARNING")
+        # COPS-2668: fail closed. This used to fall through and hand helm a
+        # value set missing these files, which either surfaced as a permanent
+        # "missing required value" blamed on the author, or — worse — rendered
+        # cleanly against different inputs and got published as fact. The
+        # exception is transient, so the PR is retried instead of judged.
+        raise ValueFileUnreadable(
+            f"{len(unreadable)} value file(s) unreadable at sha {sha[:8]} "
+            f"(Bitbucket transport, not absence): {shown}{more}")
     absent = [v for v in missing if v not in
               {u.replace("$config/", "") for u in unreadable}]
     if absent:
@@ -5111,12 +5187,14 @@ def _rename_identity_confirmed(old_clean: str, new_clean: str,
         cached = _identity_rename_verdict_cache.get(cache_key)
     if cached is not None:
         return cached
+    fetch_failed = False
     try:
         old_content, _old_status = _bb_fetch_cached(old_clean, main_sha)
         new_content, _new_status = _bb_fetch_cached(new_clean, pr_sha)
     except Exception as e:
         logsink.debug(f"identity check fetch failed for {old_clean} -> {new_clean}: {e}")
         old_content = new_content = None
+        fetch_failed = True
     old_identity = _extract_appspace_identity(old_content or "")
     new_identity = _extract_appspace_identity(new_content or "")
     verdict = _same_env_identity(old_identity, new_identity)
@@ -5124,6 +5202,17 @@ def _rename_identity_confirmed(old_clean: str, new_clean: str,
         logsink.log(f"identity-file rename {old_clean} -> {new_clean} rejected: "
                     f"declared identity changed ({old_identity} -> {new_identity}); "
                     f"treating as unrelated environments, not a move", "WARNING")
+    if fetch_failed:
+        # COPS-2668: degrading to "trust the rename" on a transient blip is
+        # deliberate (see _same_env_identity) and stays. REMEMBERING it is
+        # not: this verdict is what suppresses the decommission warning for
+        # the old environment, so caching a guess pins it for the life of the
+        # pod and every later PR touching the same pair inherits it without
+        # anyone re-asking Bitbucket. Return the permissive answer for this
+        # call only; the next one gets a real fetch.
+        logsink.debug(f"identity verdict for {old_clean} -> {new_clean} came "
+                      f"from a failed fetch; not caching it")
+        return verdict
     with _identity_rename_verdict_lock:
         _identity_rename_verdict_cache[cache_key] = verdict
         if len(_identity_rename_verdict_cache) > _IDENTITY_RENAME_CACHE_MAX:
@@ -5739,11 +5828,21 @@ def _evaluate_env_decommissions(candidates: list, pr_sha: str, main_sha: str,
         collect_full = (with_full_output and cascade
                         and _decommission_fully_phased(c["identity_file"], main_sha))
         app_deleted_docs: dict = {}
+        unrendered: list = []
         for app in c["apps"]:
             try:
                 resources = _render_main_side_resources(app, main_sha)
             except Exception as e:
-                logsink.debug(f"decommission resource listing failed for {app}: {e}")
+                # COPS-2668: this used to `continue` silently, so the totals
+                # below counted only the apps that rendered and the comment
+                # presented that as the inventory of what the cascade is
+                # about to orphan. An undercount is worse than no count here:
+                # a reviewer sizing the blast radius reads a number that is
+                # confidently too small. Record it and say so.
+                logsink.log(f"decommission resource listing failed for {app}: "
+                            f"{str(e)[:150]} — it will be reported as "
+                            f"un-inventoried, not omitted", "WARNING", app=app)
+                unrendered.append(app)
                 continue
             any_rendered = True
             n, kc, wl = _summarize_resources_dict(resources)
@@ -5802,6 +5901,22 @@ def _evaluate_env_decommissions(candidates: list, pr_sha: str, main_sha: str,
         # so the correction goes immediately after the table and before the
         # inventory it would otherwise appear to describe.
         lines += _cascade_mismatch_note(c["env_name"], c["apps"], cascade)
+        if unrendered:
+            # COPS-2668: the counts below cover only the apps that rendered.
+            # Saying so is the difference between an inventory and a guess;
+            # a reviewer sizing a destructive change must not read a number
+            # that is quietly too small.
+            _shown = ", ".join(f"`{a}`" for a in sorted(unrendered)[:5])
+            _more = (f" and {len(unrendered) - 5} more"
+                     if len(unrendered) > 5 else "")
+            lines += [
+                f"⚠️ **{len(unrendered)} of this environment's "
+                f"{len(c['apps'])} application(s) could not be rendered**, so "
+                f"the counts below EXCLUDE them and understate what this "
+                f"change affects: {_shown}{_more}. Re-run once the render "
+                f"succeeds before relying on the inventory.",
+                "",
+            ]
         if not cascade:
             lines += [
                 "\u26a0\ufe0f **The ArgoCD Application is removed, but its resources "
@@ -6323,8 +6438,14 @@ def argocd_diff(app, pr_sha, main_sha, chart_revision=None, changed_paths=None, 
 
         if reason is not None:
             last_detail, last_reason = detail or reason, reason
+            # COPS-2668: helm stderr echoes the offending values-file line, so
+            # a YAML error inside a Secret block put real secret bytes into
+            # Cloud Logging. _redact_error_detail already protects the PR
+            # comment; the redaction control has to be symmetric across every
+            # sink, or the weakest one defines it.
+            _safe_detail = _redact_error_detail(detail or "")
             logsink.debug(f"diff step failed: {reason}", app=app,
-                          attempt=attempt + 1, detail=(detail or "")[:800])
+                          attempt=attempt + 1, detail=_safe_detail[:800])
             # Permanent: the chart version does not exist. Never retry; block PR.
             if reason in PERMANENT_REASONS:
                 return _indeterminate(reason, detail or reason)
@@ -6335,7 +6456,7 @@ def argocd_diff(app, pr_sha, main_sha, chart_revision=None, changed_paths=None, 
                     _diff_stats["diff_retries"] += 1
                 logsink.log(f"[{app}] {reason} (attempt {attempt + 1}/"
                             f"{DIFF_RETRIES}), retrying in {delay:.0f}s: "
-                            f"{(detail or '')[:80]}", app=app, reason=reason,
+                            f"{_safe_detail[:80]}", app=app, reason=reason,
                             event="diff_retry")
                 time.sleep(delay)
                 continue
@@ -6387,6 +6508,16 @@ def post_build_status(pr_sha, state, description, pr_id=None, repo=None):
     back to no meaningful destination (ARGOCD_SERVER), which practically
     never happens in the normal flow.
     """
+    # COPS-2668: the merge gate is a Bitbucket write like any other, and it
+    # was the only one COPS-2654 left ungated. Comment writes, artifact writes
+    # and PR entry all check leadership; this did not, so a demoted leader
+    # finishing an in-flight PR could stamp a verdict the current leader never
+    # reached and will not overwrite. A status is the most consequential thing
+    # this service writes, so it is the last place to skip the check.
+    if not _still_leader():
+        logsink.debug(f"not leader, skipping build status {state} for "
+                      f"{pr_sha[:8]}", pr=pr_id)
+        return
     repo = repo or _repo_for_sha(pr_sha)
     # v2.6.1: Bitbucket REQUIRES a url on build statuses (empirically verified:
     # both a missing and an empty url are rejected). A bare PR link is
@@ -6733,6 +6864,16 @@ def fix_stuck_inprogress(pr_sha, pr_id, comment_raw, repo=None):
         _token = _extract_status_token(comment_raw)
         if _token == "permanent":
             state, desc = "FAILED", "Diff failed - check PR comment"
+        elif _token == "blocked":
+            # COPS-2668: a blocked PR is the strongest red this service can
+            # post -- the comment says merging breaks the environment (empty
+            # `microservices.definitions` -> ImagePullBackOff fleet-wide,
+            # COPR-31637). Before the token was readable it fell to the final
+            # `else` and resolved SUCCESSFUL, so a pod killed between the
+            # comment and the status left a green gate under a blocking
+            # comment. Recovering a status must never be the step that
+            # unblocks a merge.
+            state, desc = "FAILED", "Blocked - merging would break the environment (see comment)"
         elif _token == "clean":
             if "resource(s) will change" in comment_raw:
                 m = re.search(r"(\d+) resource\(s\) will change", comment_raw)
@@ -6753,6 +6894,11 @@ def fix_stuck_inprogress(pr_sha, pr_id, comment_raw, repo=None):
             # fixes the color of a stuck-INPROGRESS status being resolved,
             # it does not change whether the PR gets re-diffed next iteration.
             state, desc = "FAILED", "Diff unavailable - review comment (will retry automatically if transient)"
+        elif "\u26d4" in comment_raw:
+            # COPS-2668: legacy fallback for a blocked comment posted before
+            # the [blocked] token was readable. The stop sign is only ever
+            # written by the blocking paths, so it is a safe red signal.
+            state, desc = "FAILED", "Blocked - merging would break the environment (see comment)"
         elif "Error running diff" in comment_raw or "\u274c" in comment_raw:
             state, desc = "FAILED", "Diff failed - check PR comment"
         elif "not found in OCI registry" in comment_raw:
@@ -9841,17 +9987,34 @@ def process_pr(pr, path_map, base_sha="", repo=None):
         return outcome_counts
 
     except Exception as e:
-        logsink.log(f"[ERROR] PR #{pr_id}: {e}", "ERROR")
+        # COPS-2668: classify before publishing. This handler is the last word
+        # on the PR \u2014 the token it writes decides whether the service ever
+        # looks at this commit again \u2014 so a transport failure must not be
+        # recorded as the author's fault.
+        _transient = _is_transient_exception(e)
+        _tok = "transient" if _transient else "permanent"
+        logsink.log(f"[ERROR] PR #{pr_id}: {e} ({_tok})", "ERROR")
         try:
-            post_build_status(pr_sha, "FAILED", f"Diff error: {str(e)[:200]}", pr_id=pr_id)
+            _sdesc = (f"Diff unavailable (infrastructure) - will retry: {str(e)[:150]}"
+                      if _transient else f"Diff error: {str(e)[:200]}")
+            post_build_status(pr_sha, "FAILED", _sdesc, pr_id=pr_id)
         except Exception:
             pass
+        _human = (
+            f"\u26a0\ufe0f **Diff temporarily unavailable:** {str(e)[:400]}\n\n"
+            f"This is an infrastructure error, not a problem with this PR. "
+            f"It will be **retried automatically** on a later iteration; no "
+            f"action is needed from you.\n\n"
+            f"---\n**Status:** \u26a0\ufe0f Diff unavailable - will retry\n"
+            if _transient else
+            f"\u274c **Error processing diff:** {str(e)[:400]}\n\n"
+            f"---\n**Status:** \u274c Error running diff\n"
+        )
         err_body = (
             f"## \U0001f52d {STATUS_NAME}\n\n"
             f"{_comment_header(pr_sha)}\n\n"
-            f"\u274c **Error processing diff:** {str(e)[:400]}\n\n"
-            f"---\n**Status:** \u274c Error running diff\n"
-            f"*{_ts()} \u2014 {COMMENT_MARKER} [permanent]" + (f" [base:{base_sha[:8]}]" if base_sha else "") + "*"
+            f"{_human}"
+            f"*{_ts()} \u2014 {COMMENT_MARKER} [{_tok}]" + (f" [base:{base_sha[:8]}]" if base_sha else "") + "*"
         )
         try:
             upsert_comment(pr_id, err_body, existing_id, repo=repo)
@@ -9904,6 +10067,30 @@ def main_iteration():
         # Do NOT mass-FAILED all open PRs: a brief ArgoCD blip would flood every
         # PR with spurious FAILED statuses. Leave existing statuses intact and
         # let the next loop attempt recovery.
+        try:
+            argocd_login()
+        except Exception:
+            pass
+        return
+    if not path_map:
+        # COPS-2668: `argocd app list` exiting 0 with nothing annotated is a
+        # discovery FAILURE, not a clean fleet. discover_path_app_map only
+        # raises on rc!=0 and bad JSON, so an AppProject RBAC narrowing or a
+        # dropped/renamed `manifest-generate-paths` in the Application
+        # template returns {} perfectly normally — and {} means "no app
+        # matches any changed file" for every open PR at once, i.e. a
+        # SUCCESSFUL "No ArgoCD apps affected" with the decommission,
+        # VM-strip and disk-shrink panels never computed. The service would
+        # be at its most confident exactly when it knows least.
+        #
+        # Same handling as the raising branch above, and for the same reason:
+        # leave existing statuses alone rather than mass-FAILING every PR.
+        # _path_map_count is the previous inventory size, kept so the log can
+        # say whether we just lost a populated fleet or never had one.
+        logsink.log(f"ArgoCD discovery returned 0 annotated paths "
+                    f"(previous inventory: {_path_map_count} paths) — treating "
+                    f"as a discovery failure, not a clean fleet; no PR will be "
+                    f"commented this iteration", "ERROR")
         try:
             argocd_login()
         except Exception:

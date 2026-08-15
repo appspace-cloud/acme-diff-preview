@@ -19,6 +19,16 @@ import os
 import threading
 
 
+class ChartTreeUnreadable(OSError):
+    """A chart file could not be read, so no honest content key exists.
+
+    COPS-2668. Raised rather than hashing a placeholder: a key is a claim
+    about content, and a claim made over bytes we failed to read is exactly
+    the kind of confident-but-wrong answer the render cache must never give.
+    Callers treat it as a cache bypass and render fresh.
+    """
+
+
 # COPS-2646: memo for the chart tree digest. _main_render_content_key runs
 # it twice per app and it walks and reads the whole chart every time, which
 # measured ~22ms per call on an appspace-micro-services-sized tree -- about
@@ -103,8 +113,16 @@ def _hash_chart_tree(chart_path: str) -> bytes:
                         if not chunk:
                             break
                         h.update(chunk)
-            except OSError:
-                h.update(b"unreadable")
+            except OSError as e:
+                # COPS-2668: a fixed sentinel made two different unreadable
+                # trees hash identically -- and made an unreadable tree hash
+                # like one whose file literally contains the sentinel. That
+                # mints a confident, collidable render-cache key out of an I/O
+                # blip, which is the one thing this module's own docstring
+                # forbids: "Default to cache-miss on any doubt". Refuse to
+                # produce a key instead; the caller renders fresh.
+                raise ChartTreeUnreadable(
+                    f"cannot hash chart tree at {chart_path}: {rel}: {e}") from e
             h.update(b"\0")
     digest = h.digest()
 
