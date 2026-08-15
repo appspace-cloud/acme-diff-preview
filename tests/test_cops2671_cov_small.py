@@ -83,7 +83,6 @@ import comment_render as cr         # noqa: E402
 import diff_preview as m            # noqa: E402
 import grouping as g                # noqa: E402
 import render_profile as rp         # noqa: E402
-import schema_errors as se          # noqa: E402
 import version_fold as vfmod        # noqa: E402
 import vm_analysis as vma           # noqa: E402
 import vocabulary                   # noqa: E402
@@ -362,8 +361,10 @@ def test_a_resume_panel_is_reported_as_a_resume_not_a_pause():
     panel = [
         "### ▶️ Auto-sync RESUMED for `pv-qa88-a`",
         "",
-        "`appspace.autosync: false` was removed from this environment's "
-        "`customer.yaml`. Automated sync resumes for `pv-qa88-a-ss`.",
+        # One panel line, split for width -- parenthesised so it cannot be
+        # read (by a human or by CodeQL) as a list entry missing its comma.
+        ("`appspace.autosync: false` was removed from this environment's "
+         "`customer.yaml`. Automated sync resumes for `pv-qa88-a-ss`."),
         "",
     ]
     out = "\n".join(cr._build_merge_summary({}, {}, None, None, panel,

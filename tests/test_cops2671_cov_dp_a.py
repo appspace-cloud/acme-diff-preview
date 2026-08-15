@@ -261,7 +261,12 @@ class _UndeletableHints(dict):
     iterations. The peek side has to hold on its own.
     """
     def __delitem__(self, key):
-        raise RuntimeError("simulated failure while retiring the hint")
+        # KeyError, not RuntimeError: __delitem__ is contractually a
+        # LookupError site. The production handler is a bare `except
+        # Exception`, so this drives the identical path, and the message
+        # keeps the intent readable -- the key IS present here, so this is
+        # a simulated failure, not an absent-key miss.
+        raise KeyError("simulated failure while retiring the hint")
 
 
 @pytest.fixture()

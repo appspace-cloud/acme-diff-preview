@@ -35,7 +35,6 @@ import concurrent.futures as _cf
 import os
 import subprocess
 import sys
-from concurrent.futures import ThreadPoolExecutor
 
 import pytest
 
@@ -320,7 +319,7 @@ def test_without_a_pool_the_mirror_runs_inline_rather_than_being_lost(
     returns."""
     bucket = _FakeBucket().install(monkeypatch)
     monkeypatch.setattr(render_cache, "MAIN_RENDER_GCS_BUCKET", "durable-renders")
-    dead = ThreadPoolExecutor(max_workers=1)
+    dead = _cf.ThreadPoolExecutor(max_workers=1)
     dead.shutdown()
     monkeypatch.setattr(concurrency, "_get_subtask_pool", lambda: dead)
     key = "cops2671-inline"
@@ -426,7 +425,7 @@ def test_a_bucket_delete_failure_still_lets_the_audit_rewrite_the_entry(
         tiers, monkeypatch, logged):
     """The shadow audit discards then re-puts the corrected render. A bucket
     delete that raises must be logged and swallowed, so the repair completes."""
-    bucket = _FakeBucket().install(monkeypatch)
+    _FakeBucket().install(monkeypatch)
     monkeypatch.setattr(render_cache, "MAIN_RENDER_GCS_BUCKET", "durable-renders")
 
     def _boom(b, name):
