@@ -152,6 +152,7 @@ from comment_render import (  # comment rendering (same-dir module, stdlib only)
     _VERDICTS,
     _fmt_env_list,
     _build_merge_summary,
+    _DECOM_ORPHAN_HDR,
     _DECOM_PURGE_HDR,
     _DECOM_VM_STRIP_HDR,
     _SHUTDOWN_MIN_WORKLOADS,
@@ -5939,12 +5940,20 @@ def _evaluate_env_decommissions(candidates: list, pr_sha: str, main_sha: str,
             ]
         if not cascade:
             lines += [
-                "\u26a0\ufe0f **The ArgoCD Application is removed, but its resources "
-                "are NOT deleted — they keep running.** This environment has not "
-                "opted into cascade deletion, and the ApplicationSet sets "
-                "`preserveResourcesOnDeletion: true`, so every workload below is "
-                "left orphaned in the cluster: still running, still costing money, "
-                "still holding IPs and disks, and no longer managed by ArgoCD.",
+                # COPS-2668: _DECOM_ORPHAN_HDR is the sentinel the merge
+                # summary matches to tell this state from the cascade one.
+                "\u26a0\ufe0f " + _DECOM_ORPHAN_HDR + " — they keep running.**",
+                "",
+                # COPS-2668: split for the same reason as the VM-strip
+                # paragraph. As one line this ran 370 characters, over the
+                # 350-char prose-wall threshold the golden corpus guard
+                # enforces from 50 measured production comments -- and it
+                # was the newly-pinned orphan golden that surfaced it.
+                "This environment has not opted into cascade deletion, and "
+                "the ApplicationSet sets `preserveResourcesOnDeletion: true`, "
+                "so every workload below is left orphaned in the cluster: "
+                "still running, still costing money, still holding IPs and "
+                "disks, and no longer managed by ArgoCD.",
                 "",
                 "To delete them together with the Application, set "
                 "`appspace.decommission: true` in the environment's `customer.yaml` "
@@ -5993,7 +6002,15 @@ def _evaluate_env_decommissions(candidates: list, pr_sha: str, main_sha: str,
                 apps_str = ", ".join(f"`{w}`" for w in shown)
                 more = (f" *(+{len(workloads) - DECOM_WORKLOADS_MAX_SHOWN} more, truncated)*"
                         if len(workloads) > DECOM_WORKLOADS_MAX_SHOWN else "")
-                wl_label = ("**Applications removed:**" if cascade
+                # COPS-2668: the cascade side said "Applications removed" over
+                # a list of Deployment/StatefulSet/DaemonSet/CronJob/Job NAMES
+                # — pod controllers, not ArgoCD Applications. In a panel about
+                # deleting an environment, telling a reviewer that three
+                # Applications go when the names shown are workloads inside
+                # them invites exactly the wrong mental model of the blast
+                # radius. The orphan side one line below already called the
+                # same list what it is.
+                wl_label = ("**Workloads removed:**" if cascade
                             else "**Workloads left running:**")
                 lines.append(f"- {wl_label} {apps_str}{more}")
         if cascade and retained_counts:
@@ -7633,12 +7650,23 @@ def _summarize_appspace_state_changes(changed_files, pr_sha, base_sha, path_map,
         _strip_warning = [] if not _vm_broken else [
             _DECOM_VM_STRIP_HDR,
             "",
+            # COPS-2668: split into two paragraphs. As one sentence this ran
+            # 347 characters for the SHORTEST environment name in the test
+            # corpus and 369 for an ordinary production one like
+            # `pv-prod-corporate-westeurope-b`, so it crossed the 350-char
+            # prose-wall threshold that
+            # test_no_golden_comment_has_a_markdown_rendering_hazard exists to
+            # catch. That guard was written from 50 real merged comments; the
+            # most destructive panel in the service should not be the one
+            # producing the unreadable block.
             f"**This PR removes the Linux VM config for `{env_name}` in the "
-            f"same change that arms its deletion.** Helm stops rendering the "
-            f"VM resources the moment this merges, ArgoCD prunes them, and "
-            f"the live objects go out under their current "
-            f"`deletion-policy: abandon` — the real VM, its data disk and "
-            f"its reserved IP are **orphaned in the cloud, not deleted**.",
+            f"same change that arms its deletion.**",
+            "",
+            f"Helm stops rendering the VM resources the moment this merges, "
+            f"ArgoCD prunes them, and the live objects go out under their "
+            f"current `deletion-policy: abandon` — the real VM, its data "
+            f"disk and its reserved IP are **orphaned in the cloud, not "
+            f"deleted**.",
             "",
             "Stripped in this PR: " + ", ".join(
                 f"`{k[len('appspace.infra.'):]}`" for k in _stripped[:6])

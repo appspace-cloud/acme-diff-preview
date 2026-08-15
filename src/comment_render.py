@@ -221,6 +221,14 @@ _DECOM_VM_STRIP_HDR = ("## \U0001f5a5\u26d4 VM CONFIG STRIPPED WHILE "
 # purge is genuinely armed, so matching it cannot confuse the two.
 _DECOM_PURGE_HDR = "**DATA WILL BE PERMANENTLY DESTROYED.**"
 
+# COPS-2668: and a third state. The summary used to know only purge-vs-not,
+# so an environment with NO cascade armed — where the Applications go and
+# every workload keeps running, orphaned — was announced as "resources are
+# deleted", the exact opposite of the panel directly beneath it. Found by
+# reading the rendered orphan comment while preparing its golden.
+_DECOM_ORPHAN_HDR = ("**The ArgoCD Application is removed, but its resources "
+                     "are NOT deleted")
+
 
 _SEV_ROUTINE, _SEV_REVIEW, _SEV_BLOCK = 0, 1, 2
 _VERDICTS = {
@@ -281,13 +289,22 @@ def _build_merge_summary(results, rollup_by_sig, vm_change_lines,
         # also how COPS-2660 wired the VM-strip finding. One constant, written
         # by the producer, matched here.
         purge = _DECOM_PURGE_HDR in txt
+        orphan = _DECOM_ORPHAN_HDR in txt
+        if purge:
+            _what = ("data purge is ARMED: buckets/datasets are destroyed, "
+                     "not abandoned")
+        elif orphan:
+            # No cascade: the Applications go, every workload keeps running.
+            # Still a BLOCK \u2014 leaving a fleet of unmanaged workloads behind is
+            # not a safer outcome, just a different one \u2014 but saying they are
+            # "deleted" told the reviewer the opposite of what happens.
+            _what = ("no cascade armed: the Applications are removed but "
+                     "their workloads keep running, orphaned and unmanaged")
+        else:
+            _what = "resources are deleted; data is abandoned, not purged"
         findings.append((_SEV_BLOCK,
                          "\U0001f5d1\ufe0f **Environment decommission** \u2014 "
-                         + ("data purge is ARMED: buckets/datasets are "
-                            "destroyed, not abandoned"
-                            if purge else
-                            "resources are deleted; data is abandoned, "
-                            "not purged")))
+                         + _what))
     if vm_change_lines:
         hdr = vm_change_lines[0]
         if hdr == _VM_PANEL_DANGER_HDR:
