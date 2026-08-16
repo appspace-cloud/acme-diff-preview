@@ -104,7 +104,10 @@ def test_oci_not_found_shows_specific_chart_prominently(monkeypatch):
         "the specific missing chart:version must be visible in the comment, "
         "not hidden behind a generic hint"
     )
-    assert "**chart version not found in OCI registry**" in comment
+    # COPS-2676: top RENDER BLOCKED panel uses the uppercase label; the
+    # specific chart:version still has to be in the body.
+    assert ("CHART VERSION NOT FOUND" in comment
+            or "**chart version not found in OCI registry**" in comment)
 
 
 def test_other_indeterminate_reasons_unaffected(monkeypatch):

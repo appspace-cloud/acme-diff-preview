@@ -59,18 +59,25 @@ def _comment(results, **kw):
 
 def test_twenty_two_identical_failures_state_the_fix_once(monkeypatch):
     """The headline number from #4026: the same three lines of remediation
-    advice appeared 22 times. Once is the contract."""
+    advice appeared 22 times. Once is the contract.
+
+    COPS-2676 quiet mode keeps only the first Fix line on fleet failures
+    (the other two remedy lines were scroll noise next to the real error).
+    """
     monkeypatch.setattr(dp, "generate_ai_summary", lambda *a, **k: None)
     out = _comment(_fail_set(22))
     assert out.count("**Fix:** add the missing value") == 1
-    assert out.count("If this PR changed the chart version") == 1
     assert out.count("Chart template:") == 1
 
 
 def test_the_error_message_itself_is_stated_once(monkeypatch):
+    """COPS-2676: the message appears in Merge summary AND the RENDER
+    BLOCKED panel (error-first). That is two intentional surfaces, not
+    twenty-two repeats of the full block."""
     monkeypatch.setattr(dp, "generate_ai_summary", lambda *a, **k: None)
     out = _comment(_fail_set(22))
-    assert out.count("Missing Image Tag on => platform") == 1
+    assert out.count("Missing Image Tag on => platform") == 2
+    assert "RENDER BLOCKED" in out
 
 
 def test_the_comment_names_a_sample_and_accounts_for_the_rest(monkeypatch):
@@ -109,8 +116,11 @@ def test_two_distinct_errors_produce_two_groups(monkeypatch):
     results = _fail_set(5)
     results.update(_fail_set(3, err=ERR_OTHER, prefix="pv-other"))
     out = _comment(results)
-    assert out.count("Missing Image Tag on => platform") == 1
+    # Each distinct error: once in RENDER BLOCKED panel. The Merge summary
+    # headline names only the primary (largest) failure group.
+    assert out.count("Missing Image Tag on => platform") == 2
     assert out.count("Missing Registry on => core") == 1
+    assert "RENDER BLOCKED" in out
 
 
 def test_a_single_failure_renders_exactly_as_before(monkeypatch):
@@ -132,7 +142,7 @@ def test_errors_differing_only_in_noise_still_group(monkeypatch):
     results["pv-noise-a-ms"] = _res(ERR_4026 + "\n")
     results["pv-noise-b-ms"] = _res("  " + ERR_4026)
     out = _comment(results)
-    assert out.count("Missing Image Tag on => platform") == 1
+    assert out.count("Missing Image Tag on => platform") == 2
 
 
 # -- the two-surface contract (COPS-2612) ----------------------------------
@@ -145,7 +155,7 @@ def test_the_page_still_names_every_environment_separately(monkeypatch):
     page = _comment(_fail_set(22),
                     profile=dp.RenderProfile("page", is_complete_record=True,
                                               inline_diffs=True))
-    assert page.count("Missing Image Tag on => platform") == 22
+    assert page.count("Missing Image Tag on => platform") == 23  # 22 apps + merge summary
     assert page.count("**Fix:** add the missing value") == 22
 
 

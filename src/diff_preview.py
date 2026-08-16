@@ -8173,6 +8173,126 @@ def _comment_header(pr_sha: str) -> str:
     return f"**Commit** `{pr_sha[:8]}` \u2192 `main` | `{_repo_for_sha(pr_sha) or BB_REPO}`"
 
 
+# COPS-2676: when this many environments permanently fail to render, the
+# comment switches to error-first quiet mode — the failure panel is the
+# story; deletions / overview / routine bump narratives become noise.
+_FLEET_RENDER_QUIET_MIN_ENVS = 3
+
+
+def _short_permanent_error(r) -> str:
+    """One-line operator-facing reason for a permanent render failure."""
+    if not r or r.reason not in PERMANENT_REASONS:
+        return ""
+    if r.reason == REASON_MISSING_REQUIRED:
+        for line in _explain_required_error(r.error):
+            # "> **Missing Image Tag on => platform**" -> bare message
+            s = line.lstrip("> ").strip()
+            if s.startswith("**") and s.endswith("**"):
+                return s[2:-2].strip()
+            if s.startswith("**"):
+                return s.strip("*").split("**")[0].strip() or s
+        return "missing required value"
+    if r.reason == REASON_SCHEMA_INVALID:
+        for line in _explain_schema_error(r.error):
+            s = line.lstrip("> ").strip()
+            if s and not s.startswith("*"):
+                return s[:160]
+        return "values schema validation failed"
+    if r.reason == REASON_OCI_NOT_FOUND:
+        return (r.error or "chart version not found in OCI registry")[:160]
+    if r.reason == REASON_TEMPLATE:
+        lines = [l for l in (r.error or "").splitlines() if l.strip()]
+        return (lines[0] if lines else "template execution failed")[:160]
+    if r.reason == REASON_INVALID_YAML:
+        return "invalid YAML in values"
+    return (r.error or r.reason or "permanent render failure")[:160]
+
+
+def _permanent_failure_top_panel(results, failure_group_for_app, quiet: bool) -> list:
+    """Error-first panel(s) for permanent render failures (COPS-2676).
+
+    Emitted immediately under Merge summary so the operator sees what/where/fix
+    before deletions, overview tables, or bump narratives.
+    """
+    out = []
+    seen_reps = set()
+    # Stable order: grouped reps first (largest groups), then singles.
+    items = []
+    for app, r in results.items():
+        if r.outcome != OUT_INDETERMINATE or r.reason not in PERMANENT_REASONS:
+            continue
+        fgrp = failure_group_for_app.get(app)
+        if fgrp:
+            rep, members = fgrp[0], fgrp[1]
+            if rep in seen_reps:
+                continue
+            seen_reps.add(rep)
+            items.append((len(members), rep, members, results[rep]))
+        else:
+            items.append((1, app, [app], r))
+    items.sort(key=lambda t: (-t[0], t[1]))
+    if not items:
+        return out
+    out += ["## \u2699\ufe0f RENDER BLOCKED", ""]
+    for _n, rep, members, r in items:
+        short = _short_permanent_error(r)
+        if len(members) > 1:
+            out.append(
+                f"\u274c **{len(members)} environments cannot render** "
+                f"\u2014 \u2699\ufe0f **{_reason_panel_label(r.reason)}**")
+        else:
+            out.append(
+                f"\u274c **`{rep}`** \u2014 \u2699\ufe0f "
+                f"**{_reason_panel_label(r.reason)}**")
+        if r.reason == REASON_MISSING_REQUIRED:
+            out += _explain_required_error(r.error)
+            remedies = _missing_value_remedies()
+            out += remedies[:1] if quiet else remedies
+        elif r.reason == REASON_SCHEMA_INVALID:
+            out += _explain_schema_error(r.error)
+            if not quiet:
+                out += _schema_fix_hints(r.error)
+            out.append(
+                "> **Fix:** correct each value listed above in this "
+                "environment's `customer.yaml` (or the `config.yaml` of "
+                "its cohort or ring if every environment needs the fix).")
+        elif r.reason == REASON_OCI_NOT_FOUND and r.error:
+            out.append(f"> **{r.error}**")
+        elif r.reason == REASON_TEMPLATE:
+            out += _quote_helm_error(r.error)
+            out.append(
+                "> **Fix:** correct the value the error names in this "
+                "environment's `customer.yaml` (or cohort/ring "
+                "`config.yaml`).")
+        else:
+            if short:
+                out.append(f"> **{short}**")
+            out += _quote_helm_error(r.error)
+        if len(members) > 1:
+            out += ["", f"> {_fmt_service_list(members)}"]
+        out.append("")
+    if quiet:
+        out += [
+            "> *Other comment sections are collapsed while render is "
+            "blocked. Open the full-diff page for deletions / bumps / "
+            "per-app detail.*",
+            "",
+        ]
+    return out
+
+
+def _reason_panel_label(reason: str) -> str:
+    return {
+        REASON_MISSING_REQUIRED: "MISSING REQUIRED VALUE",
+        REASON_SCHEMA_INVALID: "SCHEMA VALIDATION FAILED",
+        REASON_TEMPLATE: "TEMPLATE EXECUTION FAILED",
+        REASON_OCI_NOT_FOUND: "CHART VERSION NOT FOUND",
+        REASON_INVALID_YAML: "INVALID YAML",
+        REASON_INVALID_VERSION: "INVALID VERSION",
+        REASON_NAME_TOO_LONG: "NAME TOO LONG",
+    }.get(reason, "RENDER FAILED")
+
+
 def _app_sort_key(app: str, r) -> tuple:
     """Deterministic ordering for both the overview table and the per-app
     section list (COPS-2579 item 5): anything worth a reviewer's attention
@@ -8274,18 +8394,34 @@ def format_comment(pr_sha, app_results, skipped_apps=None, base_sha="",
         for m in members:
             diff_group_for_app[m] = (rep_app, members, rep_r)
 
-    # COPS-2629: the same move for FAILURES, which the fingerprint grouping
-    # above never covered because a failed app has no diff to fingerprint.
-    # On acme-config-prod PR #4026 that gap cost 22 repetitions of one
-    # MISSING REQUIRED VALUE block, 52% of the comment.
-    #
-    # Empty on the page. is_complete_record means this surface IS the
-    # record, and "which environment failed and why" is precisely what a
-    # reader opens the page to answer, so it keeps one block per app. The
-    # comment is a decision aid and says it once.
+    # COPS-2629 / COPS-2676: group permanent failures for the comment (say
+    # once) and for the top banner on every surface. The per-app loop on
+    # the page (is_complete_record) still keeps one block per app.
+    failure_group_for_banner = _group_failures(results, tuple(PERMANENT_REASONS))
     failure_group_for_app = (
-        {} if profile.is_complete_record
-        else _group_failures(results, (REASON_MISSING_REQUIRED,)))
+        {} if profile.is_complete_record else failure_group_for_banner)
+
+    # COPS-2676: error-first quiet mode for fleet permanent render failures.
+    _blocked_apps = [
+        a for a, r in results.items()
+        if r.outcome == OUT_INDETERMINATE and r.reason in PERMANENT_REASONS]
+    _blocked_env_n = len(set(_envs_from_apps(_blocked_apps)))
+    quiet_render_block = (
+        (not profile.is_complete_record)
+        and _blocked_env_n >= _FLEET_RENDER_QUIET_MIN_ENVS
+    )
+    block_headline = ""
+    if _blocked_apps:
+        # Prefer a multi-member group's representative; else first blocked.
+        _pick = None
+        for a in sorted(_blocked_apps):
+            fg = failure_group_for_banner.get(a)
+            if fg and a == fg[0] and len(fg[1]) > 1:
+                _pick = a
+                break
+        if _pick is None:
+            _pick = sorted(_blocked_apps)[0]
+        block_headline = _short_permanent_error(results[_pick])
 
     # COPS-2629 part 2: same-SHAPE changes. The fingerprint grouping above
     # only catches byte-identical diffs, and on a fleet bump every diff
@@ -8408,8 +8544,18 @@ def format_comment(pr_sha, app_results, skipped_apps=None, base_sha="",
     # this PR is safe to merge, and only then reads down for the why.
     lines += _build_merge_summary(
         results, rollup_by_sig, vm_change_lines, decommission_lines,
-        appspace_state_lines, new_env_lines, new_env_structural, _paused_changing, _paused_envs)
+        appspace_state_lines, new_env_lines, new_env_structural,
+        _paused_changing, _paused_envs, block_headline=block_headline or None)
     lines += ["---", ""]
+
+    # COPS-2676: permanent render failures go FIRST after the verdict on the
+    # COMMENT. The full-diff page keeps one block per app (COPS-2629
+    # two-surface contract); duplicating a banner there would restate the
+    # same failure N+1 times.
+    if _blocked_apps and not profile.is_complete_record:
+        lines += _permanent_failure_top_panel(
+            results, failure_group_for_banner, quiet_render_block)
+        lines += ["---", ""]
 
     # ── Application state-flag warning (COPS-2584) ───────────────────
     # autosync pause/resume, decommission arm/disarm — shown before even the
@@ -8475,7 +8621,18 @@ def format_comment(pr_sha, app_results, skipped_apps=None, base_sha="",
     # warning: deterministic safety facts never depend on the model.
     all_deleted = [(app, hdr) for app, r in results.items()
                    for hdr in (r.deleted_resources or [])]
-    if all_deleted:
+    if all_deleted and quiet_render_block:
+        # COPS-2676: keep a one-line pointer; the render block is the story.
+        n_del = len(all_deleted)
+        lines += [
+            f"## \U0001f5d1\ufe0f {n_del} resource(s) also deleted "
+            f"(details collapsed while render is blocked)",
+            "",
+            (_full_hunks_link(artifact_url) if artifact_url else
+             "See the full-diff page for the deletion inventory."),
+            "",
+        ]
+    elif all_deleted:
         n_del = len(all_deleted)
         lines += [
             f"## \U0001f5d1\ufe0f\u26a0\ufe0f {n_del} RESOURCE(S) DELETED \u26a0\ufe0f",
@@ -8557,7 +8714,21 @@ def format_comment(pr_sha, app_results, skipped_apps=None, base_sha="",
         r.outcome in (OUT_DIFF, OUT_DECOMMISSIONED, OUT_INDETERMINATE,
                       OUT_ERROR)
         for r in results.values())
-    if _table_rendered:
+    if quiet_render_block and _table_rendered:
+        # COPS-2676: overview table is pure scroll on a fleet render miss.
+        _n_apps = sum(
+            1 for r in results.values()
+            if r.outcome in (OUT_DIFF, OUT_DECOMMISSIONED, OUT_INDETERMINATE,
+                             OUT_ERROR))
+        lines += [
+            f"#### Changeset overview collapsed ({_n_apps} apps) "
+            f"\u2014 render is blocked",
+            "",
+            (_full_hunks_link(artifact_url) if artifact_url else
+             "Open the full-diff page for the per-app table."),
+            "",
+        ]
+    elif _table_rendered:
         lines += [
             "#### Changeset overview",
             "",
@@ -8629,18 +8800,20 @@ def format_comment(pr_sha, app_results, skipped_apps=None, base_sha="",
     # One line per distinct transition (see _routine_bump_signature). The
     # folded apps stay in the overview table above and in every count;
     # only their duplicate diff blocks disappear.
-    for _sig in sorted(rollup_by_sig):
-        _grps = rollup_by_sig[_sig]
-        _apps_all = sorted(a for _g, _mem, _r in _grps for a in _mem)
-        _where = (f" \u2014 full diffs in the [full diff view]({artifact_url})"
-                  if artifact_url else
-                  " \u2014 see ArgoCD or the diff-preview full-diff view")
-        lines += [
-            f"> \u2b06\ufe0f **Routine version bump** {_routine_bump_label(_sig)} "
-            f"\u2014 **{len(set(_envs_from_apps(_apps_all)))} environments**: "
-            f"{_fmt_env_list(_apps_all)}{_where}",
-            "",
-        ]
+    # COPS-2676: skip under quiet render-block — bumps are not the story.
+    if not quiet_render_block:
+        for _sig in sorted(rollup_by_sig):
+            _grps = rollup_by_sig[_sig]
+            _apps_all = sorted(a for _g, _mem, _r in _grps for a in _mem)
+            _where = (f" \u2014 full diffs in the [full diff view]({artifact_url})"
+                      if artifact_url else
+                      " \u2014 see ArgoCD or the diff-preview full-diff view")
+            lines += [
+                f"> \u2b06\ufe0f **Routine version bump** {_routine_bump_label(_sig)} "
+                f"\u2014 **{len(set(_envs_from_apps(_apps_all)))} environments**: "
+                f"{_fmt_env_list(_apps_all)}{_where}",
+                "",
+            ]
 
     # ── Per-app diff sections ─────────────────────────────────────────
     # COPS-2579: no more arbitrary top-N inline cutoff. Every distinct
@@ -8690,6 +8863,11 @@ def format_comment(pr_sha, app_results, skipped_apps=None, base_sha="",
         elif r.outcome == OUT_INDETERMINATE:
             any_unknown = True
             unknown_apps.append(app)
+            # COPS-2676: the top RENDER BLOCKED panel already said this once
+            # on the comment. Keep per-app detail only on the full page.
+            if (not profile.is_complete_record
+                    and r.reason in PERMANENT_REASONS):
+                continue
             # COPS-2629: N environments failing the same way is one problem
             # with one fix. Grouped ONLY here, never on the page: the page
             # is where "which environment failed and why" is answered, so
@@ -8787,6 +8965,11 @@ def format_comment(pr_sha, app_results, skipped_apps=None, base_sha="",
                 # Folded into a routine-bump rollup line above: counted in
                 # every total and listed in the table, its duplicate diff
                 # block omitted.
+                continue
+            # COPS-2676: under quiet render-block, only risky diffs stay
+            # inline; routine bumps / same-shape noise hide behind the
+            # full-diff page.
+            if quiet_render_block and not _is_risky_result(rep_r):
                 continue
             # COPS-2629 part 2: N applications changing the same resources
             # is one statement. Placed AFTER total_changed above, so the

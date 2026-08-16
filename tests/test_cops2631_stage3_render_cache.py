@@ -52,7 +52,11 @@ def test_content_key_changes_when_chart_files_change(tmp_path):
     chart.mkdir()
     (chart / "Chart.yaml").write_text("name: demo\nversion: 1.0.0\n")
     before = m._main_render_content_key(str(chart), "rel", "ns", _vals())
-    (chart / "Chart.yaml").write_text("name: demo\nversion: 1.0.1\n")
+    # Size must change too: identity memo keys on (path, mtime_ns, size), and
+    # a same-length rewrite in the same second keeps the old digest (suite
+    # timing flake). Content change with a longer body forces a miss.
+    (chart / "Chart.yaml").write_text(
+        "name: demo\nversion: 1.0.1-changed-for-cache-key\n")
     after = m._main_render_content_key(str(chart), "rel", "ns", _vals())
     assert before != after
 
