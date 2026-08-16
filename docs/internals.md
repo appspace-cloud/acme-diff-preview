@@ -318,9 +318,11 @@ produces up to 248, protected the same way it always was by the per-body
 (`DISPLAY_BODY_MAX_CHARS`) and whole-comment (`MAX_COMMENT_BYTES`)
 truncation.
 
-The same grouped, complete comment body is what gets persisted to the
-full-diff web UI (see below), so the page shows the same complete picture
-without any extra work.
+COPS-2679: that collapse is COMMENT-only (`group_repeats=True`). The FULL
+page (`is_complete_record`, `group_repeats=False`) keeps one block per app
+so overview deep links (`#app-…`) and the Index cover every environment.
+Persisting a collapsed body made "see the full diff view" a dead end on
+fleet PRs like acme-config-prod #4316.
 
 
 ### Superseding an in-flight render
