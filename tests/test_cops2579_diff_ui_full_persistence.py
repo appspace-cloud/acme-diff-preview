@@ -8,12 +8,11 @@ sections per app and 6 apps inline, so the "full output" page was byte for
 byte identical to the truncated comment (measured on acme-config-prod PR
 #3837: 60 of 16616 real diff sections visible, in BOTH places).
 
-Once format_comment stores full (memory-bounded) sections per app and
-groups identical diffs instead of picking an arbitrary top-N, the SAME
-persistence mechanism automatically carries the complete content -- this
-test proves that end to end: build a large-PR-shaped body, persist it
-through the real diff_ui module, load it back, and confirm every group's
-full diff and every affected app name is present in the stored artifact.
+Once format_comment stores full (memory-bounded) sections per app, the
+persisted artifact carries the complete content. COPS-2679: the page no
+longer collapses byte-identical fleets into one representative — every
+affected app gets its own block and Index anchor so comment deep links
+work. COMMENT profile still groups (COPS-2579 item 2).
 """
 import os
 import sys
@@ -28,7 +27,7 @@ import diff_preview as m
 import diff_ui
 
 
-def _make_shared_change_body(n_apps=200, n_resources=67):
+def _make_shared_change_body(n_apps=200, n_resources=67, readable_budget=0):
     """Simulate the acme-config-prod PR #3837 shape: n_apps environments,
     all sharing the exact same n_resources-resource change."""
     sections = [
@@ -50,7 +49,7 @@ def _make_shared_change_body(n_apps=200, n_resources=67):
     # so it is built complete. A collapsed artifact would make that link a
     # dead end -- which is the regression this assertion now also guards.
     return m.format_comment("a" * 40, results, base_sha="b" * 40,
-                            readable_budget=0)
+                            readable_budget=readable_budget)
 
 
 def test_diff_ui_artifact_contains_the_full_diff_for_every_app(monkeypatch):
@@ -79,5 +78,17 @@ def test_diff_ui_artifact_contains_the_full_diff_for_every_app(monkeypatch):
         f"resources missing from persisted artifact: {missing_resources[:5]}... "
         f"({len(missing_resources)} of 67 missing)")
 
-    # And it must say so as ONE group, not 200 individual diff dumps.
-    assert "Identical diff across **200 environments**" in stored_body
+    # COPS-2679: the page keeps one block per app (not one Identical group).
+    assert "Identical diff across" not in stored_body
+    assert stored_body.count("resource(s) changed") == 200
+    outline = diff_ui.build_outline(stored_body)
+    assert len(outline) == 200
+
+
+def test_comment_still_groups_identical_fleet(monkeypatch):
+    """COPS-2579 item 2 must still collapse the Bitbucket comment."""
+    monkeypatch.setattr(m, "generate_ai_summary", lambda *a, **k: None)
+    body = _make_shared_change_body(
+        n_apps=50, n_resources=3, readable_budget=None)
+    assert "Identical diff across **50 environments**" in body
+    assert body.count("resource(s) changed") == 1

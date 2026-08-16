@@ -145,6 +145,8 @@ class RenderProfile:
     # page. None = COMMENT_INPUT_PANEL at render time.
     input_panel: bool = None
     # Collapse byte-identical apps into one representative (COPS-2579).
+    # False on the FULL page (COPS-2679): format_comment honours this so
+    # every environment keeps its own block and Index/#app- anchor.
     group_repeats: bool = True
     # Fold version-transition noise so needles stay visible (COPS-2606).
     version_fold: bool = True

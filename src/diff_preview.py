@@ -8471,7 +8471,19 @@ def format_comment(pr_sha, app_results, skipped_apps=None, base_sha="",
     # DiffResult), so the per-app loop below can render each group exactly
     # once, at the representative's sorted position, and skip every other
     # member without leaving a gap.
-    diff_groups = _group_changed_apps_by_fingerprint(changed_apps)
+    #
+    # COPS-2679: the FULL page (group_repeats=False / is_complete_record)
+    # keeps one block per app — same contract as shape/failure grouping
+    # already honour on the page. Comment collapse stays for scannability;
+    # collapsing the artifact left dead #app- deep links and a truncated
+    # "Identical … (+N more)" roster (acme-config-prod #4316).
+    if profile.group_repeats:
+        diff_groups = _group_changed_apps_by_fingerprint(changed_apps)
+    else:
+        diff_groups = [
+            (app, [app], r)
+            for app, r in sorted(changed_apps, key=lambda kv: kv[0])
+        ]
     diff_group_for_app = {}
     for rep_app, members, rep_r in diff_groups:
         for m in members:
