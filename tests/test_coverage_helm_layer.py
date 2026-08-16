@@ -285,7 +285,7 @@ def test_run_one_diff_detects_a_real_change(diff_world, monkeypatch):
     monkeypatch.setattr(m, "_fetch_value_files",
                         _values_by_sha("replicas_marker: 3", "replicas_marker: 2"))
     out = m._run_one_diff(APP, "prsha0000001", "mainsha00001")
-    diff_text, reason, detail, version_change = out
+    diff_text, reason, detail, version_change, *_rest = out
     assert reason is None and detail is None
     assert "=====" in diff_text and "Deployment" in diff_text, \
         "the diff must carry resource section headers"
@@ -298,7 +298,7 @@ def test_run_one_diff_identical_renders_report_no_diff(diff_world, monkeypatch):
     monkeypatch.setattr(m, "HELM_BIN", helm)
     monkeypatch.setattr(m, "_fetch_value_files",
                         _values_by_sha("replicas_marker: 2", "replicas_marker: 2"))
-    diff_text, reason, detail, version_change = m._run_one_diff(
+    diff_text, reason, detail, version_change, *_rest = m._run_one_diff(
         APP, "prsha0000001", "mainsha00002")
     assert reason is None and diff_text == "", "identical renders must diff to empty"
 
@@ -328,7 +328,7 @@ def test_run_one_diff_version_change_is_reported(diff_world, monkeypatch):
                         _values_by_sha("replicas_marker: 2", "replicas_marker: 2"))
     out = m._run_one_diff(APP, "prsha0000001", "mainsha00005",
                           chart_revision="2604.0.0")
-    diff_text, reason, detail, version_change = out
+    diff_text, reason, detail, version_change, *_rest = out
     assert version_change == ("2603.0.1", "2604.0.0")
 
 

@@ -93,7 +93,7 @@ def test_shutdown_stats_count_zeroed_against_total_workloads():
         ("/apps/StatefulSet c", _added_zero()),
     ]
     stats = m._detect_workload_shutdown(sections)
-    assert stats == {"zeroed": 3, "workloads": 3}
+    assert stats == {"zeroed": 3, "workloads": 3, "hpas_remaining": 0}
 
 
 def test_shutdown_stats_partial_when_one_workload_survives():
@@ -102,7 +102,7 @@ def test_shutdown_stats_partial_when_one_workload_survives():
         ("/apps/Deployment b", _scaled_up()),
     ]
     stats = m._detect_workload_shutdown(sections)
-    assert stats == {"zeroed": 1, "workloads": 2}
+    assert stats == {"zeroed": 1, "workloads": 2, "hpas_remaining": 0}
 
 
 def _result(sections, zeroed=None, stats=None):

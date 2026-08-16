@@ -33,10 +33,12 @@ ARMED_PURGE = ARMED + "  decommissionPurgeData: true\n"
 NOT_ARMED = "appspace:\n  customerName: pv-audit\n"
 ARMED_VMS_OK = (ARMED +
     "  infra:\n    deployLinuxServicesK8s:\n      defaults:\n"
-    "        allowDeletion: true\n")
+    "        allowDeletion: true\n"
+    "      svc:\n        enabled: true\n")
 ARMED_VMS_NOT_OK = (ARMED +
     "  infra:\n    deployLinuxServicesK8s:\n      defaults:\n"
-    "        size: e2-small\n")
+    "        size: e2-small\n"
+    "      svc:\n        enabled: true\n")
 
 DEPLOY_DOC = ("kind: Deployment\napiVersion: apps/v1\nmetadata:\n"
               "  name: web\nspec:\n  replicas: 2\n")
@@ -60,8 +62,11 @@ def _candidate():
 def _fetch_table(monkeypatch, base_content):
     table = {(_ID, "prsha"): (None, m.BB_NOT_FOUND),
              (_ID, "mainsha"): (base_content, m.BB_OK)}
-    monkeypatch.setattr(m, "_bb_fetch_cached",
-                        lambda f, sha, repo=None: table[(f, sha)])
+    def fetch(f, sha, repo=None):
+        # COPS-2677: Phase 1 walks ancestor config.yaml; missing parents
+        # are ignoreMissingValueFiles-shaped (not found), not KeyError.
+        return table.get((f, sha), (None, m.BB_NOT_FOUND))
+    monkeypatch.setattr(m, "_bb_fetch_cached", fetch)
 
 
 def _env(monkeypatch, base_content, resources=RESOURCES):

@@ -11,6 +11,7 @@ from the service and must stay that way.
 import re
 
 import diff_ui
+from manifest import _is_kcc_blocking_artifact
 from vocabulary import (
     OUT_DIFF,
     OUT_ERROR,
@@ -369,50 +370,96 @@ def _build_merge_summary(results, rollup_by_sig, vm_change_lines,
         findings.append((_SEV_REVIEW,
                          f"\u2b07\ufe0f **Chart version downgrade** {_dg} in "
                          f"{_fmt_env_list(downgraded)}"))
-    # COPS-2632: a rendered `%!s(<nil>)` or `<no value>` is a value the chart
-    # read and this environment does not set. Live proof: pv-stage1-a shipped
-    # `hosting-id: hst-%!s(<nil>)` and KCC rejected every Compute* resource
-    # afterwards, while this summary called the PR routine.
+    # COPS-2632 / COPS-2677: a rendered `%!s(<nil>)` or `<no value>` is a
+    # value the chart read and this environment does not set. Live proof:
+    # pv-stage1-a shipped `hosting-id: hst-%!s(<nil>)` and KCC rejected every
+    # Compute* resource afterwards, while this summary called the PR routine.
     #
-    # Reported, NOT blocking, and the distinction is deliberate. The chart is
-    # the authority on what a value must be: `required` means the author
-    # decided the render cannot proceed without it, and that already blocks
-    # through REASON_MISSING_REQUIRED / PERMANENT_REASONS. A field left with
-    # `| default` or with no guard at all is the author saying the opposite,
-    # and a tool that overrides that judgement blocks merges the chart is
-    # happy to render. The reviewer still needs to see it, because helm exits
-    # 0 and the diff otherwise looks ordinary - so it is a REVIEW item that
-    # names the resources, not a verdict of its own.
+    # Severity is scoped on purpose (2.47 global BLOCK → 2.48 REVIEW → 2.88
+    # COPS-2677 scoped BLOCK). The chart is still the authority for ordinary
+    # fields (`required` → REASON_MISSING_REQUIRED). ConfigMap/Deployment
+    # artifacts stay REVIEW. KCC Compute* artifacts BLOCK and fail the build:
+    # that is the class KCC actually rejected in production.
     artifact_apps = sorted(a for a, r in results.items()
                            if getattr(r, "template_artifacts", None))
     if artifact_apps:
-        n_res = sum(len(results[a].template_artifacts) for a in artifact_apps)
-        findings.append((_SEV_REVIEW,
-                         "\U0001f9ec **Unresolved chart value** \u2014 "
-                         f"{n_res} resource(s) render `%!s(<nil>)` or "
-                         f"`<no value>` in {_fmt_env_list(artifact_apps)}. "
-                         "The chart read a value this environment does not "
-                         "set. Check it is intended: the chart does not mark "
-                         "it `required`, so nothing failed the render."))
+        block_apps, review_apps = [], []
+        for a in artifact_apps:
+            arts = results[a].template_artifacts or []
+            if any(_is_kcc_blocking_artifact(h) for h in arts):
+                block_apps.append(a)
+            else:
+                review_apps.append(a)
+        if block_apps:
+            n_res = sum(
+                sum(1 for h in (results[a].template_artifacts or [])
+                    if _is_kcc_blocking_artifact(h))
+                for a in block_apps)
+            findings.append((_SEV_BLOCK,
+                             "\U0001f9ec **Unresolved KCC value** \u2014 "
+                             f"{n_res} Compute* resource(s) render "
+                             f"`%!s(<nil>)` or `<no value>` in "
+                             f"{_fmt_env_list(block_apps)}. KCC rejects these "
+                             "labels/fields in the cluster (COPS-2632). Set "
+                             "the missing value (usually `appspace.hostingID`) "
+                             "before merging."))
+        if review_apps:
+            n_res = sum(len(results[a].template_artifacts)
+                        for a in review_apps)
+            findings.append((_SEV_REVIEW,
+                             "\U0001f9ec **Unresolved chart value** \u2014 "
+                             f"{n_res} resource(s) render `%!s(<nil>)` or "
+                             f"`<no value>` in {_fmt_env_list(review_apps)}. "
+                             "The chart read a value this environment does not "
+                             "set. Check it is intended: the chart does not "
+                             "mark it `required`, so nothing failed the "
+                             "render."))
 
     # An environment going fully dark and a single service being scaled down
     # are different events. Both used to render as "Replicas scaled to zero",
     # and on acme-config-dev PR #7063 the whole-environment case did not
     # render at all (see _replicas_end_state). A reviewer needs the shutdown
     # stated as a shutdown, in the summary, not inferred from a resource count.
+    #
+    # COPS-2677: leftover HPAs under zeroPods are REVIEW, not BLOCK. After
+    # COPS-2548 AppSet stopped ignoring Deployment /spec/replicas, chart
+    # `replicas: 0` reaches the cluster and HPA usually idles at zero
+    # (ScalingDisabled). Blocking every hibernation PR that still has HPA
+    # enabled would false-stop merges that work today. The chart gate that
+    # skips hpa.yaml under zeroPods is the cleanup; here we only shout.
     zeroed_apps = sorted(a for a, r in results.items() if r.replicas_zeroed)
     shutdown_apps = [a for a in zeroed_apps
                      if _is_env_shutdown(results[a])]
     partial_apps = [a for a in zeroed_apps if a not in set(shutdown_apps)]
-    if shutdown_apps:
+    hpa_note_apps = [
+        a for a in shutdown_apps
+        if (getattr(results[a], "shutdown_stats", None) or {}).get(
+            "hpas_remaining", 0) > 0
+    ]
+    clean_shutdown_apps = [a for a in shutdown_apps
+                           if a not in set(hpa_note_apps)]
+    if hpa_note_apps:
+        n_hpa = sum(
+            (results[a].shutdown_stats or {}).get("hpas_remaining", 0)
+            for a in hpa_note_apps)
+        findings.append((_SEV_REVIEW,
+                         "\U0001f6d1 **Environment shutting down** \u2014 "
+                         f"every workload scaled to 0 in "
+                         f"{_fmt_env_list(hpa_note_apps)}, and "
+                         f"{n_hpa} HorizontalPodAutoscaler(s) remain in "
+                         "desired. Hibernation still applies `replicas: 0` "
+                         "(COPS-2548); leftover HPAs can fight a later "
+                         "scale-up. Prefer a chart that skips HPA under "
+                         "`appspace.zeroPods` (COPS-2677)."))
+    if clean_shutdown_apps:
         n_workloads = sum(results[a].shutdown_stats["workloads"]
-                          for a in shutdown_apps)
+                          for a in clean_shutdown_apps)
         findings.append((_SEV_REVIEW,
                          "\U0001f6d1 **Environment shutting down** \u2014 "
                          f"every workload ({n_workloads}) scaled to 0 in "
-                         f"{_fmt_env_list(shutdown_apps)}. `appspace.zeroPods` "
-                         "hibernates the environment: nothing will be running "
-                         "after this merges."))
+                         f"{_fmt_env_list(clean_shutdown_apps)}. "
+                         "`appspace.zeroPods` hibernates the environment: "
+                         "nothing will be running after this merges."))
     if partial_apps:
         findings.append((_SEV_REVIEW,
                          "\U0001f9ca **Replicas scaled to zero** in "

@@ -164,16 +164,18 @@ def _decommission_phase_table(vm_state, cascade_state, removal_state,
     if purge and purge_this_pr:
         purge_note = (" \u2014 \u2b05 **this PR arms `decommissionPurgeData`**, "
                       "so the cascade will **permanently destroy** the BigQuery "
-                      "dataset and the user content bucket, not just abandon "
-                      "them")
+                      "dataset and the user content bucket (soft-delete off on "
+                      "content; backup bucket always abandoned), not just "
+                      "abandon them")
     elif purge:
         purge_note = (" \u2014 with `decommissionPurgeData` armed the cascade "
                       "will **permanently destroy** the BigQuery dataset and "
-                      "the user content bucket, not just abandon them")
+                      "the user content bucket (soft-delete off on content; "
+                      "backup bucket always abandoned), not just abandon them")
     else:
         purge_note = (" \u2014 `decommissionPurgeData` is not armed, so the "
                       "BigQuery dataset and the content bucket are abandoned "
-                      "and stay recoverable")
+                      "and stay recoverable (backup bucket is always abandoned)")
     # The pointer to the inventory only makes sense while Phase 3 is still
     # ahead of the reviewer; on the removal PR itself they are already
     # looking at that inventory.

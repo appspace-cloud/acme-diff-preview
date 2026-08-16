@@ -139,22 +139,28 @@ def _summary(results):
     return "\n".join(m._build_merge_summary(results, {}, [], [], [], [], None))
 
 
-def test_artifacts_are_reported_but_do_not_block():
-    """Operator decision: the chart is the authority on what is mandatory.
-
-    `required` means the author decided the render cannot proceed without the
-    value, and that already blocks through REASON_MISSING_REQUIRED. A field
-    left with `| default` or no guard is the author saying the opposite, so
-    overriding that here would block merges the chart is happy to render.
-    The reviewer still has to see it, because helm exits 0.
+def test_non_kcc_artifacts_are_reported_but_do_not_block():
+    """Operator decision (2.48.0, kept for non-KCC in COPS-2677): the chart
+    is the authority on ordinary fields. `required` already blocks via
+    REASON_MISSING_REQUIRED. ConfigMap/Deployment artifacts stay REVIEW.
+    KCC Compute* artifacts BLOCK — see test_cops2677_critical_gaps.
     """
-    secs = [("/compute.cnrm.cloud.google.com/ComputeInstance vm-a",
-             _added("    hosting-id: hst-%!s(<nil>)"))]
+    secs = [("/v1/ConfigMap app",
+             _added("    tenant: <no value>"))]
     out = _summary({"pv-stage1-a-ss": _result(secs, [secs[0][0]])})
     assert "Unresolved chart value" in out, out
     assert "DO NOT MERGE" not in out, out
     assert "Review before merging" in out, out
     assert "nothing dangerous detected" not in out
+
+
+def test_kcc_compute_artifacts_do_block():
+    """COPS-2677: scoped re-block for the COPS-2632 failure class only."""
+    secs = [("/compute.cnrm.cloud.google.com/ComputeInstance vm-a",
+             _added("    hosting-id: hst-%!s(<nil>)"))]
+    out = _summary({"pv-stage1-a-ss": _result(secs, [secs[0][0]])})
+    assert "Unresolved KCC value" in out, out
+    assert "DO NOT MERGE" in out, out
 
 
 def test_a_real_helm_required_failure_still_blocks():

@@ -72,13 +72,34 @@ def _detect_replicas_zeroed(sections: list) -> list:
     return zeroed
 
 
-def _detect_workload_shutdown(sections: list):
-    """{"zeroed": n, "workloads": total} over the workload sections, or None.
+def _count_hpas_remaining(pr_resources) -> int:
+    """How many HorizontalPodAutoscaler resources the PR-side render still
+    wants. Used with full-env shutdown: flipping `zeroPods` zeroes Deployments
+    but historically left HPAs unchanged, so they never appear in the unified
+    diff and a REVIEW-only "shutting down" finding looked complete (COPS-2677).
+    """
+    if not pr_resources:
+        return 0
+    n = 0
+    for key in pr_resources:
+        type_key = key[0] if isinstance(key, tuple) else str(key)
+        if "HorizontalPodAutoscaler" in type_key:
+            n += 1
+    return n
+
+
+def _detect_workload_shutdown(sections: list, pr_resources=None,
+                               hpas_remaining=None):
+    """{"zeroed", "workloads", "hpas_remaining"} over workload sections, or None.
 
     The ratio is what separates "one service was scaled down" from "this
     environment is being switched off", and the two deserve different
     wording in the merge summary. Counted here, pre-cap, alongside the other
     safety facts.
+
+    `hpas_remaining` comes from the full PR-side resource map (not the diff):
+    unchanged HPAs are invisible in unified diffs. Pass either `pr_resources`
+    or an already-counted `hpas_remaining` int from `_run_one_diff`.
     """
     total = zeroed = 0
     for header, body in sections:
@@ -90,7 +111,10 @@ def _detect_workload_shutdown(sections: list):
             zeroed += 1
     if not total:
         return None
-    return {"zeroed": zeroed, "workloads": total}
+    if hpas_remaining is None:
+        hpas_remaining = _count_hpas_remaining(pr_resources)
+    return {"zeroed": zeroed, "workloads": total,
+            "hpas_remaining": int(hpas_remaining or 0)}
 
 
 # ── VM-domain (KCC linux-services) risk detection ────────────────────

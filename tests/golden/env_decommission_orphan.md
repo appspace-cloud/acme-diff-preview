@@ -19,7 +19,7 @@
 | Phase | State | What it does |
 |-------|-------|--------------|
 | **Phase 1 — arm VM deletion** | — not applicable | this environment declares no `deployLinuxServicesK8s` VMs, so there is nothing to arm |
-| **Phase 2 — arm cascade** | ⬜ pending | `appspace.decommission` makes the Applications eligible for the cascade-delete finalizer — `decommissionPurgeData` is not armed, so the BigQuery dataset and the content bucket are abandoned and stay recoverable |
+| **Phase 2 — arm cascade** | ⬜ pending | `appspace.decommission` makes the Applications eligible for the cascade-delete finalizer — `decommissionPurgeData` is not armed, so the BigQuery dataset and the content bucket are abandoned and stay recoverable (backup bucket is always abandoned) |
 | **Phase 3 — remove folder** | ✅ **this PR** | deletes the Applications and every resource they manage, Config Connector cloud resources included — the destructive step, and this PR is it |
 
 ⚠️ **The ArgoCD Application is removed, but its resources are NOT deleted — they keep running.**
