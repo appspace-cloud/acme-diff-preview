@@ -517,7 +517,7 @@ def test_shadow_audit_heals_a_drifted_cache_entry_within_the_same_diff(
     monkeypatch.setattr(logsink, "log",
                         lambda msg, sev="INFO", **k: logged.append((sev, msg)))
 
-    diff_text, reason, detail, _vc = m._run_one_diff(APP, PR_SHA, MAIN_SHA)
+    diff_text, reason, detail, *_rest = m._run_one_diff(APP, PR_SHA, MAIN_SHA)
     assert reason is None and "replicas: 2" in diff_text
     assert helm.main_calls == 1, "run 1 is a cache miss and must render main once"
 
@@ -531,7 +531,7 @@ def test_shadow_audit_heals_a_drifted_cache_entry_within_the_same_diff(
     before = _mismatches()
     helm.main_yaml = _manifest(9)          # the cached bytes are now wrong
 
-    diff_text, reason, detail, _vc = m._run_one_diff(APP, PR_SHA, MAIN_SHA)
+    diff_text, reason, detail, *_rest = m._run_one_diff(APP, PR_SHA, MAIN_SHA)
 
     assert reason is None, detail
     assert helm.main_calls == 2, "the sampled hit must be re-rendered for audit"
@@ -572,7 +572,7 @@ def test_shadow_audit_leaves_a_matching_entry_alone(shadow_world):
     m._run_one_diff(APP, PR_SHA, MAIN_SHA)
     before = _mismatches()
 
-    diff_text, reason, _d, _vc = m._run_one_diff(APP, PR_SHA, MAIN_SHA)
+    diff_text, reason, _d, *_rest = m._run_one_diff(APP, PR_SHA, MAIN_SHA)
 
     assert reason is None
     assert helm.main_calls == 2, "the hit is still audited"
@@ -618,7 +618,7 @@ def test_shadow_audit_failure_never_fails_the_diff(shadow_world, monkeypatch, mo
         helm.main_err_yaml = _manifest(9)
         helm.main_err = "Error: template: appspace-ms/deploy.yaml:7: nil pointer"
 
-    diff_text, reason, detail, _vc = m._run_one_diff(APP, PR_SHA, MAIN_SHA)
+    diff_text, reason, detail, *_rest = m._run_one_diff(APP, PR_SHA, MAIN_SHA)
 
     assert reason is None, f"the audit must not fail the diff: {detail}"
     assert helm.main_calls == 2, "the audit really did re-render (and fail)"

@@ -19,10 +19,12 @@
 | Phase | State | What it does |
 |-------|-------|--------------|
 | **Phase 1 — arm VM deletion** | — not applicable | this environment declares no `deployLinuxServicesK8s` VMs, so there is nothing to arm |
-| **Phase 2 — arm cascade** | ✅ **done** | `appspace.decommission` makes the Applications eligible for the cascade-delete finalizer — with `decommissionPurgeData` armed the cascade will **permanently destroy** the BigQuery dataset and the user content bucket, not just abandon them |
+| **Phase 2 — arm cascade** | ✅ **done** | `appspace.decommission` makes the Applications eligible for the cascade-delete finalizer — with `decommissionPurgeData` armed the cascade will **permanently destroy** the BigQuery dataset and the user content bucket (soft-delete off on content; backup bucket always abandoned), not just abandon them |
 | **Phase 3 — remove folder** | ✅ **this PR** | deletes the Applications and every resource they manage, Config Connector cloud resources included — the destructive step, and this PR is it |
 
-🚨 **DATA WILL BE PERMANENTLY DESTROYED.** This environment also has `appspace.decommissionPurgeData: true`, so Config Connector empties and deletes the BigQuery dataset and the user content bucket as part of the cascade. **That data is not recoverable afterwards.** Only the content backup bucket is deliberately left behind.
+🚨 **DATA WILL BE PERMANENTLY DESTROYED.** This environment also has `appspace.decommissionPurgeData: true`, so Config Connector empties and deletes the BigQuery dataset and the user content bucket as part of the cascade. **That data is not recoverable afterwards.**
+
+Soft-delete on the **content** bucket is turned off (`softDeletePolicy.retentionDurationSeconds: 0`) so `force-destroy` can complete. The **content backup** bucket always keeps `deletion-policy: abandon` and is left behind on purpose — destroy it by hand after Phase 3 if needed.
 
 - **Resources that will be removed:** 6 total — 3 Service, 3 apps/Deployment
 - **Workloads removed:** `pv-foo-c-glb-web`, `pv-foo-c-ms-web`, `pv-foo-c-ss-web`

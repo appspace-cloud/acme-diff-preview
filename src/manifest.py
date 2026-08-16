@@ -278,6 +278,26 @@ def _detect_template_artifacts(sections: list) -> list:
     return hit
 
 
+# KCC Compute* kinds that rejected `hosting-id: hst-%!s(<nil>)` live
+# (COPS-2632). Global BLOCK on every artifact was shipped in 2.47.0 and
+# rolled back to REVIEW in 2.48.0: the chart is the authority on what is
+# required. COPS-2677 re-blocks only this class — the API/KCC reject path
+# that actually broke linux-services — and leaves ConfigMap/Deployment
+# artifacts as REVIEW.
+_KCC_BLOCKING_ARTIFACT_KINDS = (
+    "ComputeInstance", "ComputeDisk", "ComputeAddress",
+    "ComputeFirewall", "ComputeForwardingRule",
+    "ComputeNetwork", "ComputeSubnetwork", "ComputeRoute",
+)
+
+
+def _is_kcc_blocking_artifact(header: str) -> bool:
+    """True when a template-artifact header is a KCC Compute* resource."""
+    if "cnrm.cloud.google.com" not in header:
+        return False
+    return any(k in header for k in _KCC_BLOCKING_ARTIFACT_KINDS)
+
+
 def _diff_resources(main_res: dict, pr_res: dict) -> str:
     """Diff two pre-parsed resource dicts (from _parse_manifest_resources).
 

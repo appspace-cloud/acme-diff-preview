@@ -207,6 +207,7 @@ from vm_analysis import (  # VM/KCC infrastructure analysis (same-dir module)
     _replicas_end_state,
     _detect_replicas_zeroed,
     _detect_workload_shutdown,
+    _count_hpas_remaining,
     _VM_KINDS,
     _VM_DELETION_POLICY_KEY,
     _VM_TRACKED_FIELDS,
@@ -258,6 +259,7 @@ from manifest import (  # rendered-manifest parsing and resource diffing
     _detect_created_resources,
     _TEMPLATE_ARTIFACT_RE,
     _detect_template_artifacts,
+    _is_kcc_blocking_artifact,
     _diff_resources,
     _DECOM_WORKLOAD_KINDS,
     _summarize_resources_dict,
@@ -2618,11 +2620,13 @@ DiffResult = namedtuple("DiffResult",
                                   None, None])
 # template_artifacts: headers whose applied side renders `%!s(<nil>)` or
 # `<no value>` - a value the chart read and this environment does not set.
-# Blocking: the API server and KCC reject these exactly as reliably in the
-# cluster as here (COPS-2632).
-# shutdown_stats: {"zeroed": n, "workloads": total} for this app, counted on
-# the full pre-cap section list. Distinguishes an environment being switched
-# off (every workload at zero) from a single service scaled down.
+# KCC Compute* headers BLOCK the merge (COPS-2677 / COPS-2632); other kinds
+# stay REVIEW so the chart remains authority on unguarded fields (2.48.0).
+# shutdown_stats: {"zeroed": n, "workloads": total, "hpas_remaining": n}
+# for this app, counted on the full pre-cap section list (+ PR-side resource
+# map for HPAs). Distinguishes an environment being switched off (every
+# workload at zero) from a single service scaled down, and surfaces zeroPods
+# + leftover HPA coexistence (COPS-2677).
 # vm_changes: structured facts about KCC linux-services (VM) resources this
 # diff touches, extracted by _detect_vm_changes on the FULL pre-cap section
 # list (same design as deleted_resources: safety facts never depend on
@@ -5785,41 +5789,89 @@ def _decommission_purges_data(identity_file: str, main_sha: str) -> bool:
             and str(flat.get("appspace.decommissionPurgeData", "")).lower() == "true")
 
 
+def _merged_kcc_flat_for_env(identity_file: str, sha: str,
+                             repo: str = None) -> dict:
+    """Flattened appspace values for an env: ancestor config.yaml chain +
+    identity file, last-wins (same order live Helm uses).
+
+    COPS-2677: Phase 1 arming used to read the identity file alone, so a
+    `deployLinuxServicesK8s.svc.enabled: true` declared only on a parent
+    cohort/region config looked like "no VMs" and folder-delete PRs could
+    pass as fully phased while cloud VMs still carried abandon. Parents also
+    carry SA emails / snapshotPolicies without enabling any role — callers
+    must use `_kcc_enabled_roles` on this merge, not prefix-any-key.
+    """
+    env_dir = identity_file.rsplit("/", 1)[0]
+    ancestors = []
+    probe = env_dir
+    while "/" in probe:
+        probe = probe.rsplit("/", 1)[0]
+        ancestors.append(f"{probe}/config.yaml")
+    ancestors.reverse()
+    merged = {}
+    for path in ancestors + [identity_file]:
+        content, status = _bb_fetch_cached(path, sha, repo=repo)
+        if status != BB_OK or not content:
+            continue
+        try:
+            flat = _flatten_yaml(_yaml_safe_load(content) or {})
+        except Exception:
+            continue
+        merged.update(flat)
+    return merged
+
+
+def _env_declares_live_kcc_vms(identity_file: str, sha: str,
+                               repo: str = None) -> tuple:
+    """(declares_live_vms, allowDeletion_armed) from the merged hierarchy.
+
+    Live VMs = any role under deployLinuxServicesK8s with `.enabled: true`
+    after ancestor merge (`_kcc_enabled_roles`). Arming = defaults.allowDeletion
+    on the same merged flat (chart digs role-level allowDeletion too; defaults
+    is what Phase 1 runbooks set).
+    """
+    merged = _merged_kcc_flat_for_env(identity_file, sha, repo=repo)
+    roles = _kcc_enabled_roles(merged)
+    if not roles:
+        return False, False
+    return True, _vm_deletion_armed_flat(merged)
+
+
 def _decommission_fully_phased(identity_file: str, main_sha: str) -> bool:
     """True when a folder-deletion PR arrives properly phased, per
-    acme-components documentation/delete.md (checked against the current
-    default branch, automation-dev/2603.2.0):
+    acme-components documentation/decommission-environment.md:
 
       phase 2 — `appspace.decommission: true` live at base, so the
         cascade actually runs when the folder goes;
-      phase 1 as applicable — when the identity file itself declares
-        `appspace.infra.deployLinuxServicesK8s`, the VM deletion must be
-        armed too (`defaults.allowDeletion: true`), or the real VM, disk
-        and IP survive the cascade under the KCC/ASO abandon policy.
+      phase 1 as applicable — when the merged value chain enables any
+        `deployLinuxServicesK8s` role, the VM deletion must be armed too
+        (`defaults.allowDeletion: true`), or the real VM, disk and IP
+        survive the cascade under the KCC/ASO abandon policy.
 
     This numbering is the canonical one and is what the rendered phase
     table uses (_decommission_phase_table). Phase 3 is the folder removal
     this function is judging.
 
-    VMs declared only at cohort level are invisible here on purpose: this
-    reads the same single file the cascade decision reads, and fails
-    CLOSED on anything unreadable, exactly like _decommission_cascades.
+    COPS-2677: parent/cohort role enablement is visible here (merged
+    hierarchy + `_kcc_enabled_roles`). Prefix-any-key on parents is NOT
+    used — region defaults (SA email, snapshotPolicies) would false-positive
+    every non-VM env under that region.
     """
     if not _decommission_cascades(identity_file, main_sha):
         return False
     content, status = _bb_fetch_cached(identity_file, main_sha)
     if status != BB_OK or not content:
         return False
+    # Fail CLOSED on unreadable identity before walking parents: a degraded
+    # cache / broken YAML must never look "fully phased" (COPS-2668 / 2677).
     try:
-        flat = _flatten_yaml(_yaml_safe_load(content) or {})
+        _flatten_yaml(_yaml_safe_load(content) or {})
     except Exception:
         return False
-    has_vms = any(k.startswith("appspace.infra.deployLinuxServicesK8s")
-                  for k in flat)
-    if not has_vms:
+    declares, armed = _env_declares_live_kcc_vms(identity_file, main_sha)
+    if not declares:
         return True
-    val = flat.get("appspace.infra.deployLinuxServicesK8s.defaults.allowDeletion")
-    return str(val).strip().lower() == "true"
+    return armed
 
 
 def _evaluate_env_decommissions(candidates: list, pr_sha: str, main_sha: str,
@@ -5860,25 +5912,34 @@ def _evaluate_env_decommissions(candidates: list, pr_sha: str, main_sha: str,
         # the full deleted manifests are collected for the audit appendix.
         cascade = _decommission_cascades(c["identity_file"], main_sha)
         purges_data = _decommission_purges_data(c["identity_file"], main_sha)
-        # COPS-2616: the phase table needs the VM-arming state too. Same
-        # single base-side file the cascade decision reads, and fails CLOSED
-        # the same way, so an unreadable identity file renders Phase 1 as
-        # pending rather than silently claiming it is done.
+        # COPS-2616 / COPS-2677: Phase 1 state from merged hierarchy when the
+        # identity file itself is readable. An unparseable identity fails
+        # CLOSED (both flags false) and logs why — COPS-2650. Role
+        # `.enabled: true` after ancestor merge is what the chart renders;
+        # parent SA/snapshot keys alone do not count.
         vm_armed, declares_vms = False, False
-        _vm_content, _vm_status = _bb_fetch_cached(c["identity_file"], main_sha)
+        _vm_content, _vm_status = _bb_fetch_cached(
+            c["identity_file"], main_sha)
         if _vm_status == BB_OK and _vm_content:
             try:
-                _vm_flat = _flatten_yaml(_yaml_safe_load(_vm_content) or {})
-                vm_armed = _vm_deletion_armed_flat(_vm_flat)
-                declares_vms = _declares_vms_flat(_vm_flat)
+                _vm_flat = _flatten_yaml(
+                    _yaml_safe_load(_vm_content) or {})
             except Exception as e:
-                # Swallowed ON PURPOSE: both flags stay False, which is the
-                # fail-closed default set above, so an unparseable identity
-                # file renders Phase 1 as pending instead of claiming it is
-                # done. Logged so the reason is visible rather than guessed
-                # at from a phase table that looks wrong (COPS-2650).
                 logsink.debug(f"VM arming state unreadable for "
                               f"{c['identity_file']}, failing closed: {e}")
+            else:
+                try:
+                    declares_vms, vm_armed = _env_declares_live_kcc_vms(
+                        c["identity_file"], main_sha)
+                except Exception as e:
+                    logsink.debug(f"VM arming state unreadable for "
+                                  f"{c['identity_file']}, failing closed: {e}")
+                    declares_vms, vm_armed = False, False
+                # Identity-only fallback: defaults/keys without role
+                # enablement still show Phase 1 (legacy strip / arming PRs).
+                if not declares_vms and _declares_vms_flat(_vm_flat):
+                    declares_vms = True
+                    vm_armed = _vm_deletion_armed_flat(_vm_flat)
         collect_full = (with_full_output and cascade
                         and _decommission_fully_phased(c["identity_file"], main_sha))
         app_deleted_docs: dict = {}
@@ -6005,8 +6066,16 @@ def _evaluate_env_decommissions(candidates: list, pr_sha: str, main_sha: str,
                 "\U0001f6a8 " + _DECOM_PURGE_HDR + " This environment "
                 + "also has `appspace.decommissionPurgeData: true`, so Config Connector "
                 + "empties and deletes the BigQuery dataset and the user content bucket "
-                + "as part of the cascade. **That data is not recoverable afterwards.** "
-                + "Only the content backup bucket is deliberately left behind.",
+                + "as part of the cascade. **That data is not recoverable afterwards.**",
+                "",
+                # COPS-2677 / COPS-2662: chart truth the old one-liner buried.
+                # Soft-delete off is why force-destroy can finish; backup is
+                # always abandon and is never destroyed by this flag.
+                "Soft-delete on the **content** bucket is turned off "
+                "(`softDeletePolicy.retentionDurationSeconds: 0`) so "
+                "`force-destroy` can complete. The **content backup** bucket "
+                "always keeps `deletion-policy: abandon` and is left behind "
+                "on purpose — destroy it by hand after Phase 3 if needed.",
                 "",
             ]
         else:
@@ -6455,7 +6524,11 @@ def _run_one_diff(app, pr_sha, main_sha, chart_revision=None, changed_paths=None
     _t_diff0 = time.perf_counter()
     diff_text = _diff_resources(main_resources, pr_resources)
     _record_stage("diff", time.perf_counter() - _t_diff0)
-    return diff_text, None, None, version_change
+    # COPS-2677: HPA count for zeroPods coexistence note. Must travel with
+    # the diff — argocd_diff only sees the unified text, and unchanged HPAs
+    # never appear there.
+    return (diff_text, None, None, version_change,
+            _count_hpas_remaining(pr_resources))
 
 
 def _indeterminate(reason, detail):
@@ -6509,10 +6582,12 @@ def argocd_diff(app, pr_sha, main_sha, chart_revision=None, changed_paths=None, 
         step = _run_one_diff(
             app, pr_sha, main_sha,
             chart_revision=chart_revision, changed_paths=changed_paths, renames=renames)
-        # v2.5.8: success returns a 4-tuple with the version change; failure
+        # v2.5.8: success returns a 4-tuple with the version change; COPS-2677
+        # extends to 5 with hpas_remaining from the PR-side render. Failure
         # paths keep returning 3-tuples.
         diff_text, reason, detail = step[0], step[1], step[2]
         version_change = step[3] if len(step) > 3 else None
+        hpas_remaining = step[4] if len(step) > 4 else 0
 
         if reason is not None:
             last_detail, last_reason = detail or reason, reason
@@ -6560,7 +6635,9 @@ def argocd_diff(app, pr_sha, main_sha, chart_revision=None, changed_paths=None, 
             renamed_res, vm_changes_res, version_fold = _package_sections(
                 filtered_sections, version_change=version_change)
         # Counted on the full pre-cap list, like every other safety fact.
-        shutdown_stats = _detect_workload_shutdown(filtered_sections)
+        # hpas_remaining is from the PR-side render in _run_one_diff (COPS-2677).
+        shutdown_stats = _detect_workload_shutdown(
+            filtered_sections, hpas_remaining=hpas_remaining)
         artifacts = _detect_template_artifacts(filtered_sections)
         return DiffResult(clean_diff, capped_sections,
                           n_res, True, None, OUT_DIFF, "changes", version_change,
@@ -7764,8 +7841,9 @@ def _summarize_appspace_state_changes(changed_files, pr_sha, base_sha, path_map,
                 f"workload keeps running, disks stay held, costs keep accruing "
                 f"and the environment is still managed by ArgoCD.",
                 "",
-                f"Even a full cascade leaves the content backup bucket and "
-                f"some namespace-level leftovers behind. Full procedure: see "
+                f"Even a full cascade leaves the content backup bucket "
+                f"(`deletion-policy: abandon`, never purged) and some "
+                f"namespace-level leftovers behind. Full procedure: see "
                 f"`acme-components` `documentation/`.",
                 "",
             ]) + _strip_warning
@@ -7792,6 +7870,11 @@ def _summarize_appspace_state_changes(changed_files, pr_sha, base_sha, path_map,
                 f"environment already armed for decommission.** {app_list} will " +
                 f"now permanently destroy the BigQuery dataset and the user " +
                 f"content bucket when the cascade runs, not just abandon them.",
+                "",
+                "Chart behaviour with purge armed (COPS-2662 / COPS-2677): "
+                "content-bucket soft-delete retention goes to **0** so "
+                "force-destroy can finish; the **backup** bucket stays "
+                "`deletion-policy: abandon` and is never purged by this flag.",
                 "",
             ] + _decommission_phase_table(
                 # The cascade is already armed at base -- that is this
@@ -9222,9 +9305,21 @@ def format_comment(pr_sha, app_results, skipped_apps=None, base_sha="",
     # new commit, like every other permanent reason.
     _arming_broken = bool(appspace_state_lines) and \
         _DECOM_VM_STRIP_HDR in appspace_state_lines
+    # COPS-2677: KCC Compute* nil artifacts must not merge green. zeroPods+HPA
+    # is REVIEW-only (see comment_render) — do not stamp permanent/FAILED.
+    _kcc_nil_block = False
+    for _v in app_results.values():
+        _rr = _result(_v)
+        _arts = getattr(_rr, "template_artifacts", None) or []
+        if any(_is_kcc_blocking_artifact(h) for h in _arts):
+            _kcc_nil_block = True
+            break
     if _arming_broken:
         status += (" | \u26d4 DECOMMISSION ARMING BROKEN \u2014 the VM would "
                    "be orphaned, see comment")
+    if _kcc_nil_block:
+        status += (" | \u26d4 UNRESOLVED KCC VALUE \u2014 "
+                   "`%!s(<nil>)` on Compute* resources, see comment")
 
     # Machine-readable token embedded in the footer. Used by process_pr to decide
     # whether to re-run without parsing the human-readable status string.
@@ -9232,7 +9327,7 @@ def format_comment(pr_sha, app_results, skipped_apps=None, base_sha="",
     # - clean     : all apps diffed successfully (no retry, mark seen)
     # - permanent : oci_not_found or hard error (no retry, mark seen)
     # - transient : diff unavailable on transient blip (retry next loop)
-    if any_error or new_env_structural or _arming_broken:
+    if any_error or new_env_structural or _arming_broken or _kcc_nil_block:
         _status_token = "permanent"
     elif any_unknown:
         # Distinguish oci_not_found (permanent) from soft indeterminate (transient)
@@ -10172,8 +10267,20 @@ def process_pr(pr, path_map, base_sha="", repo=None):
         # stood between that PR and an orphaned VM. Same single source as
         # the panel and the summary: the header constant.
         broken_arming = _DECOM_VM_STRIP_HDR in appspace_state_lines
+        # COPS-2677: KCC Compute* nil artifacts fail the build (OUT_DIFF that
+        # must not merge green). zeroPods+HPA stays REVIEW-only — after
+        # COPS-2548 hibernation works with leftover HPAs, so FAILED would
+        # false-stop legitimate maintenance PRs.
+        kcc_nil_block = False
+        for _v in app_results.values():
+            _rr = _result(_v)
+            _arts = getattr(_rr, "template_artifacts", None) or []
+            if any(_is_kcc_blocking_artifact(h) for h in _arts):
+                kcc_nil_block = True
+                break
         if (any_hard_error or has_blocking_indet or structural_envs
-                or moves_missing_cohort or broken_arming):
+                or moves_missing_cohort or broken_arming
+                or kcc_nil_block):
             # COPS-2552: a move whose destination has no cohort config.yaml
             # must never post green. Merging it removes the environment from
             # ArgoCD instead of moving it, and the apps themselves diff clean,
@@ -10190,6 +10297,11 @@ def process_pr(pr, path_map, base_sha="", repo=None):
                             "VM would be orphaned, not deleted. Keep the VM "
                             "block (see PR comment)")
                 post_build_status(pr_sha, "FAILED", _ba_desc, pr_id=pr_id)
+            elif kcc_nil_block:
+                _kcc_desc = ("Unresolved KCC value - Compute* resources render "
+                             "%!s(<nil>) / <no value>; set hostingID (or the "
+                             "missing field) before merging (see PR comment)")
+                post_build_status(pr_sha, "FAILED", _kcc_desc, pr_id=pr_id)
             elif structural_envs:
                 base_desc = (f"{len(structural_envs)} new environment(s) have a "
                              f"structural config problem: {', '.join(structural_envs)}")
@@ -10264,7 +10376,8 @@ def process_pr(pr, path_map, base_sha="", repo=None):
         is_permanent_failure = (any_hard_error or has_blocking_indet
                                 or bool(structural_envs)
                                 or bool(moves_missing_cohort)
-                                or broken_arming)
+                                or broken_arming
+                                or kcc_nil_block)
         is_transient_failure = any_unknown and not is_permanent_failure
         if not is_transient_failure:
             # Mark seen for both clean runs AND permanent failures so we don't
