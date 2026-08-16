@@ -247,13 +247,19 @@ def _fmt_env_list(apps, shown=8) -> str:
 def _build_merge_summary(results, rollup_by_sig, vm_change_lines,
                          decommission_lines, appspace_state_lines,
                          new_env_lines, new_env_structural,
-                         paused_changing=None, paused_envs=None) -> list:
+                         paused_changing=None, paused_envs=None,
+                         block_headline=None) -> list:
     """The verdict block that opens every comment.
 
     Reads the same deterministic facts the panels below use, so the
     summary can never disagree with the detail. Text panels built
     elsewhere are recognised by their own header constants rather than
     re-derived, for the same reason.
+
+    block_headline (COPS-2676): optional short string naming the permanent
+    render failure (e.g. "Missing Image Tag on => platform"). When set, the
+    cannot-render bullet leads with it so operators see *why* without
+    scrolling past deletions and bump noise.
     """
     findings = []          # (severity, line)
     sev = _SEV_ROUTINE
@@ -533,10 +539,17 @@ def _build_merge_summary(results, rollup_by_sig, vm_change_lines,
         # names with no "+more" to account for the gap. Count the same
         # deduped population the list displays.
         _blocked_envs = set(_envs_from_apps(blocked))
+        # COPS-2676: name the error in the verdict bullet. Without this the
+        # summary only listed environments and the actionable "Missing Image
+        # Tag" / template path lived ~40% down the comment under deletion and
+        # bump noise (acme-config-prod #4310).
+        _why = (f" \u2014 **{block_headline}**"
+                if block_headline else
+                " \u2014 helm failed here and the deployer will fail the "
+                "same way")
         findings.append((_SEV_BLOCK,
                          f"\u26d4 **{len(_blocked_envs)} environment(s) cannot "
-                         f"render** \u2014 helm failed here and the "
-                         f"deployer will fail the same way: "
+                         f"render**{_why}: "
                          f"{_fmt_env_list(blocked)}"))
     if errored or soft:
         findings.append((_SEV_REVIEW,

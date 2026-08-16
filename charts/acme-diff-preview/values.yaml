@@ -70,7 +70,7 @@ image:
   # Kept in sync with Chart.yaml appVersion (RELEASING.md). This default had
   # drifted since v2.7.0; it never bit us because acme-infrastructure pins the
   # tag explicitly, but anyone installing the chart as-is got a stale image.
-  tag: "2.86.2"
+  tag: "2.87.0"
   pullPolicy: IfNotPresent
 
 # Log verbosity for the diff-preview service. Set to DEBUG to emit the full
@@ -105,7 +105,9 @@ diff:
   # this before the gap closes.
   maxAppsPerRun: 1500
   # Parallel per-app helm-template diffs within one PR.
-  workers: 16
+  # COPS-2676: 32 validated live (~93s -> ~59s on a 162-env Missing Image Tag
+  # fleet shape) with no CPU limit. Was 16.
+  workers: 32
   # Parallel PR processing workers.
   prWorkers: 3
   # Seconds per diff step (OCI cache-miss pulls can be slow on the first render).
@@ -315,7 +317,7 @@ serviceAccount:
 # subprocesses (each ~50-100Mi) plus the warm-up pool during a 600+ app PR.
 resources:
   requests:
-    # CPU: sized for DIFF_WORKERS(16) × PR_WORKERS(3) concurrent helm subprocesses
+    # CPU: sized for DIFF_WORKERS(32) × PR_WORKERS(3) concurrent helm subprocesses
     # plus Bitbucket API fan-out. Each helm template call uses <0.1 CPU serially.
     cpu: 500m
     memory: 2Gi
@@ -329,14 +331,15 @@ resources:
     # eviction is not.
     ephemeral-storage: 1Gi
   limits:
-    # CPU limit prevents noisy-neighbor starvation on shared GKE nodes during
-    # 800-app PR bursts. Aligned with 48 concurrent subprocesses × node capacity.
-    cpu: "4"
-    # 8Gi, not 2Gi: a JFrog webhook burst landing on an active PR diff runs up
-    # to JFROG_DISPATCH_WORKERS(4) × `argocd app list -o json` (~100Mi of JSON
-    # each on a 919-app hub, several hundred Mi parsed) alongside 16 helm
-    # renders, which OOM-killed the pod at 2Gi. COPS-2543.
-    memory: 8Gi
+    # COPS-2676: no CPU limit. A live probe on the Missing Image Tag fleet
+    # shape dropped wall clock ~93s -> ~59s once the 4-core cap was removed
+    # and DIFF_WORKERS rose to 32. Tradeoff: a PR burst can contend with
+    # other tenants on the shared GKE node. Accepted deliberately; keep the
+    # request so the scheduler still packs honestly.
+    # 16Gi: DIFF_WORKERS doubled (16 -> 32), so worst-case concurrent helm
+    # subprocesses roughly doubles under PR_WORKERS(3). COPS-2543 raised
+    # 2Gi -> 8Gi for JFrog bursts; this keeps the same headroom ratio.
+    memory: 16Gi
     # Above tmpSizeLimit (4Gi) so the emptyDir cap binds first, with room for
     # container logs, which also count against ephemeral storage.
     ephemeral-storage: 5Gi

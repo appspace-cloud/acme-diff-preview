@@ -8,18 +8,13 @@
 
 ⛔ **DO NOT MERGE** without checking the item(s) below (1 item(s))
 
-- ⛔ **1 environment(s) cannot render** — helm failed here and the deployer will fail the same way: pv-glencore-c
+- ⛔ **1 environment(s) cannot render** — **at '/appspace/microservices/definitions/svc-00': got null, want object**: pv-glencore-c
 
 ---
 
+## ⚙️ RENDER BLOCKED
 
-#### Changeset overview
-
-| App | Status | Changed resources | Diff group |
-|-----|--------|--------------------|------------|
-| `pv-glencore-c-ms` | ❔ diff unavailable | — | — |
-
-❌ **`pv-glencore-c-ms`** — ⚙️ **SCHEMA VALIDATION FAILED — this environment's values violate the chart's schema**
+❌ **`pv-glencore-c-ms`** — ⚙️ **SCHEMA VALIDATION FAILED**
 > at '/appspace/microservices/definitions/svc-00': got null, want object
 > at '/appspace/microservices/definitions/svc-01': got null, want object
 > at '/appspace/microservices/definitions/svc-02': got null, want object
@@ -35,6 +30,15 @@
 > **Fix:** write an explicit empty map to keep the entry with pure chart defaults, for example `myservice: {}`.
 > ⚠️ Do **not** delete the key instead: the chart renders one microservice per entry under `microservices.definitions`, so removing it deletes that microservice from the environment.
 > **Fix:** correct each value listed above in this environment's `customer.yaml` (or the `config.yaml` of its cohort or ring if every environment needs the fix).
+
+---
+
+
+#### Changeset overview
+
+| App | Status | Changed resources | Diff group |
+|-----|--------|--------------------|------------|
+| `pv-glencore-c-ms` | ❔ diff unavailable | — | — |
 
 ⚠️ The full-diff page could not be produced for this run, so every hunk is inlined below.
 
