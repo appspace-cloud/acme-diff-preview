@@ -14,7 +14,7 @@
 
 ## ⚙️ RENDER BLOCKED
 
-❌ **`pv-glencore-c-ms`** — ⚙️ **SCHEMA VALIDATION FAILED**
+❌ **`pv-glencore-c`** — ⚙️ **SCHEMA VALIDATION FAILED**
 > at '/appspace/microservices/definitions/svc-00': got null, want object
 > at '/appspace/microservices/definitions/svc-01': got null, want object
 > at '/appspace/microservices/definitions/svc-02': got null, want object

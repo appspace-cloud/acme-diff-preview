@@ -22,7 +22,11 @@ from comment_render import (
 from manifest import _section_kind  # decoder lives with the format it decodes
 
 
-_WORKLOAD_KINDS = ("Deployment", "StatefulSet", "ReplicaSet")
+# Hibernation / zeroPods counting (COPS-2683): charts scale Deployments and
+# StatefulSets. ReplicaSet is controller-owned and not chart-emitted alone.
+# DaemonSet / Job / CronJob are not hibernation targets for this detector
+# (decommission inventory still uses the broader set in manifest.py).
+_WORKLOAD_KINDS = ("Deployment", "StatefulSet")
 
 
 def _replicas_end_state(body: str):
@@ -88,6 +92,62 @@ def _count_hpas_remaining(pr_resources) -> int:
     return n
 
 
+_HPA_TARGET_NAME_RE = re.compile(
+    r"^\s*name:\s*[\"']?([^\s\"'#]+)[\"']?\s*(?:#.*)?$", re.M)
+
+
+def _hpa_scale_target_name(body: str):
+    """scaleTargetRef.name from an HPA manifest body, or None."""
+    if not body:
+        return None
+    # Prefer the block under scaleTargetRef so a top-level metadata.name
+    # cannot poison the reading.
+    idx = body.find("scaleTargetRef:")
+    if idx < 0:
+        return None
+    block = body[idx:idx + 400]
+    m = _HPA_TARGET_NAME_RE.search(block)
+    return m.group(1) if m else None
+
+
+def _zeroed_workload_names(pr_resources) -> set:
+    """Deployment/StatefulSet names whose PR-side replicas end at 0."""
+    names = set()
+    if not pr_resources:
+        return names
+    for key, body in pr_resources.items():
+        type_key = key[0] if isinstance(key, tuple) else str(key)
+        kind = type_key.rsplit("/", 1)[-1]
+        if kind not in _WORKLOAD_KINDS:
+            continue
+        if _manifest_replicas(body) != 0:
+            continue
+        name = key[2] if isinstance(key, tuple) and len(key) > 2 else None
+        if name:
+            names.add(name)
+    return names
+
+
+def _count_hpas_targeting_zeroed(pr_resources) -> int:
+    """HPAs whose scaleTargetRef names a zeroed Deployment/StatefulSet.
+
+    COPS-2683: partial scale-to-zero must not shout every leftover HPA in
+    the fleet (COPS-2680), but must still warn when the zeroed workloads
+    keep an HPA that can fight them back up.
+    """
+    targets = _zeroed_workload_names(pr_resources)
+    if not targets or not pr_resources:
+        return 0
+    n = 0
+    for key, body in pr_resources.items():
+        type_key = key[0] if isinstance(key, tuple) else str(key)
+        if "HorizontalPodAutoscaler" not in type_key:
+            continue
+        if _hpa_scale_target_name(body) in targets:
+            n += 1
+    return n
+
+
 _MANIFEST_REPLICAS_RE = re.compile(r"^(\s*)replicas:\s*(\d+)\s*(?:#.*)?$")
 
 
@@ -136,7 +196,8 @@ def _count_workload_replicas(pr_resources):
 def _detect_workload_shutdown(sections: list, pr_resources=None,
                                hpas_remaining=None,
                                replica_stats=None):
-    """{"zeroed", "workloads", "hpas_remaining"} over workloads, or None.
+    """{"zeroed", "workloads", "hpas_remaining", "hpas_targeting_zeroed"}
+    over workloads, or None.
 
     The ratio is what separates "one service was scaled down" from "this
     environment is being switched off", and the two deserve different
@@ -148,26 +209,36 @@ def _detect_workload_shutdown(sections: list, pr_resources=None,
     `_run_one_diff`). Diff sections alone only see what changed (COPS-2680).
     `hpas_remaining` is the same: unchanged HPAs are invisible in unified
     diffs (COPS-2677).
+
+    COPS-2683: `replica_stats=(0, 0)` (empty parse) must not disable the
+    sections fallback when unified-diff hunks still show workloads going
+    to zero. `hpas_targeting_zeroed` counts only HPAs aimed at zeroed
+    workloads so partial scale can warn without the fleet HPA shout.
     """
+    total = zeroed = 0
     if replica_stats is not None:
         total, zeroed = replica_stats
     elif pr_resources:
         total, zeroed = _count_workload_replicas(pr_resources)
-    else:
+    if not total:
+        # Fall back to unified-diff sections (COPS-2683): replica_stats=(0,0)
+        # or an empty parse must not hide Deployments going to zero in hunks.
         total = zeroed = 0
-        for header, body in sections:
+        for header, body in sections or []:
             if _section_kind(header) not in _WORKLOAD_KINDS:
                 continue
             total += 1
             ends_zero, ends_pos = _replicas_end_state(body)
             if ends_zero and not ends_pos:
                 zeroed += 1
-    if not total:
-        return None
+        if not total:
+            return None
     if hpas_remaining is None:
         hpas_remaining = _count_hpas_remaining(pr_resources)
+    targeting = _count_hpas_targeting_zeroed(pr_resources) if pr_resources else 0
     return {"zeroed": zeroed, "workloads": total,
-            "hpas_remaining": int(hpas_remaining or 0)}
+            "hpas_remaining": int(hpas_remaining or 0),
+            "hpas_targeting_zeroed": int(targeting or 0)}
 
 
 # ── VM-domain (KCC linux-services) risk detection ────────────────────
@@ -450,10 +521,25 @@ def _detect_vm_changes(sections: list) -> list:
 
 def _vm_deletion_armed_flat(flat: dict) -> bool:
     """Phase 1 state: the real VM, disk and IP are only deleted by the
-    cascade when allowDeletion is armed. Same key _decommission_fully_phased
-    reads, applied to an already flattened dict."""
+    cascade when allowDeletion is armed. Same keys _decommission_fully_phased
+    reads, applied to an already flattened dict.
+
+    COPS-2683: chart digs role-level `allowDeletion` too, not only
+    `defaults.allowDeletion`. Treating defaults alone left role-armed
+    environments looking unarmed (and the reverse strip path incomplete).
+    """
+    if not flat:
+        return False
     val = flat.get("appspace.infra.deployLinuxServicesK8s.defaults.allowDeletion")
-    return str(val).strip().lower() == "true"
+    if str(val).strip().lower() == "true":
+        return True
+    for role in _VM_ROLE_NAMES:
+        if role == "defaults":
+            continue
+        k = f"appspace.infra.deployLinuxServicesK8s.{role}.allowDeletion"
+        if str(flat.get(k, "")).strip().lower() == "true":
+            return True
+    return False
 
 
 _VM_FLAT_PREFIX = "appspace.infra.deployLinuxServicesK8s."

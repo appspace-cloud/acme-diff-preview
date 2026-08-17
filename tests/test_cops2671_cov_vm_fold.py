@@ -123,7 +123,8 @@ def test_non_workload_sections_stay_out_of_the_shutdown_ratio():
     """
     assert vma._detect_workload_shutdown(MIXED) == {"zeroed": 2,
                                                     "workloads": 2,
-                                                    "hpas_remaining": 0}
+                                                    "hpas_remaining": 0,
+                                                    "hpas_targeting_zeroed": 0}
 
 
 def test_the_summary_still_calls_it_a_shutdown_with_a_configmap_present():

@@ -6,7 +6,7 @@
 
 ⛔ **DO NOT MERGE** without checking the item(s) below (2 item(s))
 
-- ❌ **2 resource(s) deleted** in 2 app(s): pv-advocate-b, pv-aexp-a
+- ❌ **2 resource(s) deleted** in 2 environment(s): pv-advocate-b, pv-aexp-a
 - ⛔ **4 environment(s) cannot render** — **Missing Image Tag on => platform**: pv-adl-a, pv-asi-b, pv-atea-a, pv-ato-c
 - ⬆️ **2 environment(s) bump** `2603.0.19` → `2603.2.0`: pv-advocate-b, pv-aexp-a
 
@@ -19,7 +19,7 @@
 > Chart template: `templates/configmaps/micro-versions-info.yaml:16`
 > **Fix:** add the missing value to this environment's `customer.yaml`, or to the `config.yaml` of its cohort or ring if every environment at that level needs it.
 
-> pv-adl-a-ms, pv-asi-b-ms, pv-atea-a-ms, pv-ato-c-ms
+> pv-adl-a, pv-asi-b, pv-atea-a, pv-ato-c
 
 > *Other comment sections are collapsed while render is blocked. Open the full-diff page for deletions / bumps / per-app detail.*
 

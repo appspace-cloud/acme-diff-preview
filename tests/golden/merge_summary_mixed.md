@@ -7,7 +7,7 @@
 ⛔ **DO NOT MERGE** without checking the item(s) below (2 item(s))
 
 - 🖥️ **VM infrastructure change flagged dangerous** — see the VM section
-- ❌ **1 resource(s) deleted** in 1 app(s): pv-zzz-risky
+- ❌ **1 resource(s) deleted** in 1 environment(s): pv-zzz-risky
 - ⬆️ **4 environment(s) jumping** `image`: `appspace-ms:2603.0.0` → `appspace-ms:2603.1.0`: pv-fleet-00, pv-fleet-01, pv-fleet-02, pv-fleet-03
 
 ---

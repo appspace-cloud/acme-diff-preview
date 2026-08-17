@@ -143,7 +143,8 @@ def test_full_render_all_zero_still_is_a_shutdown():
         ("autoscaling/HorizontalPodAutoscaler", "ns", "a"): "x\n",
     }
     stats = _detect_workload_shutdown(sections, pr_resources=pr)
-    assert stats == {"zeroed": 2, "workloads": 2, "hpas_remaining": 1}
+    assert stats == {"zeroed": 2, "workloads": 2, "hpas_remaining": 1,
+                     "hpas_targeting_zeroed": 0}
     out = _summary({"pv-x-ms": _result(sections, stats=stats)})
     assert "Environment shutting down" in out, out
     assert "HorizontalPodAutoscaler" in out, out
@@ -156,4 +157,5 @@ def test_sections_only_fallback_unchanged_without_pr_resources():
         ("/apps/Deployment b", _scaled_down()),
     ]
     assert _detect_workload_shutdown(sections) == {
-        "zeroed": 2, "workloads": 2, "hpas_remaining": 0}
+        "zeroed": 2, "workloads": 2, "hpas_remaining": 0,
+        "hpas_targeting_zeroed": 0}
