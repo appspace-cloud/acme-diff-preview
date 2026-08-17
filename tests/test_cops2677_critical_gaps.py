@@ -72,7 +72,8 @@ def test_hpas_remaining_counted_from_pr_resources_not_diff():
         ("autoscaling/HorizontalPodAutoscaler", "ns", "b"): "x",
     }
     stats = _detect_workload_shutdown(sections, pr_resources=pr_resources)
-    assert stats == {"zeroed": 2, "workloads": 2, "hpas_remaining": 2}
+    assert stats == {"zeroed": 2, "workloads": 2, "hpas_remaining": 2,
+                     "hpas_targeting_zeroed": 0}
     assert _count_hpas_remaining(pr_resources) == 2
 
 

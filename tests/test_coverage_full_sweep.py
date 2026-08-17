@@ -324,8 +324,9 @@ _ID = "gcp/dev/pc/ap1/custom/pv-flags-a/customer.yaml"
 
 def _flags_fetch(monkeypatch, old_txt, new_txt):
     table = {(_ID, "prsha"): (new_txt, m.BB_OK), (_ID, "mainsha"): (old_txt, m.BB_OK)}
-    monkeypatch.setattr(m, "_bb_fetch_cached",
-                        lambda f, sha, repo=None: table[(f, sha)])
+    monkeypatch.setattr(
+        m, "_bb_fetch_cached",
+        lambda f, sha, repo=None: table.get((f, sha), (None, m.BB_NOT_FOUND)))
 
 def test_state_changes_duplicate_file_reported_once_and_purge_removal(monkeypatch):
     _flags_fetch(monkeypatch,

@@ -96,7 +96,9 @@ def test_the_comment_names_a_sample_and_accounts_for_the_rest(monkeypatch):
     # the GROUP. The group's roster line keeps the 8-name sample.
     roster = next(l for l in out.split("\n")
                   if l.startswith(">") and "(+14 more)" in l)
-    assert sum(a in roster for a in results) == 8
+    # COPS-2683: roster lists environments (via `_fmt_env_list`), not apps.
+    envs = sorted({a.rsplit("-", 1)[0] for a in results})
+    assert sum(e in roster for e in envs) == 8
     assert "22 environments cannot render" in out
 
 

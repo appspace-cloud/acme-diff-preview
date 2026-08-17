@@ -369,9 +369,13 @@ def _build_merge_summary(results, rollup_by_sig, vm_change_lines,
                 1 for h in (results[a].deleted_resources or [])
                 if h in orphan_hdrs)
         if hard_n:
+            # COPS-2683: count environments to match `_fmt_env_list` (same
+            # class of app-vs-env lie as COPS-2675 on the render-blocked
+            # headline). Orphan/abandon wording above is unchanged.
+            n_envs = len(set(_envs_from_apps(hard_apps)))
             findings.append((_SEV_BLOCK,
                              f"\u274c **{hard_n} resource(s) deleted** in "
-                             f"{len(hard_apps)} app(s): "
+                             f"{n_envs} environment(s): "
                              f"{_fmt_env_list(hard_apps)}"))
         if orphan_n:
             findings.append((_SEV_REVIEW,
@@ -456,10 +460,34 @@ def _build_merge_summary(results, rollup_by_sig, vm_change_lines,
     # (ScalingDisabled). Blocking every hibernation PR that still has HPA
     # enabled would false-stop merges that work today. The chart gate that
     # skips hpa.yaml under zeroPods is the cleanup; here we only shout.
+    #
+    # COPS-2683: judge shutdown per environment across sibling apps (-ms/-ss)
+    # before the headline, and for partial scale only count HPAs whose
+    # scaleTargetRef names a zeroed workload (not the whole fleet).
     zeroed_apps = sorted(a for a, r in results.items() if r.replicas_zeroed)
     shutdown_apps = [a for a in zeroed_apps
                      if _is_env_shutdown(results[a])]
     partial_apps = [a for a in zeroed_apps if a not in set(shutdown_apps)]
+    # Demote env-level shutdown when a sibling app of the same environment
+    # still has running workloads (ms all-zero + ss partial must not read
+    # as "Environment shutting down" for that env name).
+    _shutdown_envs = set(_envs_from_apps(shutdown_apps))
+    _partial_envs = set(_envs_from_apps(partial_apps))
+    for a, r in results.items():
+        env = _envs_from_apps([a])[0]
+        if env not in _shutdown_envs:
+            continue
+        stats = getattr(r, "shutdown_stats", None) or {}
+        if stats.get("workloads") and not _is_env_shutdown(r):
+            _partial_envs.add(env)
+    _demote = _shutdown_envs & _partial_envs
+    if _demote:
+        shutdown_apps = [a for a in shutdown_apps
+                         if _envs_from_apps([a])[0] not in _demote]
+        for a in zeroed_apps:
+            if (_envs_from_apps([a])[0] in _demote
+                    and a not in partial_apps):
+                partial_apps.append(a)
     hpa_note_apps = [
         a for a in shutdown_apps
         if (getattr(results[a], "shutdown_stats", None) or {}).get(
@@ -489,10 +517,27 @@ def _build_merge_summary(results, rollup_by_sig, vm_change_lines,
                          f"{_fmt_env_list(clean_shutdown_apps)}. "
                          "`appspace.zeroPods` hibernates the environment: "
                          "nothing will be running after this merges."))
-    if partial_apps:
+    partial_hpa_apps = [
+        a for a in partial_apps
+        if (getattr(results[a], "shutdown_stats", None) or {}).get(
+            "hpas_targeting_zeroed", 0) > 0
+    ]
+    clean_partial_apps = [a for a in partial_apps
+                          if a not in set(partial_hpa_apps)]
+    if partial_hpa_apps:
+        n_hpa = sum(
+            (results[a].shutdown_stats or {}).get("hpas_targeting_zeroed", 0)
+            for a in partial_hpa_apps)
         findings.append((_SEV_REVIEW,
                          "\U0001f9ca **Replicas scaled to zero** in "
-                         f"{_fmt_env_list(partial_apps)}"))
+                         f"{_fmt_env_list(partial_hpa_apps)}, and "
+                         f"{n_hpa} HorizontalPodAutoscaler(s) still target "
+                         "those workloads. Prefer removing or disabling the "
+                         "matching HPA with the scale-down (COPS-2683)."))
+    if clean_partial_apps:
+        findings.append((_SEV_REVIEW,
+                         "\U0001f9ca **Replicas scaled to zero** in "
+                         f"{_fmt_env_list(clean_partial_apps)}"))
 
     if appspace_state_lines:
         txt = "\n".join(appspace_state_lines)

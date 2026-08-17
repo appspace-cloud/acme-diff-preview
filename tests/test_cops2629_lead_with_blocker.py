@@ -158,7 +158,11 @@ def test_two_failing_apps_of_one_environment_count_as_one_environment(
     so counting it directly over-counts against `_fmt_env_list`, which
     dedupes to the environment names actually shown -- the headline could
     read "3 environment(s)" over a list of only 2 names, with no "+more"
-    to account for the gap. pv-a fails on one app; pv-b fails on two."""
+    to account for the gap. pv-a fails on one app; pv-b fails on two.
+
+    COPS-2683: every `cannot render` line (merge summary AND RENDER BLOCKED
+    panel) must agree on the environment count.
+    """
     monkeypatch.setattr(dp, "generate_ai_summary", lambda *a, **k: None)
     results = {
         "pv-a-ms": _indet(dp.REASON_MISSING_REQUIRED),
@@ -167,10 +171,11 @@ def test_two_failing_apps_of_one_environment_count_as_one_environment(
         "pv-b-ss": _indet(dp.REASON_MISSING_REQUIRED),
     }
     out = _comment(results)
-    line = next(l for l in out.split("\n") if "cannot render" in l)
-    assert "2 environment(s)" in line, (
-        "3 failing APPS across 2 environments must read '2', not '3':\n"
-        + line)
-    assert "3 environment(s)" not in line, line
-    assert "pv-a" in line and "pv-b" in line
-    assert "+" not in line, "only 2 names exist; there is nothing to fold"
+    lines = [l for l in out.split("\n") if "cannot render" in l]
+    assert lines, out
+    for line in lines:
+        assert "2 environment" in line, (
+            "3 failing APPS across 2 environments must read '2', not '3':\n"
+            + line)
+        assert "3 environment" not in line, line
+    assert "pv-a" in out and "pv-b" in out

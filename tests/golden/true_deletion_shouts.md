@@ -8,7 +8,7 @@
 
 ⛔ **DO NOT MERGE** without checking the item(s) below (1 item(s))
 
-- ❌ **1 resource(s) deleted** in 1 app(s): pv-acme-a
+- ❌ **1 resource(s) deleted** in 1 environment(s): pv-acme-a
 
 ---
 

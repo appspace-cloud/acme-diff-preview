@@ -2623,7 +2623,8 @@ DiffResult = namedtuple("DiffResult",
 # `<no value>` - a value the chart read and this environment does not set.
 # KCC Compute* headers BLOCK the merge (COPS-2677 / COPS-2632); other kinds
 # stay REVIEW so the chart remains authority on unguarded fields (2.48.0).
-# shutdown_stats: {"zeroed": n, "workloads": total, "hpas_remaining": n}
+# shutdown_stats: {"zeroed": n, "workloads": total, "hpas_remaining": n,
+#                  "hpas_targeting_zeroed": n}
 # for this app, counted on the full pre-cap section list (+ PR-side resource
 # map for HPAs). Distinguishes an environment being switched off (every
 # workload at zero) from a single service scaled down, and surfaces zeroPods
@@ -5791,7 +5792,7 @@ def _decommission_purges_data(identity_file: str, main_sha: str) -> bool:
 
 
 def _merged_kcc_flat_for_env(identity_file: str, sha: str,
-                             repo: str = None) -> dict:
+                             repo: str = None):
     """Flattened appspace values for an env: ancestor config.yaml chain +
     identity file, last-wins (same order live Helm uses).
 
@@ -5801,6 +5802,11 @@ def _merged_kcc_flat_for_env(identity_file: str, sha: str,
     pass as fully phased while cloud VMs still carried abandon. Parents also
     carry SA emails / snapshotPolicies without enabling any role — callers
     must use `_kcc_enabled_roles` on this merge, not prefix-any-key.
+
+    COPS-2683: fail CLOSED on unreadable ancestors (BB_ERROR or unparseable
+    YAML that returned BB_OK). A missing file (BB_NOT_FOUND) is normal for
+    intermediate path segments and is skipped. Returns None when the merge
+    is not proven; callers must treat that as "not fully phased".
     """
     env_dir = identity_file.rsplit("/", 1)[0]
     ancestors = []
@@ -5812,12 +5818,14 @@ def _merged_kcc_flat_for_env(identity_file: str, sha: str,
     merged = {}
     for path in ancestors + [identity_file]:
         content, status = _bb_fetch_cached(path, sha, repo=repo)
+        if status == BB_ERROR:
+            return None
         if status != BB_OK or not content:
             continue
         try:
             flat = _flatten_yaml(_yaml_safe_load(content) or {})
         except Exception:
-            continue
+            return None
         merged.update(flat)
     return merged
 
@@ -5830,8 +5838,13 @@ def _env_declares_live_kcc_vms(identity_file: str, sha: str,
     after ancestor merge (`_kcc_enabled_roles`). Arming = defaults.allowDeletion
     on the same merged flat (chart digs role-level allowDeletion too; defaults
     is what Phase 1 runbooks set).
+
+    COPS-2683: unreadable parent chain → (True, False) so
+    `_decommission_fully_phased` fails closed.
     """
     merged = _merged_kcc_flat_for_env(identity_file, sha, repo=repo)
+    if merged is None:
+        return True, False
     roles = _kcc_enabled_roles(merged)
     if not roles:
         return False, False
@@ -7770,9 +7783,18 @@ def _summarize_appspace_state_changes(changed_files, pr_sha, base_sha, path_map,
         # that while this panel read "Phase 1 done" -- reassurance from git
         # flags without verifying the arming path can take effect, the same
         # failure class as COPS-2656.
-        _stripped = _vm_config_stripped(old_flat, new_flat)
-        _vm_broken = bool(_stripped) and (
-            is_armed or _vm_deletion_armed_flat(new_flat))
+        #
+        # COPS-2683: strip + arming on the same merged ancestor chain Phase 1
+        # uses (COPS-2677). Identity-only compare missed parent role disables.
+        _old_m = _merged_kcc_flat_for_env(clean, base_sha, repo=repo)
+        _new_m = _merged_kcc_flat_for_env(clean, pr_sha, repo=repo)
+        if _old_m is not None and _new_m is not None:
+            _stripped = _vm_config_stripped(_old_m, _new_m)
+            _armed_new = _vm_deletion_armed_flat(_new_m)
+        else:
+            _stripped = _vm_config_stripped(old_flat, new_flat)
+            _armed_new = _vm_deletion_armed_flat(new_flat)
+        _vm_broken = bool(_stripped) and (is_armed or _armed_new)
         _strip_warning = [] if not _vm_broken else [
             _DECOM_VM_STRIP_HDR,
             "",
@@ -7835,11 +7857,13 @@ def _summarize_appspace_state_changes(changed_files, pr_sha, base_sha, path_map,
                 # COPS-2660: a stripped VM config outranks the flag. The flag
                 # says armed; the same diff removed what it arms.
                 vm_state=(_PH_BROKEN if _vm_broken else
-                          (_PH_DONE if _vm_deletion_armed_flat(new_flat) else None)),
+                          (_PH_DONE if _armed_new else None)),
                 cascade_state=_PH_THIS_PR,
                 removal_state=None,
                 declares_vms=(_declares_vms_flat(new_flat)
-                              or _declares_vms_flat(old_flat)),
+                              or _declares_vms_flat(old_flat)
+                              or bool(_kcc_enabled_roles(_new_m or {}))
+                              or bool(_kcc_enabled_roles(_old_m or {}))),
                 purge=is_purge,
             ) + ([
                 "",
@@ -7897,11 +7921,13 @@ def _summarize_appspace_state_changes(changed_files, pr_sha, base_sha, path_map,
                 # the purge. Every other panel marks the phase it actually
                 # performs; this was the only one claiming a phase it did not.
                 vm_state=(_PH_BROKEN if _vm_broken else
-                          (_PH_DONE if _vm_deletion_armed_flat(new_flat) else None)),
+                          (_PH_DONE if _armed_new else None)),
                 cascade_state=_PH_DONE,
                 removal_state=None,
                 declares_vms=(_declares_vms_flat(new_flat)
-                              or _declares_vms_flat(old_flat)),
+                              or _declares_vms_flat(old_flat)
+                              or bool(_kcc_enabled_roles(_new_m or {}))
+                              or bool(_kcc_enabled_roles(_old_m or {}))),
                 purge=True,
                 purge_this_pr=True,
             ) + [
@@ -7998,7 +8024,7 @@ def _summarize_vm_changes(changed_files, pr_sha, base_sha, path_map,
     adopted_envs = set()
     seen = set()
     _prov_pending = {}   # (env, domain) -> [(rest, new_s, danger, line)]
-    for f in (changed_files or [])[:12]:
+    for f in (changed_files or []):
         clean = posixpath.normpath(f.lstrip("/"))
         if clean in seen or not clean.endswith((".yaml", ".yml")):
             continue
@@ -8356,13 +8382,17 @@ def _permanent_failure_top_panel(results, failure_group_for_app, quiet: bool) ->
     out += ["## \u2699\ufe0f RENDER BLOCKED", ""]
     for _n, rep, members, r in items:
         short = _short_permanent_error(r)
-        if len(members) > 1:
+        # COPS-2683: `members` are ArgoCD apps; count environments so the
+        # panel matches merge-summary / `_fmt_env_list` (COPS-2675 leftover).
+        n_envs = len(set(_envs_from_apps(members)))
+        if n_envs > 1:
             out.append(
-                f"\u274c **{len(members)} environments cannot render** "
+                f"\u274c **{n_envs} environments cannot render** "
                 f"\u2014 \u2699\ufe0f **{_reason_panel_label(r.reason)}**")
         else:
+            env = (_envs_from_apps(members)[0] if members else rep)
             out.append(
-                f"\u274c **`{rep}`** \u2014 \u2699\ufe0f "
+                f"\u274c **`{env}`** \u2014 \u2699\ufe0f "
                 f"**{_reason_panel_label(r.reason)}**")
         if r.reason == REASON_MISSING_REQUIRED:
             out += _explain_required_error(r.error)
@@ -8388,8 +8418,8 @@ def _permanent_failure_top_panel(results, failure_group_for_app, quiet: bool) ->
             if short:
                 out.append(f"> **{short}**")
             out += _quote_helm_error(r.error)
-        if len(members) > 1:
-            out += ["", f"> {_fmt_service_list(members)}"]
+        if n_envs > 1:
+            out += ["", f"> {_fmt_env_list(members)}"]
         out.append("")
     if quiet:
         out += [
