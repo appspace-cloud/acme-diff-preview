@@ -344,11 +344,40 @@ def _build_merge_summary(results, rollup_by_sig, vm_change_lines,
 
     deleted_apps = sorted(a for a, r in results.items() if r.deleted_resources)
     if deleted_apps:
-        n = sum(len(results[a].deleted_resources) for a in deleted_apps)
-        findings.append((_SEV_BLOCK,
-                         f"\u274c **{n} resource(s) deleted** in "
-                         f"{len(deleted_apps)} app(s): "
-                         f"{_fmt_env_list(deleted_apps)}"))
+        # COPS-2682: KCC CRs leaving the render under deletion-policy
+        # abandon (or snapshot attachments that only drop the schedule
+        # binding) are not GCP destroys. Pull them out of the BLOCK
+        # "resource(s) deleted" count so unmanage PRs stop looking like
+        # DO NOT MERGE destroy changes (acme-config-prod #4326).
+        orphan_hdrs = set()
+        for r in results.values():
+            for f in (getattr(r, "vm_changes", None) or []):
+                if f.get("orphaned") or (
+                        f.get("deleted") and not f.get("dangerous")
+                        and f.get("notes")):
+                    orphan_hdrs.add(f.get("header"))
+        hard_n = 0
+        hard_apps = []
+        orphan_n = 0
+        for a in deleted_apps:
+            hard = [h for h in (results[a].deleted_resources or [])
+                    if h not in orphan_hdrs]
+            if hard:
+                hard_n += len(hard)
+                hard_apps.append(a)
+            orphan_n += sum(
+                1 for h in (results[a].deleted_resources or [])
+                if h in orphan_hdrs)
+        if hard_n:
+            findings.append((_SEV_BLOCK,
+                             f"\u274c **{hard_n} resource(s) deleted** in "
+                             f"{len(hard_apps)} app(s): "
+                             f"{_fmt_env_list(hard_apps)}"))
+        if orphan_n:
+            findings.append((_SEV_REVIEW,
+                             f"\U0001f5a5\ufe0f **{orphan_n} KCC resource(s) "
+                             f"unmanaged** (abandon / schedule attachment "
+                             f"\u2014 GCP kept)"))
     renamed_apps = sorted(a for a, r in results.items()
                           if getattr(r, "renamed_resources", None))
     if renamed_apps:

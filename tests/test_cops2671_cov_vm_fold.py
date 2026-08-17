@@ -279,20 +279,47 @@ ATTACHMENT_GONE = (
 def test_a_disappearing_snapshot_attachment_names_the_backup_schedule():
     """This kind gets its own wording, because the generic "removed from the
     render" sentence does not tell the reviewer what actually stops: the
-    disk keeps running and quietly stops being backed up."""
+    disk keeps running and quietly stops being backed up.
+
+    COPS-2682: that note is routine (not 🚨). Pruning the attachment does
+    not destroy the VM, disk, IP, or existing snapshots.
+    """
     f = _fact(ATT_HDR, ATTACHMENT_GONE)
     assert f["deleted"] and not f["created"]
-    joined = " ".join(f["dangerous"]).lower()
-    assert "backup schedule" in joined, joined
+    assert not f["dangerous"]
+    joined = " ".join(f["notes"]).lower()
+    assert ("snapshot" in joined or "schedule" in joined
+            or "snap" in joined), joined
 
 
-def test_a_deleted_instance_gets_the_generic_wording_instead():
-    """The contrast: only the attachment kind is special-cased."""
+def test_a_deleted_instance_defaults_to_abandon_orphan_wording():
+    """COPS-2682: ComputeInstance leaving the render without an explicit
+    deletion-policy: delete is unmanage under the chart abandon default.
+    Contrast: only deletion-policy: delete (or unknown kinds) stay dangerous.
+    """
     f = _fact(CI_HDR, ATTACHMENT_GONE.replace(
         "ComputeDiskResourcePolicyAttachment", "ComputeInstance"))
+    assert f["deleted"] and f.get("orphaned")
+    assert not f["dangerous"]
+    joined = " ".join(f["notes"])
+    assert "ComputeInstance" in joined and "abandon" in joined.lower()
+
+
+def test_a_deleted_instance_with_delete_policy_is_dangerous():
+    body = (
+        "-apiVersion: compute.cnrm.cloud.google.com/v1beta1\n"
+        "-kind: ComputeInstance\n"
+        "-metadata:\n"
+        "-  name: pv-bos-svc-a\n"
+        "-  annotations:\n"
+        "-    cnrm.cloud.google.com/deletion-policy: delete\n"
+        "-spec:\n"
+        "-  machineType: n2d-standard-4\n")
+    f = _fact(CI_HDR, body)
+    assert f["deleted"] and not f.get("orphaned")
     joined = " ".join(f["dangerous"])
-    assert "backup schedule" not in joined
-    assert "ComputeInstance" in joined and "removed from the render" in joined
+    assert "deletion-policy: delete" in joined
+    assert "destroy" in joined.lower()
 
 
 ZONE_MOVE = (

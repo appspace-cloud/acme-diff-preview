@@ -8071,6 +8071,18 @@ def _summarize_vm_changes(changed_files, pr_sha, base_sha, path_map,
             old_s = "" if old_v is None else str(old_v)
             new_s = "" if new_v is None else str(new_v)
             leaf = rest.rsplit(".", 1)[-1]
+            # COPS-2682: when the domain/role is being switched off, sibling
+            # key removals (machineType, zone, instanceName, …) are noise —
+            # the enabled:false line already tells the story. Keep the
+            # enabled transition itself.
+            if new_v is None and leaf != "enabled":
+                parent_off = (str(new_flat.get(prefix + "enabled", "true"))
+                              .strip().lower() == "false")
+                role_off = (str(new_flat.get(
+                    prefix + role + ".enabled", "true")).strip().lower()
+                            == "false")
+                if parent_off or role_off:
+                    continue
             if old_v is not None and new_v is not None:
                 change = f"`{rest}`: `{old_s}` \u2192 `{new_s}`"
             elif old_v is None:
@@ -8085,10 +8097,20 @@ def _summarize_vm_changes(changed_files, pr_sha, base_sha, path_map,
                           "disk and address \u2014 the next cascade can "
                           "destroy them in GCP")
             elif leaf == "enabled" and new_s.lower() == "false":
-                danger = True
-                reason = ("the resources disappear from the render \u2014 a "
-                          "live VM stops being managed, or gets deleted if "
-                          "deletion is armed")
+                # COPS-2682: disabling KCC without arming allowDeletion is
+                # unmanage under abandon (GCP kept), not a destroy. The old
+                # wording ("or gets deleted if deletion is armed") made every
+                # disable look like DO NOT MERGE — acme-config-prod #4326.
+                if _vm_deletion_armed_flat(new_flat):
+                    danger = True
+                    reason = ("the resources disappear from the render while "
+                              "deletion is armed \u2014 live VMs can be "
+                              "destroyed in GCP")
+                else:
+                    danger = False
+                    reason = ("KCC stops managing these resources \u2014 CRs "
+                              "prune under `deletion-policy: abandon`; GCP "
+                              "VM/disk/IP stay")
             elif leaf == "machineType":
                 ds = (new_flat.get(prefix + role + ".desiredStatus")
                       or new_flat.get(prefix + "defaults.desiredStatus"))
@@ -8189,6 +8211,13 @@ def _summarize_vm_changes(changed_files, pr_sha, base_sha, path_map,
                                       if fact["deleted"] else
                                       "resource-level change"),
                         "; ".join(fact["dangerous"])))
+            elif fact.get("orphaned") or (
+                    fact["deleted"] and fact.get("notes")):
+                # COPS-2682: abandon unmanage and snapshot-attachment notes.
+                routine_lines.append(
+                    (env, "- %s: %s" % (
+                        where, "; ".join(fact["notes"]) or field_txt
+                        or "leaves KCC management")))
             elif fact["fields"] or fact["notes"]:
                 # COPS-2635: a "new Kind — appears for the first time"
                 # note on a provisioned environment restates the group
@@ -8724,9 +8753,36 @@ def format_comment(pr_sha, app_results, skipped_apps=None, base_sha="",
     # warning: deterministic safety facts never depend on the model.
     all_deleted = [(app, hdr) for app, r in results.items()
                    for hdr in (r.deleted_resources or [])]
-    if all_deleted and quiet_render_block:
+    orphan_hdrs = set()
+    for r in results.values():
+        for f in (getattr(r, "vm_changes", None) or []):
+            if f.get("orphaned") or (
+                    f.get("deleted") and not f.get("dangerous")
+                    and f.get("notes")):
+                orphan_hdrs.add(f.get("header"))
+    orphan_deleted = [(a, h) for a, h in all_deleted if h in orphan_hdrs]
+    hard_deleted = [(a, h) for a, h in all_deleted if h not in orphan_hdrs]
+    if orphan_deleted and not quiet_render_block:
+        # COPS-2682: say abandon/unmanage, not DESTROYED.
+        n_or = len(orphan_deleted)
+        lines += [
+            f"### \U0001f5a5\ufe0f {n_or} KCC resource(s) unmanaged "
+            f"(abandon \u2014 GCP kept)",
+            "",
+            "These leave Argo/KCC management. Live CRs use "
+            "`deletion-policy: abandon` (or are snapshot-policy attachments), "
+            "so the GCP VM, disk and IP stay. Existing snapshots stay; new "
+            "scheduled snaps may stop if an attachment was pruned.",
+            "",
+        ]
+        for app, hdr in orphan_deleted[:20]:
+            lines.append(f"- `{app}` \u2192 `{hdr}`")
+        if n_or > 20:
+            lines.append(f"- *(+{n_or - 20} more)*")
+        lines.append("")
+    if hard_deleted and quiet_render_block:
         # COPS-2676: keep a one-line pointer; the render block is the story.
-        n_del = len(all_deleted)
+        n_del = len(hard_deleted)
         lines += [
             f"## \U0001f5d1\ufe0f {n_del} resource(s) also deleted "
             f"(details collapsed while render is blocked)",
@@ -8735,8 +8791,8 @@ def format_comment(pr_sha, app_results, skipped_apps=None, base_sha="",
              "See the full-diff page for the deletion inventory."),
             "",
         ]
-    elif all_deleted:
-        n_del = len(all_deleted)
+    elif hard_deleted:
+        n_del = len(hard_deleted)
         lines += [
             f"## \U0001f5d1\ufe0f\u26a0\ufe0f {n_del} RESOURCE(S) DELETED \u26a0\ufe0f",
             "",
@@ -8749,8 +8805,8 @@ def format_comment(pr_sha, app_results, skipped_apps=None, base_sha="",
         # point of this block is that a reviewer can see every deletion that
         # can revoke access or destroy data, so those are listed first and in
         # full; only the ordinary kinds are capped.
-        sensitive = [(a, h) for a, h in all_deleted if _is_sensitive_kind(h)]
-        ordinary  = [(a, h) for a, h in all_deleted if not _is_sensitive_kind(h)]
+        sensitive = [(a, h) for a, h in hard_deleted if _is_sensitive_kind(h)]
+        ordinary  = [(a, h) for a, h in hard_deleted if not _is_sensitive_kind(h)]
         shown = sensitive + ordinary[:max(0, 20 - len(sensitive))]
         for app, hdr in shown:
             flag = "\U0001f510 " if _is_sensitive_kind(hdr) else ""
