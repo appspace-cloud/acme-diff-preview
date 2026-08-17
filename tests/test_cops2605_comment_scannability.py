@@ -214,9 +214,29 @@ def test_vm_facts_deletion_policy_flip_is_dangerous():
     assert "deletion" in " ".join(facts[0]["dangerous"]).lower()
 
 
-def test_vm_facts_whole_instance_deletion_is_dangerous():
+def test_vm_facts_whole_instance_deletion_defaults_to_abandon_orphan():
+    # COPS-2682: chart default for ComputeInstance is abandon when
+    # allowDeletion is unset. A CR leaving the render without an explicit
+    # deletion-policy: delete annotation is unmanage, not GCP destroy.
     facts = m._detect_vm_changes([(CI_HDR, VM_DELETED)])
+    assert facts and facts[0]["deleted"] and facts[0].get("orphaned")
+    assert not facts[0]["dangerous"]
+
+
+def test_vm_facts_whole_instance_deletion_with_delete_policy_is_dangerous():
+    body = (
+        "--- \n+++ \n@@ -1,8 +0,0 @@\n"
+        "-apiVersion: compute.cnrm.cloud.google.com/v1beta1\n"
+        "-kind: ComputeInstance\n"
+        "-metadata:\n"
+        "-  name: pv-acme-svc-a\n"
+        "-  annotations:\n"
+        "-    cnrm.cloud.google.com/deletion-policy: delete\n"
+        "-spec:\n"
+        "-  machineType: \"n2d-standard-4\"\n")
+    facts = m._detect_vm_changes([(CI_HDR, body)])
     assert facts and facts[0]["deleted"] and facts[0]["dangerous"]
+    assert not facts[0].get("orphaned")
 
 
 def test_non_vm_sections_never_produce_vm_facts():
@@ -694,14 +714,20 @@ def test_legacy_deployLinuxServices_machine_spec_is_detected(monkeypatch):
 
 def test_windows_vm_disable_is_detected(monkeypatch):
     """PR #3858 "GCP unify guard: Windows/LinuxVM off" switched VMs off
-    with no VM wording anywhere in the comment."""
+    with no VM wording anywhere in the comment.
+
+    COPS-2682: enabled→false without allowDeletion is unmanage under
+    abandon (GCP kept), so the panel is ROUTINE — still must name Windows.
+    """
     path = "gcp/prod/private-cloud/na1-a/pv-x-a/customer.yaml"
     monkeypatch.setattr(m, "_bb_fetch_cached", _fetch_stub({
         (path, BASE_SHA): "appspace:\n  infra:\n    deployWindows:\n      enabled: true\n",
         (path, PR_SHA): "appspace:\n  infra:\n    deployWindows:\n      enabled: false\n"}))
     body = "\n".join(m._summarize_vm_changes(
         [path], PR_SHA, BASE_SHA, {path: ["argocd/pv-x-a-ss"]}, {}))
-    assert "Windows" in body and "\U0001f6a8" in body
+    assert "Windows" in body
+    assert "enabled" in body and "False" in body
+    assert "\U0001f6a8" not in body, "disable without allowDeletion is not destroy"
 
 
 def test_config_panel_separates_its_bullets_from_the_file_heading(monkeypatch):

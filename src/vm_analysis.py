@@ -212,6 +212,32 @@ def _vm_unquote(v: str) -> str:
     return v
 
 
+# Kinds whose chart template defaults deletion-policy to abandon unless
+# allowDeletion is armed. Attachments never set the annotation.
+_VM_ABANDON_DEFAULT_KINDS = ("ComputeInstance", "ComputeDisk", "ComputeAddress")
+
+
+def _vm_deleted_body_policy(body: str) -> str:
+    """Return 'abandon', 'delete', or '' from minus lines of a deleted CR."""
+    saw_abandon = saw_delete = False
+    for line in (body or "").splitlines():
+        if not line.startswith("-"):
+            continue
+        if "deletion-policy" not in line:
+            continue
+        low = line.lower()
+        if "abandon" in low:
+            saw_abandon = True
+        if "deletion-policy: delete" in low or 'deletion-policy: "delete"' in low \
+                or "deletion-policy: 'delete'" in low:
+            saw_delete = True
+    if saw_delete and not saw_abandon:
+        return "delete"
+    if saw_abandon:
+        return "abandon"
+    return ""
+
+
 def _detect_vm_changes(sections: list) -> list:
     """Structured facts for every VM-domain (KCC linux-services) section.
 
@@ -234,10 +260,11 @@ def _detect_vm_changes(sections: list) -> list:
       - a disk size DECREASE is impossible in place (GCP only grows disks),
         so it implies recreation and data loss — dangerous. Growth is the
         routine case.
-      - a whole VM-domain resource disappearing from the render (an
-        `enabled` flag turning off, or the environment dropping the domain)
-        is dangerous; a snapshot-policy attachment disappearing silently
-        ends that disk's backup schedule.
+      - a whole VM-domain resource disappearing from the render under
+        `deletion-policy: abandon` (chart default when allowDeletion is
+        unset) is unmanage: GCP is kept (orphaned). The same disappearance
+        with `deletion-policy: delete` is dangerous. A snapshot-policy
+        attachment disappearing is a schedule note, not a VM destroy.
     Everything else in the domain (status transitions, brand-new resources,
     an address re-pin) is reported as a routine/notable line — the panel
     only shouts when shouting is deserved, or nobody trusts it.
@@ -305,15 +332,36 @@ def _detect_vm_changes(sections: list) -> list:
                     continue
                 fields.append((key, old, new))
         byk = {k: (o, n) for (k, o, n) in fields}
+        orphaned = False
         if deleted:
             if kind == "ComputeDiskResourcePolicyAttachment":
-                dangerous.append("snapshot-policy attachment removed — this "
-                                 "disk loses its backup schedule")
+                # Attachments do not carry deletion-policy. Pruning the CR may
+                # detach the schedule from the disk, but it does not destroy
+                # the VM, disk, IP, or existing snapshots (COPS-2682).
+                notes.append(
+                    "snapshot-policy attachment leaves KCC — the disk may "
+                    "stop getting new scheduled snaps; existing snapshots "
+                    "and the disk itself stay")
             else:
-                dangerous.append(
-                    "%s removed from the render entirely (an enabled flag "
-                    "turned off, or the environment dropped the domain)"
-                    % kind)
+                policy = _vm_deleted_body_policy(body)
+                if policy == "delete":
+                    dangerous.append(
+                        "%s removed from the render with "
+                        "`deletion-policy: delete` — Argo prune can destroy "
+                        "this resource in GCP" % kind)
+                elif policy == "abandon" or kind in _VM_ABANDON_DEFAULT_KINDS:
+                    # Chart default is abandon when allowDeletion is unset.
+                    # COPS-2682 / acme-config-prod #4326: disabling KCC for a
+                    # TERMINATED svc VM must read as unmanage, not destroy.
+                    orphaned = True
+                    notes.append(
+                        "%s leaves Argo under `deletion-policy: abandon` — "
+                        "GCP resource is kept (orphaned), not deleted" % kind)
+                else:
+                    dangerous.append(
+                        "%s removed from the render entirely (an enabled flag "
+                        "turned off, or the environment dropped the domain)"
+                        % kind)
         elif created:
             notes.append("new %s — appears in this environment for the "
                          "first time" % kind)
@@ -395,6 +443,7 @@ def _detect_vm_changes(sections: list) -> list:
         facts.append({"header": header, "kind": kind,
                       "name": _section_name(header), "fields": fields,
                       "created": created, "deleted": deleted,
+                      "orphaned": orphaned,
                       "dangerous": dangerous, "notes": notes})
     return facts
 
