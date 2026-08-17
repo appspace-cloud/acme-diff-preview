@@ -88,27 +88,80 @@ def _count_hpas_remaining(pr_resources) -> int:
     return n
 
 
+_MANIFEST_REPLICAS_RE = re.compile(r"^(\s*)replicas:\s*(\d+)\s*(?:#.*)?$")
+
+
+def _manifest_replicas(body: str):
+    """spec.replicas from a full manifest body, or None if unset.
+
+    HPA-managed Deployments often omit the field; those are not "at zero".
+    Only shallow `replicas:` lines count (indent <= 4) so a nested key inside
+    template metadata cannot poison the reading.
+    """
+    if not body:
+        return None
+    found = None
+    for line in body.splitlines():
+        m = _MANIFEST_REPLICAS_RE.match(line)
+        if not m:
+            continue
+        if len(m.group(1)) > 4:
+            continue
+        found = int(m.group(2))
+    return found
+
+
+def _count_workload_replicas(pr_resources):
+    """(total_workloads, zeroed) from the full PR-side resource map.
+
+    Same reason as `_count_hpas_remaining`: unchanged Deployments never appear
+    in the unified diff. Counting only diff sections made scaling two
+    services to 0 look like a whole-environment shutdown (COPS-2680 /
+    acme-config-prod #4321).
+    """
+    if not pr_resources:
+        return 0, 0
+    total = zeroed = 0
+    for key, body in pr_resources.items():
+        type_key = key[0] if isinstance(key, tuple) else str(key)
+        kind = type_key.rsplit("/", 1)[-1]
+        if kind not in _WORKLOAD_KINDS:
+            continue
+        total += 1
+        if _manifest_replicas(body) == 0:
+            zeroed += 1
+    return total, zeroed
+
+
 def _detect_workload_shutdown(sections: list, pr_resources=None,
-                               hpas_remaining=None):
-    """{"zeroed", "workloads", "hpas_remaining"} over workload sections, or None.
+                               hpas_remaining=None,
+                               replica_stats=None):
+    """{"zeroed", "workloads", "hpas_remaining"} over workloads, or None.
 
     The ratio is what separates "one service was scaled down" from "this
     environment is being switched off", and the two deserve different
     wording in the merge summary. Counted here, pre-cap, alongside the other
     safety facts.
 
-    `hpas_remaining` comes from the full PR-side resource map (not the diff):
-    unchanged HPAs are invisible in unified diffs. Pass either `pr_resources`
-    or an already-counted `hpas_remaining` int from `_run_one_diff`.
+    Prefer the full PR-side render for `workloads` / `zeroed` when available
+    (`pr_resources` or precomputed `replica_stats=(total, zeroed)` from
+    `_run_one_diff`). Diff sections alone only see what changed (COPS-2680).
+    `hpas_remaining` is the same: unchanged HPAs are invisible in unified
+    diffs (COPS-2677).
     """
-    total = zeroed = 0
-    for header, body in sections:
-        if _section_kind(header) not in _WORKLOAD_KINDS:
-            continue
-        total += 1
-        ends_zero, ends_pos = _replicas_end_state(body)
-        if ends_zero and not ends_pos:
-            zeroed += 1
+    if replica_stats is not None:
+        total, zeroed = replica_stats
+    elif pr_resources:
+        total, zeroed = _count_workload_replicas(pr_resources)
+    else:
+        total = zeroed = 0
+        for header, body in sections:
+            if _section_kind(header) not in _WORKLOAD_KINDS:
+                continue
+            total += 1
+            ends_zero, ends_pos = _replicas_end_state(body)
+            if ends_zero and not ends_pos:
+                zeroed += 1
     if not total:
         return None
     if hpas_remaining is None:

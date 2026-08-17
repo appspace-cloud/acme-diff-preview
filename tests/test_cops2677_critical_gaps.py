@@ -59,9 +59,15 @@ def test_hpas_remaining_counted_from_pr_resources_not_diff():
         ("/apps/Deployment a", _added_zero()),
         ("/apps/Deployment b", _added_zero()),
     ]
+    # COPS-2680: workload totals also come from the full PR-side render, so
+    # bodies must carry replicas: 0 (a stub "x" is not a zeroed Deployment).
+    deploy = (
+        "apiVersion: apps/v1\nkind: Deployment\nmetadata:\n  name: x\n"
+        "  namespace: ns\nspec:\n  replicas: 0\n"
+    )
     pr_resources = {
-        ("apps/Deployment", "ns", "a"): "x",
-        ("apps/Deployment", "ns", "b"): "x",
+        ("apps/Deployment", "ns", "a"): deploy,
+        ("apps/Deployment", "ns", "b"): deploy,
         ("autoscaling/HorizontalPodAutoscaler", "ns", "a"): "x",
         ("autoscaling/HorizontalPodAutoscaler", "ns", "b"): "x",
     }

@@ -208,6 +208,7 @@ from vm_analysis import (  # VM/KCC infrastructure analysis (same-dir module)
     _detect_replicas_zeroed,
     _detect_workload_shutdown,
     _count_hpas_remaining,
+    _count_workload_replicas,
     _VM_KINDS,
     _VM_DELETION_POLICY_KEY,
     _VM_TRACKED_FIELDS,
@@ -6524,11 +6525,14 @@ def _run_one_diff(app, pr_sha, main_sha, chart_revision=None, changed_paths=None
     _t_diff0 = time.perf_counter()
     diff_text = _diff_resources(main_resources, pr_resources)
     _record_stage("diff", time.perf_counter() - _t_diff0)
-    # COPS-2677: HPA count for zeroPods coexistence note. Must travel with
-    # the diff — argocd_diff only sees the unified text, and unchanged HPAs
-    # never appear there.
+    # COPS-2677 / COPS-2680: HPA count and workload replica totals travel
+    # with the diff — argocd_diff only sees the unified text, and unchanged
+    # Deployments / HPAs never appear there. Without the full-render
+    # workload totals, scaling two services to 0 looked like a whole-env
+    # shutdown (acme-config-prod #4321).
     return (diff_text, None, None, version_change,
-            _count_hpas_remaining(pr_resources))
+            _count_hpas_remaining(pr_resources),
+            _count_workload_replicas(pr_resources))
 
 
 def _indeterminate(reason, detail):
@@ -6583,11 +6587,13 @@ def argocd_diff(app, pr_sha, main_sha, chart_revision=None, changed_paths=None, 
             app, pr_sha, main_sha,
             chart_revision=chart_revision, changed_paths=changed_paths, renames=renames)
         # v2.5.8: success returns a 4-tuple with the version change; COPS-2677
-        # extends to 5 with hpas_remaining from the PR-side render. Failure
-        # paths keep returning 3-tuples.
+        # extends to 5 with hpas_remaining; COPS-2680 adds replica_stats
+        # (total, zeroed) from the PR-side render. Failure paths keep
+        # returning 3-tuples.
         diff_text, reason, detail = step[0], step[1], step[2]
         version_change = step[3] if len(step) > 3 else None
         hpas_remaining = step[4] if len(step) > 4 else 0
+        replica_stats = step[5] if len(step) > 5 else None
 
         if reason is not None:
             last_detail, last_reason = detail or reason, reason
@@ -6635,9 +6641,11 @@ def argocd_diff(app, pr_sha, main_sha, chart_revision=None, changed_paths=None, 
             renamed_res, vm_changes_res, version_fold = _package_sections(
                 filtered_sections, version_change=version_change)
         # Counted on the full pre-cap list, like every other safety fact.
-        # hpas_remaining is from the PR-side render in _run_one_diff (COPS-2677).
+        # hpas_remaining + replica_stats come from the PR-side render in
+        # _run_one_diff (COPS-2677 / COPS-2680).
         shutdown_stats = _detect_workload_shutdown(
-            filtered_sections, hpas_remaining=hpas_remaining)
+            filtered_sections, hpas_remaining=hpas_remaining,
+            replica_stats=replica_stats)
         artifacts = _detect_template_artifacts(filtered_sections)
         return DiffResult(clean_diff, capped_sections,
                           n_res, True, None, OUT_DIFF, "changes", version_change,
