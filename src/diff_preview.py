@@ -4437,20 +4437,25 @@ def _evaluate_new_envs(new_env_candidates: list, pr_sha: str,
     for env_info in new_env_candidates:
         # v2.13.2 (COPS-2544, explicit request): every ApplicationSet with a
         # customer.yaml git generator also loads `{{env}}/../config.yaml` as
-        # a matrix generator (verified live on the hub 2026-07-28: all of
-        # them except the six gcp/aec/ ones). If that cohort file does not
+        # a matrix generator. This once excluded the six gcp/aec/ ones;
+        # COPS-2689 gave the shared aec template that generator, so na4-a and
+        # na2-a have it live and the rest inherit it as they convert. The
+        # exemption expired and is gone. It is deliberately not replaced by a
+        # per-spoke allowlist: requiring a cohort config.yaml in every aec
+        # cohort folder costs a 4-line placeholder, matches what the prod tree
+        # has always required, and blocks nothing that exists today (the whole
+        # aec tree was audited on 2026-08-18 with zero gaps). If that file does not
         # exist at the PR head, the matrix yields ZERO results: no
         # Application is ever generated for this path, and a moved
         # environment gets decommissioned instead of followed. A green
         # "will be created on merge" here would be false, and the render
         # error it produces instead is misleading. Block with the reason.
         # A transient fetch error must NOT block (only a genuine 404 is a
-        # stable fact); gcp/aec/ paths have no cohort generator and are
-        # exempt. The wording below must never contain the phrase
+        # stable fact). The wording below must never contain the phrase
         # "missing required value": that exact phrase is the one allowed
         # green shape in _new_env_status.
         env_dir = env_info.get("env_dir", "")
-        if not env_dir.startswith("gcp/aec/") and "/" in env_dir:
+        if "/" in env_dir:
             cohort_path = env_dir.rsplit("/", 1)[0] + "/config.yaml"
             _c, _cohort_st = _bb_fetch_cached(cohort_path, pr_sha)
             # COPS-2545 (F4, live scenario 5): a cohort file that EXISTS but
@@ -5403,8 +5408,12 @@ def _moves_missing_cohort(renames: dict, pr_sha: str, repo: str = None) -> list:
 
     A moved environment needs its destination cohort file exactly as much as a
     brand-new one. Same rules as the new-env guard: only a genuine 404 blocks
-    (a transient error is not a fact), and gcp/aec paths are exempt because
-    those six ApplicationSets have no cohort generator.
+    (a transient error is not a fact).
+
+    COPS-2689 removed the gcp/aec exemption that used to sit here. It was
+    written when no aec ApplicationSet had a cohort generator; the shared aec
+    template now has one, so na4-a and na2-a are live with it and the
+    remaining spokes inherit it as they convert.
     """
     out = []
     for old, new in (renames or {}).items():
@@ -5412,7 +5421,7 @@ def _moves_missing_cohort(renames: dict, pr_sha: str, repo: str = None) -> list:
         if len(parts) < 5 or parts[-1] not in _IDENTITY_BASENAMES:
             continue
         env_dir = new.rsplit("/", 1)[0]
-        if env_dir.startswith("gcp/aec/") or "/" not in env_dir:
+        if "/" not in env_dir:
             continue
         cohort = env_dir.rsplit("/", 1)[0] + "/config.yaml"
         _c, st = _bb_fetch_cached(cohort, pr_sha, repo=repo)
