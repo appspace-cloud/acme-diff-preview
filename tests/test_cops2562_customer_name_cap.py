@@ -328,6 +328,15 @@ def test_reason_is_permanent_not_retryable():
     assert m.REASON_NAME_TOO_LONG not in m.RETRYABLE_REASONS
 
 
+# COPS-2689 fixture note: these three tests exercise the NAME CAP, and they
+# used gcp/aec/ paths because aec was once exempt from the cohort-config guard,
+# so a blanket NOT_FOUND fetch left the name check as the only one running.
+# That exemption is gone (the shared aec template now has a cohort generator),
+# so each of them must serve the cohort file to keep the name cap as the thing
+# under test. The assertions below are unchanged.
+_AEC_COHORT = "gcp/aec/private-cloud/na2-a/config.yaml"
+
+
 def test_new_env_with_a_too_long_name_is_still_blocked(monkeypatch):
     """End-to-end on the new-environment path: the original incident shape
     must still be caught, now via the cheap leaf-file read."""
@@ -335,7 +344,9 @@ def test_new_env_with_a_too_long_name_is_still_blocked(monkeypatch):
     cust = f"{env_dir}/customer.yaml"
     monkeypatch.setattr(m, "_bb_fetch_status",
                         lambda path, sha, repo=None:
-                        (LONG, m.BB_OK) if path == cust else (None, m.BB_NOT_FOUND))
+                        (LONG, m.BB_OK) if path == cust
+                        else (("---\n", m.BB_OK) if path == _AEC_COHORT
+                              else (None, m.BB_NOT_FOUND)))
     monkeypatch.setattr(m, "_render_new_env_diff",
                         lambda info, sha: (_ for _ in ()).throw(
                             AssertionError("must not render a name that cannot deploy")))
@@ -352,7 +363,9 @@ def test_new_env_with_a_valid_name_is_not_blocked(monkeypatch):
     cust = f"{env_dir}/customer.yaml"
     monkeypatch.setattr(m, "_bb_fetch_status",
                         lambda path, sha, repo=None:
-                        (GOOD, m.BB_OK) if path == cust else (None, m.BB_NOT_FOUND))
+                        (GOOD, m.BB_OK) if path == cust
+                        else (("---\n", m.BB_OK) if path == _AEC_COHORT
+                              else (None, m.BB_NOT_FOUND)))
     monkeypatch.setattr(m, "_render_new_env_diff",
                         lambda info, sha: (None,
                             "helm template failed: Missing required value: x", 0, None))
@@ -369,7 +382,9 @@ def test_blocked_headline_names_the_length_problem_not_the_cohort(monkeypatch):
     cust = f"{env_dir}/customer.yaml"
     monkeypatch.setattr(m, "_bb_fetch_status",
                         lambda path, sha, repo=None:
-                        (LONG, m.BB_OK) if path == cust else (None, m.BB_NOT_FOUND))
+                        (LONG, m.BB_OK) if path == cust
+                        else (("---\n", m.BB_OK) if path == _AEC_COHORT
+                              else (None, m.BB_NOT_FOUND)))
     monkeypatch.setattr(m, "_render_new_env_diff",
                         lambda info, sha: (_ for _ in ()).throw(AssertionError("no render")))
     env_info = {"name": "pv-universalhollywood--aec1-a", "config_file": cust,
