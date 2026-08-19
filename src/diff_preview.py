@@ -59,6 +59,7 @@ import yaml  # PyYAML (requirements.txt) - input root-cause panel only, v2.6.2
 import diff_ui  # full-diff web UI (same-dir module, stdlib only)
 import leader  # Lease-based leader election (same-dir module, stdlib only)
 import logsink  # structured logging seam (same-dir module, stdlib only)
+import fleet_health  # COPS-2694 fleet health gauges (same-dir module, stdlib only)
 import render_cache  # three-tier main-render cache (same-dir module)
 from render_cache import (  # re-exported: the suite reaches these on the hub
     MAIN_RENDER_CACHE_DIR,
@@ -1271,7 +1272,11 @@ class _HealthHandler(BaseHTTPRequestHandler):
             with _diff_stats_lock:
                 snapshot = dict(_diff_stats)
             snapshot["is_leader"] = _should_run_iteration(_leader)
-            body = render_prometheus(snapshot).encode("utf-8")
+            # COPS-2694: the fleet health block is leader-only (empty string
+            # on the standby) so sum() on the alert side never double-counts.
+            body = (render_prometheus(snapshot)
+                    + fleet_health.render_prometheus(snapshot["is_leader"])
+                    ).encode("utf-8")
             self.send_response(200)
             self.send_header("Content-Type",
                              "text/plain; version=0.0.4; charset=utf-8")
@@ -2306,6 +2311,14 @@ def discover_path_app_map():
         apps = raw if isinstance(raw, list) else raw.get("items", raw)
     except json.JSONDecodeError as e:
         raise RuntimeError(f"argocd app list: invalid JSON: {e}")
+    # COPS-2694: rebuild the fleet health gauges from this same payload -
+    # the only hub-side source of per-Application health (the hub app
+    # controller runs 0 replicas). Guarded so a metrics bug can never break
+    # discovery: diffs must survive anything this collector does.
+    try:
+        fleet_health.collect(apps)
+    except Exception as exc:
+        logsink.log(f"fleet health collect failed (non-fatal): {exc}", "WARNING")
     path_map = {}
     chart_map = {}
     chart_rev_map = {}
