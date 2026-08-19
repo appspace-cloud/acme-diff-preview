@@ -28,7 +28,9 @@ Diff outcome model:
 - error         : reserved for unexpected per-PR exceptions (see process_pr).
 
 Failure reasons (REASON_* codes set directly by _run_one_diff, no stderr regex):
-- oci_not_found  : version absent in the registry. PERMANENT -> FAILED build status
+- oci_not_found  : version absent in the registry. FAILED build status, but
+                  retried under backoff (COPS-2696): a publish that has not
+                  propagated yet self-heals without an empty commit
                    (the deployer would fail the same way), no retry, PR marked seen.
 - oci_pull_failed: transient pull/login failure -> retried with backoff.
 - metadata_pending: app not yet in the 5-min discovery cache -> retried.
@@ -59,6 +61,9 @@ import yaml  # PyYAML (requirements.txt) - input root-cause panel only, v2.6.2
 import diff_ui  # full-diff web UI (same-dir module, stdlib only)
 import leader  # Lease-based leader election (same-dir module, stdlib only)
 import logsink  # structured logging seam (same-dir module, stdlib only)
+import fleet_health  # COPS-2694 fleet health gauges (same-dir module, stdlib only)
+import user_content  # COPS-2697 shared user-content identity (same-dir module, stdlib only)
+import blast_radius  # COPS-2693 Plan B blast-radius assessment (same-dir module, stdlib only)
 import render_cache  # three-tier main-render cache (same-dir module)
 from render_cache import (  # re-exported: the suite reaches these on the hub
     MAIN_RENDER_CACHE_DIR,
@@ -116,6 +121,7 @@ from vocabulary import (  # diff outcome vocabulary (same-dir module, stdlib onl
     OUT_ERROR,
     OUT_DECOMMISSIONED,
     REASON_OCI_NOT_FOUND,
+    SELF_RESOLVING_REASONS,
     REASON_OCI_PULL,
     REASON_METADATA,
     REASON_RENDER,
@@ -154,6 +160,8 @@ from comment_render import (  # comment rendering (same-dir module, stdlib only)
     _build_merge_summary,
     _DECOM_ORPHAN_HDR,
     _DECOM_PURGE_HDR,
+    _DECOM_SHARED_UC_HDR,
+    _BLAST_RADIUS_HDR,
     _DECOM_VM_STRIP_HDR,
     _SHUTDOWN_MIN_WORKLOADS,
     _is_env_shutdown,
@@ -430,6 +438,14 @@ RISK_SECTION_RESERVE = 5
 MAX_APPS_PER_RUN   = _env_int("MAX_APPS_PER_RUN", 1500)  # ~1.7x the largest fleet (see README)
 DIFF_TIMEOUT       = _env_int("DIFF_TIMEOUT", 120)       # seconds per diff (OCI cache-miss pulls are slow)
 DIFF_WORKERS       = _env_int("DIFF_WORKERS", 16)      # parallel helm-template renders
+# COPS-2693 Plan B: blast-radius thresholds. A finding fires only for
+# NON-version changes to a shared config.yaml reaching at least this many
+# environments OR spokes. Version-only bumps (the cadence flow) are exempt
+# regardless of reach - flagging the routine would train reviewers to ignore
+# the finding. Defaults sized so a single-spoke cohort tweak stays silent and
+# a tree/region-level edit does not.
+DIFF_BLAST_ENVS    = _env_int("DIFF_BLAST_ENVS", 30)
+DIFF_BLAST_SPOKES  = _env_int("DIFF_BLAST_SPOKES", 4)
 WARM_WORKERS       = _env_int("WARM_WORKERS", 4)         # parallel chart-cache warm-up pulls
 WARM_THRESHOLD     = _env_int("WARM_THRESHOLD", 8)       # only warm when a PR fans out to more apps than this
 MAX_COMMENT_BYTES  = 245_000 # Bitbucket ~256KB limit; leave headroom
@@ -1271,7 +1287,11 @@ class _HealthHandler(BaseHTTPRequestHandler):
             with _diff_stats_lock:
                 snapshot = dict(_diff_stats)
             snapshot["is_leader"] = _should_run_iteration(_leader)
-            body = render_prometheus(snapshot).encode("utf-8")
+            # COPS-2694: the fleet health block is leader-only (empty string
+            # on the standby) so sum() on the alert side never double-counts.
+            body = (render_prometheus(snapshot)
+                    + fleet_health.render_prometheus(snapshot["is_leader"])
+                    ).encode("utf-8")
             self.send_response(200)
             self.send_header("Content-Type",
                              "text/plain; version=0.0.4; charset=utf-8")
@@ -2306,6 +2326,14 @@ def discover_path_app_map():
         apps = raw if isinstance(raw, list) else raw.get("items", raw)
     except json.JSONDecodeError as e:
         raise RuntimeError(f"argocd app list: invalid JSON: {e}")
+    # COPS-2694: rebuild the fleet health gauges from this same payload -
+    # the only hub-side source of per-Application health (the hub app
+    # controller runs 0 replicas). Guarded so a metrics bug can never break
+    # discovery: diffs must survive anything this collector does.
+    try:
+        fleet_health.collect(apps)
+    except Exception as exc:
+        logsink.log(f"fleet health collect failed (non-fatal): {exc}", "WARNING")
     path_map = {}
     chart_map = {}
     chart_rev_map = {}
@@ -4437,20 +4465,25 @@ def _evaluate_new_envs(new_env_candidates: list, pr_sha: str,
     for env_info in new_env_candidates:
         # v2.13.2 (COPS-2544, explicit request): every ApplicationSet with a
         # customer.yaml git generator also loads `{{env}}/../config.yaml` as
-        # a matrix generator (verified live on the hub 2026-07-28: all of
-        # them except the six gcp/aec/ ones). If that cohort file does not
+        # a matrix generator. This once excluded the six gcp/aec/ ones;
+        # COPS-2689 gave the shared aec template that generator, so na4-a and
+        # na2-a have it live and the rest inherit it as they convert. The
+        # exemption expired and is gone. It is deliberately not replaced by a
+        # per-spoke allowlist: requiring a cohort config.yaml in every aec
+        # cohort folder costs a 4-line placeholder, matches what the prod tree
+        # has always required, and blocks nothing that exists today (the whole
+        # aec tree was audited on 2026-08-18 with zero gaps). If that file does not
         # exist at the PR head, the matrix yields ZERO results: no
         # Application is ever generated for this path, and a moved
         # environment gets decommissioned instead of followed. A green
         # "will be created on merge" here would be false, and the render
         # error it produces instead is misleading. Block with the reason.
         # A transient fetch error must NOT block (only a genuine 404 is a
-        # stable fact); gcp/aec/ paths have no cohort generator and are
-        # exempt. The wording below must never contain the phrase
+        # stable fact). The wording below must never contain the phrase
         # "missing required value": that exact phrase is the one allowed
         # green shape in _new_env_status.
         env_dir = env_info.get("env_dir", "")
-        if not env_dir.startswith("gcp/aec/") and "/" in env_dir:
+        if "/" in env_dir:
             cohort_path = env_dir.rsplit("/", 1)[0] + "/config.yaml"
             _c, _cohort_st = _bb_fetch_cached(cohort_path, pr_sha)
             # COPS-2545 (F4, live scenario 5): a cohort file that EXISTS but
@@ -5403,8 +5436,12 @@ def _moves_missing_cohort(renames: dict, pr_sha: str, repo: str = None) -> list:
 
     A moved environment needs its destination cohort file exactly as much as a
     brand-new one. Same rules as the new-env guard: only a genuine 404 blocks
-    (a transient error is not a fact), and gcp/aec paths are exempt because
-    those six ApplicationSets have no cohort generator.
+    (a transient error is not a fact).
+
+    COPS-2689 removed the gcp/aec exemption that used to sit here. It was
+    written when no aec ApplicationSet had a cohort generator; the shared aec
+    template now has one, so na4-a and na2-a are live with it and the
+    remaining spokes inherit it as they convert.
     """
     out = []
     for old, new in (renames or {}).items():
@@ -5412,7 +5449,7 @@ def _moves_missing_cohort(renames: dict, pr_sha: str, repo: str = None) -> list:
         if len(parts) < 5 or parts[-1] not in _IDENTITY_BASENAMES:
             continue
         env_dir = new.rsplit("/", 1)[0]
-        if env_dir.startswith("gcp/aec/") or "/" not in env_dir:
+        if "/" not in env_dir:
             continue
         cohort = env_dir.rsplit("/", 1)[0] + "/config.yaml"
         _c, st = _bb_fetch_cached(cohort, pr_sha, repo=repo)
@@ -5830,6 +5867,141 @@ def _merged_kcc_flat_for_env(identity_file: str, sha: str,
     return merged
 
 
+def _fleet_identity_files(repo: str = None) -> list:
+    """Every environment's `customer.yaml` known to the hub, as repo paths.
+
+    Derived from the value-file lists discover_path_app_map() already keeps:
+    every one of the fleet's Applications carries exactly one valueFile ending
+    in `customer.yaml` (verified live: 1039/1039), and ss/ms/glb siblings share
+    it, so the set is deduplicated. No new data source, no extra API call.
+    """
+    try:
+        discover_path_app_map()          # cached; populates the maps below
+    except Exception as exc:
+        logsink.log(f"fleet census unavailable: {exc}", "WARNING")
+        return []
+    out = set()
+    for app, vfs in (_app_value_files_map or {}).items():
+        if repo and (_app_repo_map or {}).get(app) not in (None, repo):
+            continue
+        for vf in vfs or []:
+            if vf.endswith("customer.yaml"):
+                out.add(vf.split("$config/", 1)[-1].lstrip("/"))
+    return sorted(out)
+
+
+def _uc_prefilter_token(identity_file: str) -> str:
+    """`.../pv-gsk--aec1-c/customer.yaml` -> `pv-gsk--aec1`.
+
+    The bucket stem is `{appspace.prefix}-{appspace.customerName}-...`, and the
+    environment folder is `{prefix}-{customerName}-{suffix}`. Dropping the last
+    `-segment` therefore yields exactly the stem head, with no fetch at all.
+    Used only to shortlist candidates before reading their value chains; an
+    empty token means "cannot shortlist", and the caller then scans the whole
+    repo rather than risking a missed sharer.
+    """
+    parts = identity_file.rstrip("/").split("/")
+    if len(parts) < 2:
+        return ""
+    folder = parts[-2]
+    return folder.rsplit("-", 1)[0] if "-" in folder else ""
+
+
+def _shared_user_content_owners(identity_file: str, main_sha: str,
+                                repo: str = None) -> tuple:
+    """(target_identity, sharers) for an environment about to be torn down.
+
+    COPS-2697. The user-content bucket and DNS record are keyed on
+    `buckets.userContent.suffix`, not on `appspace.suffix`, so a clone made for
+    a migration resolves to the SAME objects as the original. Purging the old
+    environment then deletes what the surviving one still serves from.
+
+    Returns ({}, {}) when there is nothing to say, so the caller can skip
+    cheaply. Only ever called on a decommission/removal PR.
+    """
+    target = user_content.identity(
+        _merged_kcc_flat_for_env(identity_file, main_sha, repo=repo))
+    if target["proven"] and not target["buckets"] and not target["fqdns"]:
+        return {}, {}                    # renders no user-content objects
+    token = _uc_prefilter_token(identity_file)
+    candidates = {}
+    for other in _fleet_identity_files(repo=repo):
+        if other == identity_file:
+            continue
+        if token and _uc_prefilter_token(other) != token:
+            continue
+        label = other.split("/")[-2] if "/" in other else other
+        candidates[label] = user_content.identity(
+            _merged_kcc_flat_for_env(other, main_sha, repo=repo))
+    if not token:
+        logsink.log(
+            f"user-content prefilter could not tokenise {identity_file}; "
+            f"scanned {len(candidates)} environments in full", "WARNING")
+    return target, user_content.shared_owners(target, candidates)
+
+
+def _shared_user_content_lines(identity_file: str, main_sha: str,
+                               purge_armed: bool, repo: str = None) -> list:
+    """The comment block. Empty list when no surviving environment shares.
+
+    With the purge armed this leads with _DECOM_SHARED_UC_HDR, which
+    comment_render turns into the DO-NOT-MERGE verdict. Without it the
+    teardown is non-destructive today, so it is a REVIEW note instead: the
+    identity is still shared, and arming the purge later would destroy it.
+    """
+    try:
+        target, sharers = _shared_user_content_owners(
+            identity_file, main_sha, repo=repo)
+    except Exception as exc:
+        # Never let this guard break a decommission comment; but say so, and
+        # say it as a warning rather than staying silent (P0-6 lesson).
+        logsink.log(f"shared user-content check failed: {exc}", "WARNING")
+        return ["⚠️ The shared user-content check did not complete "
+                f"(`{type(exc).__name__}`), so a shared bucket or DNS record "
+                "cannot be ruled out. Verify by hand before merging.", ""]
+    if not sharers:
+        return []
+    env = identity_file.split("/")[-2] if "/" in identity_file else identity_file
+    names = sorted({b for h in sharers.values() for b in h["buckets"]})
+    fqdns = sorted({f for h in sharers.values() for f in h["fqdns"]})
+    unproven = sorted(l for l, h in sharers.items() if h["unproven"])
+    proven = sorted(l for l, h in sharers.items() if not h["unproven"])
+    lines = []
+    if purge_armed:
+        lines.append(
+            "🚨 " + _DECOM_SHARED_UC_HDR + f" `{env}` is being "
+            "decommissioned with `appspace.decommissionPurgeData: true`. Its "
+            "user content "
+            + (f"bucket `{names[0]}`" if len(names) == 1
+               else f"buckets {', '.join('`%s`' % n for n in names)}"
+               if names else "objects")
+            + (f" and DNS record `{fqdns[0]}`" if len(fqdns) == 1
+               else f" and DNS records {', '.join('`%s`' % f for f in fqdns)}"
+               if fqdns else "")
+            + f" resolve to the same names used by {len(sharers)} surviving "
+            + ("environment" if len(sharers) == 1 else "environments") + ": "
+            + ", ".join(f"`{l}`" for l in (proven + unproven))
+            + ". Purging this environment deletes the bucket and the A record "
+              "that the surviving environment still serves from.")
+    else:
+        lines.append(
+            f"⚠️ **Shared user content.** `{env}` shares its user "
+            "content identity with "
+            + ", ".join(f"`{l}`" for l in (proven + unproven))
+            + ". This teardown is non-destructive today "
+              "(`deletion-policy: abandon`), but do NOT arm "
+              "`appspace.decommissionPurgeData` later without repointing the "
+              "surviving environment first.")
+    if unproven:
+        lines.append("")
+        lines.append(
+            "Value chain unreadable for "
+            + ", ".join(f"`{l}`" for l in unproven)
+            + " — treated as a possible sharer rather than assumed safe.")
+    lines.append("")
+    return lines
+
+
 def _env_declares_live_kcc_vms(identity_file: str, sha: str,
                                repo: str = None) -> tuple:
     """(declares_live_vms, allowDeletion_armed) from the merged hierarchy.
@@ -6046,6 +6218,13 @@ def _evaluate_env_decommissions(candidates: list, pr_sha: str, main_sha: str,
                 f"succeeds before relying on the inventory.",
                 "",
             ]
+        # COPS-2697: leads the panel, above every cascade branch below. A
+        # shared user-content identity is worse news than anything those
+        # report, because the data destroyed belongs to an environment that is
+        # NOT being torn down. Repo defaults to None like the sibling
+        # _decommission_* calls on this same context.
+        lines += _shared_user_content_lines(
+            c["identity_file"], main_sha, purges_data)
         if not cascade:
             lines += [
                 # COPS-2668: _DECOM_ORPHAN_HDR is the sentinel the merge
@@ -7687,6 +7866,54 @@ def _declares_vms_flat(flat: dict) -> bool:
 # (COPS-2616).
 
 
+def _blast_radius_lines(changed_files, pr_sha, base_sha, path_map,
+                        repo=None) -> list:
+    """COPS-2693 Plan B: call out shared-config changes with a wide reach.
+
+    Only shared `config.yaml` files are candidates: a `customer.yaml` reaches
+    one environment by construction, and `cicd-versions.yaml` is version
+    plumbing. Reach comes from the same matcher the diff itself uses
+    (_match_files_to_apps), environments from the fleet's value-file map that
+    discovery already keeps, and both sides of the file from the same cached
+    fetch every other panel uses - no new data source.
+
+    Fail-open by design: this panel informs, it does not guard. A file whose
+    sides cannot be read is added/removed (owned by the new-env and
+    decommission panels) or transiently unreadable - either way the diff and
+    those panels tell the story, so this one stays quiet rather than guessing.
+    """
+    findings = []
+    for f in changed_files or []:
+        clean = posixpath.normpath(f.lstrip("/"))
+        if posixpath.basename(clean) != "config.yaml":
+            continue
+        new_txt, st_new = _bb_fetch_cached(clean, pr_sha, repo=repo)
+        old_txt, st_old = _bb_fetch_cached(clean, base_sha, repo=repo)
+        if st_new != BB_OK or st_old != BB_OK:
+            continue
+        try:
+            keys = blast_radius.changed_keys(
+                _flatten_yaml(_yaml_safe_load(old_txt) or {}),
+                _flatten_yaml(_yaml_safe_load(new_txt) or {}))
+        except yaml.YAMLError:
+            continue  # unparseable - the input-changes panel already flags it
+        affected = get_affected_apps([clean], path_map)
+        env_files = set()
+        for app in affected:
+            for vf in (_app_value_files_map or {}).get(app, []) or []:
+                if vf.endswith("customer.yaml"):
+                    env_files.add(vf.split("$config/", 1)[-1].lstrip("/"))
+                    break
+            else:
+                env_files.add(app)   # unmapped app counts as its own env
+        finding = blast_radius.assess(clean, keys, env_files,
+                                      DIFF_BLAST_ENVS, DIFF_BLAST_SPOKES)
+        if finding:
+            findings.append(finding)
+    return blast_radius.render_lines(findings, _BLAST_RADIUS_HDR,
+                                     DIFF_BLAST_ENVS, DIFF_BLAST_SPOKES)
+
+
 def _summarize_appspace_state_changes(changed_files, pr_sha, base_sha, path_map, repo=None) -> list:
     """Markdown block calling out changes to Application-level state flags
     read from a LIVE environment's own customer.yaml/config.yaml:
@@ -7773,6 +8000,17 @@ def _summarize_appspace_state_changes(changed_files, pr_sha, base_sha, path_map,
         # -- decommission / decommissionPurgeData (COPS-2539/COPS-2572) --
         was_armed, is_armed = _decommission_armed_flat(old_flat), _decommission_armed_flat(new_flat)
         was_purge, is_purge = _purge_armed_flat(old_flat), _purge_armed_flat(new_flat)
+
+        # COPS-2697: the other trigger. Path 1 (folder removal) covers a
+        # teardown; this covers a PR that ARMS the purge on an environment that
+        # stays in the tree. Identity is read at `base_sha`, not the PR sha, on
+        # purpose: the surviving siblings are untouched by this PR, and a
+        # decommission PR flips flags rather than renaming a bucket, so the
+        # base side is the state both halves of the comparison must share.
+        # `is_purge` (from the PR) is what decides BLOCK vs REVIEW.
+        if is_purge or is_armed:
+            lines += _shared_user_content_lines(
+                clean, base_sha, is_purge, repo=repo)
 
         # -- COPS-2660: arming while stripping the config it acts through --
         # allowDeletion only works through VM CRs helm still renders. A PR
@@ -9431,19 +9669,27 @@ def format_comment(pr_sha, app_results, skipped_apps=None, base_sha="",
     # whether to re-run without parsing the human-readable status string.
     # Tokens: clean | permanent | transient
     # - clean     : all apps diffed successfully (no retry, mark seen)
-    # - permanent : oci_not_found or hard error (no retry, mark seen)
+    # - permanent : unresolvable hard error (no retry, mark seen).
+    #   COPS-2696: oci_not_found is NOT here any more — it emits transient.
     # - transient : diff unavailable on transient blip (retry next loop)
     if any_error or new_env_structural or _arming_broken or _kcc_nil_block:
         _status_token = "permanent"
     elif any_unknown:
-        # Distinguish oci_not_found (permanent) from soft indeterminate (transient)
+        # Distinguish permanent reasons from soft indeterminate (transient).
         resolved = [_result(v) for v in app_results.values()]
         indet    = [r for r in resolved if r.outcome == OUT_INDETERMINATE]
-        # Permanent if ANY app has a permanent reason (e.g. oci_not_found mixed
-        # with transient ones). A mixed PR is still "permanent" for dedup purposes
-        # because the FAILED build status requires human action regardless.
-        has_permanent = any(r.reason in PERMANENT_REASONS for r in indet)
-        _status_token = "permanent" if has_permanent else "transient"
+        # Permanent if ANY app has a permanent reason that cannot resolve by
+        # itself (e.g. invalid_version mixed with transient ones). A mixed PR
+        # is still "permanent" for dedup purposes because the FAILED build
+        # status requires human action regardless.
+        # COPS-2696: oci_not_found alone is the exception — the status is
+        # FAILED either way, but the version may simply not have propagated
+        # to the registry yet, so the token stays "transient" and the poll
+        # loop keeps retrying under the COPS-2546 backoff instead of marking
+        # the head seen and forcing an empty commit to recover.
+        perm = {r.reason for r in indet} & PERMANENT_REASONS
+        _status_token = ("permanent" if perm - SELF_RESOLVING_REASONS
+                         else "transient")
     else:
         _status_token = "clean"
 
@@ -10218,6 +10464,13 @@ def process_pr(pr, path_map, base_sha="", repo=None):
             logsink.log(f"    [comment] appspace-state panel failed: {e}", "WARNING")
             appspace_state_lines = []
         try:
+            # COPS-2693 Plan B: shares the appspace_state_lines channel so the
+            # verdict scan in comment_render sees it without new plumbing.
+            appspace_state_lines += _blast_radius_lines(
+                changed, pr_sha, base_sha, path_map, repo=repo)
+        except Exception as e:  # informational panel must never break the comment
+            logsink.log(f"    [comment] blast-radius panel failed: {e}", "WARNING")
+        try:
             vm_change_lines = _summarize_vm_changes(
                 changed, pr_sha, base_sha, path_map, app_results, repo=repo)
         except Exception as e:  # VM panel must never break the comment
@@ -10479,7 +10732,17 @@ def process_pr(pr, path_map, base_sha="", repo=None):
         #   oci_not_found stopped the retry loop, so an invalid_yaml PR was
         #   silently re-diffed every ~60s forever even though it can never
         #   resolve itself.
-        is_permanent_failure = (any_hard_error or has_blocking_indet
+        # COPS-2696: for SCHEDULING (not status colour — has_blocking_indet
+        # above keeps the build FAILED), oci_not_found must not stop the retry
+        # loop: it is the one permanent reason that resolves by itself when
+        # the registry catches up. Everything else in PERMANENT_REASONS truly
+        # needs a human and is still marked seen below.
+        unresolvable_indet = sum(
+            1 for r in app_results.values()
+            if r.outcome == OUT_INDETERMINATE
+            and r.reason in PERMANENT_REASONS
+            and r.reason not in SELF_RESOLVING_REASONS)
+        is_permanent_failure = (any_hard_error or unresolvable_indet > 0
                                 or bool(structural_envs)
                                 or bool(moves_missing_cohort)
                                 or broken_arming

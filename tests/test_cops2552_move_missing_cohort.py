@@ -68,11 +68,31 @@ def test_transient_fetch_error_does_not_block(monkeypatch):
     assert m._moves_missing_cohort({OLD: NEW}, PR_SHA) == []
 
 
-def test_aec_paths_are_exempt(monkeypatch):
-    """The six gcp/aec ApplicationSets have no cohort generator."""
+def test_aec_paths_are_guarded_too(monkeypatch):
+    """COPS-2689: the aec exemption expired. It was written when no aec
+    ApplicationSet had a cohort generator; na4-a and na2-a now do, and the
+    rest inherit it as they convert to the shared template. An aec move into
+    a cohort folder with no config.yaml yields zero Applications exactly like
+    a prod one, so it must block.
+
+    na2-a is deliberately the example: this test previously asserted na2-a was
+    exempt, and na2-a is the very spoke whose aec tree grew monthly/ and
+    weekly/ cohorts and got the generator first."""
     old = "gcp/aec/private-cloud/na2-a/pv-x-a/customer.yaml"
     new = "gcp/aec/private-cloud/na2-a/moved/pv-x-a/customer.yaml"
     _fetch(monkeypatch, {new: "---\n"})
+    blocked = m._moves_missing_cohort({old: new}, PR_SHA)
+    assert len(blocked) == 1, blocked
+    assert blocked[0]["cohort"] == "gcp/aec/private-cloud/na2-a/moved/config.yaml"
+
+
+def test_aec_move_with_its_cohort_file_is_fine(monkeypatch):
+    """Control for the test above: the guard blocks the MISSING file, not the
+    aec tree itself. With the cohort file present the move passes."""
+    old = "gcp/aec/private-cloud/na2-a/pv-x-a/customer.yaml"
+    new = "gcp/aec/private-cloud/na2-a/moved/pv-x-a/customer.yaml"
+    cohort = "gcp/aec/private-cloud/na2-a/moved/config.yaml"
+    _fetch(monkeypatch, {new: "---\n", cohort: "---\n# placeholder\n"})
     assert m._moves_missing_cohort({old: new}, PR_SHA) == []
 
 
