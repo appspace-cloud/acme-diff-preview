@@ -221,6 +221,12 @@ _DECOM_VM_STRIP_HDR = ("## \U0001f5a5\u26d4 VM CONFIG STRIPPED WHILE "
 # `appspace.decommissionPurgeData`. This sentence is emitted ONLY when the
 # purge is genuinely armed, so matching it cannot confuse the two.
 _DECOM_PURGE_HDR = "**DATA WILL BE PERMANENTLY DESTROYED.**"
+# COPS-2697: strictly worse than the purge header above it — the purge header
+# says this environment's own data goes, this one says a SURVIVING
+# environment's data goes with it. Written verbatim by the producer in
+# diff_preview and matched here, per the one-constant rule this module's
+# docstring prescribes (same wiring as COPS-2660 / COPS-2668).
+_DECOM_SHARED_UC_HDR = "**SHARED USER CONTENT - DO NOT MERGE WITHOUT CHECKING.**"
 
 # COPS-2668: and a third state. The summary used to know only purge-vs-not,
 # so an environment with NO cascade armed — where the Applications go and
@@ -297,7 +303,17 @@ def _build_merge_summary(results, rollup_by_sig, vm_change_lines,
         # by the producer, matched here.
         purge = _DECOM_PURGE_HDR in txt
         orphan = _DECOM_ORPHAN_HDR in txt
-        if purge:
+        # COPS-2697: checked before purge. Both can be true at once, and when
+        # they are, the fact that matters is not "this environment's data is
+        # destroyed" (expected, that is what a purge is) but "a DIFFERENT,
+        # surviving environment loses its bucket and DNS record". AE-15284 was
+        # a Sev1 of that shape; the ordinary purge wording would have read as
+        # routine.
+        shared_uc = _DECOM_SHARED_UC_HDR in txt
+        if shared_uc:
+            _what = ("the user content bucket and DNS record are SHARED with a "
+                     "surviving environment, which loses them too")
+        elif purge:
             _what = ("data purge is ARMED: buckets/datasets are destroyed, "
                      "not abandoned")
         elif orphan:
