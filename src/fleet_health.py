@@ -115,8 +115,8 @@ def render_prometheus(is_leader, now=time.monotonic) -> str:
     if not is_leader or collected == 0.0:
         return ""
     out = [
-        "# HELP acme_diff_preview_argocd_app_health Applications per "
-        "destination cluster and health status, from the hub Application CRs.",
+        ("# HELP acme_diff_preview_argocd_app_health Applications per "
+         + "destination cluster and health status, from the hub Application CRs."),
         "# TYPE acme_diff_preview_argocd_app_health gauge",
     ]
     for (dest, status), n in sorted(health.items()):
@@ -124,8 +124,8 @@ def render_prometheus(is_leader, now=time.monotonic) -> str:
             'acme_diff_preview_argocd_app_health{dest_cluster="%s",'
             'health_status="%s"} %d' % (_escape(dest), _escape(status), n))
     out += [
-        "# HELP acme_diff_preview_argocd_app_sync Applications per "
-        "destination cluster and sync status, from the hub Application CRs.",
+        ("# HELP acme_diff_preview_argocd_app_sync Applications per "
+         + "destination cluster and sync status, from the hub Application CRs."),
         "# TYPE acme_diff_preview_argocd_app_sync gauge",
     ]
     for (dest, status), n in sorted(sync.items()):
@@ -133,10 +133,10 @@ def render_prometheus(is_leader, now=time.monotonic) -> str:
             'acme_diff_preview_argocd_app_sync{dest_cluster="%s",'
             'sync_status="%s"} %d' % (_escape(dest), _escape(status), n))
     out += [
-        "# HELP acme_diff_preview_fleet_snapshot_age_seconds Seconds since "
-        "the fleet counts were rebuilt from a successful argocd app list.",
+        ("# HELP acme_diff_preview_fleet_snapshot_age_seconds Seconds since "
+         + "the fleet counts were rebuilt from a successful argocd app list."),
         "# TYPE acme_diff_preview_fleet_snapshot_age_seconds gauge",
-        "acme_diff_preview_fleet_snapshot_age_seconds %g"
-        % max(0.0, now() - collected),
+        ("acme_diff_preview_fleet_snapshot_age_seconds %g"
+         % max(0.0, now() - collected)),
     ]
     return "\n".join(out) + "\n"
