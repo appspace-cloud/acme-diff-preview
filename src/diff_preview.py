@@ -60,6 +60,7 @@ import diff_ui  # full-diff web UI (same-dir module, stdlib only)
 import leader  # Lease-based leader election (same-dir module, stdlib only)
 import logsink  # structured logging seam (same-dir module, stdlib only)
 import fleet_health  # COPS-2694 fleet health gauges (same-dir module, stdlib only)
+import user_content  # COPS-2697 shared user-content identity (same-dir module, stdlib only)
 import render_cache  # three-tier main-render cache (same-dir module)
 from render_cache import (  # re-exported: the suite reaches these on the hub
     MAIN_RENDER_CACHE_DIR,
@@ -155,6 +156,7 @@ from comment_render import (  # comment rendering (same-dir module, stdlib only)
     _build_merge_summary,
     _DECOM_ORPHAN_HDR,
     _DECOM_PURGE_HDR,
+    _DECOM_SHARED_UC_HDR,
     _DECOM_VM_STRIP_HDR,
     _SHUTDOWN_MIN_WORKLOADS,
     _is_env_shutdown,
@@ -5852,6 +5854,141 @@ def _merged_kcc_flat_for_env(identity_file: str, sha: str,
     return merged
 
 
+def _fleet_identity_files(repo: str = None) -> list:
+    """Every environment's `customer.yaml` known to the hub, as repo paths.
+
+    Derived from the value-file lists discover_path_app_map() already keeps:
+    every one of the fleet's Applications carries exactly one valueFile ending
+    in `customer.yaml` (verified live: 1039/1039), and ss/ms/glb siblings share
+    it, so the set is deduplicated. No new data source, no extra API call.
+    """
+    try:
+        discover_path_app_map()          # cached; populates the maps below
+    except Exception as exc:
+        logsink.log(f"fleet census unavailable: {exc}", "WARNING")
+        return []
+    out = set()
+    for app, vfs in (_app_value_files_map or {}).items():
+        if repo and (_app_repo_map or {}).get(app) not in (None, repo):
+            continue
+        for vf in vfs or []:
+            if vf.endswith("customer.yaml"):
+                out.add(vf.split("$config/", 1)[-1].lstrip("/"))
+    return sorted(out)
+
+
+def _uc_prefilter_token(identity_file: str) -> str:
+    """`.../pv-gsk--aec1-c/customer.yaml` -> `pv-gsk--aec1`.
+
+    The bucket stem is `{appspace.prefix}-{appspace.customerName}-...`, and the
+    environment folder is `{prefix}-{customerName}-{suffix}`. Dropping the last
+    `-segment` therefore yields exactly the stem head, with no fetch at all.
+    Used only to shortlist candidates before reading their value chains; an
+    empty token means "cannot shortlist", and the caller then scans the whole
+    repo rather than risking a missed sharer.
+    """
+    parts = identity_file.rstrip("/").split("/")
+    if len(parts) < 2:
+        return ""
+    folder = parts[-2]
+    return folder.rsplit("-", 1)[0] if "-" in folder else ""
+
+
+def _shared_user_content_owners(identity_file: str, main_sha: str,
+                                repo: str = None) -> tuple:
+    """(target_identity, sharers) for an environment about to be torn down.
+
+    COPS-2697. The user-content bucket and DNS record are keyed on
+    `buckets.userContent.suffix`, not on `appspace.suffix`, so a clone made for
+    a migration resolves to the SAME objects as the original. Purging the old
+    environment then deletes what the surviving one still serves from.
+
+    Returns ({}, {}) when there is nothing to say, so the caller can skip
+    cheaply. Only ever called on a decommission/removal PR.
+    """
+    target = user_content.identity(
+        _merged_kcc_flat_for_env(identity_file, main_sha, repo=repo))
+    if target["proven"] and not target["buckets"] and not target["fqdns"]:
+        return {}, {}                    # renders no user-content objects
+    token = _uc_prefilter_token(identity_file)
+    candidates = {}
+    for other in _fleet_identity_files(repo=repo):
+        if other == identity_file:
+            continue
+        if token and _uc_prefilter_token(other) != token:
+            continue
+        label = other.split("/")[-2] if "/" in other else other
+        candidates[label] = user_content.identity(
+            _merged_kcc_flat_for_env(other, main_sha, repo=repo))
+    if not token:
+        logsink.log(
+            f"user-content prefilter could not tokenise {identity_file}; "
+            f"scanned {len(candidates)} environments in full", "WARNING")
+    return target, user_content.shared_owners(target, candidates)
+
+
+def _shared_user_content_lines(identity_file: str, main_sha: str,
+                               purge_armed: bool, repo: str = None) -> list:
+    """The comment block. Empty list when no surviving environment shares.
+
+    With the purge armed this leads with _DECOM_SHARED_UC_HDR, which
+    comment_render turns into the DO-NOT-MERGE verdict. Without it the
+    teardown is non-destructive today, so it is a REVIEW note instead: the
+    identity is still shared, and arming the purge later would destroy it.
+    """
+    try:
+        target, sharers = _shared_user_content_owners(
+            identity_file, main_sha, repo=repo)
+    except Exception as exc:
+        # Never let this guard break a decommission comment; but say so, and
+        # say it as a warning rather than staying silent (P0-6 lesson).
+        logsink.log(f"shared user-content check failed: {exc}", "WARNING")
+        return ["⚠️ The shared user-content check did not complete "
+                f"(`{type(exc).__name__}`), so a shared bucket or DNS record "
+                "cannot be ruled out. Verify by hand before merging.", ""]
+    if not sharers:
+        return []
+    env = identity_file.split("/")[-2] if "/" in identity_file else identity_file
+    names = sorted({b for h in sharers.values() for b in h["buckets"]})
+    fqdns = sorted({f for h in sharers.values() for f in h["fqdns"]})
+    unproven = sorted(l for l, h in sharers.items() if h["unproven"])
+    proven = sorted(l for l, h in sharers.items() if not h["unproven"])
+    lines = []
+    if purge_armed:
+        lines.append(
+            "🚨 " + _DECOM_SHARED_UC_HDR + f" `{env}` is being "
+            "decommissioned with `appspace.decommissionPurgeData: true`. Its "
+            "user content "
+            + (f"bucket `{names[0]}`" if len(names) == 1
+               else f"buckets {', '.join('`%s`' % n for n in names)}"
+               if names else "objects")
+            + (f" and DNS record `{fqdns[0]}`" if len(fqdns) == 1
+               else f" and DNS records {', '.join('`%s`' % f for f in fqdns)}"
+               if fqdns else "")
+            + f" resolve to the same names used by {len(sharers)} surviving "
+            + ("environment" if len(sharers) == 1 else "environments") + ": "
+            + ", ".join(f"`{l}`" for l in (proven + unproven))
+            + ". Purging this environment deletes the bucket and the A record "
+              "that the surviving environment still serves from.")
+    else:
+        lines.append(
+            f"⚠️ **Shared user content.** `{env}` shares its user "
+            "content identity with "
+            + ", ".join(f"`{l}`" for l in (proven + unproven))
+            + ". This teardown is non-destructive today "
+              "(`deletion-policy: abandon`), but do NOT arm "
+              "`appspace.decommissionPurgeData` later without repointing the "
+              "surviving environment first.")
+    if unproven:
+        lines.append("")
+        lines.append(
+            "Value chain unreadable for "
+            + ", ".join(f"`{l}`" for l in unproven)
+            + " — treated as a possible sharer rather than assumed safe.")
+    lines.append("")
+    return lines
+
+
 def _env_declares_live_kcc_vms(identity_file: str, sha: str,
                                repo: str = None) -> tuple:
     """(declares_live_vms, allowDeletion_armed) from the merged hierarchy.
@@ -6068,6 +6205,13 @@ def _evaluate_env_decommissions(candidates: list, pr_sha: str, main_sha: str,
                 f"succeeds before relying on the inventory.",
                 "",
             ]
+        # COPS-2697: leads the panel, above every cascade branch below. A
+        # shared user-content identity is worse news than anything those
+        # report, because the data destroyed belongs to an environment that is
+        # NOT being torn down. Repo defaults to None like the sibling
+        # _decommission_* calls on this same context.
+        lines += _shared_user_content_lines(
+            c["identity_file"], main_sha, purges_data)
         if not cascade:
             lines += [
                 # COPS-2668: _DECOM_ORPHAN_HDR is the sentinel the merge
@@ -7795,6 +7939,17 @@ def _summarize_appspace_state_changes(changed_files, pr_sha, base_sha, path_map,
         # -- decommission / decommissionPurgeData (COPS-2539/COPS-2572) --
         was_armed, is_armed = _decommission_armed_flat(old_flat), _decommission_armed_flat(new_flat)
         was_purge, is_purge = _purge_armed_flat(old_flat), _purge_armed_flat(new_flat)
+
+        # COPS-2697: the other trigger. Path 1 (folder removal) covers a
+        # teardown; this covers a PR that ARMS the purge on an environment that
+        # stays in the tree. Identity is read at `base_sha`, not the PR sha, on
+        # purpose: the surviving siblings are untouched by this PR, and a
+        # decommission PR flips flags rather than renaming a bucket, so the
+        # base side is the state both halves of the comparison must share.
+        # `is_purge` (from the PR) is what decides BLOCK vs REVIEW.
+        if is_purge or is_armed:
+            lines += _shared_user_content_lines(
+                clean, base_sha, is_purge, repo=repo)
 
         # -- COPS-2660: arming while stripping the config it acts through --
         # allowDeletion only works through VM CRs helm still renders. A PR
