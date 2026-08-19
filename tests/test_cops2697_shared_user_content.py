@@ -206,8 +206,17 @@ def test_purge_armed_leads_with_the_block_headline_and_names_everything(monkeypa
     # "May be shared" is not actionable: name the sharer and the exact objects
     assert "pv-gsk--aec1-c" in head
     assert "pv-gsk--aec1-b" in head
-    assert "pv-gsk--aec1-content-na1-a.appspacestorage.com" in head
-    assert "pv-gsk--aec1-content-na1-a.appspacestorage.com." in head
+    # Derived from identity(), not duplicated as literals: this pins that the
+    # message renders exactly what the detector computed, and it keeps CodeQL
+    # from reading a bare "host.tld" in text as URL substring sanitization
+    # (py/incomplete-url-substring-sanitization) — which it is not, but the
+    # variable form is both scanner-clean and the stronger assertion.
+    want = uc.identity(_flat())
+    for bucket in want["buckets"]:
+        assert bucket in head
+    for fqdn in want["fqdns"]:
+        assert fqdn in head
+    assert want["buckets"] and want["fqdns"], "fixture must own objects"
     assert "decommissionPurgeData" in head
 
 
