@@ -28,7 +28,9 @@ Diff outcome model:
 - error         : reserved for unexpected per-PR exceptions (see process_pr).
 
 Failure reasons (REASON_* codes set directly by _run_one_diff, no stderr regex):
-- oci_not_found  : version absent in the registry. PERMANENT -> FAILED build status
+- oci_not_found  : version absent in the registry. FAILED build status, but
+                  retried under backoff (COPS-2696): a publish that has not
+                  propagated yet self-heals without an empty commit
                    (the deployer would fail the same way), no retry, PR marked seen.
 - oci_pull_failed: transient pull/login failure -> retried with backoff.
 - metadata_pending: app not yet in the 5-min discovery cache -> retried.
@@ -118,6 +120,7 @@ from vocabulary import (  # diff outcome vocabulary (same-dir module, stdlib onl
     OUT_ERROR,
     OUT_DECOMMISSIONED,
     REASON_OCI_NOT_FOUND,
+    SELF_RESOLVING_REASONS,
     REASON_OCI_PULL,
     REASON_METADATA,
     REASON_RENDER,
@@ -9608,19 +9611,27 @@ def format_comment(pr_sha, app_results, skipped_apps=None, base_sha="",
     # whether to re-run without parsing the human-readable status string.
     # Tokens: clean | permanent | transient
     # - clean     : all apps diffed successfully (no retry, mark seen)
-    # - permanent : oci_not_found or hard error (no retry, mark seen)
+    # - permanent : unresolvable hard error (no retry, mark seen).
+    #   COPS-2696: oci_not_found is NOT here any more — it emits transient.
     # - transient : diff unavailable on transient blip (retry next loop)
     if any_error or new_env_structural or _arming_broken or _kcc_nil_block:
         _status_token = "permanent"
     elif any_unknown:
-        # Distinguish oci_not_found (permanent) from soft indeterminate (transient)
+        # Distinguish permanent reasons from soft indeterminate (transient).
         resolved = [_result(v) for v in app_results.values()]
         indet    = [r for r in resolved if r.outcome == OUT_INDETERMINATE]
-        # Permanent if ANY app has a permanent reason (e.g. oci_not_found mixed
-        # with transient ones). A mixed PR is still "permanent" for dedup purposes
-        # because the FAILED build status requires human action regardless.
-        has_permanent = any(r.reason in PERMANENT_REASONS for r in indet)
-        _status_token = "permanent" if has_permanent else "transient"
+        # Permanent if ANY app has a permanent reason that cannot resolve by
+        # itself (e.g. invalid_version mixed with transient ones). A mixed PR
+        # is still "permanent" for dedup purposes because the FAILED build
+        # status requires human action regardless.
+        # COPS-2696: oci_not_found alone is the exception — the status is
+        # FAILED either way, but the version may simply not have propagated
+        # to the registry yet, so the token stays "transient" and the poll
+        # loop keeps retrying under the COPS-2546 backoff instead of marking
+        # the head seen and forcing an empty commit to recover.
+        perm = {r.reason for r in indet} & PERMANENT_REASONS
+        _status_token = ("permanent" if perm - SELF_RESOLVING_REASONS
+                         else "transient")
     else:
         _status_token = "clean"
 
@@ -10656,7 +10667,17 @@ def process_pr(pr, path_map, base_sha="", repo=None):
         #   oci_not_found stopped the retry loop, so an invalid_yaml PR was
         #   silently re-diffed every ~60s forever even though it can never
         #   resolve itself.
-        is_permanent_failure = (any_hard_error or has_blocking_indet
+        # COPS-2696: for SCHEDULING (not status colour — has_blocking_indet
+        # above keeps the build FAILED), oci_not_found must not stop the retry
+        # loop: it is the one permanent reason that resolves by itself when
+        # the registry catches up. Everything else in PERMANENT_REASONS truly
+        # needs a human and is still marked seen below.
+        unresolvable_indet = sum(
+            1 for r in app_results.values()
+            if r.outcome == OUT_INDETERMINATE
+            and r.reason in PERMANENT_REASONS
+            and r.reason not in SELF_RESOLVING_REASONS)
+        is_permanent_failure = (any_hard_error or unresolvable_indet > 0
                                 or bool(structural_envs)
                                 or bool(moves_missing_cohort)
                                 or broken_arming

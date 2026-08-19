@@ -117,13 +117,26 @@ def test_status_token_clean_matches_real_output(monkeypatch):
 def test_status_token_permanent_matches_real_output(monkeypatch):
     mod = _import_module()
     monkeypatch.setattr(mod, "generate_ai_summary", lambda *a, **k: None)
+    # COPS-2696: oci_not_found now emits 'transient' BY DESIGN — the version
+    # may simply not have propagated to the registry yet, so the poll loop
+    # keeps retrying under the COPS-2546 backoff instead of stranding the head
+    # until someone pushes an empty commit. What this test guards is
+    # unchanged: the token must round-trip through _extract_status_token, not
+    # fall back to legacy text matching. 'permanent' is pinned with a reason
+    # that truly cannot self-resolve.
     results = {"app-a": mod.DiffResult("", [], 0, False, "chart not found",
                                        mod.OUT_INDETERMINATE, mod.REASON_OCI_NOT_FOUND)}
     comment = mod.format_comment("a" * 40, results, base_sha="b" * 40)
-    assert mod._extract_status_token(comment) == "permanent", (
-        "an oci_not_found (permanent) error must round-trip as 'permanent', "
-        "not silently fail to match and fall back to legacy text-matching "
-        "(which mis-derives 'transient' behavior for this case)"
+    assert mod._extract_status_token(comment) == "transient", (
+        "oci_not_found must round-trip as 'transient' (COPS-2696): the "
+        "registry catching up is the only way it heals without a new commit"
+    )
+    results_perm = {"app-a": mod.DiffResult("", [], 0, False, "bad version",
+                                            mod.OUT_INDETERMINATE,
+                                            mod.REASON_INVALID_VERSION)}
+    comment_perm = mod.format_comment("a" * 40, results_perm, base_sha="b" * 40)
+    assert mod._extract_status_token(comment_perm) == "permanent", (
+        "a truly unresolvable reason must still round-trip as 'permanent'"
     )
 
 
