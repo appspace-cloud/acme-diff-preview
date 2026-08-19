@@ -927,7 +927,15 @@ def test_status_token_in_comment_footer():
         "env-a-ms": mod.DiffResult("", [], 0, False, "oci err", mod.OUT_INDETERMINATE, mod.REASON_OCI_NOT_FOUND)
     }
     body_indet = mod.format_comment("abc1234", results_indet)
-    assert "[permanent]" in body_indet, "oci_not_found must embed [permanent] token"
+    # COPS-2696: oci_not_found embeds [transient] by design — FAILED status,
+    # but retried under backoff so a registry propagation lag self-heals.
+    assert "[transient]" in body_indet, "oci_not_found must embed [transient] (COPS-2696)"
+    results_hard = {
+        "env-a-ms": mod.DiffResult("", [], 0, False, "bad version",
+                                   mod.OUT_INDETERMINATE, mod.REASON_INVALID_VERSION)
+    }
+    body_hard = mod.format_comment("abc1234", results_hard)
+    assert "[permanent]" in body_hard, "unresolvable reason must embed [permanent]"
 
     results_transient = {
         "env-a-ms": mod.DiffResult("", [], 0, False, "timeout", mod.OUT_INDETERMINATE, mod.REASON_TIMEOUT)
