@@ -368,7 +368,7 @@ EXTRACTED_LEAVES = ("redact", "vocabulary", "comment_render", "version_fold",
                     "identity", "envcfg", "schema_errors", "chart_identity",
                     "app_meta", "ai_summary", "logsink", "render_profile",
                     "concurrency", "stats", "render_cache", "fleet_health",
-                    "user_content")
+                    "user_content", "blast_radius")
 
 # Modules that predate the split and are allowed to be reached from the hub
 # without being leaves themselves.

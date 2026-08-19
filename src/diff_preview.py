@@ -63,6 +63,7 @@ import leader  # Lease-based leader election (same-dir module, stdlib only)
 import logsink  # structured logging seam (same-dir module, stdlib only)
 import fleet_health  # COPS-2694 fleet health gauges (same-dir module, stdlib only)
 import user_content  # COPS-2697 shared user-content identity (same-dir module, stdlib only)
+import blast_radius  # COPS-2693 Plan B blast-radius assessment (same-dir module, stdlib only)
 import render_cache  # three-tier main-render cache (same-dir module)
 from render_cache import (  # re-exported: the suite reaches these on the hub
     MAIN_RENDER_CACHE_DIR,
@@ -160,6 +161,7 @@ from comment_render import (  # comment rendering (same-dir module, stdlib only)
     _DECOM_ORPHAN_HDR,
     _DECOM_PURGE_HDR,
     _DECOM_SHARED_UC_HDR,
+    _BLAST_RADIUS_HDR,
     _DECOM_VM_STRIP_HDR,
     _SHUTDOWN_MIN_WORKLOADS,
     _is_env_shutdown,
@@ -436,6 +438,14 @@ RISK_SECTION_RESERVE = 5
 MAX_APPS_PER_RUN   = _env_int("MAX_APPS_PER_RUN", 1500)  # ~1.7x the largest fleet (see README)
 DIFF_TIMEOUT       = _env_int("DIFF_TIMEOUT", 120)       # seconds per diff (OCI cache-miss pulls are slow)
 DIFF_WORKERS       = _env_int("DIFF_WORKERS", 16)      # parallel helm-template renders
+# COPS-2693 Plan B: blast-radius thresholds. A finding fires only for
+# NON-version changes to a shared config.yaml reaching at least this many
+# environments OR spokes. Version-only bumps (the cadence flow) are exempt
+# regardless of reach - flagging the routine would train reviewers to ignore
+# the finding. Defaults sized so a single-spoke cohort tweak stays silent and
+# a tree/region-level edit does not.
+DIFF_BLAST_ENVS    = _env_int("DIFF_BLAST_ENVS", 30)
+DIFF_BLAST_SPOKES  = _env_int("DIFF_BLAST_SPOKES", 4)
 WARM_WORKERS       = _env_int("WARM_WORKERS", 4)         # parallel chart-cache warm-up pulls
 WARM_THRESHOLD     = _env_int("WARM_THRESHOLD", 8)       # only warm when a PR fans out to more apps than this
 MAX_COMMENT_BYTES  = 245_000 # Bitbucket ~256KB limit; leave headroom
@@ -7856,6 +7866,54 @@ def _declares_vms_flat(flat: dict) -> bool:
 # (COPS-2616).
 
 
+def _blast_radius_lines(changed_files, pr_sha, base_sha, path_map,
+                        repo=None) -> list:
+    """COPS-2693 Plan B: call out shared-config changes with a wide reach.
+
+    Only shared `config.yaml` files are candidates: a `customer.yaml` reaches
+    one environment by construction, and `cicd-versions.yaml` is version
+    plumbing. Reach comes from the same matcher the diff itself uses
+    (_match_files_to_apps), environments from the fleet's value-file map that
+    discovery already keeps, and both sides of the file from the same cached
+    fetch every other panel uses - no new data source.
+
+    Fail-open by design: this panel informs, it does not guard. A file whose
+    sides cannot be read is added/removed (owned by the new-env and
+    decommission panels) or transiently unreadable - either way the diff and
+    those panels tell the story, so this one stays quiet rather than guessing.
+    """
+    findings = []
+    for f in changed_files or []:
+        clean = posixpath.normpath(f.lstrip("/"))
+        if posixpath.basename(clean) != "config.yaml":
+            continue
+        new_txt, st_new = _bb_fetch_cached(clean, pr_sha, repo=repo)
+        old_txt, st_old = _bb_fetch_cached(clean, base_sha, repo=repo)
+        if st_new != BB_OK or st_old != BB_OK:
+            continue
+        try:
+            keys = blast_radius.changed_keys(
+                _flatten_yaml(_yaml_safe_load(old_txt) or {}),
+                _flatten_yaml(_yaml_safe_load(new_txt) or {}))
+        except yaml.YAMLError:
+            continue  # unparseable - the input-changes panel already flags it
+        affected = get_affected_apps([clean], path_map)
+        env_files = set()
+        for app in affected:
+            for vf in (_app_value_files_map or {}).get(app, []) or []:
+                if vf.endswith("customer.yaml"):
+                    env_files.add(vf.split("$config/", 1)[-1].lstrip("/"))
+                    break
+            else:
+                env_files.add(app)   # unmapped app counts as its own env
+        finding = blast_radius.assess(clean, keys, env_files,
+                                      DIFF_BLAST_ENVS, DIFF_BLAST_SPOKES)
+        if finding:
+            findings.append(finding)
+    return blast_radius.render_lines(findings, _BLAST_RADIUS_HDR,
+                                     DIFF_BLAST_ENVS, DIFF_BLAST_SPOKES)
+
+
 def _summarize_appspace_state_changes(changed_files, pr_sha, base_sha, path_map, repo=None) -> list:
     """Markdown block calling out changes to Application-level state flags
     read from a LIVE environment's own customer.yaml/config.yaml:
@@ -10405,6 +10463,13 @@ def process_pr(pr, path_map, base_sha="", repo=None):
         except Exception as e:  # state-flag panel must never break the comment
             logsink.log(f"    [comment] appspace-state panel failed: {e}", "WARNING")
             appspace_state_lines = []
+        try:
+            # COPS-2693 Plan B: shares the appspace_state_lines channel so the
+            # verdict scan in comment_render sees it without new plumbing.
+            appspace_state_lines += _blast_radius_lines(
+                changed, pr_sha, base_sha, path_map, repo=repo)
+        except Exception as e:  # informational panel must never break the comment
+            logsink.log(f"    [comment] blast-radius panel failed: {e}", "WARNING")
         try:
             vm_change_lines = _summarize_vm_changes(
                 changed, pr_sha, base_sha, path_map, app_results, repo=repo)
