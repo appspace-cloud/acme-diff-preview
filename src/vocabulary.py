@@ -39,6 +39,17 @@ REASON_TEMPLATE      = "template_failed"       # COPS-2661: template EXECUTION f
 
 
 RETRYABLE_REASONS = {REASON_OCI_PULL, REASON_METADATA, REASON_TIMEOUT, REASON_RENDER}
+# COPS-2696: the one permanent reason that can resolve WITHOUT a new commit.
+# oci_not_found means "this exact version is absent from the registry" — which
+# is either a wrong version pinned in config (needs a human, forever) or a
+# publish that has not propagated yet (resolves by itself in minutes; observed
+# on acme-config-prod #4359, where the charts appeared shortly after the first
+# render and the PR stayed stuck until someone pushed an empty commit).
+# The two cases are indistinguishable at render time, so scheduling treats the
+# reason as retryable (the COPS-2546 escalating backoff caps the cost) while
+# the STATUS stays FAILED via PERMANENT_REASONS — a missing chart still blocks
+# the merge either way.
+SELF_RESOLVING_REASONS = {REASON_OCI_NOT_FOUND}
 # Reasons that permanently block the PR (the deployer would fail the same way).
 PERMANENT_REASONS = {REASON_OCI_NOT_FOUND, REASON_INVALID_VERSION,
                      REASON_INVALID_YAML, REASON_MISSING_REQUIRED,

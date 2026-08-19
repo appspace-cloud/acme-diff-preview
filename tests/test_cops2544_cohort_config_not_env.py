@@ -186,29 +186,26 @@ def test_cohort_present_renders_normally(monkeypatch):
     assert calls["render"] == 1
 
 
-def test_aec_path_skips_cohort_check(monkeypatch):
+def test_aec_path_is_cohort_checked_too(monkeypatch):
+    """COPS-2689: the aec exemption expired. It was written when no aec
+    ApplicationSet had a cohort generator; na4-a and na2-a now do, and the
+    rest inherit it as they convert. A new aec environment whose cohort
+    config.yaml is missing generates zero Applications, so it blocks like a
+    prod one instead of rendering a false green."""
     aec_dir = "gcp/aec/private-cloud/gb1-b/pv-aec-x-a"
     cand = {"name": "pv-aec-x-a", "config_file": f"{aec_dir}/customer.yaml",
             "env_dir": aec_dir, "all_yaml_files": []}
-    # COPS-2552 note: the immediate parent's config.yaml is BOTH what the
-    # (skipped-for-aec) cohort check would have fetched AND a legitimate
-    # ancestor level the GSA-name guard fetches for every candidate,
-    # aec included (the live incident this ticket fixes was itself an aec
-    # environment, so that guard must run there too). A specific-path
-    # assertion can no longer distinguish "cohort check ran" from "GSA
-    # check's ancestor walk ran"; what actually matters, and what this test
-    # verifies, is the OUTCOME: an aec candidate is never blocked as
-    # "cohort missing" and still renders, regardless of which paths any
-    # guard along the way happens to touch.
     def fake_fetch(clean, sha, repo=None):
         return None, m.BB_NOT_FOUND
     monkeypatch.setattr(m, "_bb_fetch_status", fake_fetch)
     monkeypatch.setattr(m, "_render_new_env_diff",
                         lambda info, sha: EXPECTED_GREEN_RENDER)
     lines, structural, total = m._evaluate_new_envs([cand], PR_SHA)
-    assert structural == []
-    assert not any("cohort" in l.lower() and "does not exist" in l.lower()
-                   for l in lines), "aec candidate must never get the cohort-missing block"
+    assert structural, "an aec env with no cohort config.yaml must block"
+    joined = "\n".join(lines).lower()
+    assert "cohort" in joined and "does not exist" in joined, joined
+    # Never the one phrase _new_env_status treats as an allowed green shape.
+    assert "missing required value" not in joined, joined
 
 
 def test_transient_cohort_fetch_error_does_not_block(monkeypatch):
