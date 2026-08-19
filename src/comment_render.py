@@ -227,6 +227,10 @@ _DECOM_PURGE_HDR = "**DATA WILL BE PERMANENTLY DESTROYED.**"
 # diff_preview and matched here, per the one-constant rule this module's
 # docstring prescribes (same wiring as COPS-2660 / COPS-2668).
 _DECOM_SHARED_UC_HDR = "**SHARED USER CONTENT - DO NOT MERGE WITHOUT CHECKING.**"
+# COPS-2693 Plan B: written by the blast-radius panel (blast_radius.render_lines
+# via diff_preview), matched here for the REVIEW verdict line. Same one-constant
+# wiring as the headers above.
+_BLAST_RADIUS_HDR = "**Blast radius.**"
 
 # COPS-2668: and a third state. The summary used to know only purge-vs-not,
 # so an environment with NO cascade armed — where the Applications go and
@@ -606,6 +610,20 @@ def _build_merge_summary(results, rollup_by_sig, vm_change_lines,
             findings.append((_SEV_REVIEW,
                              "\u25b6\ufe0f **ArgoCD auto-sync resumed** \u2014 "
                              "pending drift will be applied"))
+        # COPS-2693 Plan B: a non-version change to a shared config.yaml that
+        # reaches many environments at once. REVIEW, never BLOCK: legitimate
+        # fleet-wide changes exist, but their reach must be impossible to miss
+        # in the verdict, because with automated+prune+selfHeal it lands on
+        # everything simultaneously ~5 minutes after merge.
+        if _BLAST_RADIUS_HDR in txt:
+            m = re.search(r"(\d+) environments across (\d+) spoke", txt)
+            _reach = (f" \u2014 reaches {m.group(1)} environments across "
+                      f"{m.group(2)} spoke(s)" if m else "")
+            findings.append((_SEV_REVIEW,
+                             "\U0001f4a5 **Wide-reach config change**"
+                             + _reach +
+                             "; changes to shared config bypass cohort "
+                             "staging (see the blast-radius note)"))
     if new_env_lines:
         findings.append((_SEV_REVIEW if new_env_structural else _SEV_ROUTINE,
                          "\U0001f195 **New environment** in this PR"
