@@ -151,3 +151,22 @@ def test_only_the_cache_builder_lists_the_fleet():
     assert src.count('"app", "list"') == 2, (
         "a new full-fleet `argocd app list` appeared; each one is 47 MB that "
         "argocd-server has to marshal alongside real UI users")
+
+
+def test_chart_exposes_the_ttl():
+    """The knob is useless if the chart cannot set it.
+
+    This chart has no extraEnv escape hatch - every variable is an explicit
+    template entry - so an env-driven constant with no chart wiring ships
+    unreachable. That already happened once in this ticket with argocd.server,
+    which sat in values.yaml consumed by nothing.
+    """
+    chart = os.path.abspath(os.path.join(os.path.dirname(__file__), "..",
+                                         "charts", "acme-diff-preview"))
+    with open(os.path.join(chart, "templates", "deployment.yaml"),
+              encoding="utf-8") as fh:
+        dep = fh.read()
+    assert "name: PATH_MAP_TTL" in dep, "the chart cannot set PATH_MAP_TTL"
+    assert ".pathMapTtl" in dep, "PATH_MAP_TTL is not driven by a value"
+    with open(os.path.join(chart, "values.yaml"), encoding="utf-8") as fh:
+        assert "pathMapTtl:" in fh.read(), "pathMapTtl is not declared"
