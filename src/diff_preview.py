@@ -1252,6 +1252,14 @@ _path_map_count: int   = 0    # extra invalidation: rebuild if app count changes
 # roughly 1440 a day where today there are ~290. A TTL below one iteration
 # interval cannot help anyway.
 PATH_MAP_TTL            = max(60, _env_int("PATH_MAP_TTL", 300))   # seconds
+# COPS-2702: the rebuild is now reachable from two threads - the poll loop and
+# the JFrog webhook handler, which is NOT gated by leader election and so runs
+# on whichever replica the Service happened to route to. Without this lock two
+# concurrent callers each pay a 47 MB list and both rebind the globals; the
+# result is not corrupt (they rebind wholesale, never mutate in place) but one
+# of the two listings is pure waste. Double-checked below so the fast path
+# stays lock-free.
+_path_map_lock          = threading.Lock()
 # COPS-2507 multi-repo: app full_name -> git config repo slug (from the app's
 # git source repoURL), and the per-repo partition of the path map. A PR in
 # repo R only matches apps in _repo_path_maps[R].
@@ -1841,41 +1849,28 @@ def _jfrog_hard_refresh(chart_name: str, chart_version: str) -> None:
     # waste this removes. An app created inside the TTL window that tracks this
     # chart:version is therefore missed until the next event for it - the OCI
     # cache-bust is late, not lost, and dev charts get pushed repeatedly.
-    matching = []
-    if _app_chart_map:
-        matching = [a for a, c in _app_chart_map.items()
-                    if c == chart_name
-                    and _app_chart_revision_map.get(a) == chart_version]
-        source = f"cached path map, {len(_app_chart_map)} apps"
-    else:
-        # Cold start: a webhook can arrive before the first iteration has built
-        # the cache. Keep the original behaviour rather than silently skipping.
-        r = subprocess.run(
-            [ARGOCD_BIN, "app", "list", "--output", "json"]
-            + [arg for p in ARGOCD_PROJECTS for arg in ("--project", p)] + _auth_flags(),
-            capture_output=True, text=True, timeout=60,
-            env=_argocd_subprocess_env())
+    # Populate-or-reuse the cache, then match. discover_path_app_map() is the
+    # ONLY place that lists the fleet now, and it caches for PATH_MAP_TTL.
+    #
+    # This matters because webhooks are NOT gated by leader election: they land
+    # on whichever replica the Service routes to, and the standby never runs the
+    # poll loop, so its cache was permanently empty. Measured live on 2.99.1:
+    # 3 events took "[cached path map]" and 3 took "[cold-start app list]" -
+    # exactly half of them still paying 47 MB, on the replica that never warms
+    # its own cache. Calling the cached builder makes the standby pay one
+    # listing per TTL instead of one per event.
+    try:
+        discover_path_app_map()
+    except Exception as e:
+        logsink.log(f"JFrog webhook: path map unavailable ({e}); "
+                    f"cannot resolve apps for {chart_name}:{chart_version}",
+                    "ERROR")
+        return
 
-        if r.returncode != 0:
-            logsink.log(f"JFrog webhook: app list failed: {r.stderr[:200]}"
-                        + ("..." if len(r.stderr) > 200 else ""), "ERROR")
-            return
-
-        try:
-            data = json.loads(r.stdout)
-        except json.JSONDecodeError as exc:
-            logsink.log(f"JFrog webhook: malformed app list JSON: {exc}", "ERROR")
-            return
-
-        # argocd app list -o json returns a JSON array directly (not {"items": [...]})
-        apps = data if isinstance(data, list) else data.get("items", [])
-        for app in apps:
-            for src_entry in app["spec"].get("sources", []):
-                if (src_entry.get("chart") == chart_name
-                        and src_entry.get("targetRevision") == chart_version):
-                    matching.append(app["metadata"]["name"])
-                    break
-        source = "cold-start app list"
+    matching = [a for a, c in _app_chart_map.items()
+                if c == chart_name
+                and _app_chart_revision_map.get(a) == chart_version]
+    source = f"path map, {len(_app_chart_map)} apps"
 
     if not matching:
         logsink.log(f"JFrog webhook: no apps found for {chart_name}:{chart_version}"
@@ -2397,14 +2392,27 @@ def discover_path_app_map():
     Result is cached for PATH_MAP_TTL seconds. Cache is invalidated on
     argocd_login() so a re-login (session expiry) picks up new apps.
     """
-    global _path_map_cache, _path_map_ts, _path_map_count, _path_map_app_count, \
-           _app_chart_map, _app_chart_revision_map, _app_chart_registry_map, \
-           _app_value_files_map, _app_namespace_map, _app_repo_map, _repo_path_maps
+    # No `global` here on purpose: this function only READS the cache now. Every
+    # assignment moved into _discover_path_app_map_locked, which is the one
+    # place allowed to rebind them, and only under the lock.
     if _path_map_cache and (time.monotonic() - _path_map_ts) < PATH_MAP_TTL:
         # Within TTL: return cached map. The self-referential app-count comparison
         # (comparing cache to itself) was removed — it could never detect new apps
         # added under existing paths between refreshes. Rely purely on TTL.
         return _path_map_cache
+    with _path_map_lock:
+        # Re-check under the lock: a caller that queued behind a rebuild must
+        # use its result rather than start a second 47 MB listing.
+        if _path_map_cache and (time.monotonic() - _path_map_ts) < PATH_MAP_TTL:
+            return _path_map_cache
+        return _discover_path_app_map_locked()
+
+
+def _discover_path_app_map_locked():
+    """The rebuild itself. Only ever entered holding _path_map_lock."""
+    global _path_map_cache, _path_map_ts, _path_map_count, _path_map_app_count, \
+           _app_chart_map, _app_chart_revision_map, _app_chart_registry_map, \
+           _app_value_files_map, _app_namespace_map, _app_repo_map, _repo_path_maps
     r = subprocess.run(
         [ARGOCD_BIN, "app", "list", "-o", "json"] + _auth_flags(),
         capture_output=True, text=True, timeout=90,
