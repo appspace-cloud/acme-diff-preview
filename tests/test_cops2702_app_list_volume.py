@@ -73,18 +73,32 @@ class TestTtlIsTunable:
             "envcfg._env_int changed contract; the floor may now be redundant")
 
 
+def _warm_cache(monkeypatch, charts, revs):
+    """Put the module in the state a warm path-map cache really implies.
+
+    Setting only the derived dicts is not enough since COPS-2702: the webhook
+    goes through discover_path_app_map(), which decides on _path_map_cache and
+    _path_map_ts. An earlier version of these tests patched just the dicts and
+    so still drove the rebuild - the failure that caught it.
+    """
+    import time as _t
+    monkeypatch.setattr(diff_preview, "_app_chart_map", charts)
+    monkeypatch.setattr(diff_preview, "_app_chart_revision_map", revs)
+    monkeypatch.setattr(diff_preview, "_path_map_cache", {"some/path": list(charts)})
+    monkeypatch.setattr(diff_preview, "_path_map_ts", _t.monotonic())
+
+
 class TestWebhookUsesTheCache:
     def test_warm_cache_issues_no_api_call(self, monkeypatch):
         """The regression this guards: any `argocd app list` from the webhook
         path once the cache is warm. Fails loudly rather than silently paying
         47 MB again."""
-        monkeypatch.setattr(diff_preview, "_app_chart_map",
-                            {"pv-a-ms": "appspace-micro-services",
-                             "pv-b-ms": "appspace-micro-services",
-                             "pv-c-ss": "appspace-supporting-services"})
-        monkeypatch.setattr(diff_preview, "_app_chart_revision_map",
-                            {"pv-a-ms": "2603.2.1", "pv-b-ms": "2603.0.19",
-                             "pv-c-ss": "2603.2.1"})
+        _warm_cache(monkeypatch,
+                    {"pv-a-ms": "appspace-micro-services",
+                     "pv-b-ms": "appspace-micro-services",
+                     "pv-c-ss": "appspace-supporting-services"},
+                    {"pv-a-ms": "2603.2.1", "pv-b-ms": "2603.0.19",
+                     "pv-c-ss": "2603.2.1"})
 
         def _boom(*a, **k):
             raise AssertionError("the webhook listed the fleet with a warm cache")
@@ -97,13 +111,12 @@ class TestWebhookUsesTheCache:
     def test_warm_cache_matches_the_right_apps(self, monkeypatch):
         """Matching is on BOTH chart and targetRevision, so a different
         version of the same chart is not refreshed."""
-        monkeypatch.setattr(diff_preview, "_app_chart_map",
-                            {"pv-a-ms": "appspace-micro-services",
-                             "pv-b-ms": "appspace-micro-services",
-                             "pv-c-ss": "appspace-supporting-services"})
-        monkeypatch.setattr(diff_preview, "_app_chart_revision_map",
-                            {"pv-a-ms": "2603.2.1", "pv-b-ms": "2603.0.19",
-                             "pv-c-ss": "2603.2.1"})
+        _warm_cache(monkeypatch,
+                    {"pv-a-ms": "appspace-micro-services",
+                     "pv-b-ms": "appspace-micro-services",
+                     "pv-c-ss": "appspace-supporting-services"},
+                    {"pv-a-ms": "2603.2.1", "pv-b-ms": "2603.0.19",
+                     "pv-c-ss": "2603.2.1"})
         seen = []
 
         def _fake_run(cmd, **kw):
@@ -142,13 +155,15 @@ class TestWebhookUsesTheCache:
 
 
 def test_only_the_cache_builder_lists_the_fleet():
-    """Sentinel: exactly two `argocd app list` sites remain in the module -
-    the cache builder and the webhook's cold-start path. A third would mean
-    someone reintroduced a full-fleet listing."""
+    """Sentinel: exactly ONE `argocd app list` site remains in the module.
+
+    It was two until the webhook's cold-start branch was folded into the cached
+    builder. Any new one is a full-fleet listing that bypasses the cache, which
+    is 47 MB argocd-server has to marshal alongside real UI users."""
     with open(os.path.join(os.path.dirname(__file__), "..", "src",
                            "diff_preview.py"), encoding="utf-8") as fh:
         src = fh.read()
-    assert src.count('"app", "list"') == 2, (
+    assert src.count('"app", "list"') == 1, (
         "a new full-fleet `argocd app list` appeared; each one is 47 MB that "
         "argocd-server has to marshal alongside real UI users")
 
@@ -170,3 +185,52 @@ def test_chart_exposes_the_ttl():
     assert ".pathMapTtl" in dep, "PATH_MAP_TTL is not driven by a value"
     with open(os.path.join(chart, "values.yaml"), encoding="utf-8") as fh:
         assert "pathMapTtl:" in fh.read(), "pathMapTtl is not declared"
+
+
+class TestConcurrentRebuildListsOnce:
+    """The rebuild became reachable from two threads at once.
+
+    Webhooks are not gated by leader election, so the JFrog handler runs on
+    whichever replica the Service routes to and can hit the builder at the same
+    moment as the poll loop. Without the lock both pay a 47 MB listing. Nothing
+    corrupts - the globals are rebound wholesale, never mutated - but one of the
+    two is pure waste, which is the whole thing this ticket is about.
+    """
+
+    def test_ten_threads_produce_one_listing(self, monkeypatch):
+        import threading
+        import time as _t
+
+        monkeypatch.setattr(diff_preview, "_path_map_cache", {})
+        monkeypatch.setattr(diff_preview, "_path_map_ts", 0.0)
+        calls = []
+        lock = threading.Lock()
+
+        def _fake_rebuild():
+            with lock:
+                calls.append(1)
+            _t.sleep(0.05)          # widen the window a real listing would open
+            diff_preview._path_map_cache = {"p": ["a"]}
+            diff_preview._path_map_ts = _t.monotonic()
+            return diff_preview._path_map_cache
+
+        monkeypatch.setattr(diff_preview, "_discover_path_app_map_locked",
+                            _fake_rebuild)
+
+        threads = [threading.Thread(target=diff_preview.discover_path_app_map)
+                   for _ in range(10)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join(timeout=10)
+
+        assert len(calls) == 1, (
+            f"{len(calls)} concurrent rebuilds; each one is a 47 MB response "
+            "argocd-server has to marshal")
+
+    def test_the_lock_exists_and_guards_the_rebuild(self):
+        src = _module_source()
+        assert "_path_map_lock" in src, "the rebuild lock is gone"
+        assert "with _path_map_lock:" in src, "the rebuild is no longer guarded"
+        assert "def _discover_path_app_map_locked" in src, (
+            "the rebuild is no longer isolated in its own locked function")
