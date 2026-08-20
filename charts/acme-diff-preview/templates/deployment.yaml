@@ -77,6 +77,22 @@ spec:
           env:
             - name: ARGOCD_USER
               value: {{ .Values.argocd.username | quote }}
+            {{- /* COPS-2702: argocd.server existed in values.yaml since the
+                   chart was created but nothing consumed it - the code
+                   hardcoded the public host. Wired here so an environment can
+                   point the API at the in-cluster Service. */}}
+            {{- if .Values.argocd.server }}
+            - name: ARGOCD_SERVER
+              value: {{ .Values.argocd.server | quote }}
+            {{- end }}
+            {{- if .Values.argocd.plaintext }}
+            - name: ARGOCD_PLAINTEXT
+              value: "1"
+            {{- end }}
+            {{- if .Values.argocd.webHost }}
+            - name: ARGOCD_WEB_HOST
+              value: {{ .Values.argocd.webHost | quote }}
+            {{- end }}
             {{- if .Values.argocd.projects }}
             # Comma-separated ArgoCD projects the JFrog-webhook hard-refresh
             # targets (COPS-2507: add appspace-stage when serving that repo).

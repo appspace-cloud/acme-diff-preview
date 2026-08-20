@@ -34,6 +34,22 @@ if SRC not in sys.path:
 import diff_preview as mod  # noqa: E402
 
 
+CHART = os.path.abspath(os.path.join(os.path.dirname(__file__), "..",
+                                     "charts", "acme-diff-preview"))
+
+
+def _read_chart(relpath):
+    """Read a chart file for the wiring assertions.
+
+    Text assertions rather than `helm template`: nothing else in this suite
+    shells out to helm for the service's OWN chart, and CI is not guaranteed a
+    helm binary. What matters here is only that the template names the values,
+    which a string check settles.
+    """
+    with open(os.path.join(CHART, relpath), encoding="utf-8") as fh:
+        return fh.read()
+
+
 def _read_source(name):
     """Read a module's source for the sentinel assertions below.
 
@@ -163,3 +179,43 @@ def test_dev_hard_refresh_moved_in_step():
     assert '"--plaintext"' in src
     assert 'scheme   = "http" if PLAINTEXT else "https"' in src
     assert "cleartext" in src
+
+
+def test_chart_wires_the_endpoint_values_into_the_container():
+    """The code being env-driven is useless if the chart cannot set the env.
+
+    This is the gap the integration review caught: values.yaml had declared
+    `argocd.server` since the chart was created and NOTHING consumed it — the
+    deployment template emitted no ARGOCD_SERVER and the code hardcoded the
+    public host. Exactly the declared-but-inert pattern audited in COPS-2698.
+    Without this wiring the change ships unusable: there is no extraEnv or
+    envFrom escape hatch in this chart, so an operator has no way to opt in.
+    """
+    dep = _read_chart("templates/deployment.yaml")
+    for name, source in (("ARGOCD_SERVER", ".Values.argocd.server"),
+                         ("ARGOCD_PLAINTEXT", ".Values.argocd.plaintext"),
+                         ("ARGOCD_WEB_HOST", ".Values.argocd.webHost")):
+        assert f"name: {name}" in dep, f"{name} is not emitted by the chart"
+        assert source in dep, f"{name} is not driven by {source}"
+
+
+def test_chart_defaults_keep_todays_behaviour():
+    """Defaults must describe the public host over TLS.
+
+    An image-and-chart upgrade with no values change has to be inert: same
+    endpoint, no plaintext, and webHost empty so the code default applies.
+    """
+    values = _read_chart("values.yaml")
+    assert "server: argocd.appspace.com" in values
+    assert "plaintext: false" in values
+    assert "webHost: ''" in values
+
+
+def test_chart_documents_the_short_svc_form():
+    """The hub runs a custom cluster domain, so the canonical
+    argocd-server.argocd.svc.cluster.local returns NXDOMAIN there (verified
+    live from both replicas). An operator copying the FQDN habit would get a
+    service that cannot resolve its API, so the values file has to say it."""
+    values = _read_chart("values.yaml")
+    assert "argocd-server.argocd.svc:80" in values
+    assert "NXDOMAIN" in values
