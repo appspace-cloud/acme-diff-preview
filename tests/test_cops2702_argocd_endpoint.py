@@ -34,6 +34,16 @@ if SRC not in sys.path:
 import diff_preview as mod  # noqa: E402
 
 
+def _read_source(name):
+    """Read a module's source for the sentinel assertions below.
+
+    A context manager rather than open(...).read() so the handle is closed
+    deterministically even when an assertion in the caller fails.
+    """
+    with open(os.path.join(SRC, name), encoding="utf-8") as fh:
+        return fh.read()
+
+
 def _import_in_subprocess(**env):
     """Import diff_preview in a clean interpreter with a specific environment.
 
@@ -49,11 +59,12 @@ def _import_in_subprocess(**env):
                  ("ARGOCD_PASS", "test"),
                  ("JFROG_WEBHOOK_SECRET", "testsecret")):
         child.setdefault(k, v)
-    r = subprocess.run(
-        [sys.executable, "-c",
-         "import diff_preview as m;"
-         "print(m.ARGOCD_SERVER, m.ARGOCD_WEB_HOST, m.ARGOCD_PLAINTEXT)"],
-        cwd=SRC, env=child, capture_output=True, text=True)
+    probe = (
+        "import diff_preview as m; "
+        "print(m.ARGOCD_SERVER, m.ARGOCD_WEB_HOST, m.ARGOCD_PLAINTEXT)"
+    )
+    r = subprocess.run([sys.executable, "-c", probe],
+                       cwd=SRC, env=child, capture_output=True, text=True)
     return r.returncode, r.stdout + r.stderr
 
 
@@ -126,7 +137,7 @@ def test_session_url_is_the_single_scheme_seam():
     """The REST login is the only place a session URL is built, so every
     renewal path (startup retry, proactive TTL refresh, reactive re-login)
     inherits the scheme from there. One seam means nothing can half-migrate."""
-    src = open(os.path.join(SRC, "diff_preview.py")).read()
+    src = _read_source("diff_preview.py")
     assert 'scheme = "http" if ARGOCD_PLAINTEXT else "https"' in src
     assert 'url  = f"{scheme}://{ARGOCD_SERVER}/api/v1/session"' in src
     assert src.count("/api/v1/session") == 1
@@ -137,7 +148,7 @@ def test_only_the_web_host_reaches_user_visible_urls():
     """Sentinel: ARGOCD_SERVER must never be interpolated into a URL a human or
     an external system receives. The audit found exactly one such site
     (post_build_status's fallback link); this keeps the count at zero."""
-    src = open(os.path.join(SRC, "diff_preview.py")).read()
+    src = _read_source("diff_preview.py")
     assert 'f"https://{ARGOCD_WEB_HOST}"' in src
     assert 'f"https://{ARGOCD_SERVER}"' not in src
 
@@ -147,7 +158,7 @@ def test_dev_hard_refresh_moved_in_step():
     https only, so a future 'copy the Deployment env into the CronJob' would
     have made it TLS against a plaintext port. Its own docstring mandates that
     both copies of the login move together."""
-    src = open(os.path.join(SRC, "dev_hard_refresh.py")).read()
+    src = _read_source("dev_hard_refresh.py")
     assert "ARGOCD_PLAINTEXT" in src
     assert '"--plaintext"' in src
     assert 'scheme   = "http" if PLAINTEXT else "https"' in src
