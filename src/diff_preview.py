@@ -161,6 +161,8 @@ from comment_render import (  # comment rendering (same-dir module, stdlib only)
     _DECOM_ORPHAN_HDR,
     _DECOM_PURGE_HDR,
     _DECOM_SHARED_UC_HDR,
+    _DECOM_PUBLIC_CLOUD_HDR,
+    _DECOM_PUBLIC_CLOUD_NOOP_HDR,
     _BLAST_RADIUS_HDR,
     _DECOM_VM_STRIP_HDR,
     _SHUTDOWN_MIN_WORKLOADS,
@@ -250,6 +252,8 @@ from decommission import (
     _cascade_retention_reason,
     _split_resources_by_cascade_fate,
     _decommission_armed_flat,
+    _is_public_cloud_env,
+    _public_cloud_teardown_phase_table,
     _PH_THIS_PR,
     _PH_BROKEN,
     _PH_PENDING,
@@ -6098,6 +6102,20 @@ def _evaluate_env_decommissions(candidates: list, pr_sha: str, main_sha: str,
         # the full deleted manifests are collected for the audit appendix.
         cascade = _decommission_cascades(c["identity_file"], main_sha)
         purges_data = _decommission_purges_data(c["identity_file"], main_sha)
+        # COPS-2701: the private-cloud gate was never ported to cl-*
+        # ApplicationSets (COPS-2700). Even if someone set
+        # appspace.decommission: true in config, no finalizer is templated,
+        # so treating cascade as True would promise a cleanup that cannot
+        # happen. Force orphaning semantics and the manual-teardown panel.
+        # Keep whether the flag was present so the panel can paint that
+        # false confidence in red (operator thought they armed a cleanup).
+        public_cloud = _is_public_cloud_env(
+            c["identity_file"], c.get("env_name", ""))
+        flag_set_noop = False
+        if public_cloud:
+            flag_set_noop = bool(cascade or purges_data)
+            cascade = False
+            purges_data = False
         # COPS-2616 / COPS-2677: Phase 1 state from merged hierarchy when the
         # identity file itself is readable. An unparseable identity fails
         # CLOSED (both flags false) and logs why — COPS-2650. Role
@@ -6173,35 +6191,51 @@ def _evaluate_env_decommissions(candidates: list, pr_sha: str, main_sha: str,
         # "true" is treated as orphaning: that is both the default and, as of
         # 2026-07-31, the only case that exists in any repo, so a wrong guess
         # must never be the reassuring one.
+        # COPS-2701: public cloud never cascades (forced above).
         total = del_total if cascade else all_total
         kind_counts = del_kinds if cascade else all_kinds
         workloads = del_workloads if cascade else all_workloads
-        lines += [
-            f"# \U0001f5d1\ufe0f\u26a0\ufe0f ENVIRONMENT DECOMMISSION \u26a0\ufe0f\U0001f5d1\ufe0f",
-            "",
-            f"**`{c['env_name']}` is being deleted by this PR "
-            f"(was running chart version `{', '.join(versions) or 'unknown'}`). "
-            f"This is a destructive, hard-to-reverse change — verify this is intentional.**",
-            "",
-        ] + _decommission_phase_table(
-            # Position before volume: the reviewer sees where this PR sits in
-            # the sequence before scrolling the inventory. A Phase 2 row that
-            # is not done is also why the orphaning warning below fires
-            # (COPS-2616).
-            vm_state=(_PH_DONE if vm_armed else None),
-            cascade_state=(_PH_DONE if cascade else None),
-            removal_state=_PH_THIS_PR,
-            declares_vms=declares_vms,
-            purge=purges_data,
-        ) + [
-            "",
-        ]
-        # COPS-2656: the phase table above just reported Phase 2 from a
-        # config key. If the cluster does not actually carry the finalizer,
-        # everything below this point is a promise that will not be kept,
-        # so the correction goes immediately after the table and before the
-        # inventory it would otherwise appear to describe.
-        lines += _cascade_mismatch_note(c["env_name"], c["apps"], cascade)
+        if public_cloud:
+            lines += [
+                f"# \U0001f5d1\ufe0f\u26a0\ufe0f PUBLIC CLOUD MANUAL TEARDOWN "
+                f"\u26a0\ufe0f\U0001f5d1\ufe0f",
+                "",
+                f"**`{c['env_name']}` is being removed by this PR "
+                f"(was running chart version `{', '.join(versions) or 'unknown'}`). "
+                f"Public-cloud (`cl-*`) teardown is manual — verify this is intentional.**",
+                "",
+            ] + _public_cloud_teardown_phase_table() + [
+                "",
+            ]
+            # No _cascade_mismatch_note: there is no gate to mismatch.
+        else:
+            lines += [
+                f"# \U0001f5d1\ufe0f\u26a0\ufe0f ENVIRONMENT DECOMMISSION "
+                f"\u26a0\ufe0f\U0001f5d1\ufe0f",
+                "",
+                f"**`{c['env_name']}` is being deleted by this PR "
+                f"(was running chart version `{', '.join(versions) or 'unknown'}`). "
+                f"This is a destructive, hard-to-reverse change — verify this is intentional.**",
+                "",
+            ] + _decommission_phase_table(
+                # Position before volume: the reviewer sees where this PR sits in
+                # the sequence before scrolling the inventory. A Phase 2 row that
+                # is not done is also why the orphaning warning below fires
+                # (COPS-2616).
+                vm_state=(_PH_DONE if vm_armed else None),
+                cascade_state=(_PH_DONE if cascade else None),
+                removal_state=_PH_THIS_PR,
+                declares_vms=declares_vms,
+                purge=purges_data,
+            ) + [
+                "",
+            ]
+            # COPS-2656: the phase table above just reported Phase 2 from a
+            # config key. If the cluster does not actually carry the finalizer,
+            # everything below this point is a promise that will not be kept,
+            # so the correction goes immediately after the table and before the
+            # inventory it would otherwise appear to describe.
+            lines += _cascade_mismatch_note(c["env_name"], c["apps"], cascade)
         if unrendered:
             # COPS-2668: the counts below cover only the apps that rendered.
             # Saying so is the difference between an inventory and a guess;
@@ -6225,7 +6259,46 @@ def _evaluate_env_decommissions(candidates: list, pr_sha: str, main_sha: str,
         # _decommission_* calls on this same context.
         lines += _shared_user_content_lines(
             c["identity_file"], main_sha, purges_data)
-        if not cascade:
+        if public_cloud:
+            lines += [
+                "\u26a0\ufe0f " + _DECOM_PUBLIC_CLOUD_HDR,
+                "",
+            ]
+            if flag_set_noop:
+                # Operator set the private-cloud gate on a cl-* env. Paint
+                # that false confidence loud and red before the orphan
+                # inventory — the flag never templates a finalizer here.
+                lines += [
+                    "\U0001f6a8 " + _DECOM_PUBLIC_CLOUD_NOOP_HDR,
+                    "",
+                    ("This environment had `appspace.decommission: true` "
+                     + "(and/or `decommissionPurgeData`) set. On public "
+                     + "cloud that is a **silent no-op by design** "
+                     + "(COPS-2700): no cascade finalizer is ever "
+                     + "templated, so **nothing is auto-deleted** when "
+                     + "the folder goes. Do not treat the flag as "
+                     + "protection."),
+                    "",
+                ]
+            lines += [
+                # Keep the orphan sentinel so existing summary / tests that
+                # match orphaning still see it; the public-cloud header is
+                # what changes the verdict wording.
+                "\u26a0\ufe0f " + _DECOM_ORPHAN_HDR + " — they keep running.**",
+                "",
+                ("There is **no** cascade-delete finalizer on the `cl-*` "
+                 + "ApplicationSets, and `appspace.decommission: true` is a "
+                 + "**silent no-op** here (COPS-2700). Setting that flag will "
+                 + "not arm a cleanup. This PR only removes the Argo CD "
+                 + "Applications."),
+                "",
+                ("Workloads stay running — still costing money, still holding "
+                 + "IPs and disks, no longer managed by ArgoCD — until you "
+                 + "`kubectl delete namespace` and remove abandoned GCP objects "
+                 + "by hand (see the step table above)."),
+                "",
+            ]
+        elif not cascade:
             lines += [
                 # COPS-2668: _DECOM_ORPHAN_HDR is the sentinel the merge
                 # summary matches to tell this state from the cascade one.
@@ -8066,6 +8139,38 @@ def _summarize_appspace_state_changes(changed_files, pr_sha, base_sha, path_map,
         ]
 
         if not was_armed and is_armed:
+            # COPS-2701: cl-* ApplicationSets never template the cascade
+            # finalizer. Calling this "DECOMMISSION ARMED" would promise a
+            # cleanup that cannot happen — paint the no-op in red instead.
+            if _is_public_cloud_env(clean, env_name):
+                lines += [
+                    f"## \U0001f6a8 PUBLIC CLOUD: DECOMMISSION FLAG IS A "
+                    f"NO-OP for `{env_name}` \U0001f6a8",
+                    "",
+                    "\U0001f6a8 " + _DECOM_PUBLIC_CLOUD_NOOP_HDR,
+                    "",
+                    f"**`appspace.decommission: true` was added on a "
+                    f"public-cloud (`cl-*`) environment.** That flag only "
+                    f"works on private-cloud ApplicationSets (COPS-2539). "
+                    f"On `cl-*` units it is a **silent no-op by design** "
+                    f"(COPS-2700): no cascade finalizer is templated, so "
+                    f"**nothing is auto-deleted** when the folder is later "
+                    f"removed.",
+                    "",
+                    f"{app_list} keep running unmanaged after a folder "
+                    f"delete until you `kubectl delete namespace` and clean "
+                    f"abandoned GCP objects by hand. Remove this flag or "
+                    f"treat teardown as fully manual — do not rely on it.",
+                    "",
+                ]
+                if is_purge:
+                    lines += [
+                        "\U0001f6a8 **`decommissionPurgeData` is also a "
+                        "no-op here** — public cloud never cascade-deletes "
+                        "or force-destroys buckets via this gate.",
+                        "",
+                    ]
+                continue
             # The phase table is shared with the arm-purge and folder-removal
             # panels (_decommission_phase_table), so a reviewer sees the same
             # three rows on every PR of the sequence with only the marks
@@ -8133,6 +8238,25 @@ def _summarize_appspace_state_changes(changed_files, pr_sha, base_sha, path_map,
                 "",
             ]
         elif is_armed and not was_purge and is_purge:
+            if _is_public_cloud_env(clean, env_name):
+                lines += [
+                    f"## \U0001f6a8 PUBLIC CLOUD: PURGE FLAG IS A NO-OP "
+                    f"for `{env_name}` \U0001f6a8",
+                    "",
+                    "\U0001f6a8 " + _DECOM_PUBLIC_CLOUD_NOOP_HDR,
+                    "",
+                    f"**`appspace.decommissionPurgeData: true` was added on "
+                    f"a public-cloud (`cl-*`) environment.** That gate only "
+                    f"runs during a private-cloud cascade. On `cl-*` there "
+                    f"is **no cascade**, so buckets and datasets are **not** "
+                    f"force-destroyed by this flag (COPS-2700).",
+                    "",
+                    "Treat data destruction as a separate, manual GCP "
+                    "operation after namespace cleanup — do not rely on "
+                    "this flag.",
+                    "",
+                ]
+                continue
             lines += [
                 f"## \U0001f6a8 PURGE ARMED for already-decommissioned `{env_name}` \U0001f6a8",
                 "",
