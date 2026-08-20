@@ -31,7 +31,17 @@ import sys
 import time
 import urllib.request
 
+# COPS-2702: this env name is SHARED with the diff-preview service, which can
+# now be pointed at the in-cluster Service (argocd-server.argocd.svc:80,
+# plaintext). Keep both in step: if ARGOCD_SERVER ever names a cluster-local
+# address here, ARGOCD_PLAINTEXT must be set too, or this script would attempt
+# TLS against a plaintext port. The CronJob template deliberately sets neither.
 SERVER    = os.environ.get("ARGOCD_SERVER", "argocd.appspace.com")
+PLAINTEXT = os.environ.get("ARGOCD_PLAINTEXT", "").strip().lower() in (
+    "1", "true", "yes", "on")
+if PLAINTEXT and "." in SERVER.split(":")[0] and ".svc" not in SERVER:
+    sys.exit("FATAL: ARGOCD_PLAINTEXT set but ARGOCD_SERVER is not in-cluster; "
+             "refusing to send credentials in cleartext.")
 ARGOCD    = os.environ.get("ARGOCD_BIN", "/usr/local/bin/argocd")
 PROJECTS  = [p.strip() for p in os.environ.get(
     "HARD_REFRESH_PROJECTS", "appspace-dev,appspace-qa,appspace-stage").split(",")
@@ -80,7 +90,7 @@ ATTEMPTS  = _env_int("HARD_REFRESH_ATTEMPTS", 2)
 BASE_FLAGS = [
     "--server", SERVER,
     "--grpc-web",
-]
+] + (["--plaintext"] if PLAINTEXT else [])
 
 
 def _fetch_argocd_token() -> str:
@@ -99,7 +109,8 @@ def _fetch_argocd_token() -> str:
     """
     user     = os.environ.get("ARGOCD_USER", "diff-preview")
     password = os.environ["ARGOCD_PASS"]
-    url      = f"https://{SERVER}/api/v1/session"
+    scheme   = "http" if PLAINTEXT else "https"
+    url      = f"{scheme}://{SERVER}/api/v1/session"
     data     = json.dumps({"username": user, "password": password}).encode()
     req      = urllib.request.Request(
         url, data=data,
