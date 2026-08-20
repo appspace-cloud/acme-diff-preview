@@ -21,9 +21,6 @@ sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..",
 import diff_preview  # noqa: E402
 
 
-import pytest  # noqa: E402
-
-
 def _module_source():
     with open(os.path.join(os.path.dirname(__file__), "..", "src",
                            "diff_preview.py"), encoding="utf-8") as fh:
