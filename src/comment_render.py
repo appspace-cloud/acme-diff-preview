@@ -239,6 +239,14 @@ _BLAST_RADIUS_HDR = "**Blast radius.**"
 # reading the rendered orphan comment while preparing its golden.
 _DECOM_ORPHAN_HDR = ("**The ArgoCD Application is removed, but its resources "
                      "are NOT deleted")
+# COPS-2701: public-cloud (cl-*) folder removal. Same orphan outcome as the
+# header above, but the private-cloud Phase 2/3 / COPS-2539 wording must
+# never appear — appspace.decommission is a no-op there (COPS-2700).
+_DECOM_PUBLIC_CLOUD_HDR = ("**Public cloud (`cl-*`) teardown is MANUAL.**")
+# COPS-2701: someone set appspace.decommission[:PurgeData] on a cl-* env.
+# Private-cloud wording would call that "ARMED"; here it arms nothing.
+_DECOM_PUBLIC_CLOUD_NOOP_HDR = (
+    "**Public cloud: `appspace.decommission` does NOT arm cascade delete.**")
 
 
 _SEV_ROUTINE, _SEV_REVIEW, _SEV_BLOCK = 0, 1, 2
@@ -307,6 +315,11 @@ def _build_merge_summary(results, rollup_by_sig, vm_change_lines,
         # by the producer, matched here.
         purge = _DECOM_PURGE_HDR in txt
         orphan = _DECOM_ORPHAN_HDR in txt
+        # COPS-2701: checked with orphan. Public-cloud teardowns also write
+        # the orphan header (Applications gone, workloads stay), but the
+        # verdict must not read as a private-cloud "decommission" that can
+        # be armed with appspace.decommission.
+        public_cloud = _DECOM_PUBLIC_CLOUD_HDR in txt
         # COPS-2697: checked before purge. Both can be true at once, and when
         # they are, the fact that matters is not "this environment's data is
         # destroyed" (expected, that is what a purge is) but "a DIFFERENT,
@@ -317,9 +330,16 @@ def _build_merge_summary(results, rollup_by_sig, vm_change_lines,
         if shared_uc:
             _what = ("the user content bucket and DNS record are SHARED with a "
                      "surviving environment, which loses them too")
+            _label = "Environment decommission"
+        elif public_cloud:
+            _what = ("public-cloud manual teardown: Applications are removed "
+                     "but workloads stay until namespace/GCP cleanup "
+                     "(no decommission gate; COPS-2700)")
+            _label = "Public-cloud teardown"
         elif purge:
             _what = ("data purge is ARMED: buckets/datasets are destroyed, "
                      "not abandoned")
+            _label = "Environment decommission"
         elif orphan:
             # No cascade: the Applications go, every workload keeps running.
             # Still a BLOCK \u2014 leaving a fleet of unmanaged workloads behind is
@@ -327,10 +347,12 @@ def _build_merge_summary(results, rollup_by_sig, vm_change_lines,
             # "deleted" told the reviewer the opposite of what happens.
             _what = ("no cascade armed: the Applications are removed but "
                      "their workloads keep running, orphaned and unmanaged")
+            _label = "Environment decommission"
         else:
             _what = "resources are deleted; data is abandoned, not purged"
+            _label = "Environment decommission"
         findings.append((_SEV_BLOCK,
-                         "\U0001f5d1\ufe0f **Environment decommission** \u2014 "
+                         "\U0001f5d1\ufe0f **" + _label + "** \u2014 "
                          + _what))
     if vm_change_lines:
         hdr = vm_change_lines[0]
@@ -583,7 +605,17 @@ def _build_merge_summary(results, rollup_by_sig, vm_change_lines,
         # the body shouted DECOMMISSION ARMED while this summary said
         # "Routine - nothing dangerous detected". A verdict that contradicts
         # the panel below it is worse than no verdict at all.
-        if "PURGE ARMED" in txt:
+        # COPS-2701: checked before PURGE/DECOMMISSION ARMED. On cl-* the
+        # panel writes _DECOM_PUBLIC_CLOUD_NOOP_HDR instead of those banners;
+        # matching the private-cloud strings here would promise a cascade
+        # that the ApplicationSets never template (COPS-2700).
+        if _DECOM_PUBLIC_CLOUD_NOOP_HDR in txt:
+            findings.append((_SEV_BLOCK,
+                             "\U0001f6a8 **Public-cloud decommission flag "
+                             "is a NO-OP** \u2014 `cl-*` ApplicationSets "
+                             "never cascade-delete; workloads stay until "
+                             "manual namespace/GCP cleanup (COPS-2700)"))
+        elif "PURGE ARMED" in txt:
             findings.append((_SEV_BLOCK,
                              "\U0001f6a8 **Data purge ARMED** \u2014 the "
                              "cascade will permanently destroy the BigQuery "

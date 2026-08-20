@@ -127,6 +127,50 @@ def _decommission_armed_flat(flat: dict) -> bool:
     return str(flat.get("appspace.decommission", "")).lower() == "true"
 
 
+def _is_public_cloud_env(identity_file: str, env_name: str = "") -> bool:
+    """True for public-cloud / cl-* environments (COPS-2700 / COPS-2701).
+
+    The private-cloud decommission gate (COPS-2539) was deliberately never
+    ported to the cl-* ApplicationSets. On those units
+    `preserveResourcesOnDeletion: true` is set and no cascade finalizer is
+    ever templated, so `appspace.decommission: true` is a silent no-op.
+    Detect by path (`/public-cloud/`) or by the `cl-` environment prefix.
+    """
+    path = (identity_file or "").replace("\\", "/")
+    if "/public-cloud/" in f"/{path.strip('/')}/":
+        return True
+    return (env_name or "").startswith("cl-")
+
+
+def _public_cloud_teardown_phase_table() -> list:
+    """Checklist for a cl-* folder removal. Not the pv-* Phase 1/2/3 table.
+
+    COPS-2701: the private-cloud table tells reviewers to arm
+    `appspace.decommission` and claims Phase 3 deletes managed resources.
+    Neither is true on public cloud. This table is the manual procedure
+    already documented in the config-repo READMEs and COPS-2700.
+    """
+    return [
+        "| Step | State | What it does |",
+        "|------|-------|--------------|",
+        "| **1 — confirm no shared user content** | \u2b1c operator | "
+        "bucket/DNS are keyed on `buckets.userContent.suffix`, not "
+        "`appspace.suffix`; a surviving sibling can share them |",
+        "| **2 — remove folder** | " + _PH_THIS_PR + " | "
+        "deletes the Argo CD Applications only; workloads and KCC "
+        "objects keep running unmanaged (`preserveResourcesOnDeletion`) |",
+        "| **3 — delete the namespace** | \u2b1c operator | "
+        "`kubectl delete namespace <env>` removes workloads and namespaced "
+        "KCC CRs |",
+        "| **4 — clean abandoned GCP objects** | \u2b1c operator | "
+        "KCC `deletion-policy: abandon` leaves URL maps, forwarding "
+        "rules, backend services, target HTTPS proxies, health checks, "
+        "buckets, DNSRecordSets and any GCE VMs in the project |",
+        "| **5 — verify** | \u2b1c operator | "
+        "nothing named after the environment survives in the GCP project |",
+    ]
+
+
 _PH_THIS_PR = "\u2705 **this PR**"
 _PH_PENDING = "\u2b1c pending"
 _PH_NA = "\u2014 not applicable"
