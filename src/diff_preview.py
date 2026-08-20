@@ -1234,13 +1234,24 @@ LOGIN_FAIL_THRESHOLD  = _env_int("LOGIN_FAIL_THRESHOLD", 3)
 # MAX_PR_WORKERS × DIFF_WORKERS. Env-overridable via PR_WORKERS.
 MAX_PR_WORKERS  = _env_int("PR_WORKERS", 3)
 
-# Path map TTL cache: argocd app list is ~350ms and downloads ~50KB.
+# Path map TTL cache. This comment used to claim the call "downloads ~50KB";
+# measured against the real hub on 2026-08-20 it is 128 MB of JSON, 47 MB on
+# the wire, for 1042 apps. The map only changes when apps are added or removed,
+# which is rare, so the TTL is the cheapest lever on how often argocd-server
+# has to marshal that: every doubling halves the number of 47 MB responses it
+# builds alongside real UI users. Env-overridable so an environment can tune
+# it without a release; default unchanged.
 # The map only changes when apps are added/removed (rare).
 # Cache for 5 min so idle iterations cost ~1ms instead of ~350ms.
 _path_map_cache: dict  = {}
 _path_map_ts:    float = 0.0
 _path_map_count: int   = 0    # extra invalidation: rebuild if app count changes
-PATH_MAP_TTL            = 300   # seconds
+# Floor at 60s deliberately. envcfg._env_int only guards against ValueError,
+# not against 0 or a negative, so PATH_MAP_TTL=0 would disable the cache and
+# buy a fresh 47 MB list on EVERY iteration - the loop runs about every 60s, so
+# roughly 1440 a day where today there are ~290. A TTL below one iteration
+# interval cannot help anyway.
+PATH_MAP_TTL            = max(60, _env_int("PATH_MAP_TTL", 300))   # seconds
 # COPS-2507 multi-repo: app full_name -> git config repo slug (from the app's
 # git source repoURL), and the per-repo partition of the path map. A PR in
 # repo R only matches apps in _repo_path_maps[R].
@@ -1812,37 +1823,64 @@ def _jfrog_hard_refresh(chart_name: str, chart_version: str) -> None:
     logsink.log(f"JFrog webhook: looking for apps tracking {chart_name}:{chart_version}",
                 chart=chart_name, version=chart_version)
 
-    r = subprocess.run(
-        [ARGOCD_BIN, "app", "list", "--output", "json"]
-         + [arg for p in ARGOCD_PROJECTS for arg in ("--project", p)] + _auth_flags(),
-        capture_output=True, text=True, timeout=60,
-        env=_argocd_subprocess_env())
-
-    if r.returncode != 0:
-        logsink.log(f"JFrog webhook: app list failed: {r.stderr[:200]}"
-                    + ("..." if len(r.stderr) > 200 else ""), "ERROR")
-        return
-
-    try:
-        data = json.loads(r.stdout)
-    except json.JSONDecodeError as exc:
-        logsink.log(f"JFrog webhook: malformed app list JSON: {exc}", "ERROR")
-        return
-
-    # argocd app list -o json returns a JSON array directly (not {"items": [...]})
-    apps = data if isinstance(data, list) else data.get("items", [])
+    # COPS-2702: match against the maps the path-map cache already built rather
+    # than listing the fleet again. discover_path_app_map() extracts exactly
+    # these two facts per app (_extract_app_chart_info -> chart, targetRevision),
+    # so a second `argocd app list` asked argocd-server to marshal 47 MB for
+    # data already in memory. This handler ran on BOTH replicas, uncached, once
+    # per webhook event.
+    #
+    # The maps are REBOUND wholesale by the cache builder, never mutated in
+    # place, so reading them from this thread yields either the previous dict
+    # or the next one - never a half-built one - without needing a lock.
+    #
+    # Deliberately NO fresh-list fallback when nothing matches: measured over
+    # 48h on the live hub, this handler fired ~132 times and found zero
+    # matching apps EVERY time (136 "no apps found" lines, not one match).
+    # Zero is the normal outcome, so a fallback would reinstate exactly the
+    # waste this removes. An app created inside the TTL window that tracks this
+    # chart:version is therefore missed until the next event for it - the OCI
+    # cache-bust is late, not lost, and dev charts get pushed repeatedly.
     matching = []
-    for app in apps:
-        for src_entry in app["spec"].get("sources", []):
-            if (src_entry.get("chart") == chart_name
-                    and src_entry.get("targetRevision") == chart_version):
-                matching.append(app["metadata"]["name"])
-                break
+    if _app_chart_map:
+        matching = [a for a, c in _app_chart_map.items()
+                    if c == chart_name
+                    and _app_chart_revision_map.get(a) == chart_version]
+        source = f"cached path map, {len(_app_chart_map)} apps"
+    else:
+        # Cold start: a webhook can arrive before the first iteration has built
+        # the cache. Keep the original behaviour rather than silently skipping.
+        r = subprocess.run(
+            [ARGOCD_BIN, "app", "list", "--output", "json"]
+            + [arg for p in ARGOCD_PROJECTS for arg in ("--project", p)] + _auth_flags(),
+            capture_output=True, text=True, timeout=60,
+            env=_argocd_subprocess_env())
+
+        if r.returncode != 0:
+            logsink.log(f"JFrog webhook: app list failed: {r.stderr[:200]}"
+                        + ("..." if len(r.stderr) > 200 else ""), "ERROR")
+            return
+
+        try:
+            data = json.loads(r.stdout)
+        except json.JSONDecodeError as exc:
+            logsink.log(f"JFrog webhook: malformed app list JSON: {exc}", "ERROR")
+            return
+
+        # argocd app list -o json returns a JSON array directly (not {"items": [...]})
+        apps = data if isinstance(data, list) else data.get("items", [])
+        for app in apps:
+            for src_entry in app["spec"].get("sources", []):
+                if (src_entry.get("chart") == chart_name
+                        and src_entry.get("targetRevision") == chart_version):
+                    matching.append(app["metadata"]["name"])
+                    break
+        source = "cold-start app list"
 
     if not matching:
-        logsink.log(f"JFrog webhook: no apps found for {chart_name}:{chart_version}")
+        logsink.log(f"JFrog webhook: no apps found for {chart_name}:{chart_version}"
+                    f" [{source}]")
         return
-
     logsink.log(f"JFrog webhook: {len(matching)} apps to hard-refresh: "
                 f"{', '.join(matching[:5])}{'...' if len(matching) > 5 else ''}")
 
