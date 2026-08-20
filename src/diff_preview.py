@@ -395,7 +395,48 @@ BB_TOKEN           = os.environ["BB_TOKEN"]
 import base64 as _base64
 _BB_AUTH_HEADER    = "Basic " + _base64.b64encode(
     f"{os.environ['BB_USER']}:{os.environ['BB_TOKEN']}".encode()).decode()
-ARGOCD_SERVER      = "argocd.appspace.com"
+# COPS-2702: the ArgoCD API endpoint and the host a human clicks are two
+# different things, and conflating them is what kept 19 GB/day of `app list`
+# traffic on the public ALB. This service runs INSIDE the hub cluster, so the
+# API can go straight to the in-cluster Service while every user-visible link
+# keeps pointing at the public host.
+#
+# Measured on the live hub (2026-08-20): one `argocd app list -o json` is
+# 128 MB of JSON / 47 MB on the wire, this process issues ~377/day, and that is
+# 99.3% of ALL traffic reaching argocd.appspace.com (browsers are 0.7%).
+# In-cluster is also faster: median 3.33s vs 3.96s over the public path.
+#
+# Defaults are the public host with TLS, so an image-only deploy is inert.
+# The Deployment opts in with:
+#   ARGOCD_SERVER=argocd-server.argocd.svc:80
+#   ARGOCD_PLAINTEXT=1
+# NOTE the short `.svc` form. The hub runs a CUSTOM cluster domain
+# (gcp-shared-devops-na1-a.appspace.cluster.local), so the canonical
+# `argocd-server.argocd.svc.cluster.local` returns NXDOMAIN there — verified
+# live from both replicas.
+ARGOCD_SERVER      = os.environ.get("ARGOCD_SERVER", "argocd.appspace.com")
+# Plaintext (http / h2c) instead of TLS. Only ever valid for the in-cluster
+# Service: argocd-server listens plaintext on 8080 (server.insecure=true) and
+# the public GCLB is what terminates TLS today, so the whole public ingress
+# already depends on that same plaintext port.
+ARGOCD_PLAINTEXT   = os.environ.get("ARGOCD_PLAINTEXT", "").strip().lower() in (
+    "1", "true", "yes", "on")
+# Public host used ONLY to build links humans click (see post_build_status).
+# Never the API endpoint, so pointing the API in-cluster can never post an
+# unroutable cluster-local address into a Bitbucket build status.
+ARGOCD_WEB_HOST    = os.environ.get("ARGOCD_WEB_HOST", "argocd.appspace.com")
+# Fail fast on the one combination that would leak credentials: plaintext
+# against anything that is not cluster-local means POSTing ARGOCD_PASS in
+# cleartext, and the very first startup login would do it. Checked at import,
+# i.e. strictly before _startup_argocd_login can run.
+if ARGOCD_PLAINTEXT and "." in ARGOCD_SERVER.split(":")[0] \
+        and ".svc" not in ARGOCD_SERVER:
+    raise SystemExit(
+        "FATAL: ARGOCD_PLAINTEXT is set but ARGOCD_SERVER "
+        f"({ARGOCD_SERVER!r}) is not an in-cluster address. Refusing to start: "
+        "the startup login would POST ARGOCD_PASS in cleartext. Set "
+        "ARGOCD_SERVER=argocd-server.argocd.svc:80 (short .svc form — the hub "
+        "uses a custom cluster domain) or unset ARGOCD_PLAINTEXT.")
 ARGOCD_BIN         = os.environ.get("ARGOCD_BIN", "/usr/local/bin/argocd")
 # Configurable via environment variables — set via ExternalSecret.
 ARGOCD_USER          = os.environ.get("ARGOCD_USER", "diff-preview")
@@ -1930,7 +1971,16 @@ def _auth_flags():
     """
     # --insecure removed: argocd.appspace.com has a valid CA-signed certificate;
     # TLS verification is enforced on both the CLI and the REST session API.
-    return ["--server", ARGOCD_SERVER, "--grpc-web"]
+    #
+    # COPS-2702: --plaintext (not --insecure) when the endpoint is the
+    # in-cluster Service, which speaks plain HTTP on port 80 -> 8080. Without
+    # it the CLI attempts TLS against a plaintext port and dies with
+    # "connection reset by peer" (verified live), which reads as a network
+    # fault rather than a misconfiguration.
+    flags = ["--server", ARGOCD_SERVER, "--grpc-web"]
+    if ARGOCD_PLAINTEXT:
+        flags.append("--plaintext")
+    return flags
 
 
 def _argocd_subprocess_env() -> dict:
@@ -2474,7 +2524,11 @@ def _argocd_fetch_token() -> str:
     duplication is accepted on purpose. If the ArgoCD session endpoint,
     auth payload, or TLS handling changes, UPDATE BOTH copies.
     """
-    url  = f"https://{ARGOCD_SERVER}/api/v1/session"
+    # COPS-2702: scheme follows the endpoint. This is the single place the
+    # service builds a session URL, so every renewal path (startup retry,
+    # proactive TTL refresh, reactive re-login) inherits it.
+    scheme = "http" if ARGOCD_PLAINTEXT else "https"
+    url  = f"{scheme}://{ARGOCD_SERVER}/api/v1/session"
     data = json.dumps({"username": ARGOCD_USER, "password": ARGOCD_PASS}).encode()
     req  = urllib.request.Request(
         url, data=data,
@@ -6960,7 +7014,7 @@ def post_build_status(pr_sha, state, description, pr_id=None, repo=None):
             _cid = _comment_id_cache.get((repo or BB_REPO, pr_id))
     _anchor = f"#comment-{_cid}" if _cid else ""
     url = (f"https://bitbucket.org/{BB_WORKSPACE}/{repo or BB_REPO}/pull-requests/{pr_id}{_anchor}"
-           if pr_id else f"https://{ARGOCD_SERVER}")
+           if pr_id else f"https://{ARGOCD_WEB_HOST}")
     # Full-diff UI: when the full-diff UI is enabled AND reachable (base url set)
     # AND this exact commit's artifact exists, the build icon deep-links to
     # the complete, untruncated diff (Atlantis-style). Any other case keeps
@@ -11144,7 +11198,9 @@ def main():
     global _last_ok, _loop_idle, _leader
     logsink.log("acme-diff-preview starting (Deployment mode, helm-template diff)",
                 version=APP_VERSION,
-                argocd_server=ARGOCD_SERVER, argocd_user=ARGOCD_USER,
+                argocd_server=ARGOCD_SERVER,
+                argocd_plaintext=ARGOCD_PLAINTEXT,
+                argocd_web_host=ARGOCD_WEB_HOST, argocd_user=ARGOCD_USER,
                 bb_repos=";".join(f"{r}:{'|'.join(c['scopes']) or '*'}" for r, c in REPOS.items()),
                 diff_workers=DIFF_WORKERS, pr_workers=MAX_PR_WORKERS,
                 max_apps_per_run=MAX_APPS_PER_RUN, diff_timeout=DIFF_TIMEOUT,
