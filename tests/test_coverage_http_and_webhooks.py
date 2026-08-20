@@ -301,6 +301,11 @@ def test_jfrog_hard_refresh_no_match_logs_and_returns(tmp_path, monkeypatch):
 
 
 def test_jfrog_hard_refresh_survives_cli_failure(tmp_path, monkeypatch):
+    # COPS-2702: _jfrog_hard_refresh now matches against the path-map cache
+    # and only falls back to `argocd app list` on a cold start. This test
+    # exercises the list path, so declare that precondition instead of
+    # inheriting whatever an earlier test left in the global.
+    monkeypatch.setattr(m, "_app_chart_map", {})
     p = tmp_path / "argocd"
     p.write_text("#!/bin/bash\necho denied >&2; exit 1\n")
     p.chmod(p.stat().st_mode | stat.S_IEXEC)

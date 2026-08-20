@@ -40,6 +40,11 @@ from test_coverage_helm_layer import (  # noqa: E402
 # ── _do_refresh: hard-refresh timeout (mocked, no real 60s wait) ─────────
 
 def test_do_refresh_timeout_is_caught_and_counted(monkeypatch):
+    # COPS-2702: _jfrog_hard_refresh now matches against the path-map cache
+    # and only falls back to `argocd app list` on a cold start. This test
+    # exercises the list path, so declare that precondition instead of
+    # inheriting whatever an earlier test left in the global.
+    monkeypatch.setattr(m, "_app_chart_map", {})
     import subprocess as _sp
     monkeypatch.setattr(m, "ARGOCD_BIN", "argocd")
     monkeypatch.setattr(m, "_auth_flags", lambda: [])

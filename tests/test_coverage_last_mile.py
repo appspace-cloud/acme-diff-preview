@@ -100,6 +100,11 @@ def test_find_existing_comment_page_scan_error_raises_to_skip_the_pr(monkeypatch
 # ── JFrog hard refresh: malformed list, per-app failure counting ─────────
 
 def test_jfrog_hard_refresh_malformed_app_list_and_failure_count(tmp_path, monkeypatch):
+    # COPS-2702: _jfrog_hard_refresh now matches against the path-map cache
+    # and only falls back to `argocd app list` on a cold start. This test
+    # exercises the list path, so declare that precondition instead of
+    # inheriting whatever an earlier test left in the global.
+    monkeypatch.setattr(m, "_app_chart_map", {})
     import stat as stat_mod
     # Fake argocd whose `app list` emits garbage -> the JSON guard returns.
     bad = tmp_path / "argocd_bad"
