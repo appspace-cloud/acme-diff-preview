@@ -145,6 +145,15 @@ spec:
             - name: DIFF_RETRIES
               value: {{ .retries | int64 | quote }}
             {{- end }}
+            {{- if .pathMapTtl }}
+            # COPS-2702: seconds the path map is cached. Each rebuild makes
+            # argocd-server marshal a 47 MB response, so this is the cheapest
+            # lever on that load. The code floors it at 60s, so a bad value
+            # here cannot disable the cache and buy a fresh list every
+            # iteration. Unset = code default (300).
+            - name: PATH_MAP_TTL
+              value: {{ .pathMapTtl | int64 | quote }}
+            {{- end }}
             {{- if .warmWorkers }}
             - name: WARM_WORKERS
               value: {{ .warmWorkers | int64 | quote }}
