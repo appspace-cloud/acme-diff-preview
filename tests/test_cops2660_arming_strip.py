@@ -134,12 +134,36 @@ def test_the_4247_shape_breaks_phase_1_and_warns(monkeypatch):
     assert "deployLinuxServicesK8s.enabled" in out
 
 
-def test_happy_path_arming_still_reads_done_and_does_not_warn(monkeypatch):
+def test_happy_path_arming_reads_satisfied_and_does_not_warn(monkeypatch):
+    """The contract this test was written for: the runbook-correct shape must
+    not read broken and must not warn.
+
+    HAPPY_YAML adds `decommission` and `allowDeletion` in the SAME diff --
+    the combined phase 1+2 PR decommission-environment.md allows. The
+    assertion used to be the literal word "done", which COPS-2707 sharpened
+    to "this PR": both say Phase 1 is satisfied, and only one of them tells
+    the reviewer that this is the PR doing it. The satisfied mark is what
+    this test guards, so it is pinned by state constant rather than by a
+    word the panel is free to improve.
+    """
     out = _panel(monkeypatch, OLD_YAML, HAPPY_YAML)
     assert "DECOMMISSION ARMED" in out
     assert comment_render._DECOM_VM_STRIP_HDR not in out
     phase1 = next(l for l in out.splitlines() if "Phase 1" in l)
-    assert "✅" in phase1 and "done" in phase1, phase1
+    assert "✅" in phase1, f"the happy path must not read broken: {phase1}"
+    assert m._PH_THIS_PR in phase1, phase1
+
+
+def test_arming_the_cascade_over_an_earlier_phase1_reads_done(monkeypatch):
+    """The other half of the same distinction. When `allowDeletion` was armed
+    by an EARLIER PR, Phase 1 is done, not this PR -- otherwise the table
+    would credit every later PR with work it did not do."""
+    already_armed = HAPPY_YAML.replace("  decommission: true\n", "")
+    out = _panel(monkeypatch, already_armed, HAPPY_YAML,
+                 base="base2660b", pr="pr2660b")
+    phase1 = next(l for l in out.splitlines() if "Phase 1" in l)
+    assert m._PH_DONE in phase1, phase1
+    assert m._PH_THIS_PR not in phase1, phase1
 
 
 def test_stripping_an_already_armed_environment_warns_standalone(monkeypatch):

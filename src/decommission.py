@@ -127,6 +127,157 @@ def _decommission_armed_flat(flat: dict) -> bool:
     return str(flat.get("appspace.decommission", "")).lower() == "true"
 
 
+# ── teardown flags the platform never reads (COPS-2707) ───────────────────
+#
+# `appspace.decommission`, `appspace.decommissionPurgeData` and the VM tree's
+# `allowDeletion` are the three keys whose only job is to authorise
+# destruction. Misspell one, or get its casing wrong, and neither the chart
+# nor the ApplicationSet templatePatch reads it: the environment renders
+# byte-identically, every panel in this service stays quiet, and the verdict
+# is "Routine -- nothing dangerous detected".
+#
+# acme-config-prod #4376 merged `appspace.decomission: true` -- one `m` --
+# with exactly that green comment. The folder-removal PR that followed was
+# correctly blocked for having no cascade armed, but nothing on either PR
+# could tell the operator WHY the flag they had just merged did not count.
+_TEARDOWN_FLAG_MAX_EDITS = 2
+
+_APPSPACE_PREFIX = "appspace."
+_CASCADE_FLAG_LEAVES = ("decommission", "decommissionPurgeData")
+# allowDeletion hangs off a role, so its parent varies by one segment.
+_VM_ARMING_PREFIX = "appspace.infra.deployLinuxServicesK8s."
+_VM_ARMING_LEAF = "allowDeletion"
+
+
+def _flag_edit_distance(a: str, b: str) -> int:
+    """Levenshtein distance between two flag names, two rows at a time.
+
+    The inputs are 10 to 25 characters and get compared a handful of times
+    per PR, so the plain form is both fast enough and easier to audit than
+    pulling in a dependency for it.
+    """
+    if a == b:
+        return 0
+    prev = list(range(len(b) + 1))
+    for i, ca in enumerate(a, 1):
+        cur = [i]
+        for j, cb in enumerate(b, 1):
+            cur.append(min(prev[j] + 1, cur[j - 1] + 1,
+                           prev[j - 1] + (ca != cb)))
+        prev = cur
+    return prev[-1]
+
+
+def _squash_flag(name: str) -> str:
+    """Lowercase, letters and digits only -- what two keys look like to a
+    reader who is not counting characters."""
+    return "".join(c for c in (name or "") if c.isalnum()).lower()
+
+
+def _reads_as_flag(leaf: str, canonical: str) -> bool:
+    """True when a reviewer reads `leaf` as `canonical` but Helm will not.
+
+    Two independent signals, because operators make two different kinds of
+    mistake. Casing and separators (`decommissionpurgedata`,
+    `decommission_purge_data`) are exact matches to the eye and invisible to
+    a YAML key lookup. A dropped or doubled letter (`decomission`,
+    `decommisson`) is what actually gets typed. An exact match is not a typo
+    and returns False, so no caller has to special-case the correct spelling.
+    """
+    if leaf == canonical:
+        return False
+    if _squash_flag(leaf) == _squash_flag(canonical):
+        return True
+    return (_flag_edit_distance(leaf.lower(), canonical.lower())
+            <= _TEARDOWN_FLAG_MAX_EDITS)
+
+
+def _canonical_teardown_flag(key: str):
+    """The teardown flag a flat key is a near-miss of, as
+    (canonical_leaf, parent_prefix), or (None, None).
+
+    Depth is part of the match. `appspace.decomission` is the typo;
+    `appspace.something.decomission` is a key inside another map that happens
+    to share a name, and guessing at it would put noise into a panel whose
+    entire value is that it only speaks when something is wrong.
+    """
+    if key.startswith(_VM_ARMING_PREFIX):
+        rest = key[len(_VM_ARMING_PREFIX):]
+        if rest.count(".") == 1:
+            role, leaf = rest.split(".")
+            if _reads_as_flag(leaf, _VM_ARMING_LEAF):
+                return _VM_ARMING_LEAF, f"{_VM_ARMING_PREFIX}{role}."
+        return None, None
+    if not key.startswith(_APPSPACE_PREFIX):
+        return None, None
+    leaf = key[len(_APPSPACE_PREFIX):]
+    if "." in leaf:
+        return None, None
+    best, best_distance = None, None
+    for canonical in _CASCADE_FLAG_LEAVES:
+        if not _reads_as_flag(leaf, canonical):
+            continue
+        distance = _flag_edit_distance(leaf.lower(), canonical.lower())
+        if best_distance is None or distance < best_distance:
+            best, best_distance = canonical, distance
+    if best is None:
+        return None, None
+    return best, _APPSPACE_PREFIX
+
+
+def _flag_is_true(flat: dict, key: str) -> bool:
+    return str((flat or {}).get(key, "")).strip().lower() == "true"
+
+
+def _teardown_flag_typos(flat: dict, previous: dict = None) -> list:
+    """Keys that read as a teardown flag, are set to `true`, and do nothing.
+
+    Returns `[{"found": flat key, "canonical": flat key that works}]`,
+    sorted, so a caller can render a stable two-column table.
+
+    Only `true` is reported: that is the value which creates a false belief
+    of arming, and skipping the rest keeps a leftover `decomission: false`
+    out of the comment. A typo standing next to a correctly spelled flag
+    that IS armed is skipped too -- the cascade is armed either way, so
+    nothing the operator intended failed to happen.
+
+    With `previous` given, the answer is limited to flags this diff turned
+    on. That is what the PR-review panels want: every other branch in
+    `_summarize_appspace_state_changes` is a transition, and firing on a
+    pre-existing key would block unrelated PRs that merely touch the file.
+    Pass `previous=None` to ask the state question instead -- is this
+    environment carrying an inert flag right now -- which is what the
+    folder-removal panel needs to explain why the cascade is not armed.
+    """
+    found = []
+    for key in (flat or {}):
+        if not _flag_is_true(flat, key):
+            continue
+        canonical_leaf, parent = _canonical_teardown_flag(key)
+        if canonical_leaf is None:
+            continue
+        canonical = parent + canonical_leaf
+        if _flag_is_true(flat, canonical):
+            continue
+        if previous is not None and _flag_is_true(previous, key):
+            continue
+        found.append({"found": key, "canonical": canonical})
+    return sorted(found, key=lambda d: d["found"])
+
+
+def _teardown_flag_typo_table(typos: list,
+                              found_label: str = "In this PR") -> list:
+    """Two columns and nothing else: what is written, and what works.
+
+    A reviewer comparing `decomission` with `decommission` in running prose
+    has to count letters. Side by side in a table they do not.
+    """
+    rows = [f"| {found_label} | The key the platform reads |", "|---|---|"]
+    for typo in typos:
+        rows.append(f"| `{typo['found']}` | `{typo['canonical']}` |")
+    return rows
+
+
 def _is_public_cloud_env(identity_file: str, env_name: str = "") -> bool:
     """True for public-cloud / cl-* environments (COPS-2700 / COPS-2701).
 

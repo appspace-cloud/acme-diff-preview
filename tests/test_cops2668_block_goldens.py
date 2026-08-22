@@ -1,4 +1,4 @@
-"""Goldens for the five comment shapes that describe irreversible changes.
+"""Goldens for the comment shapes that describe irreversible changes.
 
 The existing golden corpus covers the everyday shapes — an ordinary version
 bump, a resource deletion, a VM field change — and left the loudest ones
@@ -8,6 +8,8 @@ uncovered. Until this file, nothing pinned the exact rendering of:
   * a data purge being armed
   * decommission being armed on a live environment
   * the COPS-2660 VM-strip break
+  * (COPS-2707) Phase 1 on its own, and a teardown flag that is misspelled
+    and therefore arms nothing
 
 Those are the comments a reviewer reads immediately before approving something
 they cannot undo, and the only tests on them were substring checks — which stay
@@ -70,6 +72,11 @@ PURGE = ARMED + "  decommissionPurgeData: true\n"
 VM_BLOCK = ("  infra:\n    deployLinuxServicesK8s:\n      enabled: true\n"
             "      defaults:\n        allowDeletion: true\n"
             "      instances:\n        svc-a:\n          enabled: true\n")
+# The same block before Phase 1 arms it: VMs declared, deletion not allowed.
+VM_BLOCK_UNARMED = ("  infra:\n    deployLinuxServicesK8s:\n      enabled: true\n"
+                    "      instances:\n        svc-a:\n          enabled: true\n")
+# COPS-2707: acme-config-prod #4376, byte for byte. One `m`.
+MISSPELLED = LIVE + "  decomission: true\n"
 
 
 @pytest.fixture(autouse=True)
@@ -199,3 +206,36 @@ def test_golden_vm_strip_while_arming(monkeypatch):
     """
     _assert_golden("vm_strip_while_arming",
                    _state_body(monkeypatch, LIVE + VM_BLOCK, ARMED))
+
+
+def test_golden_decommission_phase1(monkeypatch):
+    """COPS-2707: the first PR of a teardown, arming `allowDeletion` alone.
+
+    acme-config-prod #4378 shipped this shape with no phase table at all —
+    the VM panel reported the deletion-policy flip and nothing said which of
+    the three phases the reviewer was looking at. The golden pins that the
+    table is present, that Phase 1 reads "this PR" rather than "done", and
+    that the panel is explicit nothing is deleted by merging it.
+
+    The verdict here reads Routine because this harness drives the state
+    panel alone. On the real PR the VM panel rides along and blocks; the
+    phase table is positional context and must not raise a second finding
+    for the same event (the COPS-2616 contract, asserted in
+    test_cops2707_phase1_and_flag_typos.py).
+    """
+    _assert_golden("decommission_phase1",
+                   _state_body(monkeypatch, LIVE + VM_BLOCK_UNARMED,
+                               LIVE + VM_BLOCK))
+
+
+def test_golden_teardown_flag_misspelled(monkeypatch):
+    """COPS-2707: `appspace.decomission: true`, one `m`, exactly as merged on
+    acme-config-prod #4376.
+
+    Nothing is armed and nothing renders differently, so before this the
+    whole comment read "Routine — nothing dangerous detected". The golden
+    exists to keep the verdict red: this is the shape where a green comment
+    is itself the incident.
+    """
+    _assert_golden("teardown_flag_misspelled",
+                   _state_body(monkeypatch, LIVE, MISSPELLED))

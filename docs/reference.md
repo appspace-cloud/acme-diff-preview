@@ -51,6 +51,8 @@ and QA apps when CI publishes a new chart, so they pick it up past the OCI cache
 | 🆕 New Environment(s) Detected | A brand-new environment is added. The provisioning summary (chart version, resource counts, applications) comes first; the complete redacted manifest is kept on the **full-diff page** behind the build-status link; the comment links to it rather than inlining it. |
 | ⏸️/▶️ Auto-sync PAUSED/RESUMED | `appspace.autosync` was toggled. Shown even when it is the ONLY change — no rendered manifest is touched, so the resource diff has nothing to say. |
 | 🔒 DECOMMISSION ARMED / 🔓 DISARMED | `appspace.decommission` (and `decommissionPurgeData`) was toggled on a LIVE environment. Different from the block above: nothing is deleted yet, this is the flag that decides what happens the day the folder actually goes. |
+| 🔒 DECOMMISSION PHASE 1 | `allowDeletion` was armed on this environment's Linux VMs, and nothing else. The first PR of a teardown, which used to show only the VM danger bullets: this panel carries the same Phase 1/2/3 table as the later phases, so the reviewer can see which steps are done and which are still ahead. |
+| 🚨 TEARDOWN FLAG MISSPELLED | A key that reads as `decommission`, `decommissionPurgeData` or `allowDeletion` but is not one the platform looks up — a dropped letter, or the wrong casing. Helm and the ApplicationSet match the key exactly, so the environment renders byte-identically and the PR would otherwise merge as a routine no-op with the operator believing a phase is done. Also shown on a folder-removal PR, where it explains why Phase 2 reads pending over a file that looks armed. |
 | 🖥️ VM infrastructure | **Always present**, in a fixed place, so "did this PR touch VMs?" is answerable without reading anything else: `🖥️🚨 VM INFRASTRUCTURE CHANGES` when something dangerous is found, `🖥️ (routine)` for harmless changes, and an explicit `no changes` line when the domain is untouched. Covers KCC linux-services (`ComputeInstance`, `ComputeDisk`, `ComputeAddress`, snapshot-policy attachments); instance-type and disk-type changes are always highlighted, since both mean destroy-and-recreate. |
 | ⬆️ Routine version bump | Several environments taking the same version-only change, folded into one line naming the transition and every environment it covers. Only ever applied to changes that are provably version-only. |
 | ✂️ N more changed app(s) omitted | The readability budget folded ordinary diff blocks away. Nothing risk-flagged is ever folded; the link goes to the full-diff page, which always holds everything. |
@@ -71,6 +73,23 @@ Resuming a long-paused environment also gets a reminder that the accumulated
 diff applies immediately; arming decommission is explicit that nothing is
 deleted by that PR alone. See `acme-components` `documentation/` for what each
 flag actually does.
+
+**The teardown phases** (`acme-components`
+`documentation/decommission-environment.md`): Phase 1 arms `allowDeletion`,
+Phase 2 arms the cascade with `appspace.decommission` (the data purge is a
+qualifier on it), Phase 3 removes the environment folder and is the only
+destructive one. Phases 1 and 2 may share a PR; Phase 3 must not. Every PR in
+the sequence renders the same three-row table with only the marks moving, so
+"where am I" is answerable from the comment alone. A row reads `✅ this PR`
+for work this diff performs, `✅ done` for work an earlier PR did, and
+`⛔ broken by this PR` when the diff arms a phase while removing the config
+that phase acts through (COPS-2660).
+
+Because those flags are matched by exact key, a near miss arms nothing while
+looking armed to any reader. `appspace.decomission: true` — one `m` — merged
+green on acme-config-prod #4376 and left the following folder-removal PR
+about to orphan 473 resources. Misspellings and casing slips of the three
+teardown flags are now their own blocking finding (COPS-2707).
 
 Apps whose full diff is byte-for-byte identical (a shared ancestor-file
 change rolled out the same way to many environments, e.g. removing a
