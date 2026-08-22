@@ -427,6 +427,10 @@ def _public_cloud_teardown_phase_table(block: str = None) -> list:
 _PH_THIS_PR = "\u2705 **this PR**"
 _PH_PENDING = "\u2b1c pending"
 _PH_NA = "\u2014 not applicable"
+# COPS-2710: a phase being taken back. Rendering the row as plain pending
+# again would be true and useless -- it hides that this diff is what undid
+# it, which is the one thing the reviewer of a rollback needs to see.
+_PH_UNDONE = "\u21a9\ufe0f **undone by this PR**"
 # COPS-2660: the arming flag is present but the same PR removed the VM config
 # it acts through, so the phase can never complete as written.
 _PH_BROKEN = "\u26d4 **broken by this PR**"

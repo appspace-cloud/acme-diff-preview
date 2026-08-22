@@ -261,6 +261,7 @@ from decommission import (
     _PH_BROKEN,
     _PH_PENDING,
     _PH_NA,
+    _PH_UNDONE,
     _decommission_phase_table,
     _teardown_flag_typos,
     _teardown_flag_typo_table,
@@ -8293,11 +8294,17 @@ def _summarize_appspace_state_changes(changed_files, pr_sha, base_sha, path_map,
         # decommission-environment.md allows phases 1 and 2 to share a PR --
         # so it feeds the table's state as well as gating its own panel.
         _arms_vm_now = _armed_new and not _armed_old
+        # COPS-2710: the same transition in reverse. Taking `allowDeletion`
+        # back moves the environment from Phase 1 done to Phase 1 pending,
+        # and flips the live deletion-policy from `delete` to `abandon`.
+        _disarms_vm_now = _armed_old and not _armed_new
         # Phase 1 reads "this PR" when this diff armed it and plain "done"
         # when an earlier PR did. Both are true statements about the same
         # flag; only one of them tells the reviewer where they are standing.
+        # Same reasoning for the undo.
         _vm_phase_state = (_PH_BROKEN if _vm_broken else
                            _PH_THIS_PR if _arms_vm_now else
+                           _PH_UNDONE if _disarms_vm_now else
                            _PH_DONE if _armed_new else None)
         _strip_warning = [] if not _vm_broken else [
             _DECOM_VM_STRIP_HDR,
@@ -8460,6 +8467,11 @@ def _summarize_appspace_state_changes(changed_files, pr_sha, base_sha, path_map,
             # and `allowDeletion: true` can survive the disarm, so ArgoCD can
             # still prune them. The warning belongs on this path as much as
             # on the arming one.
+            # COPS-2710: the table belongs on the way back as much as on the
+            # way out. COPS-2616's contract is that every PR in the sequence
+            # renders the same three rows with only the marks moving, and a
+            # rollback is exactly when someone is recovering from a mistake
+            # and most needs to see where the environment now sits.
             lines += [
                 f"### \U0001f513 Decommission DISARMED for `{env_name}`",
                 "",
@@ -8467,7 +8479,18 @@ def _summarize_appspace_state_changes(changed_files, pr_sha, base_sha, path_map,
                 f"eligible for cascade deletion if this environment's folder is " +
                 f"removed later.",
                 "",
-            ]
+            ] + _decommission_phase_table(
+                vm_state=_vm_phase_state,
+                cascade_state=_PH_UNDONE,
+                removal_state=None,
+                declares_vms=(_declares_vms_flat(new_flat)
+                              or _declares_vms_flat(old_flat)
+                              or bool(_kcc_enabled_roles(_new_m or {}))
+                              or bool(_kcc_enabled_roles(_old_m or {}))),
+                purge=is_purge,
+            ) + [
+                "",
+            ] + _strip_warning
         elif is_armed and not was_purge and is_purge:
             if _is_public_cloud_env(clean, env_name):
                 _cl = _public_cloud_env_name(clean, env_name)
@@ -8536,6 +8559,22 @@ def _summarize_appspace_state_changes(changed_files, pr_sha, base_sha, path_map,
                 f"`appspace.decommissionPurgeData` was removed \u2014 data is no " +
                 f"longer purged by the cascade.*",
                 "",
+            # COPS-2710: the cascade is still armed here, so the sequence is
+            # still live and the table still answers "where am I". The purge
+            # is a qualifier on Phase 2 (COPS-2669), so softening it shows as
+            # Phase 2 done without the destruction note rather than as a
+            # phase of its own being undone.
+            ] + _decommission_phase_table(
+                vm_state=_vm_phase_state,
+                cascade_state=_PH_DONE,
+                removal_state=None,
+                declares_vms=(_declares_vms_flat(new_flat)
+                              or _declares_vms_flat(old_flat)
+                              or bool(_kcc_enabled_roles(_new_m or {}))
+                              or bool(_kcc_enabled_roles(_old_m or {}))),
+                purge=False,
+            ) + [
+                "",
             # COPS-2668: `+ _strip_warning` was missing here. The warning is
             # computed for every branch, but this one dropped it AND, by
             # matching, made the `elif _vm_broken` fallback below unreachable
@@ -8595,6 +8634,42 @@ def _summarize_appspace_state_changes(changed_files, pr_sha, base_sha, path_map,
                 "",
                 f"**Next:** {_next_step}. Phases 1 and 2 may share a PR; "
                 f"Phase 3 must not.",
+                "",
+            ]
+        elif _disarms_vm_now and not _is_public_cloud_env(clean, env_name):
+            # COPS-2710: Phase 1 taken back. acme-config-prod #4385 removed
+            # `allowDeletion` from pv-gsk--aec1-b and the comment said
+            # nothing about phases at all -- verdict Routine, one routine VM
+            # panel. The environment moved from Phase 1 done to Phase 1
+            # pending, which is a position in the runbook's sequence and the
+            # table is what shows it.
+            #
+            # Deliberately no new verdict: `delete` going back to `abandon`
+            # is the safe direction, the VM panel already reports it as
+            # routine, and the table is positional context (COPS-2616).
+            lines += [
+                f"## \u21a9\ufe0f DECOMMISSION PHASE 1 UNDONE for `{env_name}`",
+                "",
+                (f"**`allowDeletion` was removed.** This environment's Linux "
+                 f"VM, its data disk and its reserved IP go back to "
+                 f"`deletion-policy: abandon`, so a cascade would leave them "
+                 f"in GCP rather than delete them. Safe direction, but it "
+                 f"steps the teardown back a phase."),
+                "",
+            ] + _decommission_phase_table(
+                vm_state=_PH_UNDONE,
+                cascade_state=(_PH_DONE if is_armed else None),
+                removal_state=None,
+                declares_vms=True,
+                purge=is_purge,
+            ) + [
+                "",
+                (f"**If `{env_name}` is still being decommissioned**, Phase 1 "
+                 f"has to be armed again before the folder is removed, or the "
+                 f"cascade orphans the VM instead of deleting it."
+                 if is_armed else
+                 f"Nothing else in the teardown sequence is armed for "
+                 f"`{env_name}`."),
                 "",
             ]
 
