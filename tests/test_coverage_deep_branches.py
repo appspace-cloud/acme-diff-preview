@@ -691,7 +691,12 @@ def test_process_pr_hard_error_without_structural_desc(world, monkeypatch):
                                         m.OUT_ERROR, "unexpected")
     m.process_pr(_mk_pr(pr_id=607), PATH_MAP, base_sha=BASE_SHA)
     state, desc = sinks.statuses[-1]
-    assert state == "FAILED" and desc == "Diff failed - check PR comment"
+    # COPS-2709: the description now carries the error itself. "Diff failed"
+    # on its own named nothing an operator could act on, and the message was
+    # sitting on the result the whole time.
+    assert state == "FAILED"
+    assert desc.startswith("Diff failed"), desc
+    assert "boom" in desc, desc
 
 
 def test_process_pr_clean_with_new_envs_success_desc(world, monkeypatch):

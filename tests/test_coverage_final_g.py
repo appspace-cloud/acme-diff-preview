@@ -277,7 +277,12 @@ def test_process_pr_structural_new_env_with_oci_not_found_composes_combined_desc
     states = [s for s, _ in sinks.statuses]
     descs = [d for _, d in sinks.statuses]
     assert states[-1] == "FAILED"
-    assert "structural" in descs[-1] and "chart version not found" in descs[-1]
+    # COPS-2709: "structural config problem" was a category, not a problem,
+    # so the new-env half now says it cannot render and, when the render
+    # named a reason, carries it. Both halves must still be present.
+    assert "new environment(s) cannot render" in descs[-1], descs[-1]
+    assert "pv-newenv-a" in descs[-1]
+    assert "chart version not found" in descs[-1], descs[-1]
 
 
 def test_process_pr_outer_exception_is_caught_posts_failed_and_fallback_comment(world, monkeypatch):

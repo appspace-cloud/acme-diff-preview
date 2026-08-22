@@ -8989,6 +8989,62 @@ def _short_permanent_error(r) -> str:
     return (r.error or r.reason or "permanent render failure")[:160]
 
 
+def _permanent_failure_status_description(app_results) -> str:
+    """The checks-list line for a permanent render failure (COPS-2709).
+
+    Bitbucket shows this description and nothing else, so it is the whole
+    message for a reviewer who never opens the comment. It used to read
+    "N app(s): invalid config -- fix and push again" for a missing required
+    value, a schema violation, a template blowing up and a name over 63
+    characters alike: four different problems with four different fixes,
+    named by none of them.
+
+    The comment has said which one since COPS-2676, through
+    `_short_permanent_error`. This is that same function on the surface it
+    was left out of. Failures are grouped by their message so a fleet PR
+    where fifty apps break the same way reads as one problem, and the
+    largest group leads with ties broken on the text, so the string is
+    deterministic for the SHA dedup the poll loop does on it.
+
+    Returns "" when nothing permanent failed, so callers can fall back.
+    """
+    failures = []
+    for app, v in (app_results or {}).items():
+        r = _result(v)
+        if r.outcome == OUT_INDETERMINATE and r.reason in PERMANENT_REASONS:
+            failures.append((app, r))
+    if not failures:
+        return ""
+    by_error = {}
+    for app, r in failures:
+        by_error.setdefault(
+            _short_permanent_error(r) or r.reason or "render failure",
+            []).append(app)
+    error, apps = sorted(by_error.items(),
+                         key=lambda kv: (-len(kv[1]), kv[0]))[0]
+    envs = sorted(set(_envs_from_apps(apps)))
+    where = ", ".join(envs[:3])
+    if len(envs) > 3:
+        where += f" (+{len(envs) - 3} more)"
+    others = len(by_error) - 1
+    tail = f" | +{others} other failure(s)" if others else ""
+    # The action depends on whether the author can act. A chart version that
+    # is not in the registry may simply not have published yet, and the poll
+    # loop keeps retrying it (COPS-2696), so telling someone to fix and push
+    # would send them to change a version that is probably correct.
+    _reasons = {r.reason for _a, r in failures if _a in apps}
+    action = ("check the version or wait for the registry"
+              if _reasons <= SELF_RESOLVING_REASONS else "fix and push")
+    # The action is the part a truncated status can least afford to lose, so
+    # the error gives up characters first rather than the whole line being
+    # cut at 255 by post_build_status.
+    suffix = f" \u2014 {where}{tail} \u2014 {action}"
+    budget = 255 - len(suffix)
+    if len(error) > budget:
+        error = error[:max(budget - 1, 40)] + "\u2026"
+    return f"{error}{suffix}"
+
+
 def _permanent_failure_top_panel(results, failure_group_for_app, quiet: bool) -> list:
     """Error-first panel(s) for permanent render failures (COPS-2676).
 
@@ -11119,8 +11175,14 @@ def process_pr(pr, path_map, base_sha="", repo=None):
                              "missing field) before merging (see PR comment)")
                 post_build_status(pr_sha, "FAILED", _kcc_desc, pr_id=pr_id)
             elif structural_envs:
-                base_desc = (f"{len(structural_envs)} new environment(s) have a "
-                             f"structural config problem: {', '.join(structural_envs)}")
+                # COPS-2709: "structural config problem" is a category, not a
+                # problem. When the render named one, lead with it.
+                _se_why = _permanent_failure_status_description(app_results)
+                _se_why = _se_why.split(" \u2014 ")[0] if _se_why else ""
+                base_desc = (f"{len(structural_envs)} new environment(s) "
+                             f"cannot render"
+                             + (f" ({_se_why})" if _se_why else "")
+                             + f": {', '.join(structural_envs)}")
                 if oci_not_found_count:
                     desc = f"{base_desc} | {oci_not_found_count} existing app(s): chart version not found in OCI registry"
                 elif any_hard_error:
@@ -11131,17 +11193,35 @@ def process_pr(pr, path_map, base_sha="", repo=None):
                     desc = base_desc
                 post_build_status(pr_sha, "FAILED", desc, pr_id=pr_id)
             elif oci_not_found_count:
-                post_build_status(pr_sha, "FAILED",
-                    f"{oci_not_found_count} app(s): chart version not found in OCI registry",
-                    pr_id=pr_id)
+                # COPS-2709: name the chart and version. "chart version not
+                # found" without saying which one leaves the reader to guess
+                # between the bump they just made and every pin they did not.
+                _oci_desc = (
+                    _permanent_failure_status_description(app_results)
+                    or f"{oci_not_found_count} app(s): chart version not "
+                       f"found in OCI registry")
+                post_build_status(pr_sha, "FAILED", _oci_desc, pr_id=pr_id)
             elif any_hard_error:
-                post_build_status(pr_sha, "FAILED", "Diff failed - check PR comment", pr_id=pr_id)
+                # COPS-2709: "Diff failed" named nothing at all. The error is
+                # right there on the result.
+                _errs = [(_result(v).error or "").strip()
+                         for v in app_results.values()
+                         if _result(v).outcome == OUT_ERROR]
+                _errs = [e for e in _errs if e]
+                _hd_desc = (f"Diff failed: {_errs[0].splitlines()[0][:180]} "
+                            f"- check PR comment" if _errs else
+                            "Diff failed - check PR comment")
+                post_build_status(pr_sha, "FAILED", _hd_desc, pr_id=pr_id)
             else:
-                # Permanent indeterminate reason other than oci_not_found
-                # (invalid_yaml, invalid_version) — author must fix the file.
-                post_build_status(pr_sha, "FAILED",
-                    f"{permanent_indet_count} app(s): invalid config — fix and push again "
-                    f"(check PR comment for details)", pr_id=pr_id)
+                # Permanent indeterminate reason other than oci_not_found.
+                # COPS-2709: this branch is reached by four different
+                # failures, and until now described all of them as "invalid
+                # config".
+                _pf_desc = (
+                    _permanent_failure_status_description(app_results)
+                    or f"{permanent_indet_count} app(s): invalid config — "
+                       f"fix and push again (check PR comment for details)")
+                post_build_status(pr_sha, "FAILED", _pf_desc, pr_id=pr_id)
         elif skipped_apps:
             # Apps beyond MAX_APPS_PER_RUN were never evaluated — never post SUCCESSFUL
             # with a coverage gap, as reviewers assume full coverage.

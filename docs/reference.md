@@ -243,6 +243,26 @@ before any diff, that no rendered diff would make obvious to a reviewer.
 | Structural new-env failure | a new environment missing a required value (e.g. `appspace.version`) | the environment cannot render at all on merge |
 | **Empty `microservices.definitions`** | a value file (typically `cicd-versions.yaml`) with `appspace.microservices.definitions` present but **null/empty** | silently deletes every microservice on merge ([details](docs/internals.md#why-an-empty-microservicesdefinitions-is-blocked)) |
 
+**The red status names the failure, not its category** (COPS-2709). Bitbucket
+shows the description and nothing else, so it is the whole message for anyone
+who reads the checks list instead of opening the comment. A missing required
+value, a schema violation, a template blowing up and a name over 63 characters
+used to share one line, `N app(s): invalid config`, which named none of them.
+Each now carries the same short error the comment headline has used since
+COPS-2676, plus the environments and the action:
+
+```
+Missing Image Tag on => platform — pv-uwm-a — fix and push
+at '/microservices/definitions/a': got string, want object — pv-uwm-a — fix and push
+appspace-ms:2603.9.9 not found — pv-uwm-a — check the version or wait for the registry
+```
+
+A chart version missing from the registry gets a different action on purpose:
+it is self-resolving, the poll loop keeps retrying it (COPS-2696), and telling
+the author to fix and push would send them to change a version that is
+probably correct. Apps failing the same way are grouped, so a fleet PR reads
+as one problem with an environment count rather than fifty lines.
+
 See [docs/internals.md](docs/internals.md) for the reasoning behind each guard,
 how mass version bumps are handled, the secret-leak hardening, and the
 full-diff web UI.

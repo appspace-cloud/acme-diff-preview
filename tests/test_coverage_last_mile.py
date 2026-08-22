@@ -362,7 +362,12 @@ def test_process_pr_oci_not_found_alone_desc(world, monkeypatch):
                                         m.OUT_INDETERMINATE, m.REASON_OCI_NOT_FOUND)
     m.process_pr(_mk_pr(pr_id=705), PATH_MAP, base_sha=BASE_SHA)
     state, desc = sinks.statuses[-1]
-    assert state == "FAILED" and "chart version not found in OCI registry" in desc
+    # COPS-2709: the description now carries the registry's own message, so
+    # a reader learns WHICH chart is missing. The old line said only that
+    # some version somewhere was not found.
+    assert state == "FAILED"
+    assert "chart gone" in desc, desc
+    assert "pv-orch-a" in desc, desc
 
 
 def test_process_batch_survives_a_crashing_diff(world, monkeypatch):
