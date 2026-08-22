@@ -263,7 +263,8 @@ _DECOM_PUBLIC_CLOUD_WHY = (
 # Same contract as the constants above -- the panel writes it, the summary
 # matches it, so the two can never drift apart.
 _DECOM_FLAG_TYPO_HDR = (
-    "**A teardown flag here is misspelled, so it arms nothing.**")
+    "**A teardown flag here is misspelled or in the wrong place, so it "
+    "arms nothing (or not what you expect).**")
 
 
 _SEV_ROUTINE, _SEV_REVIEW, _SEV_BLOCK = 0, 1, 2
@@ -636,10 +637,11 @@ def _build_merge_summary(results, rollup_by_sig, vm_change_lines,
         # was done.
         if _DECOM_FLAG_TYPO_HDR in txt:
             findings.append((_SEV_BLOCK,
-                             "\U0001f6a8 **Teardown flag misspelled** "
-                             "\u2014 a `decommission` / `allowDeletion` key "
-                             "in this PR is not one the platform reads, so "
-                             "it arms nothing (COPS-2707)"))
+                             "\U0001f6a8 **Teardown flag misspelled or misplaced** "
+                             "\u2014 a `decommission` / `allowDeletion` / "
+                             "`confirmProdDeletion` key in this PR is not one "
+                             "the platform reads at that depth, so it arms "
+                             "nothing (COPS-2707)"))
         # Arming destruction is the highest-severity thing a config-only PR
         # can do, and it is invisible in the manifest diff: the footer still
         # reads "No manifest changes". Live proof, acme-config-dev PR #7024:

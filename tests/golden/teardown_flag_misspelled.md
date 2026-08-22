@@ -8,13 +8,13 @@
 
 ⛔ **DO NOT MERGE** without checking the item(s) below (1 item(s))
 
-- 🚨 **Teardown flag misspelled** — a `decommission` / `allowDeletion` key in this PR is not one the platform reads, so it arms nothing (COPS-2707)
+- 🚨 **Teardown flag misspelled or misplaced** — a `decommission` / `allowDeletion` / `confirmProdDeletion` key in this PR is not one the platform reads at that depth, so it arms nothing (COPS-2707)
 
 ---
 
 ## ⛔ STOP — teardown flag misspelled in `pv-foo-c`
 
-⛔ **A teardown flag here is misspelled, so it arms nothing.**
+⛔ **A teardown flag here is misspelled or in the wrong place, so it arms nothing (or not what you expect).**
 
 | You wrote | The key the platform reads |
 |---|---|
