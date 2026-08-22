@@ -247,6 +247,11 @@ _DECOM_PUBLIC_CLOUD_HDR = ("**Public cloud (`cl-*`) teardown is MANUAL.**")
 # Private-cloud wording would call that "ARMED"; here it arms nothing.
 _DECOM_PUBLIC_CLOUD_NOOP_HDR = (
     "**Public cloud: `appspace.decommission` does NOT arm cascade delete.**")
+# COPS-2707: a teardown flag spelled in a way the platform does not read.
+# Same contract as the constants above -- the panel writes it, the summary
+# matches it, so the two can never drift apart.
+_DECOM_FLAG_TYPO_HDR = (
+    "**A teardown flag here is misspelled, so it arms nothing.**")
 
 
 _SEV_ROUTINE, _SEV_REVIEW, _SEV_BLOCK = 0, 1, 2
@@ -354,6 +359,17 @@ def _build_merge_summary(results, rollup_by_sig, vm_change_lines,
         findings.append((_SEV_BLOCK,
                          "\U0001f5d1\ufe0f **" + _label + "** \u2014 "
                          + _what))
+        # COPS-2707: the orphan finding above says the cascade is not armed.
+        # When the reason is a misspelled flag, that is the actionable half
+        # of the verdict -- the operator believes the flag is set, and the
+        # panel is the only place that can tell them otherwise. Its own
+        # finding, because it survives whichever branch chose `_what`.
+        if _DECOM_FLAG_TYPO_HDR in txt:
+            findings.append((_SEV_BLOCK,
+                             "\U0001f6a8 **Teardown flag misspelled** "
+                             "\u2014 the cascade flag on this environment "
+                             "is not a key the platform reads, which is why "
+                             "Phase 2 is pending (COPS-2707)"))
     if vm_change_lines:
         hdr = vm_change_lines[0]
         if hdr == _VM_PANEL_DANGER_HDR:
@@ -599,6 +615,19 @@ def _build_merge_summary(results, rollup_by_sig, vm_change_lines,
                              "`abandon` and ORPHANED in the cloud, not "
                              "deleted. Keep the VM block and only add "
                              "`allowDeletion`."))
+        # COPS-2707: its own axis, so a plain `if`. A misspelled flag is not
+        # an alternative to the states below, it is the reason none of them
+        # fired: the key never reached Helm, so the render is identical and
+        # every other panel is quiet. acme-config-prod #4376 merged
+        # `decomission: true` under a green "Routine" verdict, and the
+        # operator went on to open the folder-removal PR believing Phase 2
+        # was done.
+        if _DECOM_FLAG_TYPO_HDR in txt:
+            findings.append((_SEV_BLOCK,
+                             "\U0001f6a8 **Teardown flag misspelled** "
+                             "\u2014 a `decommission` / `allowDeletion` key "
+                             "in this PR is not one the platform reads, so "
+                             "it arms nothing (COPS-2707)"))
         # Arming destruction is the highest-severity thing a config-only PR
         # can do, and it is invisible in the manifest diff: the footer still
         # reads "No manifest changes". Live proof, acme-config-dev PR #7024:

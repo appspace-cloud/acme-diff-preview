@@ -24,6 +24,8 @@ Each golden below maps to a real incident:
 | `ordinary_version_bump.md` | The 83.7% case. If this changes shape, everything else is suspect. |
 | `version_downgrade.md` | Downgrades must be flagged, not shown as an ordinary change. |
 | `all_clean.md` | The all-green baseline. |
+| `decommission_phase1.md` | COPS-2707. acme-config-prod #4378 armed `allowDeletion` and showed no phase table, leaving the first PR of a three-PR teardown as the one with no positional context. |
+| `teardown_flag_misspelled.md` | COPS-2707. acme-config-prod #4376 merged `appspace.decomission: true` — one `m`, read by nothing — under a green "Routine, nothing dangerous detected". |
 
 ## Updating them
 

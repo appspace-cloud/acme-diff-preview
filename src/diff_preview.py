@@ -165,6 +165,7 @@ from comment_render import (  # comment rendering (same-dir module, stdlib only)
     _DECOM_PUBLIC_CLOUD_NOOP_HDR,
     _BLAST_RADIUS_HDR,
     _DECOM_VM_STRIP_HDR,
+    _DECOM_FLAG_TYPO_HDR,
     _SHUTDOWN_MIN_WORKLOADS,
     _is_env_shutdown,
 )
@@ -259,6 +260,8 @@ from decommission import (
     _PH_PENDING,
     _PH_NA,
     _decommission_phase_table,
+    _teardown_flag_typos,
+    _teardown_flag_typo_table,
 )
 from manifest import (  # rendered-manifest parsing and resource diffing
     _parse_manifest_resources,
@@ -6122,6 +6125,11 @@ def _evaluate_env_decommissions(candidates: list, pr_sha: str, main_sha: str,
         # `.enabled: true` after ancestor merge is what the chart renders;
         # parent SA/snapshot keys alone do not count.
         vm_armed, declares_vms = False, False
+        # COPS-2707: an inert near-miss of a teardown flag sitting in the
+        # file this panel is judging. Asked as a state question, not a
+        # transition one -- the typo was merged by an earlier PR, and this
+        # panel's job is to explain the state it found.
+        _base_flag_typos = []
         _vm_content, _vm_status = _bb_fetch_cached(
             c["identity_file"], main_sha)
         if _vm_status == BB_OK and _vm_content:
@@ -6144,6 +6152,7 @@ def _evaluate_env_decommissions(candidates: list, pr_sha: str, main_sha: str,
                 if not declares_vms and _declares_vms_flat(_vm_flat):
                     declares_vms = True
                     vm_armed = _vm_deletion_armed_flat(_vm_flat)
+                _base_flag_typos = _teardown_flag_typos(_vm_flat)
         collect_full = (with_full_output and cascade
                         and _decommission_fully_phased(c["identity_file"], main_sha))
         app_deleted_docs: dict = {}
@@ -6236,6 +6245,24 @@ def _evaluate_env_decommissions(candidates: list, pr_sha: str, main_sha: str,
             # so the correction goes immediately after the table and before the
             # inventory it would otherwise appear to describe.
             lines += _cascade_mismatch_note(c["env_name"], c["apps"], cascade)
+            # COPS-2707: the table above just reported Phase 2 as pending on
+            # an environment whose file looks armed to a reader. Saying only
+            # "not armed" is what left acme-config-prod #4377 arguing with
+            # its own customer.yaml -- the answer to "but I set the flag" is
+            # here, next to the row that raised the question.
+            if not cascade and _base_flag_typos:
+                lines += [
+                    "\U0001f6a8 " + _DECOM_FLAG_TYPO_HDR,
+                    "",
+                    (f"Phase 2 reads pending above because the flag set on "
+                     f"`{c['env_name']}` is not a key the platform reads. "
+                     f"Fix the spelling, let the environment sync, and "
+                     f"re-check this PR before merging it."),
+                    "",
+                ] + _teardown_flag_typo_table(
+                    _base_flag_typos, found_label="In the environment") + [
+                    "",
+                ]
         if unrendered:
             # COPS-2668: the counts below cover only the apps that rendered.
             # Saying so is the difference between an inventory and a guess;
@@ -8102,10 +8129,23 @@ def _summarize_appspace_state_changes(changed_files, pr_sha, base_sha, path_map,
         if _old_m is not None and _new_m is not None:
             _stripped = _vm_config_stripped(_old_m, _new_m)
             _armed_new = _vm_deletion_armed_flat(_new_m)
+            _armed_old = _vm_deletion_armed_flat(_old_m)
         else:
             _stripped = _vm_config_stripped(old_flat, new_flat)
             _armed_new = _vm_deletion_armed_flat(new_flat)
+            _armed_old = _vm_deletion_armed_flat(old_flat)
         _vm_broken = bool(_stripped) and (is_armed or _armed_new)
+        # COPS-2707: Phase 1 performed by THIS PR rather than an earlier one.
+        # Not exclusive with the cascade branches below --
+        # decommission-environment.md allows phases 1 and 2 to share a PR --
+        # so it feeds the table's state as well as gating its own panel.
+        _arms_vm_now = _armed_new and not _armed_old
+        # Phase 1 reads "this PR" when this diff armed it and plain "done"
+        # when an earlier PR did. Both are true statements about the same
+        # flag; only one of them tells the reviewer where they are standing.
+        _vm_phase_state = (_PH_BROKEN if _vm_broken else
+                           _PH_THIS_PR if _arms_vm_now else
+                           _PH_DONE if _armed_new else None)
         _strip_warning = [] if not _vm_broken else [
             _DECOM_VM_STRIP_HDR,
             "",
@@ -8137,6 +8177,35 @@ def _summarize_appspace_state_changes(changed_files, pr_sha, base_sha, path_map,
             "deleted the VM (Phase 3).",
             "",
         ]
+
+        # COPS-2707: a key that reads as a teardown flag and is not one.
+        # Deliberately outside the transition chain below: a misspelled flag
+        # is the REASON none of those branches fire, so making it one of them
+        # would hide it in exactly the case it exists for. It also stands
+        # alongside them, because a PR can arm one flag correctly and
+        # misspell another.
+        _flag_typos = _teardown_flag_typos(new_flat, previous=old_flat)
+        if _flag_typos:
+            lines += [
+                f"## \U0001f6a8 TEARDOWN FLAG MISSPELLED for `{env_name}` "
+                f"\U0001f6a8",
+                "",
+                "\U0001f6a8 " + _DECOM_FLAG_TYPO_HDR,
+                "",
+                ("Helm and the ApplicationSet `templatePatch` look the key up "
+                 "by its exact name. A near miss is not read, not defaulted "
+                 "and not warned about anywhere else: the environment renders "
+                 "byte-identically, so this PR would otherwise merge as a "
+                 "no-op."),
+                "",
+            ] + _teardown_flag_typo_table(_flag_typos) + [
+                "",
+                (f"**Nothing is armed for `{env_name}`.** Fix the spelling in "
+                 f"this PR. If a later PR removes this environment's folder "
+                 f"believing the cascade is on, every workload is left "
+                 f"running and unmanaged instead of deleted."),
+                "",
+            ]
 
         if not was_armed and is_armed:
             # COPS-2701: cl-* ApplicationSets never template the cascade
@@ -8199,8 +8268,10 @@ def _summarize_appspace_state_changes(changed_files, pr_sha, base_sha, path_map,
             ] + _decommission_phase_table(
                 # COPS-2660: a stripped VM config outranks the flag. The flag
                 # says armed; the same diff removed what it arms.
-                vm_state=(_PH_BROKEN if _vm_broken else
-                          (_PH_DONE if _armed_new else None)),
+                # COPS-2707: when this same PR also arms allowDeletion -- the
+                # combined 1+2 shape the runbook allows -- Phase 1 reads
+                # "this PR" too, so both rows the PR performs are marked.
+                vm_state=_vm_phase_state,
                 cascade_state=_PH_THIS_PR,
                 removal_state=None,
                 declares_vms=(_declares_vms_flat(new_flat)
@@ -8282,8 +8353,7 @@ def _summarize_appspace_state_changes(changed_files, pr_sha, base_sha, path_map,
                 # precondition) AND still mark this PR as the change adding
                 # the purge. Every other panel marks the phase it actually
                 # performs; this was the only one claiming a phase it did not.
-                vm_state=(_PH_BROKEN if _vm_broken else
-                          (_PH_DONE if _armed_new else None)),
+                vm_state=_vm_phase_state,
                 cascade_state=_PH_DONE,
                 removal_state=None,
                 declares_vms=(_declares_vms_flat(new_flat)
@@ -8321,6 +8391,45 @@ def _summarize_appspace_state_changes(changed_files, pr_sha, base_sha, path_map,
                 declares_vms=True,
                 purge=is_purge,
             ) + [
+                "",
+            ]
+        elif _arms_vm_now and not _is_public_cloud_env(clean, env_name):
+            # COPS-2707: Phase 1 on its own -- the first PR of the sequence,
+            # and until now the only one with no phase table. No cascade
+            # transition fires here, and the VM panel next to it reports the
+            # deletion-policy flip without ever saying which phase this is,
+            # so acme-config-prod #4378 told its reviewer that something
+            # dangerous was happening and nothing about where it sat in a
+            # three-PR teardown.
+            #
+            # Public cloud is excluded for the COPS-2701 reason: the private
+            # Phase 1/2/3 model does not apply to cl-*, where no cascade is
+            # ever templated and teardown is manual end to end.
+            _next_step = (
+                "remove the environment folder in its own PR (Phase 3)"
+                if is_armed else
+                "arm the cascade with `appspace.decommission: true` "
+                "(Phase 2), let it sync, then remove the environment folder "
+                "in its own PR (Phase 3)")
+            lines += [
+                f"## \U0001f512 DECOMMISSION PHASE 1 for `{env_name}`",
+                "",
+                (f"**`allowDeletion` was armed. This PR deletes nothing by "
+                 f"itself.** It flips this environment's Linux VM, its data "
+                 f"disk and its reserved IP from `deletion-policy: abandon` "
+                 f"to `delete`, so a later cascade can remove them in GCP "
+                 f"instead of leaving them behind."),
+                "",
+            ] + _decommission_phase_table(
+                vm_state=_PH_THIS_PR,
+                cascade_state=(_PH_DONE if is_armed else None),
+                removal_state=None,
+                declares_vms=True,
+                purge=is_purge,
+            ) + [
+                "",
+                f"**Next:** {_next_step}. Phases 1 and 2 may share a PR; "
+                f"Phase 3 must not.",
                 "",
             ]
 
