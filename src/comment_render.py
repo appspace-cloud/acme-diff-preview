@@ -247,6 +247,18 @@ _DECOM_PUBLIC_CLOUD_HDR = ("**Public cloud (`cl-*`) teardown is MANUAL.**")
 # Private-cloud wording would call that "ARMED"; here it arms nothing.
 _DECOM_PUBLIC_CLOUD_NOOP_HDR = (
     "**Public cloud: `appspace.decommission` does NOT arm cascade delete.**")
+# COPS-2708: the reason, not just the mechanism. Every public-cloud panel
+# said a finalizer is never templated, which reads like an omission somebody
+# ought to fix. It is a safety property: a `cl-*` namespace is shared, so
+# there is no delete that is safe to automate for one customer in it. Said
+# once, here, and used by all three panels so they cannot drift.
+_DECOM_PUBLIC_CLOUD_WHY = (
+    "A `cl-*` namespace is **shared**: one constellation serves many "
+    "customers from the same microservices, NEGs and load balancers, so no "
+    "delete is safe to automate for one of them. That is why the "
+    "cascade gate was deliberately never ported to the public-cloud "
+    "ApplicationSets (COPS-2700), and why teardown here is operator-driven "
+    "from start to finish.")
 # COPS-2707: a teardown flag spelled in a way the platform does not read.
 # Same contract as the constants above -- the panel writes it, the summary
 # matches it, so the two can never drift apart.

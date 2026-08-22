@@ -163,6 +163,7 @@ from comment_render import (  # comment rendering (same-dir module, stdlib only)
     _DECOM_SHARED_UC_HDR,
     _DECOM_PUBLIC_CLOUD_HDR,
     _DECOM_PUBLIC_CLOUD_NOOP_HDR,
+    _DECOM_PUBLIC_CLOUD_WHY,
     _BLAST_RADIUS_HDR,
     _DECOM_VM_STRIP_HDR,
     _DECOM_FLAG_TYPO_HDR,
@@ -254,6 +255,7 @@ from decommission import (
     _split_resources_by_cascade_fate,
     _decommission_armed_flat,
     _is_public_cloud_env,
+    _public_cloud_env_name,
     _public_cloud_teardown_phase_table,
     _PH_THIS_PR,
     _PH_BROKEN,
@@ -5723,10 +5725,26 @@ def _detect_env_decommission_candidates(changed_files: list, path_map: dict, ren
         if not apps:
             continue  # not a currently-live environment
         env_name = posixpath.basename(posixpath.dirname(clean))
+        # COPS-2708: public cloud nests a block under the constellation, so
+        # this basename is `constellation` / `api` / `app7` and never
+        # prefixes the apps it owns (`cl-dev11-a-ms`, `cl-dev11-a-app1-glb`).
+        # Every public-cloud identity file in acme-config-dev and
+        # acme-config-prod uses that layout, so the guard below dropped all
+        # of them and the COPS-2701 teardown panel could not fire anywhere:
+        # removing a `cl-*` folder got no teardown warning at all. The
+        # constellation is the name the apps are actually prefixed with; the
+        # block is kept because it decides whether the shared namespace may
+        # be deleted.
+        block = ""
+        if _is_public_cloud_env(clean):
+            constellation = _public_cloud_env_name(clean)
+            if constellation and constellation != env_name:
+                block, env_name = env_name, constellation
         if not all(a.split("/")[-1].startswith(env_name + "-") for a in apps):
             continue  # shared ancestor default, not this env's own identity file
         seen_identity_files.add(clean)
-        candidates.append({"env_name": env_name, "identity_file": clean, "apps": list(apps)})
+        candidates.append({"env_name": env_name, "identity_file": clean,
+                           "apps": list(apps), "block": block})
     return candidates
 
 
@@ -6308,15 +6326,22 @@ def _evaluate_env_decommissions(candidates: list, pr_sha: str, main_sha: str,
         kind_counts = del_kinds if cascade else all_kinds
         workloads = del_workloads if cascade else all_workloads
         if public_cloud:
+            # COPS-2708: name the block as well as the constellation.
+            # "`cl-prod-b` is being removed" reads as the whole constellation
+            # going when the diff may only remove one load-balancer block,
+            # and the two have very different blast radii.
+            _block = c.get("block") or ""
+            _what = (f"`{c['env_name']}` / `{_block}`" if _block
+                     else f"`{c['env_name']}`")
             lines += [
                 f"# \U0001f5d1\ufe0f\u26a0\ufe0f PUBLIC CLOUD MANUAL TEARDOWN "
                 f"\u26a0\ufe0f\U0001f5d1\ufe0f",
                 "",
-                f"**`{c['env_name']}` is being removed by this PR "
+                f"**{_what} is being removed by this PR "
                 f"(was running chart version `{', '.join(versions) or 'unknown'}`). "
                 f"Public-cloud (`cl-*`) teardown is manual — verify this is intentional.**",
                 "",
-            ] + _public_cloud_teardown_phase_table() + [
+            ] + _public_cloud_teardown_phase_table(_block) + [
                 "",
             ]
             # No _cascade_mismatch_note: there is no gate to mismatch.
@@ -6392,6 +6417,11 @@ def _evaluate_env_decommissions(candidates: list, pr_sha: str, main_sha: str,
         if public_cloud:
             lines += [
                 "\u26a0\ufe0f " + _DECOM_PUBLIC_CLOUD_HDR,
+                "",
+                # COPS-2708: the header states the rule, this states why it
+                # exists. Without it the manual procedure below reads like a
+                # gap in the tooling rather than the safety property it is.
+                _DECOM_PUBLIC_CLOUD_WHY,
                 "",
             ]
             if flag_set_noop:
@@ -8333,9 +8363,13 @@ def _summarize_appspace_state_changes(changed_files, pr_sha, base_sha, path_map,
             # finalizer. Calling this "DECOMMISSION ARMED" would promise a
             # cleanup that cannot happen — paint the no-op in red instead.
             if _is_public_cloud_env(clean, env_name):
+                # COPS-2708: name the constellation, not the block. The
+                # basename rule that is right everywhere else yields
+                # `constellation` / `api` / `app7` on this layout.
+                _cl = _public_cloud_env_name(clean, env_name)
                 lines += [
                     f"## \U0001f6a8 PUBLIC CLOUD: DECOMMISSION FLAG IS A "
-                    f"NO-OP for `{env_name}` \U0001f6a8",
+                    f"NO-OP for `{_cl}` \U0001f6a8",
                     "",
                     "\U0001f6a8 " + _DECOM_PUBLIC_CLOUD_NOOP_HDR,
                     "",
@@ -8346,6 +8380,10 @@ def _summarize_appspace_state_changes(changed_files, pr_sha, base_sha, path_map,
                     f"(COPS-2700): no cascade finalizer is templated, so "
                     f"**nothing is auto-deleted** when the folder is later "
                     f"removed.",
+                    "",
+                    "\u26a0\ufe0f " + _DECOM_PUBLIC_CLOUD_HDR,
+                    "",
+                    _DECOM_PUBLIC_CLOUD_WHY,
                     "",
                     f"{app_list} keep running unmanaged after a folder "
                     f"delete until you `kubectl delete namespace` and clean "
@@ -8431,9 +8469,10 @@ def _summarize_appspace_state_changes(changed_files, pr_sha, base_sha, path_map,
             ]
         elif is_armed and not was_purge and is_purge:
             if _is_public_cloud_env(clean, env_name):
+                _cl = _public_cloud_env_name(clean, env_name)
                 lines += [
                     f"## \U0001f6a8 PUBLIC CLOUD: PURGE FLAG IS A NO-OP "
-                    f"for `{env_name}` \U0001f6a8",
+                    f"for `{_cl}` \U0001f6a8",
                     "",
                     "\U0001f6a8 " + _DECOM_PUBLIC_CLOUD_NOOP_HDR,
                     "",
@@ -8442,6 +8481,10 @@ def _summarize_appspace_state_changes(changed_files, pr_sha, base_sha, path_map,
                     f"runs during a private-cloud cascade. On `cl-*` there "
                     f"is **no cascade**, so buckets and datasets are **not** "
                     f"force-destroyed by this flag (COPS-2700).",
+                    "",
+                    "\u26a0\ufe0f " + _DECOM_PUBLIC_CLOUD_HDR,
+                    "",
+                    _DECOM_PUBLIC_CLOUD_WHY,
                     "",
                     "Treat data destruction as a separate, manual GCP "
                     "operation after namespace cleanup — do not rely on "
