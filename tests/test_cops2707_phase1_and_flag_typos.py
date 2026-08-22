@@ -30,6 +30,7 @@ os.environ.setdefault("ARGOCD_PASS", "t")
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
 
 import diff_preview as m  # noqa: E402
+import decommission  # noqa: E402
 from decommission import (  # noqa: E402
     _flag_edit_distance,
     _reads_as_flag,
@@ -328,11 +329,26 @@ def test_a_pr_adding_a_misspelled_flag_says_so(monkeypatch):
     """The #4376 shape end to end. It merged with a green comment."""
     head = "appspace:\n  decomission: true\n  customerName: g\n" + VM_BLOCK
     out = _panel(monkeypatch, BASE, head, "typo1")
-    assert "TEARDOWN FLAG MISSPELLED" in out, out
+    assert "STOP" in out, out
     assert m._DECOM_FLAG_TYPO_HDR in out
     assert "`appspace.decomission`" in out, "name what was written"
     assert "`appspace.decommission`" in out, "and what works"
-    assert "Nothing is armed" in out
+    assert "**Fix:**" in out, "an operator must not have to infer the action"
+    assert IDENT in out, "name the file to edit, not just the key"
+
+
+def test_the_misspelled_flag_panel_is_short(monkeypatch):
+    """Every other destructive panel describes something a reviewer has to
+    weigh. This one describes a mistake with a single correct response, so
+    prose about how Helm resolves keys is just distance to the fix.
+
+    Pinned as a budget rather than a shape: the exact wording is free to
+    improve, the length is what regressed the first time round.
+    """
+    head = "appspace:\n  decomission: true\n  customerName: g\n" + VM_BLOCK
+    out = _panel(monkeypatch, BASE, head, "typoshort")
+    panel = [l for l in out.splitlines() if l.strip()]
+    assert len(panel) <= 8, "the panel grew back into an essay:\n" + out
 
 
 def test_the_misspelled_flag_panel_blocks_the_merge(monkeypatch):
@@ -416,6 +432,173 @@ def test_folder_removal_verdict_names_the_misspelling(monkeypatch):
     assert "misspelled" in joined.lower(), joined
     assert "no cascade armed" in joined.lower(), \
         "the orphaning finding must survive alongside it"
+
+
+# ── 6b. a misspelled flag must fail the build, not just the comment ──────
+
+def test_the_status_line_carries_the_blocker(monkeypatch):
+    """COPS-2660 fixed this shape once for the VM strip: a red paragraph
+    under a green tick loses to the tick. A misspelled flag renders nothing,
+    so every ordinary branch would post SUCCESSFUL and mark the run clean.
+    """
+    head = "appspace:\n  decomission: true\n  customerName: g\n" + VM_BLOCK
+    panel = _panel(monkeypatch, BASE, head, "typostat").splitlines()
+    body = m.format_comment(
+        "abc12345", {APPS[0]: m.DiffResult("", [], 0, False, None,
+                                           m.OUT_NO_DIFF, None, None,
+                                           None, None, None)},
+        base_sha="def67890", appspace_state_lines=panel)
+    assert "TEARDOWN FLAG MISSPELLED" in body, body[-900:]
+    assert "[permanent]" in body, \
+        "a misspelled key does not fix itself on the next poll"
+    assert "[clean]" not in body
+
+
+def _stop_comment(monkeypatch, sha_tag, results=None):
+    head = "appspace:\n  decomission: true\n  customerName: g\n" + VM_BLOCK
+    panel = _panel(monkeypatch, BASE, head, sha_tag).splitlines()
+    return m.format_comment(
+        "abc12345",
+        results or {APPS[0]: m.DiffResult("", [], 0, False, None, m.OUT_DIFF,
+                                          None, None, None, None, None)},
+        base_sha="def67890", appspace_state_lines=panel,
+        vm_change_lines=["## \U0001f5a5\ufe0f VM INFRASTRUCTURE CHANGES", "",
+                         "- \U0001f6a8 `pv-x` danger danger", ""])
+
+
+def test_a_misspelled_flag_stops_the_whole_comment(monkeypatch):
+    """Marcos, on the acme-config-dev #7193 drill: "sale demasiada cosa".
+    The fix was the last thing on the page, under the VM bullets, the
+    changeset table and the diff links. Nothing else is worth reading until
+    the key is corrected, so nothing else is rendered."""
+    body = _stop_comment(monkeypatch, "stopall")
+    assert "STOP" in body
+    assert "**Fix:**" in body
+    assert "unreviewed" in body
+    assert "VM INFRASTRUCTURE CHANGES" not in body, body
+    assert "Changeset overview" not in body, body
+    assert "DECOMMISSION PHASE 1" not in body, \
+        "the phase table is context for a review that is not happening"
+
+
+def test_the_stopped_comment_still_carries_a_parseable_footer(monkeypatch):
+    """The poll loop reads the footer tokens to dedup by SHA. A comment that
+    drops them is re-posted every 60 seconds."""
+    body = _stop_comment(monkeypatch, "stopfoot")
+    assert "\n---\n**Status:**" in body, "_truncate_comment locates this exactly"
+    assert "[permanent]" in body
+    assert "[base:def67890]" in body
+    assert "\n---\n---\n" not in body, "doubled rule renders as an empty band"
+
+
+def test_the_stopped_verdict_does_not_point_at_a_missing_section(monkeypatch):
+    """COPS-2668's rule: the summary must never describe a panel that is not
+    below it. The VM finding says "see the VM section", and there is none."""
+    body = _stop_comment(monkeypatch, "stopverdict")
+    summary = body.split("---")[0 if "Merge summary" in body.split("---")[0]
+                                else 1]
+    assert "DO NOT MERGE" in body
+    assert "misspelled" in body.lower()
+    assert "see the VM section" not in summary, summary
+
+
+def test_the_full_diff_page_is_never_stopped(monkeypatch):
+    """The page is the evidence surface and withholds nothing (COPS-2609).
+    Suppressing there would leave the fix with no record to check against."""
+    head = "appspace:\n  decomission: true\n  customerName: g\n" + VM_BLOCK
+    panel = _panel(monkeypatch, BASE, head, "stoppage").splitlines()
+    body = m.format_comment(
+        "abc12345", {APPS[0]: m.DiffResult("", [], 0, False, None,
+                                           m.OUT_NO_DIFF, None, None,
+                                           None, None, None)},
+        base_sha="def67890", appspace_state_lines=panel,
+        vm_change_lines=["## \U0001f5a5\ufe0f VM INFRASTRUCTURE CHANGES", "",
+                         "- \U0001f6a8 `pv-x` danger danger", ""],
+        profile=m.render_profile.FULL_PROFILE)
+    assert "VM INFRASTRUCTURE CHANGES" in body
+    assert "unreviewed" not in body
+
+
+def test_the_stop_panel_does_not_swallow_the_panel_after_it(monkeypatch):
+    """The typo and a Phase 1 arming in the same diff, which is the
+    `pv-gsk--aec1-b` shape. The extractor walks to the next heading, so a
+    bug here would either drop the STOP panel or drag the phase table into
+    the stopped comment along with it."""
+    head = ("appspace:\n  decomission: true\n  customerName: g\n"
+            + VM_BLOCK_ARMED)
+    panel = _panel(monkeypatch, BASE, head, "stopboth")
+    assert "DECOMMISSION PHASE 1" in panel, "both panels must be produced"
+    kept = decommission._teardown_flag_typo_panels(panel.splitlines())
+    joined = "\n".join(kept)
+    assert "STOP" in joined and "**Fix:**" in joined
+    assert "DECOMMISSION PHASE 1" not in joined, \
+        "the extractor must stop at the next heading:\n" + joined
+
+
+def test_process_pr_fails_the_build_on_a_misspelled_flag(monkeypatch):
+    """End to end through the orchestrator. acme-config-prod #4376 got
+    SUCCESSFUL here, which is the only reason it merged."""
+    sha, base = "ffee1122", "99887766"
+    ident = "gcp/dev/private-cloud/ap1/custom/pv-typo-a/customer.yaml"
+    apps = ["pv-typo-a-ms"]
+    files = {
+        (ident, base): "appspace:\n  customerName: t\n" + VM_BLOCK,
+        (ident, sha): ("appspace:\n  decomission: true\n  customerName: t\n"
+                       + VM_BLOCK),
+    }
+    statuses = []
+    m._seen.clear()
+    monkeypatch.setattr(m, "_bb_fetch_status",
+                        lambda p, s, repo=None: (files[(p, s)], m.BB_OK)
+                        if (p, s) in files else (None, m.BB_NOT_FOUND))
+    monkeypatch.setattr(m, "get_pr_changed_files",
+                        lambda pr_id, repo=None: ([ident], {}))
+    monkeypatch.setattr(m, "find_existing_comment",
+                        lambda pr_id, repo=None: (None, "", ""))
+    monkeypatch.setattr(m, "upsert_comment",
+                        lambda pr_id, body, existing_id=None, repo=None,
+                        **kw: 1)
+    monkeypatch.setattr(m, "post_build_status",
+                        lambda pr_sha, state, description, pr_id=None,
+                        repo=None: statuses.append((state, description)))
+    monkeypatch.setattr(m, "fix_stuck_inprogress", lambda *a, **k: None)
+    monkeypatch.setattr(m, "_touch_progress", lambda: None)
+    monkeypatch.setattr(m, "argocd_diff",
+                        lambda app, pr_sha, main_sha, chart_revision=None,
+                        changed_paths=None, renames=None:
+                        m.DiffResult("", [], 0, False, "", m.OUT_NO_DIFF, ""))
+
+    m.process_pr({"id": 4376,
+                  "title": "decommissioning aec clone",
+                  "source": {"commit": {"hash": sha},
+                             "branch": {"name": "gsk-b-n4-decomm"}},
+                  "destination": {"branch": {"name": "main"}}},
+                 {ident: apps}, base_sha=base)
+
+    assert statuses, "the orchestrator must post a status"
+    state, description = statuses[-1]
+    assert state == "FAILED", f"got {state}: {description}"
+    assert "decomission" in description, description
+    assert "decommission" in description, description
+
+
+def test_the_build_status_description_names_the_key_and_the_rename():
+    """The checks list is where a reviewer who never opens the comment
+    decides. It has to carry the whole message."""
+    panel = ["| You wrote | The key the platform reads |", "|---|---|",
+             "| `appspace.decomission` | `appspace.decommission` |"]
+    desc = m._flag_typo_status_description(panel)
+    assert "appspace.decomission" in desc
+    assert "appspace.decommission" in desc
+    assert "rename" in desc.lower()
+
+
+def test_the_status_description_degrades_instead_of_disappearing():
+    """If the table ever stops being parseable the check must still fail,
+    just less specifically. A parse miss must never become a green build."""
+    desc = m._flag_typo_status_description(["nothing parseable here"])
+    assert "misspelled" in desc.lower()
+    assert "arms" in desc.lower()
 
 
 # ── 7. the phase table is context, never a verdict ───────────────────────

@@ -18,6 +18,8 @@ rule refuses to move a member the suite patches. Their only reader is
 relaxing the rule is worth its own decision rather than 40 quiet lines.
 """
 
+import re
+
 from manifest import _strip_trailing_comment
 
 
@@ -266,7 +268,7 @@ def _teardown_flag_typos(flat: dict, previous: dict = None) -> list:
 
 
 def _teardown_flag_typo_table(typos: list,
-                              found_label: str = "In this PR") -> list:
+                              found_label: str = "You wrote") -> list:
     """Two columns and nothing else: what is written, and what works.
 
     A reviewer comparing `decomission` with `decommission` in running prose
@@ -276,6 +278,54 @@ def _teardown_flag_typo_table(typos: list,
     for typo in typos:
         rows.append(f"| `{typo['found']}` | `{typo['canonical']}` |")
     return rows
+
+
+# Shared by the panel writer and the two readers below, so none of them can
+# drift into looking for a heading the others stopped emitting.
+_FLAG_TYPO_PANEL_HDR_PREFIX = "## \u26d4 STOP \u2014 teardown flag misspelled in "
+
+
+def _teardown_flag_typo_panels(lines) -> list:
+    """Only the STOP panels out of a rendered appspace-state block.
+
+    A misspelled teardown flag is a broken PR rather than a change to
+    review, so the comment surface renders this and stops. Pulling the panel
+    back out of the assembled block, rather than having the producer hand it
+    over separately, keeps one code path building it: two producers for the
+    same panel is how the summary and the body drift apart (COPS-2668).
+
+    A PR can touch several environments, so every STOP panel is collected.
+    """
+    out, keeping = [], False
+    for line in lines or []:
+        if line.startswith(_FLAG_TYPO_PANEL_HDR_PREFIX):
+            keeping = True
+        elif keeping and (line.startswith("## ") or line.startswith("### ")):
+            keeping = False
+        if keeping:
+            out.append(line)
+    return out
+
+
+_TYPO_ROW_RE = re.compile(r"^\| `([^`]+)` \| `([^`]+)` \|$")
+
+
+def _teardown_flag_typo_pairs(lines) -> list:
+    """Read back the (wrong, right) pairs `_teardown_flag_typo_table` wrote.
+
+    Reader and writer sit together on purpose. The Bitbucket build-status
+    description has to name the key and its fix -- it is the whole message
+    for anyone reading the checks list instead of the comment -- and by the
+    time the status is posted the rendered panel is the only place that
+    pairing still exists. Adjacency is what stops the format drifting away
+    from the parse.
+    """
+    pairs = []
+    for line in lines or []:
+        match = _TYPO_ROW_RE.match(line.strip())
+        if match:
+            pairs.append((match.group(1), match.group(2)))
+    return pairs
 
 
 def _is_public_cloud_env(identity_file: str, env_name: str = "") -> bool:
