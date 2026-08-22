@@ -310,6 +310,7 @@ from schema_errors import (  # render-failure explanation
     _HELM_ERROR_MAX,
     _SCHEMA_ERROR_MAX_LINES,
     _cap_helm_error,
+    _tidy_helm_error,
     _render_reason,
     _quote_helm_error,
     _explain_schema_error,
@@ -8961,9 +8962,21 @@ _FLEET_RENDER_QUIET_MIN_ENVS = 3
 
 
 def _short_permanent_error(r) -> str:
-    """One-line operator-facing reason for a permanent render failure."""
+    """One-line operator-facing reason for a permanent render failure.
+
+    Every branch runs through `_tidy_helm_error` on the way out: this string
+    is the comment headline AND, since COPS-2709, the build-status
+    description, so a Helm `coalesce.go:316: warning:` prefix or an inline
+    dump of the merged values map is thousands of characters of nothing in
+    the two places an operator reads first.
+    """
     if not r or r.reason not in PERMANENT_REASONS:
         return ""
+    return _tidy_helm_error(_short_permanent_error_raw(r))[:160]
+
+
+def _short_permanent_error_raw(r) -> str:
+    """The reason-specific extraction, before Helm's noise is stripped."""
     if r.reason == REASON_MISSING_REQUIRED:
         for line in _explain_required_error(r.error):
             # "> **Missing Image Tag on => platform**" -> bare message
