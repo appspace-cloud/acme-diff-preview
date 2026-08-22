@@ -95,6 +95,31 @@ def _render_reason(render_err: str) -> str:
     return REASON_RENDER
 
 
+# COPS-2709 follow-up: Helm's own internals leaking into an operator-facing
+# line. `coalesce.go:316: warning:` names a file inside Helm, and the inline
+# dump of the merged values map runs into the thousands of characters on a
+# real environment, so it gets cut mid-key and buries the one part that
+# matters. Seen live on a drill: the whole status read
+#   coalesce.go:316: warning: cannot overwrite table with non table for
+#   appspace-micro-services.appspace.microservices.definitions (map[accesscontrol:map[livenessPr
+# where everything after the key path is noise.
+_HELM_FILE_PREFIX_RE = re.compile(r"^\s*\w+\.go:\d+:\s*(?:warning:\s*)?", re.I)
+_GO_MAP_DUMP_RE = re.compile(r"\s*\(?map\[[\s\S]*$")
+
+
+def _tidy_helm_error(message: str) -> str:
+    """Drop Helm's internals from a message a human has to read.
+
+    Keeps the sentence and the value path it names, which is what tells an
+    operator which key to go and fix. A message with neither shape in it is
+    returned unchanged, so ordinary schema violations
+    ("at '/x': got string, want object") pass straight through.
+    """
+    out = _HELM_FILE_PREFIX_RE.sub("", message or "")
+    out = _GO_MAP_DUMP_RE.sub("", out)
+    return out.strip() or (message or "").strip()
+
+
 def _explain_schema_error(err: str) -> list:
     """Break a Helm values.schema.json failure into one violation per line.
 
@@ -108,7 +133,8 @@ def _explain_schema_error(err: str) -> list:
     lines = [l.strip() for l in (err or "").splitlines()]
     violations = [l[1:].strip() for l in lines if l.startswith("-")]
     if not violations:
-        return [f"> {(err or 'no error output').splitlines()[0][:300]}"]
+        _first = (err or "no error output").splitlines()[0]
+        return [f"> {_tidy_helm_error(_first)[:300]}"]
     # COPS-2564: cap by COUNT, never by characters. PR 3837 hit 53 violations
     # and a character cap cut the last one mid path, which reads like a
     # rendering bug and hides how many were left. Ten is enough to see the

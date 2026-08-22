@@ -173,6 +173,44 @@ def test_a_short_error_is_not_truncated():
     assert d.startswith("name exceeds 63 characters"), d
 
 
+# ── 4b. Helm's internals are not the message ─────────────────────────────
+
+COALESCE = (
+    "coalesce.go:316: warning: cannot overwrite table with non table for "
+    "appspace-micro-services.appspace.microservices.definitions "
+    "(map[accesscontrol:map[livenessProbe:map[custom:map[failureThreshold:2 "
+    "httpGet:map[path:/api/v3/authorization/ping port:80]]]] account:map[])")
+
+
+def test_helm_internals_are_stripped_from_the_line_people_read():
+    """Read live on a drill against 2.102.0. The status was a Helm source
+    file name, then the useful sentence, then a dump of the merged values
+    map cut mid-key at 255 characters."""
+    d = desc({"pv-qa11-a-ms": _res("schema_invalid", COALESCE)})
+    assert "coalesce.go" not in d, d
+    assert "map[" not in d, d
+    assert "cannot overwrite table with non table" in d, d
+    assert "appspace.microservices.definitions" in d, \
+        "the value path is the part that says which key to fix: " + d
+    assert d.endswith("fix and push"), d
+
+
+def test_an_ordinary_violation_is_left_alone():
+    """The tidier must only remove Helm's noise. A normal schema violation
+    has neither shape in it and must come through untouched."""
+    d = desc({"pv-a-ms": SCHEMA()})
+    assert d.startswith("at '/microservices/definitions/a': "
+                        "got string, want object"), d
+
+
+def test_the_tidier_never_returns_nothing():
+    """A message that is only noise must still say something, or the caller
+    falls back to a generic line and the failure loses its name."""
+    from schema_errors import _tidy_helm_error
+    assert _tidy_helm_error("coalesce.go:1: warning: map[a:b]") != ""
+    assert _tidy_helm_error("") == ""
+
+
 # ── 5. the paths that build their own line ───────────────────────────────
 
 def test_a_hard_error_names_the_error(monkeypatch):
