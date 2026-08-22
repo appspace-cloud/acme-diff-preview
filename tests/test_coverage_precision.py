@@ -40,6 +40,15 @@ from test_coverage_helm_layer import (  # noqa: E402
 # ── _do_refresh: hard-refresh timeout (mocked, no real 60s wait) ─────────
 
 def test_do_refresh_timeout_is_caught_and_counted(monkeypatch):
+    # COPS-2702: _jfrog_hard_refresh resolves apps through
+    # discover_path_app_map(), the single cached listing site. This test drives
+    # the listing, so empty the cache it consults rather than inheriting
+    # whatever an earlier test left in those globals. A failure now surfaces as
+    # "path map unavailable" (the builder raises) instead of the handler's own
+    # "app list failed" - the error moved with the call.
+    monkeypatch.setattr(m, "_app_chart_map", {})
+    monkeypatch.setattr(m, "_path_map_cache", {})
+    monkeypatch.setattr(m, "_path_map_ts", 0.0)
     import subprocess as _sp
     monkeypatch.setattr(m, "ARGOCD_BIN", "argocd")
     monkeypatch.setattr(m, "_auth_flags", lambda: [])

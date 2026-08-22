@@ -72,7 +72,26 @@ def test_post_build_status_falls_back_without_pr_id(monkeypatch):
     posted = {}
     monkeypatch.setattr(mod, "bb", lambda method, path, body=None, **kw: posted.update(body or {}))
     mod.post_build_status("a" * 40, "SUCCESSFUL", "No manifest changes")
-    assert posted["url"] == f"https://{mod.ARGOCD_SERVER}"
+    assert posted["url"] == f"https://{mod.ARGOCD_WEB_HOST}"
+
+
+def test_post_build_status_fallback_uses_web_host_not_api_endpoint(monkeypatch):
+    """COPS-2702: the API endpoint and the clickable host are separate.
+
+    Asserting against ARGOCD_WEB_HOST alone proves nothing while both default
+    to the same string, so drive them APART: point the API at the in-cluster
+    Service (what the Deployment does in production) and require the posted
+    build-status URL to still carry the public host. Without the split this
+    posts https://argocd-server.argocd.svc:80 into a Bitbucket status.
+    """
+    mod = _import_module()
+    monkeypatch.setattr(mod, "ARGOCD_SERVER", "argocd-server.argocd.svc:80")
+    monkeypatch.setattr(mod, "ARGOCD_WEB_HOST", "argocd.appspace.com")
+    posted = {}
+    monkeypatch.setattr(mod, "bb", lambda method, path, body=None, **kw: posted.update(body or {}))
+    mod.post_build_status("a" * 40, "SUCCESSFUL", "No manifest changes")
+    assert posted["url"] == "https://argocd.appspace.com"
+    assert ".svc" not in posted["url"]
 
 
 def test_all_process_pr_call_sites_pass_pr_id():

@@ -301,6 +301,15 @@ def test_jfrog_hard_refresh_no_match_logs_and_returns(tmp_path, monkeypatch):
 
 
 def test_jfrog_hard_refresh_survives_cli_failure(tmp_path, monkeypatch):
+    # COPS-2702: _jfrog_hard_refresh resolves apps through
+    # discover_path_app_map(), the single cached listing site. This test drives
+    # the listing, so empty the cache it consults rather than inheriting
+    # whatever an earlier test left in those globals. A failure now surfaces as
+    # "path map unavailable" (the builder raises) instead of the handler's own
+    # "app list failed" - the error moved with the call.
+    monkeypatch.setattr(m, "_app_chart_map", {})
+    monkeypatch.setattr(m, "_path_map_cache", {})
+    monkeypatch.setattr(m, "_path_map_ts", 0.0)
     p = tmp_path / "argocd"
     p.write_text("#!/bin/bash\necho denied >&2; exit 1\n")
     p.chmod(p.stat().st_mode | stat.S_IEXEC)
@@ -308,4 +317,4 @@ def test_jfrog_hard_refresh_survives_cli_failure(tmp_path, monkeypatch):
     logs = []
     monkeypatch.setattr(logsink, "log", lambda msg, *a, **k: logs.append(str(msg)))
     m._jfrog_hard_refresh("appspace-ms", "1.0.0")  # must not raise
-    assert any("app list failed" in l for l in logs)
+    assert any("path map unavailable" in l for l in logs), logs

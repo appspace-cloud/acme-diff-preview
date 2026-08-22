@@ -117,6 +117,11 @@ diff:
   retries: 5
   # Parallel chart-cache warm-up pulls (one representative per distinct OCI chart
   # is pulled first so the fan-out reuses the local tarball).
+  # COPS-2702: seconds to cache the path map. Each rebuild costs
+  # argocd-server a 47 MB response (~320/day measured), so raising this
+  # is the cheapest way to cut that load. Empty = code default (300).
+  # Floored at 60s in code.
+  pathMapTtl: ""
   warmWorkers: 4
   # warmThreshold was removed — it had no effect after the warm-diff pass was
   # replaced by the pre-pull phase. Keeping the key here is intentionally omitted.
@@ -236,9 +241,33 @@ diffUi:
 mainRenderCache:
   gcsBucket: ""
 
-# ArgoCD server (hub cluster ingress)
+# ArgoCD API endpoint and the public host, which are deliberately separate.
 argocd:
+  # The API endpoint this service talks to. Until COPS-2702 this value was
+  # declared here and consumed by nothing: the deployment template emitted no
+  # ARGOCD_SERVER and the code hardcoded the public host. It is wired now.
+  #
+  # This pod runs INSIDE the hub cluster, so the API can go straight to the
+  # in-cluster Service and skip Cloud NAT plus the public load balancer for
+  # what is 99.3% of all traffic reaching argocd.appspace.com (one
+  # `argocd app list -o json` is 47 MB on the wire, ~377 of them a day):
+  #
+  #   server: argocd-server.argocd.svc:80
+  #   plaintext: true
+  #
+  # Use the SHORT `.svc` form: the hub runs a custom cluster domain, so
+  # argocd-server.argocd.svc.cluster.local returns NXDOMAIN there.
   server: argocd.appspace.com
+  # Speak plain HTTP instead of TLS. Only ever valid for the in-cluster
+  # Service; argocd-server listens plaintext on 8080 (server.insecure=true),
+  # the same port the public load balancer already targets. The service
+  # refuses to start if this is set while `server` is not cluster-local,
+  # rather than POSTing its password in cleartext.
+  plaintext: false
+  # Public host used ONLY for links a human clicks (Bitbucket build statuses),
+  # kept separate from `server` so pointing the API in-cluster can never post
+  # an unroutable cluster-local URL. Empty falls back to the code default.
+  webHost: ''
   username: diff-preview
   # Comma-separated ArgoCD projects for the JFrog-webhook hard-refresh.
   # Unset = code default (appspace-dev,appspace-qa). Add appspace-stage

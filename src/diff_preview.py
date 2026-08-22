@@ -398,7 +398,48 @@ BB_TOKEN           = os.environ["BB_TOKEN"]
 import base64 as _base64
 _BB_AUTH_HEADER    = "Basic " + _base64.b64encode(
     f"{os.environ['BB_USER']}:{os.environ['BB_TOKEN']}".encode()).decode()
-ARGOCD_SERVER      = "argocd.appspace.com"
+# COPS-2702: the ArgoCD API endpoint and the host a human clicks are two
+# different things, and conflating them is what kept 19 GB/day of `app list`
+# traffic on the public ALB. This service runs INSIDE the hub cluster, so the
+# API can go straight to the in-cluster Service while every user-visible link
+# keeps pointing at the public host.
+#
+# Measured on the live hub (2026-08-20): one `argocd app list -o json` is
+# 128 MB of JSON / 47 MB on the wire, this process issues ~377/day, and that is
+# 99.3% of ALL traffic reaching argocd.appspace.com (browsers are 0.7%).
+# In-cluster is also faster: median 3.33s vs 3.96s over the public path.
+#
+# Defaults are the public host with TLS, so an image-only deploy is inert.
+# The Deployment opts in with:
+#   ARGOCD_SERVER=argocd-server.argocd.svc:80
+#   ARGOCD_PLAINTEXT=1
+# NOTE the short `.svc` form. The hub runs a CUSTOM cluster domain
+# (gcp-shared-devops-na1-a.appspace.cluster.local), so the canonical
+# `argocd-server.argocd.svc.cluster.local` returns NXDOMAIN there — verified
+# live from both replicas.
+ARGOCD_SERVER      = os.environ.get("ARGOCD_SERVER", "argocd.appspace.com")
+# Plaintext (http / h2c) instead of TLS. Only ever valid for the in-cluster
+# Service: argocd-server listens plaintext on 8080 (server.insecure=true) and
+# the public GCLB is what terminates TLS today, so the whole public ingress
+# already depends on that same plaintext port.
+ARGOCD_PLAINTEXT   = os.environ.get("ARGOCD_PLAINTEXT", "").strip().lower() in (
+    "1", "true", "yes", "on")
+# Public host used ONLY to build links humans click (see post_build_status).
+# Never the API endpoint, so pointing the API in-cluster can never post an
+# unroutable cluster-local address into a Bitbucket build status.
+ARGOCD_WEB_HOST    = os.environ.get("ARGOCD_WEB_HOST", "argocd.appspace.com")
+# Fail fast on the one combination that would leak credentials: plaintext
+# against anything that is not cluster-local means POSTing ARGOCD_PASS in
+# cleartext, and the very first startup login would do it. Checked at import,
+# i.e. strictly before _startup_argocd_login can run.
+if ARGOCD_PLAINTEXT and "." in ARGOCD_SERVER.split(":")[0] \
+        and ".svc" not in ARGOCD_SERVER:
+    raise SystemExit(
+        "FATAL: ARGOCD_PLAINTEXT is set but ARGOCD_SERVER "
+        f"({ARGOCD_SERVER!r}) is not an in-cluster address. Refusing to start: "
+        "the startup login would POST ARGOCD_PASS in cleartext. Set "
+        "ARGOCD_SERVER=argocd-server.argocd.svc:80 (short .svc form — the hub "
+        "uses a custom cluster domain) or unset ARGOCD_PLAINTEXT.")
 ARGOCD_BIN         = os.environ.get("ARGOCD_BIN", "/usr/local/bin/argocd")
 # Configurable via environment variables — set via ExternalSecret.
 ARGOCD_USER          = os.environ.get("ARGOCD_USER", "diff-preview")
@@ -1196,13 +1237,32 @@ LOGIN_FAIL_THRESHOLD  = _env_int("LOGIN_FAIL_THRESHOLD", 3)
 # MAX_PR_WORKERS × DIFF_WORKERS. Env-overridable via PR_WORKERS.
 MAX_PR_WORKERS  = _env_int("PR_WORKERS", 3)
 
-# Path map TTL cache: argocd app list is ~350ms and downloads ~50KB.
+# Path map TTL cache. This comment used to claim the call "downloads ~50KB";
+# measured against the real hub on 2026-08-20 it is 128 MB of JSON, 47 MB on
+# the wire, for 1042 apps. The map only changes when apps are added or removed,
+# which is rare, so the TTL is the cheapest lever on how often argocd-server
+# has to marshal that: every doubling halves the number of 47 MB responses it
+# builds alongside real UI users. Env-overridable so an environment can tune
+# it without a release; default unchanged.
 # The map only changes when apps are added/removed (rare).
 # Cache for 5 min so idle iterations cost ~1ms instead of ~350ms.
 _path_map_cache: dict  = {}
 _path_map_ts:    float = 0.0
 _path_map_count: int   = 0    # extra invalidation: rebuild if app count changes
-PATH_MAP_TTL            = 300   # seconds
+# Floor at 60s deliberately. envcfg._env_int only guards against ValueError,
+# not against 0 or a negative, so PATH_MAP_TTL=0 would disable the cache and
+# buy a fresh 47 MB list on EVERY iteration - the loop runs about every 60s, so
+# roughly 1440 a day where today there are ~290. A TTL below one iteration
+# interval cannot help anyway.
+PATH_MAP_TTL            = max(60, _env_int("PATH_MAP_TTL", 300))   # seconds
+# COPS-2702: the rebuild is now reachable from two threads - the poll loop and
+# the JFrog webhook handler, which is NOT gated by leader election and so runs
+# on whichever replica the Service happened to route to. Without this lock two
+# concurrent callers each pay a 47 MB list and both rebind the globals; the
+# result is not corrupt (they rebind wholesale, never mutate in place) but one
+# of the two listings is pure waste. Double-checked below so the fast path
+# stays lock-free.
+_path_map_lock          = threading.Lock()
 # COPS-2507 multi-repo: app full_name -> git config repo slug (from the app's
 # git source repoURL), and the per-repo partition of the path map. A PR in
 # repo R only matches apps in _repo_path_maps[R].
@@ -1774,37 +1834,51 @@ def _jfrog_hard_refresh(chart_name: str, chart_version: str) -> None:
     logsink.log(f"JFrog webhook: looking for apps tracking {chart_name}:{chart_version}",
                 chart=chart_name, version=chart_version)
 
-    r = subprocess.run(
-        [ARGOCD_BIN, "app", "list", "--output", "json"]
-         + [arg for p in ARGOCD_PROJECTS for arg in ("--project", p)] + _auth_flags(),
-        capture_output=True, text=True, timeout=60,
-        env=_argocd_subprocess_env())
-
-    if r.returncode != 0:
-        logsink.log(f"JFrog webhook: app list failed: {r.stderr[:200]}"
-                    + ("..." if len(r.stderr) > 200 else ""), "ERROR")
-        return
-
+    # COPS-2702: match against the maps the path-map cache already built rather
+    # than listing the fleet again. discover_path_app_map() extracts exactly
+    # these two facts per app (_extract_app_chart_info -> chart, targetRevision),
+    # so a second `argocd app list` asked argocd-server to marshal 47 MB for
+    # data already in memory. This handler ran on BOTH replicas, uncached, once
+    # per webhook event.
+    #
+    # The maps are REBOUND wholesale by the cache builder, never mutated in
+    # place, so reading them from this thread yields either the previous dict
+    # or the next one - never a half-built one - without needing a lock.
+    #
+    # Deliberately NO fresh-list fallback when nothing matches: measured over
+    # 48h on the live hub, this handler fired ~132 times and found zero
+    # matching apps EVERY time (136 "no apps found" lines, not one match).
+    # Zero is the normal outcome, so a fallback would reinstate exactly the
+    # waste this removes. An app created inside the TTL window that tracks this
+    # chart:version is therefore missed until the next event for it - the OCI
+    # cache-bust is late, not lost, and dev charts get pushed repeatedly.
+    # Populate-or-reuse the cache, then match. discover_path_app_map() is the
+    # ONLY place that lists the fleet now, and it caches for PATH_MAP_TTL.
+    #
+    # This matters because webhooks are NOT gated by leader election: they land
+    # on whichever replica the Service routes to, and the standby never runs the
+    # poll loop, so its cache was permanently empty. Measured live on 2.99.1:
+    # 3 events took "[cached path map]" and 3 took "[cold-start app list]" -
+    # exactly half of them still paying 47 MB, on the replica that never warms
+    # its own cache. Calling the cached builder makes the standby pay one
+    # listing per TTL instead of one per event.
     try:
-        data = json.loads(r.stdout)
-    except json.JSONDecodeError as exc:
-        logsink.log(f"JFrog webhook: malformed app list JSON: {exc}", "ERROR")
+        discover_path_app_map()
+    except Exception as e:
+        logsink.log(f"JFrog webhook: path map unavailable ({e}); "
+                    f"cannot resolve apps for {chart_name}:{chart_version}",
+                    "ERROR")
         return
 
-    # argocd app list -o json returns a JSON array directly (not {"items": [...]})
-    apps = data if isinstance(data, list) else data.get("items", [])
-    matching = []
-    for app in apps:
-        for src_entry in app["spec"].get("sources", []):
-            if (src_entry.get("chart") == chart_name
-                    and src_entry.get("targetRevision") == chart_version):
-                matching.append(app["metadata"]["name"])
-                break
+    matching = [a for a, c in _app_chart_map.items()
+                if c == chart_name
+                and _app_chart_revision_map.get(a) == chart_version]
+    source = f"path map, {len(_app_chart_map)} apps"
 
     if not matching:
-        logsink.log(f"JFrog webhook: no apps found for {chart_name}:{chart_version}")
+        logsink.log(f"JFrog webhook: no apps found for {chart_name}:{chart_version}"
+                    f" [{source}]")
         return
-
     logsink.log(f"JFrog webhook: {len(matching)} apps to hard-refresh: "
                 f"{', '.join(matching[:5])}{'...' if len(matching) > 5 else ''}")
 
@@ -1933,7 +2007,16 @@ def _auth_flags():
     """
     # --insecure removed: argocd.appspace.com has a valid CA-signed certificate;
     # TLS verification is enforced on both the CLI and the REST session API.
-    return ["--server", ARGOCD_SERVER, "--grpc-web"]
+    #
+    # COPS-2702: --plaintext (not --insecure) when the endpoint is the
+    # in-cluster Service, which speaks plain HTTP on port 80 -> 8080. Without
+    # it the CLI attempts TLS against a plaintext port and dies with
+    # "connection reset by peer" (verified live), which reads as a network
+    # fault rather than a misconfiguration.
+    flags = ["--server", ARGOCD_SERVER, "--grpc-web"]
+    if ARGOCD_PLAINTEXT:
+        flags.append("--plaintext")
+    return flags
 
 
 def _argocd_subprocess_env() -> dict:
@@ -2312,14 +2395,27 @@ def discover_path_app_map():
     Result is cached for PATH_MAP_TTL seconds. Cache is invalidated on
     argocd_login() so a re-login (session expiry) picks up new apps.
     """
-    global _path_map_cache, _path_map_ts, _path_map_count, _path_map_app_count, \
-           _app_chart_map, _app_chart_revision_map, _app_chart_registry_map, \
-           _app_value_files_map, _app_namespace_map, _app_repo_map, _repo_path_maps
+    # No `global` here on purpose: this function only READS the cache now. Every
+    # assignment moved into _discover_path_app_map_locked, which is the one
+    # place allowed to rebind them, and only under the lock.
     if _path_map_cache and (time.monotonic() - _path_map_ts) < PATH_MAP_TTL:
         # Within TTL: return cached map. The self-referential app-count comparison
         # (comparing cache to itself) was removed — it could never detect new apps
         # added under existing paths between refreshes. Rely purely on TTL.
         return _path_map_cache
+    with _path_map_lock:
+        # Re-check under the lock: a caller that queued behind a rebuild must
+        # use its result rather than start a second 47 MB listing.
+        if _path_map_cache and (time.monotonic() - _path_map_ts) < PATH_MAP_TTL:
+            return _path_map_cache
+        return _discover_path_app_map_locked()
+
+
+def _discover_path_app_map_locked():
+    """The rebuild itself. Only ever entered holding _path_map_lock."""
+    global _path_map_cache, _path_map_ts, _path_map_count, _path_map_app_count, \
+           _app_chart_map, _app_chart_revision_map, _app_chart_registry_map, \
+           _app_value_files_map, _app_namespace_map, _app_repo_map, _repo_path_maps
     r = subprocess.run(
         [ARGOCD_BIN, "app", "list", "-o", "json"] + _auth_flags(),
         capture_output=True, text=True, timeout=90,
@@ -2477,7 +2573,11 @@ def _argocd_fetch_token() -> str:
     duplication is accepted on purpose. If the ArgoCD session endpoint,
     auth payload, or TLS handling changes, UPDATE BOTH copies.
     """
-    url  = f"https://{ARGOCD_SERVER}/api/v1/session"
+    # COPS-2702: scheme follows the endpoint. This is the single place the
+    # service builds a session URL, so every renewal path (startup retry,
+    # proactive TTL refresh, reactive re-login) inherits it.
+    scheme = "http" if ARGOCD_PLAINTEXT else "https"
+    url  = f"{scheme}://{ARGOCD_SERVER}/api/v1/session"
     data = json.dumps({"username": ARGOCD_USER, "password": ARGOCD_PASS}).encode()
     req  = urllib.request.Request(
         url, data=data,
@@ -6987,7 +7087,7 @@ def post_build_status(pr_sha, state, description, pr_id=None, repo=None):
             _cid = _comment_id_cache.get((repo or BB_REPO, pr_id))
     _anchor = f"#comment-{_cid}" if _cid else ""
     url = (f"https://bitbucket.org/{BB_WORKSPACE}/{repo or BB_REPO}/pull-requests/{pr_id}{_anchor}"
-           if pr_id else f"https://{ARGOCD_SERVER}")
+           if pr_id else f"https://{ARGOCD_WEB_HOST}")
     # Full-diff UI: when the full-diff UI is enabled AND reachable (base url set)
     # AND this exact commit's artifact exists, the build icon deep-links to
     # the complete, untruncated diff (Atlantis-style). Any other case keeps
@@ -11253,7 +11353,9 @@ def main():
     global _last_ok, _loop_idle, _leader
     logsink.log("acme-diff-preview starting (Deployment mode, helm-template diff)",
                 version=APP_VERSION,
-                argocd_server=ARGOCD_SERVER, argocd_user=ARGOCD_USER,
+                argocd_server=ARGOCD_SERVER,
+                argocd_plaintext=ARGOCD_PLAINTEXT,
+                argocd_web_host=ARGOCD_WEB_HOST, argocd_user=ARGOCD_USER,
                 bb_repos=";".join(f"{r}:{'|'.join(c['scopes']) or '*'}" for r, c in REPOS.items()),
                 diff_workers=DIFF_WORKERS, pr_workers=MAX_PR_WORKERS,
                 max_apps_per_run=MAX_APPS_PER_RUN, diff_timeout=DIFF_TIMEOUT,
