@@ -117,9 +117,16 @@ def test_cops2584_wording_contract_still_holds(monkeypatch):
         assert app in out
 
 
-def test_disarmed_panel_is_unchanged(monkeypatch):
-    """Scope guard: only the ARMED branch grows. DISARMED must not pick up
-    phase chatter."""
+def test_disarmed_panel_now_carries_the_table_too(monkeypatch):
+    """Superseded scope guard. COPS-2587 kept the phase table out of the
+    DISARMED branch to hold its own change small, and COPS-2710 reversed
+    that on purpose: every PR in the sequence renders the same three rows
+    with only the marks moving, and a rollback is exactly when someone is
+    recovering from a mistake and most needs to see where they now are.
+
+    What this test still guards is the part that was never about scope: the
+    reviewer is not sent to run commands.
+    """
     monkeypatch.setattr(m, "_bb_fetch_status", _mk_fetch({
         (IDENT, "mainsha"): "appspace:\n  decommission: true\n  customerName: ukhsa\n",
         (IDENT, "prsha"):   "appspace:\n  customerName: ukhsa\n",
@@ -127,8 +134,9 @@ def test_disarmed_panel_is_unchanged(monkeypatch):
     out = "\n".join(m._summarize_appspace_state_changes(
         [IDENT], "prsha", "mainsha", PATH_MAP))
     assert "DISARMED" in out.upper()
-    assert "Phase 1" not in out
     assert "kubectl" not in out
+    phase2 = next(l for l in out.splitlines() if "**Phase 2" in l)
+    assert m._PH_UNDONE in phase2, phase2
 
 
 def test_paused_panel_is_unchanged(monkeypatch):

@@ -28,7 +28,7 @@
 
 Helm stops rendering the VM resources the moment this merges, ArgoCD prunes them, and the live objects go out under their current `deletion-policy: abandon` — the real VM, its data disk and its reserved IP are **orphaned in the cloud, not deleted**.
 
-Stripped in this PR: `deployLinuxServicesK8s.defaults.allowDeletion`, `deployLinuxServicesK8s.enabled`, `deployLinuxServicesK8s.instances.svc-a.enabled`
+Stripped in this PR: `deployLinuxServicesK8s.enabled`, `deployLinuxServicesK8s.instances.svc-a.enabled`
 
 **Fix:** keep the existing `deployLinuxServicesK8s` block exactly as it is and only add `defaults.allowDeletion: true`. The block can be removed after the cascade has actually deleted the VM (Phase 3).
 

@@ -94,9 +94,19 @@ qualifier on it), Phase 3 removes the environment folder and is the only
 destructive one. Phases 1 and 2 may share a PR; Phase 3 must not. Every PR in
 the sequence renders the same three-row table with only the marks moving, so
 "where am I" is answerable from the comment alone. A row reads `✅ this PR`
-for work this diff performs, `✅ done` for work an earlier PR did, and
+for work this diff performs, `✅ done` for work an earlier PR did,
+`↩️ undone by this PR` when the diff takes a phase back, and
 `⛔ broken by this PR` when the diff arms a phase while removing the config
 that phase acts through (COPS-2660).
+
+**Undo is part of the sequence** (COPS-2710). Removing `allowDeletion`,
+removing `appspace.decommission` and softening the purge each render the same
+table, because a rollback is when someone is recovering from a mistake and
+most needs the map. None of them changes the verdict: `delete` going back to
+`abandon` is the safe direction, and the table is positional context. Note
+that removing `allowDeletion` is a **disarm, not a strip** — helm keeps
+rendering every CR, so the COPS-2660 broken-arming panel deliberately does
+not fire on it.
 
 Because those flags are matched by exact key, a near miss arms nothing while
 looking armed to any reader. `appspace.decomission: true` — one `m` — merged

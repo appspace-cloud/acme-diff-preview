@@ -544,6 +544,18 @@ def _vm_deletion_armed_flat(flat: dict) -> bool:
 
 _VM_FLAT_PREFIX = "appspace.infra.deployLinuxServicesK8s."
 
+# COPS-2710: the arming flags themselves, which cannot be "the VM config the
+# arming acts through". Removing `allowDeletion` is a disarm: helm keeps
+# rendering every CR, they simply go back to `deletion-policy: abandon`,
+# which is the safe direction. Counting it as a strip made a rollback on an
+# armed environment render as "VM CONFIG STRIPPED WHILE ARMING DECOMMISSION"
+# and advise the operator to do the opposite of what they were doing.
+_VM_ARMING_LEAF_KEYS = ("allowDeletion", "confirmProdDeletion")
+
+
+def _is_vm_arming_key(flat_key: str) -> bool:
+    return flat_key.rsplit(".", 1)[-1] in _VM_ARMING_LEAF_KEYS
+
 
 def _vm_config_stripped(old_flat: dict, new_flat: dict) -> list:
     """Keys under deployLinuxServicesK8s this diff removes or switches off.
@@ -562,7 +574,8 @@ def _vm_config_stripped(old_flat: dict, new_flat: dict) -> list:
     diff intact.
     """
     removed = [k for k in old_flat
-               if k.startswith(_VM_FLAT_PREFIX) and k not in new_flat]
+               if k.startswith(_VM_FLAT_PREFIX) and k not in new_flat
+               and not _is_vm_arming_key(k)]
     disabled = [k for k in old_flat
                 if k.startswith(_VM_FLAT_PREFIX) and k.endswith(".enabled")
                 and str(old_flat.get(k)).strip().lower() == "true"

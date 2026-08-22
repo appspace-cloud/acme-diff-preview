@@ -335,8 +335,11 @@ def test_state_changes_duplicate_file_reported_once_and_purge_removal(monkeypatc
     lines = m._summarize_appspace_state_changes(
         [_ID, _ID], "prsha", "mainsha", {_ID: ["pv-flags-a-ms"]})
     body = "\n".join(lines)
-    assert body.count("decommissionPurgeData") == 1     # duplicate path deduped
-    assert "no longer purged" in body
+    # Duplicate path deduped. Counting the flag name used to prove it, but
+    # COPS-2710 gave this branch the phase table and its Phase 2 row names
+    # the flag as well, so the panel itself is what gets counted now.
+    assert body.count("no longer purged") == 1, body
+    assert body.count("| **Phase 2") == 1, body
 
 def test_state_changes_unparseable_yaml_is_skipped(monkeypatch):
     _flags_fetch(monkeypatch, "::\nnot: [valid", "::\nnot: [valid")
