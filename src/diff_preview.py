@@ -8159,9 +8159,10 @@ def _flag_typo_status_description(appspace_state_lines) -> str:
     """
     pairs = _teardown_flag_typo_pairs(appspace_state_lines)
     if not pairs:
-        return ("Teardown flag misspelled - a decommission/allowDeletion key "
-                "in this PR is not one the platform reads, so it arms "
-                "nothing (see PR comment)")
+        return ("Teardown flag misspelled or misplaced - a decommission/"
+                "allowDeletion/confirmProdDeletion key in this PR is not "
+                "one the platform reads at that depth, so it arms nothing "
+                "(see PR comment)")
     wrong, right = pairs[0]
     extra = f" (+{len(pairs) - 1} more)" if len(pairs) > 1 else ""
     return (f"Teardown flag misspelled: {wrong} arms nothing{extra} - "

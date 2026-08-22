@@ -131,12 +131,13 @@ def _decommission_armed_flat(flat: dict) -> bool:
 
 # ── teardown flags the platform never reads (COPS-2707) ───────────────────
 #
-# `appspace.decommission`, `appspace.decommissionPurgeData` and the VM tree's
-# `allowDeletion` are the three keys whose only job is to authorise
-# destruction. Misspell one, or get its casing wrong, and neither the chart
-# nor the ApplicationSet templatePatch reads it: the environment renders
-# byte-identically, every panel in this service stays quiet, and the verdict
-# is "Routine -- nothing dangerous detected".
+# `appspace.decommission`, `appspace.decommissionPurgeData`, and the VM tree's
+# `allowDeletion` / `confirmProdDeletion` are the keys whose only job is to
+# authorise destruction. Misspell one, put one at a depth the chart never
+# reads, or get its casing wrong, and neither the chart nor the ApplicationSet
+# templatePatch reads it: the environment renders byte-identically, every
+# panel in this service stays quiet, and the verdict is "Routine -- nothing
+# dangerous detected".
 #
 # acme-config-prod #4376 merged `appspace.decomission: true` -- one `m` --
 # with exactly that green comment. The folder-removal PR that followed was
@@ -146,9 +147,11 @@ _TEARDOWN_FLAG_MAX_EDITS = 2
 
 _APPSPACE_PREFIX = "appspace."
 _CASCADE_FLAG_LEAVES = ("decommission", "decommissionPurgeData")
-# allowDeletion hangs off a role, so its parent varies by one segment.
+# VM arming keys hang off a role (allowDeletion) or only off defaults
+# (confirmProdDeletion on Azure stage/prod). Parent varies by segment.
 _VM_ARMING_PREFIX = "appspace.infra.deployLinuxServicesK8s."
-_VM_ARMING_LEAF = "allowDeletion"
+_VM_ARMING_LEAVES = ("allowDeletion", "confirmProdDeletion")
+_VM_ROLE_NAMES = ("defaults", "svc", "mongo", "rabbit")
 
 
 def _flag_edit_distance(a: str, b: str) -> int:
@@ -194,6 +197,26 @@ def _reads_as_flag(leaf: str, canonical: str) -> bool:
             <= _TEARDOWN_FLAG_MAX_EDITS)
 
 
+def _canonical_vm_arming_path(leaf: str) -> str:
+    """Where the runbook and chart read VM arming flags (defaults block)."""
+    return f"{_VM_ARMING_PREFIX}defaults.{leaf}"
+
+
+def _vm_arming_key_is_chart_readable(key: str) -> bool:
+    """True when supporting-services reads this exact flat key for arming."""
+    if not key.startswith(_VM_ARMING_PREFIX):
+        return False
+    rest = key[len(_VM_ARMING_PREFIX):]
+    if rest.count(".") != 1:
+        return False
+    role, leaf = rest.split(".")
+    if role not in _VM_ROLE_NAMES or leaf not in _VM_ARMING_LEAVES:
+        return False
+    if leaf == "confirmProdDeletion" and role != "defaults":
+        return False
+    return True
+
+
 def _canonical_teardown_flag(key: str):
     """The teardown flag a flat key is a near-miss of, as
     (canonical_leaf, parent_prefix), or (None, None).
@@ -207,8 +230,12 @@ def _canonical_teardown_flag(key: str):
         rest = key[len(_VM_ARMING_PREFIX):]
         if rest.count(".") == 1:
             role, leaf = rest.split(".")
-            if _reads_as_flag(leaf, _VM_ARMING_LEAF):
-                return _VM_ARMING_LEAF, f"{_VM_ARMING_PREFIX}{role}."
+            for canonical_leaf in _VM_ARMING_LEAVES:
+                if not _reads_as_flag(leaf, canonical_leaf):
+                    continue
+                if canonical_leaf == "confirmProdDeletion":
+                    return canonical_leaf, f"{_VM_ARMING_PREFIX}defaults."
+                return canonical_leaf, f"{_VM_ARMING_PREFIX}{role}."
         return None, None
     if not key.startswith(_APPSPACE_PREFIX):
         return None, None
@@ -229,6 +256,30 @@ def _canonical_teardown_flag(key: str):
 
 def _flag_is_true(flat: dict, key: str) -> bool:
     return str((flat or {}).get(key, "")).strip().lower() == "true"
+
+
+def _misplaced_vm_arming_flags(flat: dict, previous: dict = None) -> list:
+    """VM arming keys spelled correctly but at a depth the chart never reads.
+
+    Role-level `allowDeletion` (e.g. under `svc`) is valid and omitted here.
+    `confirmProdDeletion` is only read from `defaults` on Azure stage/prod.
+    """
+    found = []
+    for key in (flat or {}):
+        if not _flag_is_true(flat, key):
+            continue
+        leaf = key.rsplit(".", 1)[-1]
+        if leaf not in _VM_ARMING_LEAVES:
+            continue
+        if _vm_arming_key_is_chart_readable(key):
+            continue
+        canonical = _canonical_vm_arming_path(leaf)
+        if _flag_is_true(flat, canonical):
+            continue
+        if previous is not None and _flag_is_true(previous, key):
+            continue
+        found.append({"found": key, "canonical": canonical})
+    return found
 
 
 def _teardown_flag_typos(flat: dict, previous: dict = None) -> list:
@@ -264,6 +315,10 @@ def _teardown_flag_typos(flat: dict, previous: dict = None) -> list:
         if previous is not None and _flag_is_true(previous, key):
             continue
         found.append({"found": key, "canonical": canonical})
+    for item in _misplaced_vm_arming_flags(flat, previous=previous):
+        if any(d["found"] == item["found"] for d in found):
+            continue
+        found.append(item)
     return sorted(found, key=lambda d: d["found"])
 
 

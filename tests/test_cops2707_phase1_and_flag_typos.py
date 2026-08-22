@@ -315,6 +315,49 @@ def test_typo_detector_covers_the_vm_arming_flag():
     assert found[0]["canonical"].endswith("defaults.allowDeletion")
 
 
+def test_typo_detector_covers_confirm_prod_deletion():
+    found = _teardown_flag_typos({
+        "appspace.infra.deployLinuxServicesK8s.defaults."
+        "confirmproddeletion": "true"})
+    assert len(found) == 1
+    assert found[0]["canonical"].endswith("defaults.confirmProdDeletion")
+
+
+def test_misplaced_allow_deletion_without_role_segment():
+    found = _teardown_flag_typos({
+        "appspace.infra.deployLinuxServicesK8s.allowDeletion": "true"})
+    assert len(found) == 1
+    assert found[0] == {
+        "found": "appspace.infra.deployLinuxServicesK8s.allowDeletion",
+        "canonical": "appspace.infra.deployLinuxServicesK8s.defaults."
+                     "allowDeletion",
+    }
+
+
+def test_misplaced_confirm_prod_deletion_under_svc():
+    found = _teardown_flag_typos({
+        "appspace.infra.deployLinuxServicesK8s.svc.confirmProdDeletion":
+        "true"})
+    assert len(found) == 1
+    assert found[0]["canonical"].endswith("defaults.confirmProdDeletion")
+
+
+def test_role_level_allow_deletion_is_not_misplaced():
+    """COPS-2683: svc.allowDeletion is a real arming path, not a typo."""
+    assert _teardown_flag_typos({
+        "appspace.infra.deployLinuxServicesK8s.svc.allowDeletion": "true",
+    }) == []
+
+
+def test_misplaced_skipped_when_defaults_path_is_also_armed():
+    flat = {
+        "appspace.infra.deployLinuxServicesK8s.allowDeletion": "true",
+        "appspace.infra.deployLinuxServicesK8s.defaults.allowDeletion":
+        "true",
+    }
+    assert _teardown_flag_typos(flat) == []
+
+
 def test_typo_detector_transition_mode_ignores_pre_existing_keys():
     """PR-review mode. The typo was merged weeks ago; an unrelated version
     bump touching the same file must not be blocked by it."""
