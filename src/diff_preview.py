@@ -262,6 +262,9 @@ from decommission import (
     _decommission_phase_table,
     _teardown_flag_typos,
     _teardown_flag_typo_table,
+    _teardown_flag_typo_pairs,
+    _teardown_flag_typo_panels,
+    _FLAG_TYPO_PANEL_HDR_PREFIX,
 )
 from manifest import (  # rendered-manifest parsing and resource diffing
     _parse_manifest_resources,
@@ -8114,6 +8117,25 @@ def _blast_radius_lines(changed_files, pr_sha, base_sha, path_map,
                                      DIFF_BLAST_ENVS, DIFF_BLAST_SPOKES)
 
 
+def _flag_typo_status_description(appspace_state_lines) -> str:
+    """The Bitbucket build-status line for a misspelled teardown flag.
+
+    Names the key and the rename, because the checks list is where a
+    reviewer who never opens the comment makes their decision. Falls back to
+    the generic sentence if the pairing cannot be read back, so a parse miss
+    degrades to a vaguer FAILED rather than to no failure at all.
+    """
+    pairs = _teardown_flag_typo_pairs(appspace_state_lines)
+    if not pairs:
+        return ("Teardown flag misspelled - a decommission/allowDeletion key "
+                "in this PR is not one the platform reads, so it arms "
+                "nothing (see PR comment)")
+    wrong, right = pairs[0]
+    extra = f" (+{len(pairs) - 1} more)" if len(pairs) > 1 else ""
+    return (f"Teardown flag misspelled: {wrong} arms nothing{extra} - "
+            f"rename it to {right} and push")
+
+
 def _summarize_appspace_state_changes(changed_files, pr_sha, base_sha, path_map, repo=None) -> list:
     """Markdown block calling out changes to Application-level state flags
     read from a LIVE environment's own customer.yaml/config.yaml:
@@ -8286,24 +8308,23 @@ def _summarize_appspace_state_changes(changed_files, pr_sha, base_sha, path_map,
         # misspell another.
         _flag_typos = _teardown_flag_typos(new_flat, previous=old_flat)
         if _flag_typos:
+            # Deliberately the shortest destructive panel in the service. The
+            # others describe something real that a reviewer has to weigh;
+            # this one describes a mistake with exactly one correct response,
+            # so prose about how Helm resolves keys is not help, it is
+            # something to scroll past on the way to the fix.
+            _right = ", ".join(f"`{t['canonical']}`" for t in _flag_typos)
             lines += [
-                f"## \U0001f6a8 TEARDOWN FLAG MISSPELLED for `{env_name}` "
-                f"\U0001f6a8",
+                f"{_FLAG_TYPO_PANEL_HDR_PREFIX}`{env_name}`",
                 "",
-                "\U0001f6a8 " + _DECOM_FLAG_TYPO_HDR,
-                "",
-                ("Helm and the ApplicationSet `templatePatch` look the key up "
-                 "by its exact name. A near miss is not read, not defaulted "
-                 "and not warned about anywhere else: the environment renders "
-                 "byte-identically, so this PR would otherwise merge as a "
-                 "no-op."),
+                "\u26d4 " + _DECOM_FLAG_TYPO_HDR,
                 "",
             ] + _teardown_flag_typo_table(_flag_typos) + [
                 "",
-                (f"**Nothing is armed for `{env_name}`.** Fix the spelling in "
-                 f"this PR. If a later PR removes this environment's folder "
-                 f"believing the cascade is on, every workload is left "
-                 f"running and unmanaged instead of deleted."),
+                (f"**Fix:** rename the key to {_right} in `{clean}` and push. "
+                 f"Until then nothing is armed on `{env_name}`, and a later "
+                 f"folder removal would leave every workload running instead "
+                 f"of deleting it."),
                 "",
             ]
 
@@ -9272,6 +9293,38 @@ def format_comment(pr_sha, app_results, skipped_apps=None, base_sha="",
     if budget and _full_view and not artifact_url:
         budget += len(_full_view.encode("utf-8")) + 2
 
+    # ── COPS-2707 follow-up: a broken PR, not a change to review ─────
+    # A misspelled teardown flag has exactly one correct response, and until
+    # it is taken the rest of the comment answers a question nobody asked:
+    # the operator believes an environment is armed and it is not. The drill
+    # on acme-config-dev #7193 put the one-line fix under fifty lines of VM
+    # bullets, a changeset table and diff links.
+    #
+    # The full-diff page is exempt. It is the evidence surface and never
+    # withholds anything (COPS-2609 two-surface contract).
+    _typo_panels = ([] if profile.is_complete_record
+                    else _teardown_flag_typo_panels(appspace_state_lines))
+    if _typo_panels:
+        # The verdict is built from the STOP panel alone. Keeping the VM
+        # finding while suppressing the VM panel would leave the summary
+        # pointing at a section that is not there, which is exactly the
+        # self-contradiction COPS-2668 exists to prevent. The unreviewed
+        # note below says the same thing without the dangling pointer.
+        lines += _build_merge_summary(
+            {}, {}, None, None, _typo_panels, None, False)
+        lines += ["---", ""] + _typo_panels + [
+            "**Everything else in this PR is unreviewed** \u2014 no diff, no "
+            "VM check, no phase table. Fix the key, push, and the full "
+            "review comes back on the next commit.",
+            "",
+            "---",
+            "**Status:** \u26d4 TEARDOWN FLAG MISSPELLED \u2014 it arms "
+            "nothing, see above",
+            f"*{_ts()} \u2014 {COMMENT_MARKER} [permanent]"
+            + (f" [base:{base_sha[:8]}]" if base_sha else "") + "*",
+        ]
+        return "\n".join(lines)
+
     # ── Merge summary ────────────────────────────────────────────────
     # The verdict, before any detail: an operator decides here whether
     # this PR is safe to merge, and only then reads down for the why.
@@ -9982,6 +10035,17 @@ def format_comment(pr_sha, app_results, skipped_apps=None, base_sha="",
     # new commit, like every other permanent reason.
     _arming_broken = bool(appspace_state_lines) and \
         _DECOM_VM_STRIP_HDR in appspace_state_lines
+    # COPS-2707 follow-up: same reasoning, one step earlier in the sequence.
+    # A misspelled teardown flag renders nothing, so the diff is clean and
+    # every branch above posts SUCCESSFUL — which is exactly how
+    # acme-config-prod #4376 merged. The comment blocking while the build
+    # passes is the shape COPS-2660 already fixed once for the VM strip; a
+    # green tick outranks a red paragraph for anyone skimming.
+    # Substring over the joined panel, not list membership: this header is
+    # emitted with an emoji prefix on its line (the VM-strip one is not), so
+    # the `in list` form the sibling check uses would silently never match.
+    _flag_typo_block = _DECOM_FLAG_TYPO_HDR in "\n".join(
+        appspace_state_lines or [])
     # COPS-2677: KCC Compute* nil artifacts must not merge green. zeroPods+HPA
     # is REVIEW-only (see comment_render) — do not stamp permanent/FAILED.
     _kcc_nil_block = False
@@ -9994,6 +10058,9 @@ def format_comment(pr_sha, app_results, skipped_apps=None, base_sha="",
     if _arming_broken:
         status += (" | \u26d4 DECOMMISSION ARMING BROKEN \u2014 the VM would "
                    "be orphaned, see comment")
+    if _flag_typo_block:
+        status += (" | \u26d4 TEARDOWN FLAG MISSPELLED \u2014 it arms "
+                   "nothing, see comment")
     if _kcc_nil_block:
         status += (" | \u26d4 UNRESOLVED KCC VALUE \u2014 "
                    "`%!s(<nil>)` on Compute* resources, see comment")
@@ -10005,7 +10072,8 @@ def format_comment(pr_sha, app_results, skipped_apps=None, base_sha="",
     # - permanent : unresolvable hard error (no retry, mark seen).
     #   COPS-2696: oci_not_found is NOT here any more — it emits transient.
     # - transient : diff unavailable on transient blip (retry next loop)
-    if any_error or new_env_structural or _arming_broken or _kcc_nil_block:
+    if (any_error or new_env_structural or _arming_broken
+            or _flag_typo_block or _kcc_nil_block):
         _status_token = "permanent"
     elif any_unknown:
         # Distinguish permanent reasons from soft indeterminate (transient).
@@ -10959,6 +11027,13 @@ def process_pr(pr, path_map, base_sha="", repo=None):
         # stood between that PR and an orphaned VM. Same single source as
         # the panel and the summary: the header constant.
         broken_arming = _DECOM_VM_STRIP_HDR in appspace_state_lines
+        # COPS-2707 follow-up: the misspelled flag has to fail the build for
+        # the same reason the VM strip does. Both are invisible in the
+        # manifest diff, so without this the chain below lands on the
+        # ordinary "N resource(s) will change" and posts SUCCESSFUL — which
+        # is what acme-config-prod #4376 got, and it merged.
+        flag_typo_block = _DECOM_FLAG_TYPO_HDR in "\n".join(
+            appspace_state_lines or [])
         # COPS-2677: KCC Compute* nil artifacts fail the build (OUT_DIFF that
         # must not merge green). zeroPods+HPA stays REVIEW-only — after
         # COPS-2548 hibernation works with leftover HPAs, so FAILED would
@@ -10972,7 +11047,7 @@ def process_pr(pr, path_map, base_sha="", repo=None):
                 break
         if (any_hard_error or has_blocking_indet or structural_envs
                 or moves_missing_cohort or broken_arming
-                or kcc_nil_block):
+                or flag_typo_block or kcc_nil_block):
             # COPS-2552: a move whose destination has no cohort config.yaml
             # must never post green. Merging it removes the environment from
             # ArgoCD instead of moving it, and the apps themselves diff clean,
@@ -10989,6 +11064,12 @@ def process_pr(pr, path_map, base_sha="", repo=None):
                             "VM would be orphaned, not deleted. Keep the VM "
                             "block (see PR comment)")
                 post_build_status(pr_sha, "FAILED", _ba_desc, pr_id=pr_id)
+            elif flag_typo_block:
+                # The description is the whole message for anyone reading the
+                # checks list rather than the comment, so it names the key and
+                # the fix rather than pointing at a panel.
+                _ft_desc = _flag_typo_status_description(appspace_state_lines)
+                post_build_status(pr_sha, "FAILED", _ft_desc, pr_id=pr_id)
             elif kcc_nil_block:
                 _kcc_desc = ("Unresolved KCC value - Compute* resources render "
                              "%!s(<nil>) / <no value>; set hostingID (or the "

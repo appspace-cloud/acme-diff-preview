@@ -12,24 +12,18 @@
 
 ---
 
-## 🚨 TEARDOWN FLAG MISSPELLED for `pv-foo-c` 🚨
+## ⛔ STOP — teardown flag misspelled in `pv-foo-c`
 
-🚨 **A teardown flag here is misspelled, so it arms nothing.**
+⛔ **A teardown flag here is misspelled, so it arms nothing.**
 
-Helm and the ApplicationSet `templatePatch` look the key up by its exact name. A near miss is not read, not defaulted and not warned about anywhere else: the environment renders byte-identically, so this PR would otherwise merge as a no-op.
-
-| In this PR | The key the platform reads |
+| You wrote | The key the platform reads |
 |---|---|
 | `appspace.decomission` | `appspace.decommission` |
 
-**Nothing is armed for `pv-foo-c`.** Fix the spelling in this PR. If a later PR removes this environment's folder believing the cascade is on, every workload is left running and unmanaged instead of deleted.
+**Fix:** rename the key to `appspace.decommission` in `gcp/prod/private-cloud/na2-a/monthly/pv-foo-c/customer.yaml` and push. Until then nothing is armed on `pv-foo-c`, and a later folder removal would leave every workload running instead of deleting it.
+
+**Everything else in this PR is unreviewed** — no diff, no VM check, no phase table. Fix the key, push, and the full review comes back on the next commit.
 
 ---
-
-✅ **`pv-foo-c-glb`** — no manifest changes
-
-⚠️ The full-diff page could not be produced for this run, so every hunk is inlined below.
-
----
-**Status:** ✅ No manifest changes
-*2026-01-01 00:00 UTC — acme-diff-preview [clean] [base:00001111]*
+**Status:** ⛔ TEARDOWN FLAG MISSPELLED — it arms nothing, see above
+*2026-01-01 00:00 UTC — acme-diff-preview [permanent] [base:00001111]*
