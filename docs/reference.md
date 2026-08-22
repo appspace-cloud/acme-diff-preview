@@ -74,6 +74,19 @@ diff applies immediately; arming decommission is explicit that nothing is
 deleted by that PR alone. See `acme-components` `documentation/` for what each
 flag actually does.
 
+**Public cloud is different, on purpose.** A `cl-*` namespace is shared: one
+constellation serves many customers from the same microservices, NEGs and
+load balancers, so no delete is safe to automate for one of them. The cascade
+gate was deliberately never ported there (COPS-2700), which means
+`appspace.decommission` is a silent no-op and teardown is operator-driven end
+to end. Every public-cloud panel says that reason, not just the mechanism, and
+names the constellation rather than the block inside it — `cl-prod-b`, not
+`constellation` or `app7` (COPS-2708). The manual checklist adapts to what is
+going: removing the `constellation` block takes the shared workloads with it,
+so `kubectl delete namespace` is right and the checklist says whose service
+that ends; removing a single load-balancer block must **not** touch the
+namespace, and the checklist says so instead.
+
 **The teardown phases** (`acme-components`
 `documentation/decommission-environment.md`): Phase 1 arms `allowDeletion`,
 Phase 2 arms the cascade with `appspace.decommission` (the data purge is a

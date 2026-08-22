@@ -343,14 +343,69 @@ def _is_public_cloud_env(identity_file: str, env_name: str = "") -> bool:
     return (env_name or "").startswith("cl-")
 
 
-def _public_cloud_teardown_phase_table() -> list:
+def _public_cloud_env_name(identity_file: str, fallback: str = "") -> str:
+    """The constellation a public-cloud identity file belongs to.
+
+    Everywhere on private cloud the environment is the basename of the
+    identity file's parent directory (`.../pv-qa-15-a/customer.yaml`).
+    Public cloud nests a block under the constellation
+    (`.../cl-dev11-a/constellation/customer.yaml`), so that same rule yields
+    `constellation`, `api`, `user-content` or `app7` -- none of which name
+    anything an operator can act on, with thirteen constellations in the
+    fleet (COPS-2708).
+
+    The `cl-` path segment is the answer and is unambiguous: it is the only
+    segment that can carry that prefix. Falls back to whatever the caller
+    already had when there is no such segment, so a layout this does not
+    recognise degrades to today's behaviour rather than to an empty name.
+    """
+    for segment in (identity_file or "").replace("\\", "/").split("/"):
+        if segment.startswith("cl-"):
+            return segment
+    return fallback
+
+
+# The block that owns a constellation's shared workloads. Every other block
+# under a `cl-*` directory (`api`, `cloud`, `user-content`, `app1`..`app16`)
+# is a load-balancer instance in front of those same workloads.
+_PUBLIC_CLOUD_SHARED_BLOCK = "constellation"
+
+
+def _public_cloud_teardown_phase_table(block: str = None) -> list:
     """Checklist for a cl-* folder removal. Not the pv-* Phase 1/2/3 table.
 
     COPS-2701: the private-cloud table tells reviewers to arm
     `appspace.decommission` and claims Phase 3 deletes managed resources.
     Neither is true on public cloud. This table is the manual procedure
     already documented in the config-repo READMEs and COPS-2700.
+
+    COPS-2708: step 3 depends on WHICH block is going. A constellation's
+    namespace holds the `-ms` and `-ss` workloads that every customer in it
+    is served from, so `kubectl delete namespace` is the right instruction
+    when the `constellation` block goes and a catastrophic one when a single
+    load-balancer block does -- removing `app1` must not take `app2` and
+    every other customer down with it. `block=None` keeps the original
+    generic wording for callers that do not know.
     """
+    if block and block != _PUBLIC_CLOUD_SHARED_BLOCK:
+        namespace_step = (
+            "| **3 — leave the namespace alone** | \u26d4 do NOT delete | "
+            f"only the `{block}` load balancer is going; the namespace holds "
+            "the shared workloads every other customer in this constellation "
+            "is served from |")
+        verify_step = (
+            "| **5 — verify** | \u2b1c operator | "
+            f"nothing named after `{block}` survives in the GCP project, and "
+            "the sibling blocks still serve |")
+    else:
+        namespace_step = (
+            "| **3 — delete the namespace** | \u2b1c operator | "
+            "`kubectl delete namespace <env>` removes the workloads and "
+            "namespaced KCC CRs — this is every customer in the "
+            "constellation, so confirm the whole constellation is going |")
+        verify_step = (
+            "| **5 — verify** | \u2b1c operator | "
+            "nothing named after the environment survives in the GCP project |")
     return [
         "| Step | State | What it does |",
         "|------|-------|--------------|",
@@ -360,15 +415,12 @@ def _public_cloud_teardown_phase_table() -> list:
         "| **2 — remove folder** | " + _PH_THIS_PR + " | "
         "deletes the Argo CD Applications only; workloads and KCC "
         "objects keep running unmanaged (`preserveResourcesOnDeletion`) |",
-        "| **3 — delete the namespace** | \u2b1c operator | "
-        "`kubectl delete namespace <env>` removes workloads and namespaced "
-        "KCC CRs |",
+        namespace_step,
         "| **4 — clean abandoned GCP objects** | \u2b1c operator | "
         "KCC `deletion-policy: abandon` leaves URL maps, forwarding "
         "rules, backend services, target HTTPS proxies, health checks, "
         "buckets, DNSRecordSets and any GCE VMs in the project |",
-        "| **5 — verify** | \u2b1c operator | "
-        "nothing named after the environment survives in the GCP project |",
+        verify_step,
     ]
 
 
