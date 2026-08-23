@@ -70,19 +70,13 @@ The VM would be orphaned in the cloud, not deleted. Blocked.</i></sub>
 
 ## How it works
 
-```
-PR opened on acme-config-*
-        │
-        ├─ which ArgoCD apps does this PR touch?      (inventory, refreshed every 5 min)
-        ├─ render each app at main         ──┐
-        ├─ render each app at the PR sha   ──┴─ diff, resource by resource
-        │
-        └─ one comment  +  one build status (green / blocked)
-```
+<p align="center">
+<img src="docs/assets/pr-to-verdict.svg" width="900" alt="A config pull request is rendered on both sides with helm template, compared resource by resource, and graded into a verdict posted as a PR comment and a build status.">
+</p>
 
 **It renders locally.** `helm template` for both sides, diffed in Python.
 ArgoCD is used only to discover which apps exist — never to perform the diff,
-and no spoke agent is contacted.
+and no spoke agent is contacted. The app inventory is refreshed every 5 minutes.
 
 **It compares desired against desired** — the PR against `main`, not against
 live state. Accurate here because every ApplicationSet runs `selfHeal: true`
