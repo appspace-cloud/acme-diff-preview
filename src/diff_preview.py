@@ -199,6 +199,7 @@ from version_fold import (  # version-transition fold (same-dir module, stdlib o
     _classify_fold_pair,
     _classify_version_fold,
 )
+import uptime_schedule  # VM uptime-schedule advisory notes (same-dir module, stdlib only)
 from grouping import (  # same-change grouping and rollup (same-dir module)
     _HELM_EXEC_ERR_RE,
     _HELM_TPL_ERR_RE,
@@ -8915,6 +8916,18 @@ def _summarize_vm_changes(changed_files, pr_sha, base_sha, path_map,
                 # suppressed by one environment's adoption card.
                 routine_lines.append(
                     (env_name if path_map.get(clean) else None, line))
+
+        # COPS-2714: read the uptime schedule this file ends up with.
+        # The bullets above say a cron field changed; these say what GCP
+        # will DO with it — a start it silently ignores, a pair too close
+        # together to run in order, a zone that does not exist. Routine
+        # by construction: for nearly every shape worth a note there is a
+        # legitimate twin (a weekend park, a nightly bounce), so blocking
+        # would be wrong often enough to train people to skim the panel.
+        for note in uptime_schedule.notes_for_changed_roles(
+                new_flat, keys, _KCC_PREFIX):
+            routine_lines.append(
+                (env_name if path_map.get(clean) else None, note))
 
     # COPS-2635: resolve the buffered provisions. Tainted ones (any real
     # danger among their keys) replay their lines verbatim and never
