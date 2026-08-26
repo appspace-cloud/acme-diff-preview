@@ -147,6 +147,29 @@ immutable — destroy and recreate), a disk **shrink**, and a VM or
 snapshot-policy attachment disappearing from the render. Disk growth, status
 transitions and brand-new resources are reported quietly as routine.
 
+**Uptime schedules** (`uptimeSchedule`, COPS-2714) get advisory notes on top
+of those bullets, and they never block. The chart already refuses what it can
+be certain of — clock times, wrong field counts, minute 60, a non-IANA time
+zone — and that render failure blocks the merge through this service's own
+status. These notes cover the layer underneath: expressions the chart renders
+and GCP accepts, that still do not do what the author meant. A `stop` and
+`start` set to the same expression (GCP prioritises the stop and silently
+never starts the VM), a pair closer together than GCP's 15-minute jitter, a
+time zone with the right shape that is not in the tz database, an
+out-of-range or impossible calendar field, day-of-month and day-of-week both
+set (cron unions them, it does not intersect them), the 02:00 hour in a DST
+zone, and start-only schedules.
+
+They stay advisory on purpose. Nearly every one of those shapes has a
+legitimate twin — a Friday-stop/Monday-start weekend park, a deliberate
+nightly bounce, an overnight batch runner — so blocking would be wrong often
+enough to teach people to skim the panel, and a guardrail nobody trusts is
+worse than none. Eight such twins are asserted silent in the tests, so
+tightening a rule has to break a named test rather than quietly start
+nagging. The time-zone check degrades to silence when the container has no
+tz database: absence of the database is a fact about the container, never
+about the config.
+
 Detection runs at **two levels**, because either one alone misses real cases:
 the rendered manifests, and the value files themselves. The values level is
 what catches a VM change on an environment where the templates do not render
