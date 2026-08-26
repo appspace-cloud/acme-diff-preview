@@ -89,7 +89,7 @@ _main_render_disk_prune_lock = threading.Lock()
 # Salt bumped when render-affecting code changes (same idea as ArgoCD
 # CacheVersion). Part of every content key AND of every bucket object name,
 # so a bump orphans the durable copies instead of serving them.
-MAIN_RENDER_CACHE_SALT = os.environ.get("MAIN_RENDER_CACHE_SALT", "cops2631-v1")
+MAIN_RENDER_CACHE_SALT = os.environ.get("MAIN_RENDER_CACHE_SALT", "cops2718-v1")
 # COPS-2645: durable tier. memory -> disk -> GCS -> render. Both local tiers
 # live in the /tmp emptyDir, which dies with the pod; the pod was replaced
 # three times in ninety minutes during the 2026-08-11 audit (a deploy plus an

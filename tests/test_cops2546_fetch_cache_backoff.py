@@ -182,6 +182,7 @@ def test_cache_is_bounded_no_second_unbounded_dict():
         "_comment_id_cache",              # pruned with _seen by the stale sweep
         "_helm_chart_cache",              # popped by the chart prune
         "_path_map_cache",                # snapshot, replaced wholesale on refresh
+        "_merge_preview_cache",           # cleared past 512 entries (COPS-2718)
         # locks, not caches
         "_vf_cache_lock", "_comment_id_cache_lock", "_helm_cache_lock",
     }
