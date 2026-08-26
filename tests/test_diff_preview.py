@@ -1051,7 +1051,7 @@ def test_new_env_detected_in_process_pr():
     """process_pr must call _detect_new_env_candidates (v2.5.4: unconditionally,
     not just when affected is empty -- see Finding 4)."""
     src = _source()
-    assert "_detect_new_env_candidates(changed, path_map, renames, pr_sha=pr_sha, repo=repo)" in src, (
+    assert "_detect_new_env_candidates(changed, path_map, renames, pr_sha=render_sha, repo=repo)" in src, (
         "process_pr must call _detect_new_env_candidates"
     )
 

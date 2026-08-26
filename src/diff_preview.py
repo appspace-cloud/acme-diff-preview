@@ -2953,11 +2953,19 @@ def _git_env(auth_header: str = None) -> dict:
     return env
 
 
-def _git_run(args, cwd=None, timeout=None, auth_header=None):
-    """Run git and return the CompletedProcess, or None if it could not run."""
+def _git_run(args, cwd=None, timeout=None, auth_header=None, env_extra=None):
+    """Run git and return the CompletedProcess, or None if it could not run.
+
+    `env_extra` lays extra variables over the sanitised git environment —
+    the merge preview pins author/committer identity and epoch dates there
+    so its synthetic commit sha is a pure function of its parents.
+    """
+    env = _git_env(auth_header)
+    if env_extra:
+        env = {**env, **env_extra}
     try:
         return subprocess.run([GIT_BIN, *args], cwd=cwd, capture_output=True,
-                              text=True, env=_git_env(auth_header),
+                              text=True, env=env,
                               timeout=timeout or GIT_MIRROR_TIMEOUT)
     except Exception as e:
         logsink.debug(f"[mirror] git {' '.join(args[:2])} failed to run: {e}")
@@ -3077,6 +3085,92 @@ def _git_read_file(repo: str, sha: str, filepath: str):
         return None, BB_NOT_FOUND
     _count_bb_call("mirror_reads")
     return r.stdout, BB_OK
+
+
+# ── COPS-2718: the merge preview ─────────────────────────────────────
+# The question every comment answers is "what will the cluster do when this
+# merges" — and ArgoCD deploys MAIN, so the honest PR side is the MERGE of
+# main and the branch, not the branch as it was when somebody cut it. The
+# base side was already fresh (the poll re-reads main's tip and syncs the
+# mirror every iteration); this closes the other half. `git merge-tree`
+# computes that merge inside the existing bare mirror — no worktree, no
+# clone, one subprocess — and reports conflicts, which are the one case
+# where the diff cannot honestly be computed at all.
+#
+# The tree is wrapped in a synthetic COMMIT with pinned identity and epoch
+# timestamps, so the resulting sha is a pure function of (base, pr): every
+# pod computes the same sha, `_mirror_has_sha` accepts it unchanged (it
+# checks ^{commit}), and every (sha, path) cache layer keeps working. The
+# synthetic sha exists only in the mirror — Bitbucket has never heard of
+# it — which is safe precisely because the mirror answers first and always
+# CAN answer for a sha it minted itself.
+
+_merge_preview_cache = {}   # (repo, base_sha, pr_sha) -> (render_sha, conflicts)
+_MERGE_PREVIEW_ENV = {
+    "GIT_AUTHOR_NAME": "acme-diff-preview", "GIT_AUTHOR_EMAIL": "preview@local",
+    "GIT_COMMITTER_NAME": "acme-diff-preview", "GIT_COMMITTER_EMAIL": "preview@local",
+    "GIT_AUTHOR_DATE": "1970-01-01T00:00:00Z",
+    "GIT_COMMITTER_DATE": "1970-01-01T00:00:00Z",
+}
+
+
+def _merge_preview(repo, base_sha, pr_sha):
+    """The merge of main and the PR, as a commit sha the mirror can serve.
+
+    Returns (render_sha, conflicted_paths):
+      (sha,  [])     — clean merge; read the PR side at `sha`.
+      (None, [...])  — REAL CONFLICT with main; the paths are the evidence.
+      (None, None)   — could not compute (mirror off, sha missing, old git).
+                       The caller falls back to reading at pr_sha, which is
+                       yesterday's behaviour — degraded, never wrong about
+                       conflicts, and it must be told apart from a conflict.
+    """
+    if not GIT_MIRROR_ENABLED or _mirror_disabled or not base_sha or not pr_sha:
+        return None, None
+    key = (repo, base_sha, pr_sha)
+    hit = _merge_preview_cache.get(key)
+    if hit is not None:
+        return hit
+    path = _mirror_path(repo)
+    if not _mirror_has_sha(repo, base_sha) or not _mirror_has_sha(repo, pr_sha):
+        return None, None
+    r = _git_run(["--git-dir", path, "merge-tree", "--write-tree",
+                  "--name-only", base_sha, pr_sha], timeout=60)
+    if r is None:
+        return None, None
+    lines = (r.stdout or "").splitlines()
+    if r.returncode == 1 and lines:
+        # Conflict. Output: the (unusable) tree oid, then the conflicted
+        # paths, then an informational section after a blank line.
+        conflicted = []
+        for ln in lines[1:]:
+            if not ln.strip():
+                break
+            conflicted.append(ln.strip())
+        out = (None, conflicted or ["(paths not reported by git)"])
+        _merge_preview_cache[key] = out
+        return out
+    if r.returncode != 0 or not lines:
+        # Not a conflict: merge-tree itself failed (exit 2, missing merge
+        # base, pre-2.38 git). Degrade, and say so where somebody can see it.
+        logsink.log(f"[merge-preview] merge-tree failed for {repo} "
+                    f"{base_sha[:8]}..{pr_sha[:8]} (rc={r.returncode}); "
+                    f"reading the PR side at its branch tip instead", "WARN")
+        return None, None
+    tree = lines[0].strip()
+    c = _git_run(["--git-dir", path, "commit-tree", tree,
+                  "-p", base_sha, "-p", pr_sha,
+                  "-m", "merge preview (synthetic, deterministic)"],
+                 timeout=30, env_extra=_MERGE_PREVIEW_ENV)
+    if c is None or c.returncode != 0 or not c.stdout.strip():
+        logsink.log(f"[merge-preview] commit-tree failed for {repo}; "
+                    f"degrading to the branch tip", "WARN")
+        return None, None
+    out = (c.stdout.strip(), [])
+    _merge_preview_cache[key] = out
+    if len(_merge_preview_cache) > 512:
+        _merge_preview_cache.clear()
+    return out
 
 
 def _bb_fetch_status(filepath, sha, repo=None):
@@ -10513,6 +10607,54 @@ def process_pr(pr, path_map, base_sha="", repo=None):
                 with _seen_lock:
                     _seen[sk] = (pr_sha, base_sha)
                 return
+        # ── COPS-2718: the PR side is the MERGE of main and the branch ──
+        # The comment answers "what will the cluster do when this merges",
+        # and ArgoCD deploys main — so every content read below happens at
+        # the merge preview, minted in the local mirror. pr_sha remains the
+        # PR's IDENTITY (header token, build status, supersede checks): the
+        # two mean different things and must never be conflated. A conflict
+        # means THE diff cannot be computed, and per the one unbreakable
+        # rule that is a red status, never an approximation: any fallback
+        # diff would describe a merge that will never happen.
+        render_sha, _merge_conflicts = _merge_preview(repo, base_sha, pr_sha)
+        if _merge_conflicts:
+            _files_md = "\n".join(f"- `{c}`" for c in _merge_conflicts)
+            desc = (f"CONFLICT with main in {len(_merge_conflicts)} file(s) "
+                    f"— resolve before the diff can be computed")
+            post_build_status(pr_sha, "FAILED", desc, pr_id=pr_id)
+            body = (
+                f"## \U0001f52d {STATUS_NAME}\n\n"
+                f"{_comment_header(pr_sha)}\n\n"
+                f"\u26d4 **This PR CONFLICTS with `main` — the diff cannot "
+                f"be computed.**\n\n"
+                f"Since this branch was cut, `main` changed the same lines "
+                f"in:\n\n{_files_md}\n\n"
+                f"Any diff shown here would describe a merge that will never "
+                f"happen, so nothing else was rendered. **How to fix:** merge "
+                f"`main` into this branch (or rebase) and resolve the "
+                f"conflicts; the full review comes back on the next push.\n\n"
+                f"---\n**Status:** \u26d4 CONFLICT with main \u2014 "
+                f"{len(_merge_conflicts)} file(s), see above\n"
+                f"*{_ts()} \u2014 {COMMENT_MARKER} [conflict]"
+                + (f" [base:{base_sha[:8]}]" if base_sha else "") + "*"
+            )
+            upsert_comment(pr_id, body, existing_id, repo=repo)
+            with _seen_lock:
+                _seen[sk] = (pr_sha, base_sha)
+            return
+        if render_sha:
+            _register_sha_repo(render_sha, repo)
+            if render_sha != pr_sha:
+                logsink.log(f"merge preview {render_sha[:8]} "
+                            f"(main {base_sha[:8]} + PR {pr_sha[:8]})",
+                            "DEBUG", pr=pr_id, repo=repo,
+                            event="merge_preview")
+        else:
+            # Mirror unavailable (fork PR, sha not fetched yet, old git):
+            # yesterday's behaviour, reads at the branch tip. Degraded but
+            # never wrong about conflicts — this path asserts none exist.
+            render_sha = pr_sha
+
         # Single O(files x paths) match for the whole PR (v2.4.8 perf fix) —
         # _app_to_files is reused below for the version-bump detection pass
         # instead of every app independently rescanning changed x path_map.
@@ -10529,7 +10671,7 @@ def process_pr(pr, path_map, base_sha="", repo=None):
         # found, blocks the merge outright with a red status: no rendered diff
         # would make the danger obvious, so we refuse instead of commenting a
         # green diff. Runs on every PR regardless of affected apps.
-        wiped = _detect_wiped_definitions(changed, pr_sha, repo=repo)
+        wiped = _detect_wiped_definitions(changed, render_sha, repo=repo)
         if wiped:
             _files_md = "\n".join(f"- `{w}`" for w in wiped)
             desc = (f"BLOCKED: {len(wiped)} file(s) empty out "
@@ -10577,8 +10719,8 @@ def process_pr(pr, path_map, base_sha="", repo=None):
         # BEFORE any consumer runs, so the folder-move machinery, the
         # new-env exclusion and the decommission detector all see the move.
         renames = _augment_renames_with_identity_moves(
-            changed, renames, path_map, base_sha, pr_sha, repo=repo)
-        new_env_candidates = _detect_new_env_candidates(changed, path_map, renames, pr_sha=pr_sha, repo=repo)
+            changed, renames, path_map, base_sha, render_sha, repo=repo)
+        new_env_candidates = _detect_new_env_candidates(changed, path_map, renames, pr_sha=render_sha, repo=repo)
         if new_env_candidates:
             logsink.log(f"PR #{pr_id}: {len(new_env_candidates)} new env candidate(s): "
                         f"{[e['name'] for e in new_env_candidates]}", pr=pr_id)
@@ -10591,12 +10733,12 @@ def process_pr(pr, path_map, base_sha="", repo=None):
         # identity file has a rename pairing (v2.5.15: that pairing is then
         # identity-verified via one cached fetch pair, not assumed).
         decommission_candidates = _detect_env_decommission_candidates(
-            changed, path_map, renames, main_sha=base_sha, pr_sha=pr_sha)
+            changed, path_map, renames, main_sha=base_sha, pr_sha=render_sha)
         decommission_lines, decommissioned_envs = ([], [])
         decom_full_lines = []
         if decommission_candidates:
             decommission_lines, decommissioned_envs, decom_full_lines = \
-                _evaluate_env_decommissions(decommission_candidates, pr_sha,
+                _evaluate_env_decommissions(decommission_candidates, render_sha,
                                             base_sha, with_full_output=True)
             if decommissioned_envs:
                 logsink.log(f"PR #{pr_id}: environment decommission detected: "
@@ -10607,7 +10749,7 @@ def process_pr(pr, path_map, base_sha="", repo=None):
             if new_env_candidates:
                 post_build_status(pr_sha, "INPROGRESS", "Rendering new environment(s)...", pr_id=pr_id)
                 new_env_lines, structural_envs, total_new, new_env_full_lines = \
-                    _evaluate_new_envs(new_env_candidates, pr_sha,
+                    _evaluate_new_envs(new_env_candidates, render_sha,
                                        with_full_output=True)
 
                 lines = [
@@ -10747,7 +10889,7 @@ def process_pr(pr, path_map, base_sha="", repo=None):
         invalid_version_apps = set()
         with ThreadPoolExecutor(max_workers=max(1, min(DIFF_WORKERS, len(affected)))) as ex:
             rev_futs = {ex.submit(_pr_chart_revision_checked, app, _app_to_files.get(app, []),
-                                   pr_sha, main_sha=base_sha, renames=renames): app
+                                   render_sha, main_sha=base_sha, renames=renames): app
                         for app in affected}
             for fut in as_completed(rev_futs):
                 app = rev_futs[fut]
@@ -10770,7 +10912,7 @@ def process_pr(pr, path_map, base_sha="", repo=None):
         # file -- so a pure version bump does no value-chain resolution at
         # all. Replaces the second prep ThreadPoolExecutor entirely (point 4:
         # one pass, not two serial pools over the same apps).
-        bad_name_files = _changed_files_with_bad_names(changed, pr_sha, base_sha,
+        bad_name_files = _changed_files_with_bad_names(changed, render_sha, base_sha,
                                                        repo=repo)
         gsa_invalid_apps = {}
         if bad_name_files:
@@ -10824,7 +10966,7 @@ def process_pr(pr, path_map, base_sha="", repo=None):
                                         OUT_INDETERMINATE, REASON_INVALID_VERSION)
                     return app, result, round(time.monotonic() - t0, 1)
                 chart_rev = pr_chart_revisions.get(app)
-                result = argocd_diff(app, pr_sha, main_sha=base_sha,
+                result = argocd_diff(app, render_sha, main_sha=base_sha,
                                      chart_revision=chart_rev,
                                      changed_paths=_changed_paths_set,
                                      renames=renames)
@@ -11034,7 +11176,7 @@ def process_pr(pr, path_map, base_sha="", repo=None):
         new_env_full_lines = []
         if new_env_candidates:
             new_env_lines, structural_envs, total_new, new_env_full_lines = \
-                _evaluate_new_envs(new_env_candidates, pr_sha,
+                _evaluate_new_envs(new_env_candidates, render_sha,
                                    with_full_output=True)
         new_env_desc = (
             f"{len(structural_envs)} new environment(s) have a structural "
@@ -11043,7 +11185,7 @@ def process_pr(pr, path_map, base_sha="", repo=None):
 
         # COPS-2552: a paired move is excluded from the new-env candidates, so
         # the cohort guard above never sees it. Check the destinations here.
-        moves_missing_cohort = _moves_missing_cohort(renames, pr_sha, repo=repo)
+        moves_missing_cohort = _moves_missing_cohort(renames, render_sha, repo=repo)
         if moves_missing_cohort:
             envs = ", ".join(b["env"] for b in moves_missing_cohort)
             logsink.log(f"PR #{pr_id}: move(s) with no cohort config.yaml at the "
@@ -11055,13 +11197,13 @@ def process_pr(pr, path_map, base_sha="", repo=None):
                             f"{envs}")
 
         try:
-            input_change_lines = _summarize_input_changes(changed, pr_sha, base_sha, repo=repo)
+            input_change_lines = _summarize_input_changes(changed, render_sha, base_sha, repo=repo)
         except Exception as e:  # cause panel must never break the comment
             logsink.log(f"    [comment] input-changes panel failed: {e}", "WARNING")
             input_change_lines = []
         try:
             appspace_state_lines = _summarize_appspace_state_changes(
-                changed, pr_sha, base_sha, path_map, repo=repo)
+                changed, render_sha, base_sha, path_map, repo=repo)
         except Exception as e:  # state-flag panel must never break the comment
             logsink.log(f"    [comment] appspace-state panel failed: {e}", "WARNING")
             appspace_state_lines = []
@@ -11069,12 +11211,12 @@ def process_pr(pr, path_map, base_sha="", repo=None):
             # COPS-2693 Plan B: shares the appspace_state_lines channel so the
             # verdict scan in comment_render sees it without new plumbing.
             appspace_state_lines += _blast_radius_lines(
-                changed, pr_sha, base_sha, path_map, repo=repo)
+                changed, render_sha, base_sha, path_map, repo=repo)
         except Exception as e:  # informational panel must never break the comment
             logsink.log(f"    [comment] blast-radius panel failed: {e}", "WARNING")
         try:
             vm_change_lines = _summarize_vm_changes(
-                changed, pr_sha, base_sha, path_map, app_results, repo=repo)
+                changed, render_sha, base_sha, path_map, app_results, repo=repo)
         except Exception as e:  # VM panel must never break the comment
             logsink.log(f"    [comment] vm-changes panel failed: {e}", "WARNING")
             vm_change_lines = []
@@ -11102,7 +11244,7 @@ def process_pr(pr, path_map, base_sha="", repo=None):
         # pr_sha because the question is what is true AFTER the merge.
         try:
             _comment_kwargs["paused_apps"] = _paused_apps_for(
-                list(app_results.keys()), path_map, pr_sha, repo=repo)
+                list(app_results.keys()), path_map, render_sha, repo=repo)
         except Exception as e:
             # Never let this cost a comment. Silence here is the behaviour
             # every release before this one had.
@@ -11127,7 +11269,7 @@ def process_pr(pr, path_map, base_sha="", repo=None):
         _full_kwargs = dict(_comment_kwargs)
         try:
             _full_kwargs["input_change_lines"] = _summarize_input_changes(
-                changed, pr_sha, base_sha, repo=repo, full=True) or None
+                changed, render_sha, base_sha, repo=repo, full=True) or None
         except Exception as e:
             logsink.log(f"    [comment] full input panel failed: {e}", "WARNING")
         full_body = format_comment(pr_sha, app_results,

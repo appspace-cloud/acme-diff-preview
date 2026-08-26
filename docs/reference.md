@@ -252,6 +252,27 @@ OCI registry, value files and namespace. Then, per affected app:
    used to be one Bitbucket API call per file.
 3. `helm template` each side and diff the rendered YAML, resource by resource.
 
+**Which two shas (COPS-2718).** The base side is `main`'s tip as of this
+iteration — re-read every poll, mirror freshly fetched. The PR side is the
+**merge preview**: `git merge-tree` of that tip and the branch, computed in
+the mirror and wrapped in a deterministic synthetic commit. The comment's
+question is "what will the cluster do when this merges", and ArgoCD deploys
+`main` — so a branch that is weeks behind still previews against everything
+`main` has learned since, exactly as the merge will. Before this, the PR side
+was the branch as-is: a version bump merged to `main` after the branch point
+was invisible, and the preview showed the old chart — a downgrade the real
+merge would never produce. When `main` moves, the `[base:]` token in the
+posted comment no longer matches, and the next iteration re-renders and
+updates the comment in place.
+
+**Merge conflict = red.** When the branch conflicts with `main`, the merge —
+and therefore *the* diff — cannot be computed. The comment names the
+conflicted files, nothing else is rendered (a fallback diff would describe a
+merge that will never happen), and the build status goes FAILED until the
+author resolves and pushes. A sha the mirror cannot serve (a fork PR, a push
+newer than the last fetch) is *not* a conflict: those degrade to reading the
+branch tip, yesterday's behaviour.
+
 Typical latency is 4 to 6 seconds per app with a warm chart cache. If the PR bumps
 `appspace.version`, the new chart version is used for the PR side, so the diff
 shows the real image changes.
