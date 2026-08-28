@@ -82,6 +82,21 @@ COMMENT_INPUT_PANEL   = os.environ.get("COMMENT_INPUT_PANEL", "false").strip().l
 COMMENT_INLINE_EVIDENCE_LINES = _env_int("COMMENT_INLINE_EVIDENCE_LINES", 0)
 
 
+# COPS-2715: the one case phase E got wrong in the other direction. A PR whose
+# whole rendered change is a few hundred bytes has its evidence on the page and
+# nothing in the comment -- acme-config-prod #4437 (remove one env var) and
+# #4436 (add it back) produced BYTE-IDENTICAL comments apart from the sha.
+# Measured over 120 live artifacts, rendered hunk bytes are bimodal: p25 = 482,
+# p50 = 9,350, and the small band is almost all single-hunk PRs. Below this
+# threshold the comment can simply carry the diff.
+#
+# 0 (the default) is off, which is what keeps every existing golden and every
+# phase E test describing the default shape unchanged. Read through the module
+# namespace at render time, never snapshotted -- same rule as the switches
+# above, and the same reason: a snapshot makes the knob decorative on a pod.
+COMMENT_SMALL_DIFF_INLINE_BYTES = _env_int("COMMENT_SMALL_DIFF_INLINE_BYTES", 0)
+
+
 # COPS-2579: DiffResult.sections used to be hard-capped to
 # AI_MAX_SECTIONS_PER_APP (10) at diff time -- a cap meant for the AI
 # prompt (see the independent re-slice at generate_ai_summary's
