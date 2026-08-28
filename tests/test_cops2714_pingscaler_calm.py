@@ -126,6 +126,34 @@ def test_detection_composes_from_raw_sections():
         m._detect_created_resources(mod)) is False
 
 
+def _fake_diff_text(sections):
+    return "\n".join(f"===== {h} ======\n{b}" for h, b in sections)
+
+
+def test_argocd_diff_sets_created_only_for_a_true_creation(monkeypatch):
+    """Through the REAL argocd_diff, which is where the first fix's mutation
+    survived: the fact must come from the CREATED subset of sections. A
+    MODIFIED ping-scaler Deployment (an image bump on an environment where
+    it already runs) must not activate the calm path."""
+    made = {"text": ""}
+
+    def fake_run(*a, **k):
+        return (made["text"], None, "", None, 0, None)
+    monkeypatch.setattr(m, "_run_one_diff", fake_run)
+
+    made["text"] = _fake_diff_text(
+        [(PS_NEW, _add_body("Deployment", "acme-ping-scaler"))])
+    r = m.argocd_diff("pv-ford--aec1-b-ss", "aaaa1111", "bbbb2222")
+    assert r.outcome == m.OUT_DIFF
+    assert r.pingscaler_created is True
+
+    made["text"] = _fake_diff_text(
+        [(PS_NEW, "--- \n+++ \n kind: Deployment\n+  image: new\n")])
+    r = m.argocd_diff("pv-ford--aec1-b-ss", "cccc3333", "dddd4444")
+    assert r.outcome == m.OUT_DIFF
+    assert r.pingscaler_created is False
+
+
 # ── comment level: calm panel, and the alarm only when deserved ─────────
 
 def _ford(deleted_ms, extra_ms_deleted=()):
