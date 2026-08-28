@@ -8874,9 +8874,9 @@ def _summarize_vm_changes(changed_files, pr_sha, base_sha, path_map,
     seen = set()
     _prov_pending = {}   # (env, domain) -> [(rest, new_s, danger, line)]
     # COPS-2717: whether the file that buffered each provision is an actual
-    # environment. The routine-line path already draws this distinction; the
-    # provision path did not, and reported `gcp/aec/config.yaml` as "1
-    # environment provisions a NEW linux VM" (acme-config-prod #4449).
+    # environment (a customer.yaml), rather than a cohort file inherited by
+    # many. path_map cannot answer that -- an ancestor config.yaml feeds
+    # every app below it, so `_env_file` is true for both.
     _prov_env_file = {}  # (env, domain) -> bool
     for f in (changed_files or []):
         clean = posixpath.normpath(f.lstrip("/"))
@@ -8934,6 +8934,13 @@ def _summarize_vm_changes(changed_files, pr_sha, base_sha, path_map,
         # inherited by many environments, so one line already covers all
         # of them and there is nothing to group.
         _env_file = bool(path_map.get(clean))
+        # COPS-2717: _env_file only says the file feeds some app, and a
+        # cohort config.yaml feeds every app below it -- so it is true for
+        # ancestor files too, and `gcp/aec/config.yaml` was reported as "1
+        # environment provisions a NEW linux VM" (acme-config-prod #4449).
+        # An environment is a folder holding a customer.yaml; nothing else
+        # registers one.
+        _is_env_leaf = posixpath.basename(clean) == "customer.yaml"
         _domain_new_by_prefix = {}
         for k in keys:
             prefix = next(p for p in _VM_VALUES_PREFIXES if k.startswith(p))
@@ -9048,7 +9055,7 @@ def _summarize_vm_changes(changed_files, pr_sha, base_sha, path_map,
                 # prevent.
                 _prov_pending.setdefault((env_name, domain), []).append(
                     (rest, new_s, danger, line))
-                _prov_env_file[(env_name, domain)] = _env_file
+                _prov_env_file[(env_name, domain)] = _is_env_leaf
                 continue
             if danger:
                 dangerous_lines.append(line)
@@ -9085,11 +9092,12 @@ def _summarize_vm_changes(changed_files, pr_sha, base_sha, path_map,
                 else:
                     routine_lines.append((env, line))
             continue
-        # COPS-2717: a cohort/ancestor config.yaml is not an environment and
-        # provisions nothing by itself -- a role block still needs its own
-        # `enabled: true` to render a machine. Say it as a routine change,
-        # but ONLY when the render agrees there is no new machine anywhere,
-        # so an ancestor file that really does provision keeps its warning.
+        # COPS-2717: a cohort config.yaml is not an environment, and a role
+        # block written there provisions nothing by itself. Say it as a
+        # routine change -- but ONLY when the render agrees no machine is
+        # being built, because a cohort file CAN provision fleet-wide (add
+        # `svc.enabled: true` there and every environment below gets a VM),
+        # and that must keep its warning.
         # Narrow on purpose: untainted entries only (a dangerous key took the
         # branch above), and computed once, lazily, so PRs with no ancestor
         # provision pay nothing.

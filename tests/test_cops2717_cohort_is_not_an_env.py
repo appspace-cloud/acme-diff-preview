@@ -80,14 +80,21 @@ def _result(outcome, sections=()):
                          outcome == dp.OUT_DIFF, "", outcome, "r")
 
 
-def _panel(monkeypatch, path, new_text, app_results, is_env):
+def _panel(monkeypatch, path, new_text, app_results, is_env=None):
+    """is_env is derived from the filename, exactly as production does.
+
+    path_map is ALWAYS populated: that is the shape that reproduces the
+    bug. A cohort config.yaml is a valueFile for every application below
+    it, so `path_map.get(file)` is truthy for ancestor files too -- which
+    is precisely why it could not be used to tell the two apart.
+    """
     def fetch(p, sha, repo=None):
         # The base side is the SAME file without the domain -- the real
         # shape. An empty/absent base is a different case entirely.
         return (BASE if sha == "base" * 10 else new_text), dp.BB_OK
     monkeypatch.setattr(dp, "_bb_fetch_cached", fetch)
     return "\n".join(dp._summarize_vm_changes(
-        [path], path_map=({path: ["pv-x--aec1-a-ss"]} if is_env else {}),
+        [path], path_map={path: ["pv-x--aec1-a-ss", "pv-y--aec1-b-ss"]},
         app_results=app_results, repo="acme-config-prod",
         pr_sha="a" * 40, base_sha="base" * 10))
 
@@ -136,36 +143,36 @@ def test_clean_renders_with_nothing_created_corroborate():
 def test_a_cohort_file_no_longer_claims_a_new_vm(monkeypatch):
     out = _panel(monkeypatch, COHORT, COHORT_NEW,
                  {"pv-x--aec1-a-ss": _result(dp.OUT_DIFF,
-                                             [_modified(DEPLOY_HDR)])},
-                 is_env=False)
+                                             [_modified(DEPLOY_HDR)])})
     assert not _is_danger(out), out
     assert "provision" not in out.lower(), out
     assert "ignoreDesiredStatus" in out, "the change must still be reported"
-    assert "ancestor" in out, (
-        "and reported as what it is: a file inherited by the environments "
-        "below it, not an environment of its own")
+    # The line still opens with `aec`, the scope wording this panel uses for
+    # every file that feeds an application. Renaming that is a separate and
+    # much wider decision -- it would change the wording for every ancestor
+    # file in the fleet -- and this ticket is about the false BLOCK, not
+    # about how a routine line is labelled. Deliberately unchanged.
+    assert "(routine)" in out
 
 
 def test_the_same_cohort_change_still_warns_when_a_vm_really_appears(monkeypatch):
     """The render is the corroborating fact, not the file's path."""
     out = _panel(monkeypatch, COHORT, COHORT_NEW,
                  {"pv-x--aec1-a-ss": _result(dp.OUT_DIFF,
-                                             [_created(VM_HDR)])},
-                 is_env=False)
+                                             [_created(VM_HDR)])})
     assert _is_danger(out), out
     assert "provisions a new" in out
 
 
 def test_a_cohort_change_warns_when_nothing_rendered(monkeypatch):
     """No corroboration available -> keep the warning."""
-    out = _panel(monkeypatch, COHORT, COHORT_NEW, {}, is_env=False)
+    out = _panel(monkeypatch, COHORT, COHORT_NEW, {})
     assert _is_danger(out), out
 
 
 def test_a_cohort_change_warns_when_an_app_failed_to_render(monkeypatch):
     out = _panel(monkeypatch, COHORT, COHORT_NEW,
-                 {"pv-x--aec1-a-ss": _result(dp.OUT_INDETERMINATE)},
-                 is_env=False)
+                 {"pv-x--aec1-a-ss": _result(dp.OUT_INDETERMINATE)})
     assert _is_danger(out), out
 
 
@@ -176,8 +183,7 @@ def test_a_real_environment_provisioning_is_untouched(monkeypatch):
     role still shouts, whatever the render says."""
     out = _panel(monkeypatch, ENVFILE, ENV_NEW_VM,
                  {"pv-x--aec1-a-ss": _result(dp.OUT_DIFF,
-                                             [_modified(DEPLOY_HDR)])},
-                 is_env=True)
+                                             [_modified(DEPLOY_HDR)])})
     assert _is_danger(out), out
     assert "provisions a new" in out
 
@@ -193,6 +199,5 @@ def test_a_dangerous_key_on_a_cohort_file_still_shouts(monkeypatch):
              "        allowDeletion: true\n")
     out = _panel(monkeypatch, COHORT, armed,
                  {"pv-x--aec1-a-ss": _result(dp.OUT_DIFF,
-                                             [_modified(DEPLOY_HDR)])},
-                 is_env=False)
+                                             [_modified(DEPLOY_HDR)])})
     assert _is_danger(out), out
