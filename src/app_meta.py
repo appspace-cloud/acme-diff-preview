@@ -103,9 +103,17 @@ def _extract_status_token(raw: str) -> str:
     blocking comment sitting next to it. Any token the writer emits must be
     readable here.
     """
-    m = re.search(re.escape(COMMENT_MARKER)
-                  + r'\s+\[(clean|permanent|transient|blocked)\]', raw)
-    return m.group(1) if m else ""
+    # COPS-2715: LAST match, not first. The token is written in the footer,
+    # so the last occurrence is always the real one -- while everything
+    # before it can be rendered manifest content, i.e. bytes a pull request
+    # author controls. A first-match read lets a hunk containing this exact
+    # sequence shadow the footer, and an unrecognised or wrong token falls
+    # through fix_stuck_inprogress to SUCCESSFUL (the COPS-2668 failure).
+    # The exposure predates inline tiny diffs: the no-page fallback and the
+    # INLINE profile already put hunks in the body.
+    ms = re.findall(re.escape(COMMENT_MARKER)
+                    + r'\s+\[(clean|permanent|transient|blocked)\]', raw)
+    return ms[-1] if ms else ""
 
 
 def _extract_app_git_repo(app):

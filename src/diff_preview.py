@@ -9432,6 +9432,30 @@ def format_comment(pr_sha, app_results, skipped_apps=None, base_sha="",
         or total_diff_bytes > LARGE_PR_DIFF_BYTES
     )
 
+    # COPS-2715: a change small enough to simply show. Measured on the FULL
+    # section bodies, not on r.text -- text is pre-capped at
+    # MAX_RESOURCES_FULL sections of MAX_DIFF_CHARS each, so it saturates
+    # and would call a 200-resource app "small". This sum is exactly what
+    # the blocks below would render, before grouping collapses identical
+    # apps, so it can only ever over-estimate.
+    #
+    # Narrow on purpose. The flag is handed to _format_app_diff_block alone
+    # (see below) and never to `profile`, because profile.inline_diffs also
+    # stops clean apps rolling up into one count -- 19 lines of green noise
+    # on a 20-app PR whose one real hunk is 211 bytes. Off (0) by default.
+    _small_inline_max = render_profile.COMMENT_SMALL_DIFF_INLINE_BYTES
+    _inline_bytes = sum(len(b) for _, r in changed_apps
+                        for _, b in (r.sections or []))
+    tiny_inline = bool(
+        _small_inline_max
+        and not profile.is_complete_record
+        and not profile.inline_diffs
+        and 0 < _inline_bytes <= _small_inline_max)
+    if tiny_inline:
+        logsink.log(f"[comment] tiny change ({_inline_bytes}B <= "
+                    f"{_small_inline_max}B): inlining the diff",
+                    "DEBUG", event="tiny_inline", inline_bytes=_inline_bytes)
+
     # COPS-2579: group changed apps whose full diff is byte-for-byte
     # identical. diff_group_for_app maps EVERY member app (including the
     # representative) to (representative_app, member_apps, representative
@@ -10186,6 +10210,7 @@ def format_comment(pr_sha, app_results, skipped_apps=None, base_sha="",
             # is_complete_record renders every block.
             if (_table_rendered and artifact_url
                     and not profile.inline_diffs
+                    and not tiny_inline
                     and not profile.is_complete_record
                     and not _risky and app not in _fp_grouped
                     and not getattr(rep_r, "version_fold", None)):
@@ -10242,7 +10267,12 @@ def format_comment(pr_sha, app_results, skipped_apps=None, base_sha="",
                 n_res=rep_r.n_res, risk_headers=_risk_hdrs,
                 version_fold=_fold, artifact_url=artifact_url,
                 size_budget=_room, group_repeats=profile.group_repeats,
-                profile=profile,
+                # COPS-2715: the ONLY place the tiny-change flag reaches.
+                # Scoped to this call so the clean-app rollup, the input
+                # panel and every other inline_diffs behaviour stay exactly
+                # as they are on the default surface.
+                profile=(profile.replace(inline_diffs=True)
+                         if tiny_inline else profile),
                 # COPS-2640: the app's table row carries the deep link
                 # whenever the table renders on this surface, so the
                 # block's trailing "Full hunks for" line would repeat it.
@@ -10602,14 +10632,21 @@ def process_pr(pr, path_map, base_sha="", repo=None):
         # (bughunt F1). Legacy comments without a [base:] token are treated
         # as stale once and rewritten with the token.
         if not rerun and base_sha:
-            base_m = re.search(r"\[base:([0-9a-f]{4,12})\]", comment_raw)
-            if not base_m or base_m.group(1) != base_sha[:8]:
+            # COPS-2715: LAST match, for the reason spelled out in
+            # _extract_status_token -- the token lives in the footer, and
+            # anything before it may be rendered manifest content. A
+            # first-match read of a shadowing hunk either pins rerun=True
+            # forever (a re-render every poll) or falsely satisfies the
+            # main-advanced check and freezes a stale comment.
+            _base_ms = re.findall(r"\[base:([0-9a-f]{4,12})\]", comment_raw)
+            base_m = _base_ms[-1] if _base_ms else None
+            if not base_m or base_m != base_sha[:8]:
                 rerun = True
                 # Structured (not just print): this is the F1 fix actually
                 # firing — worth counting/alerting on, unlike the narrative
                 # trace lines around it (bughunt N7).
                 logsink.log(f"PR #{pr_id}: recompute triggered by main advancing "
-                            f"({base_m.group(1) if base_m else 'legacy'} -> {base_sha[:8]})",
+                            f"({base_m or 'legacy'} -> {base_sha[:8]})",
                             pr=pr_id, event="main_advanced_recompute")
         if rerun:
             logsink.log(f"Re-running: previous comment for SHA {pr_sha[:8]} was "
