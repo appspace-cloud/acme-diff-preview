@@ -242,6 +242,39 @@ def _detect_created_resources(sections: list) -> list:
     return created
 
 
+# COPS-2714: the one deletion wave that is a feature working as designed.
+# Enabling acme-ping-scaler makes the micro-services chart stop rendering
+# every HPA in the namespace (hpa.yaml: "Skip all HPA rendering when
+# acmePingScaler is enabled to prevent replica conflicts") -- both would own
+# replica counts. So a PR that turns the scaler on shows dozens of HPA
+# deletions, and the DO-NOT-MERGE deletion block made an intentional
+# activation look like an incident (acme-config-prod #4444: 23 HPAs).
+# The pairing is deliberately narrow, exactly like the rename split above,
+# because a false match would SUPPRESS a real deletion warning: the calm
+# path requires the acme-ping-scaler Deployment to be CREATED in this same
+# diff, and only ever reclassifies HorizontalPodAutoscaler headers.
+_PINGSCALER_DEPLOY_PREFIX = "/apps/Deployment "
+_PINGSCALER_NAME = "acme-ping-scaler"
+_HPA_HDR_PREFIX = "/autoscaling/HorizontalPodAutoscaler "
+
+
+def _detect_pingscaler_takeover(deleted: list, created: list):
+    """Deleted HPA headers explained by a ping-scaler activation, else None.
+
+    Requires BOTH sides of the chart's contract in one diff: the
+    acme-ping-scaler Deployment is created (all-plus section) and the HPAs
+    are deleted (all-minus sections). An HPA deleted any other way -- or any
+    other kind deleted alongside -- stays a hard deletion.
+    """
+    activated = any(
+        h.startswith(_PINGSCALER_DEPLOY_PREFIX)
+        and h.split(" ", 1)[1].split("/")[-1] == _PINGSCALER_NAME
+        for h in created)
+    if not activated:
+        return None
+    return [h for h in deleted if h.startswith(_HPA_HDR_PREFIX)] or None
+
+
 # Go's own output for a nil or missing template/printf argument. Matched
 # tightly on purpose: a bare "%!" or the word "value" appears in legitimate
 # ConfigMap data (log format strings, embedded templates), and a block that

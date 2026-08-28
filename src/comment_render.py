@@ -267,6 +267,12 @@ _DECOM_FLAG_TYPO_HDR = (
     "arms nothing (or not what you expect).**")
 
 
+# COPS-2714: where the ping-scaler handover is documented for operators.
+# Page-id URL on purpose (Confluence "3. Environments: charts and
+# configuration", section "Replica control"): it survives page renames.
+PINGSCALER_DOCS_URL = ("https://appspace.atlassian.net/wiki/spaces/cops/"
+                       "pages/1181089800")
+
 _SEV_ROUTINE, _SEV_REVIEW, _SEV_BLOCK = 0, 1, 2
 _VERDICTS = {
     _SEV_BLOCK: "\u26d4 **DO NOT MERGE** without checking the item(s) below",
@@ -427,12 +433,17 @@ def _build_merge_summary(results, rollup_by_sig, vm_change_lines,
                         f.get("deleted") and not f.get("dangerous")
                         and f.get("notes")):
                     orphan_hdrs.add(f.get("header"))
+        # COPS-2714: HPAs removed because this same PR enables the
+        # ping-scaler are the chart's documented contract, not a destroy.
+        # They get their own REVIEW line below instead of the BLOCK count.
+        ps_hdrs = {a: set(getattr(results[a], "pingscaler_takeover", None)
+                          or ()) for a in deleted_apps}
         hard_n = 0
         hard_apps = []
         orphan_n = 0
         for a in deleted_apps:
             hard = [h for h in (results[a].deleted_resources or [])
-                    if h not in orphan_hdrs]
+                    if h not in orphan_hdrs and h not in ps_hdrs.get(a, ())]
             if hard:
                 hard_n += len(hard)
                 hard_apps.append(a)
@@ -453,6 +464,15 @@ def _build_merge_summary(results, rollup_by_sig, vm_change_lines,
                              f"\U0001f5a5\ufe0f **{orphan_n} KCC resource(s) "
                              f"unmanaged** (abandon / schedule attachment "
                              f"\u2014 GCP kept)"))
+        ps_apps = sorted(a for a in deleted_apps if ps_hdrs.get(a))
+        if ps_apps:
+            n_hpa = sum(len(ps_hdrs[a]) for a in ps_apps)
+            findings.append((_SEV_REVIEW,
+                             f"\U0001f39a\ufe0f **acme-ping-scaler activated** "
+                             f"in {_fmt_env_list(ps_apps)} \u2014 it takes "
+                             f"over replica control; {n_hpa} HPA(s) removed "
+                             f"by design "
+                             f"([how it works]({PINGSCALER_DOCS_URL}))"))
     renamed_apps = sorted(a for a, r in results.items()
                           if getattr(r, "renamed_resources", None))
     if renamed_apps:

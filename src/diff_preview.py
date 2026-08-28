@@ -150,6 +150,7 @@ from comment_render import (  # comment rendering (same-dir module, stdlib only)
     _full_hunks_link,
     _fmt_service_list,
     _routine_bump_label,
+    PINGSCALER_DOCS_URL,
     _VM_PANEL_DANGER_HDR,
     _VM_PANEL_ROUTINE_HDR,
     _SEV_ROUTINE,
@@ -280,6 +281,7 @@ from manifest import (  # rendered-manifest parsing and resource diffing
     _split_yaml_docs,
     _detect_deleted_resources,
     _detect_created_resources,
+    _detect_pingscaler_takeover,
     _TEMPLATE_ARTIFACT_RE,
     _detect_template_artifacts,
     _is_kcc_blocking_artifact,
@@ -2759,9 +2761,14 @@ DiffResult = namedtuple("DiffResult",
                          "version_change", "deleted_resources", "replicas_zeroed",
                          "fingerprint", "renamed_resources", "vm_changes",
                          "version_fold", "shutdown_stats",
-                         "template_artifacts"],
+                         "template_artifacts", "pingscaler_takeover"],
                         defaults=[None, None, None, None, None, None, None,
-                                  None, None])
+                                  None, None, None])
+# pingscaler_takeover (COPS-2714): deleted HPA headers explained by an
+# acme-ping-scaler Deployment CREATED in this same diff -- the chart skips
+# all HPA rendering while a ping-scaler is on, so those deletions are the
+# documented handover of replica control, not a destroy. None everywhere
+# else; the summary and the deleted panel both read it to reclassify.
 # template_artifacts: headers whose applied side renders `%!s(<nil>)` or
 # `<no value>` - a value the chart read and this environment does not set.
 # KCC Compute* headers BLOCK the merge (COPS-2677 / COPS-2632); other kinds
@@ -7169,11 +7176,16 @@ def argocd_diff(app, pr_sha, main_sha, chart_revision=None, changed_paths=None, 
             filtered_sections, hpas_remaining=hpas_remaining,
             replica_stats=replica_stats)
         artifacts = _detect_template_artifacts(filtered_sections)
+        # COPS-2714: like shutdown_stats and artifacts above, computed on the
+        # full pre-cap list. deleted_res is already rename-split, so this
+        # only ever sees true deletions.
+        pingscaler_res = _detect_pingscaler_takeover(
+            deleted_res, _detect_created_resources(filtered_sections))
         return DiffResult(clean_diff, capped_sections,
                           n_res, True, None, OUT_DIFF, "changes", version_change,
                           deleted_res, zeroed_res, fingerprint, renamed_res,
                           vm_changes_res, version_fold, shutdown_stats,
-                          artifacts)
+                          artifacts, pingscaler_res)
     # Exhausted retries
     return _indeterminate(last_reason, last_detail or "unknown error")
 
@@ -9702,6 +9714,14 @@ def format_comment(pr_sha, app_results, skipped_apps=None, base_sha="",
     # warning: deterministic safety facts never depend on the model.
     all_deleted = [(app, hdr) for app, r in results.items()
                    for hdr in (r.deleted_resources or [])]
+    # COPS-2714: HPAs whose deletion is the ping-scaler handover get their
+    # own calm panel below, out of the shouty block -- same design as the
+    # orphan/abandon split, and per-app so an HPA deleted any other way in
+    # the same PR still alarms.
+    ps_pairs = [(app, hdr) for app, r in results.items()
+                for hdr in (getattr(r, "pingscaler_takeover", None) or [])]
+    ps_set = set(ps_pairs)
+    all_deleted = [p for p in all_deleted if p not in ps_set]
     orphan_hdrs = set()
     for r in results.values():
         for f in (getattr(r, "vm_changes", None) or []):
@@ -9763,6 +9783,38 @@ def format_comment(pr_sha, app_results, skipped_apps=None, base_sha="",
         if n_del > len(shown):
             lines.append(
                 f"- *(+{n_del - len(shown)} more, all non-sensitive kinds)*")
+        lines.append("")
+
+    # ── Ping-scaler handover (COPS-2714) ────────────────────────────
+    # The HPAs pulled out of the block above, said calmly and with the
+    # mechanism: this is the chart working as documented, not a destroy.
+    if ps_pairs and not quiet_render_block:
+        ps_apps_p = sorted({a_ for a_, _ in ps_pairs})
+        n_ps = len(ps_pairs)
+        lines += [
+            f"### \U0001f39a\ufe0f acme-ping-scaler takes over replica "
+            f"control in {_fmt_env_list(ps_apps_p)}",
+            "",
+            "This PR enables `acme-ping-scaler` here. From now on it owns "
+            "the replica counts: it pings its target host every minute, "
+            "scales every Deployment in the namespace to **0** while the "
+            "host is down, and restores the configured replicas when the "
+            "host answers.",
+            "",
+            f"The {n_ps} HorizontalPodAutoscaler(s) this PR deletes go "
+            "**by design**: the chart never renders HPA while a "
+            "ping-scaler is on, so the two cannot fight over replicas. "
+            "They come back on the next sync after "
+            "`acmePingScaler.enabled` is set back to `false`.",
+            "",
+            f"How it works: {PINGSCALER_DOCS_URL} "
+            "(details: `acme-components/documentation/scaling.md`)",
+            "",
+        ]
+        for app, hdr in ps_pairs[:8]:
+            lines.append(f"- `{app}` \u2192 `{hdr}`")
+        if n_ps > 8:
+            lines.append(f"- *(+{n_ps - 8} more HPAs, same reason)*")
         lines.append("")
 
     # ── Renamed resources (COPS-2594) ────────────────────────────────
