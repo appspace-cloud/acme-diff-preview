@@ -258,21 +258,31 @@ _PINGSCALER_NAME = "acme-ping-scaler"
 _HPA_HDR_PREFIX = "/autoscaling/HorizontalPodAutoscaler "
 
 
-def _detect_pingscaler_takeover(deleted: list, created: list):
-    """Deleted HPA headers explained by a ping-scaler activation, else None.
+def _detect_pingscaler_created(created: list) -> bool:
+    """True when this diff CREATES the acme-ping-scaler Deployment.
 
-    Requires BOTH sides of the chart's contract in one diff: the
-    acme-ping-scaler Deployment is created (all-plus section) and the HPAs
-    are deleted (all-minus sections). An HPA deleted any other way -- or any
-    other kind deleted alongside -- stays a hard deletion.
+    Field report (the first 2.106.0 render of acme-config-prod #4444): the
+    two halves of the chart's contract live in DIFFERENT apps of the same
+    environment -- the ping-scaler Deployment is rendered by
+    supporting-services ({env}-ss) while the HPAs it displaces belong to
+    micro-services ({env}-ms). A same-diff pairing therefore never fires in
+    production. So this detects only the creation half, per app; the
+    render layer pairs it with HPA deletions across the SAME ENVIRONMENT
+    (comment_render._pingscaler_reclass). Name matched exactly: a
+    lookalike must not unlock the calm path.
     """
-    activated = any(
+    return any(
         h.startswith(_PINGSCALER_DEPLOY_PREFIX)
         and h.split(" ", 1)[1].split("/")[-1] == _PINGSCALER_NAME
         for h in created)
-    if not activated:
-        return None
-    return [h for h in deleted if h.startswith(_HPA_HDR_PREFIX)] or None
+
+
+def _hpa_headers(deleted) -> list:
+    """The HorizontalPodAutoscaler subset of a deleted-headers list.
+
+    One definition shared by the summary and the panel, so the two can
+    never disagree about which deletions the handover explains."""
+    return [h for h in (deleted or []) if h.startswith(_HPA_HDR_PREFIX)]
 
 
 # Go's own output for a nil or missing template/printf argument. Matched

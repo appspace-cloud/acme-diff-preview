@@ -151,6 +151,7 @@ from comment_render import (  # comment rendering (same-dir module, stdlib only)
     _fmt_service_list,
     _routine_bump_label,
     PINGSCALER_DOCS_URL,
+    _pingscaler_reclass,
     _VM_PANEL_DANGER_HDR,
     _VM_PANEL_ROUTINE_HDR,
     _SEV_ROUTINE,
@@ -281,7 +282,7 @@ from manifest import (  # rendered-manifest parsing and resource diffing
     _split_yaml_docs,
     _detect_deleted_resources,
     _detect_created_resources,
-    _detect_pingscaler_takeover,
+    _detect_pingscaler_created,
     _TEMPLATE_ARTIFACT_RE,
     _detect_template_artifacts,
     _is_kcc_blocking_artifact,
@@ -2761,14 +2762,15 @@ DiffResult = namedtuple("DiffResult",
                          "version_change", "deleted_resources", "replicas_zeroed",
                          "fingerprint", "renamed_resources", "vm_changes",
                          "version_fold", "shutdown_stats",
-                         "template_artifacts", "pingscaler_takeover"],
+                         "template_artifacts", "pingscaler_created"],
                         defaults=[None, None, None, None, None, None, None,
                                   None, None, None])
-# pingscaler_takeover (COPS-2714): deleted HPA headers explained by an
-# acme-ping-scaler Deployment CREATED in this same diff -- the chart skips
-# all HPA rendering while a ping-scaler is on, so those deletions are the
-# documented handover of replica control, not a destroy. None everywhere
-# else; the summary and the deleted panel both read it to reclassify.
+# pingscaler_created (COPS-2714): True when this app's diff CREATES the
+# acme-ping-scaler Deployment. The chart skips all HPA rendering while a
+# ping-scaler is on, so the HPAs it displaces -- deleted in the SIBLING
+# {env}-ms app, not here -- are the documented handover of replica control,
+# not a destroy. The render layers pair the two per environment via
+# comment_render._pingscaler_reclass.
 # template_artifacts: headers whose applied side renders `%!s(<nil>)` or
 # `<no value>` - a value the chart read and this environment does not set.
 # KCC Compute* headers BLOCK the merge (COPS-2677 / COPS-2632); other kinds
@@ -7177,10 +7179,9 @@ def argocd_diff(app, pr_sha, main_sha, chart_revision=None, changed_paths=None, 
             replica_stats=replica_stats)
         artifacts = _detect_template_artifacts(filtered_sections)
         # COPS-2714: like shutdown_stats and artifacts above, computed on the
-        # full pre-cap list. deleted_res is already rename-split, so this
-        # only ever sees true deletions.
-        pingscaler_res = _detect_pingscaler_takeover(
-            deleted_res, _detect_created_resources(filtered_sections))
+        # full pre-cap list.
+        pingscaler_res = _detect_pingscaler_created(
+            _detect_created_resources(filtered_sections))
         return DiffResult(clean_diff, capped_sections,
                           n_res, True, None, OUT_DIFF, "changes", version_change,
                           deleted_res, zeroed_res, fingerprint, renamed_res,
@@ -9716,10 +9717,12 @@ def format_comment(pr_sha, app_results, skipped_apps=None, base_sha="",
                    for hdr in (r.deleted_resources or [])]
     # COPS-2714: HPAs whose deletion is the ping-scaler handover get their
     # own calm panel below, out of the shouty block -- same design as the
-    # orphan/abandon split, and per-app so an HPA deleted any other way in
-    # the same PR still alarms.
-    ps_pairs = [(app, hdr) for app, r in results.items()
-                for hdr in (getattr(r, "pingscaler_takeover", None) or [])]
+    # orphan/abandon split. Paired per ENVIRONMENT (the Deployment lands in
+    # {env}-ss, the HPAs leave {env}-ms), so an HPA deleted any other way
+    # in the same PR still alarms.
+    _ps_by_app = _pingscaler_reclass(results)
+    ps_pairs = [(app, hdr) for app, hdrs in sorted(_ps_by_app.items())
+                for hdr in sorted(hdrs)]
     ps_set = set(ps_pairs)
     all_deleted = [p for p in all_deleted if p not in ps_set]
     orphan_hdrs = set()
