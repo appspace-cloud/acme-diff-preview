@@ -8806,6 +8806,35 @@ _VM_DOMAIN_LABELS = {
 _VM_DISK_TYPE_KEYS = ("dataDiskType", "bootDiskType", "diskType")
 
 
+# COPS-2717: the ground truth for "is a VM being provisioned" is the render,
+# and this service already computed it. A KCC ComputeInstance that appears as
+# an all-plus section is a machine being built; nothing else is.
+_KCC_VM_HDR = "/compute.cnrm.cloud.google.com/ComputeInstance "
+
+
+def _render_creates_a_kcc_vm(app_results) -> bool:
+    """Whether any app's rendered diff CREATES a KCC ComputeInstance.
+
+    True whenever that cannot be established -- an app that did not render
+    cannot corroborate anything, and a provisioning warning must never be
+    dropped on missing information. Only a complete set of successful
+    renders, none of which creates a machine, returns False.
+    """
+    seen = False
+    for _app, r in (app_results or {}).items():
+        outcome = getattr(r, "outcome", None)
+        if outcome == OUT_NO_DIFF:
+            seen = True
+            continue
+        if outcome != OUT_DIFF:
+            return True
+        seen = True
+        for hdr in _detect_created_resources(getattr(r, "sections", None) or []):
+            if hdr.startswith(_KCC_VM_HDR):
+                return True
+    return not seen
+
+
 def _summarize_vm_changes(changed_files, pr_sha, base_sha, path_map,
                           app_results, repo=None) -> list:
     """Markdown panel for VM-domain (KCC linux-services) changes.
@@ -8844,6 +8873,11 @@ def _summarize_vm_changes(changed_files, pr_sha, base_sha, path_map,
     adopted_envs = set()
     seen = set()
     _prov_pending = {}   # (env, domain) -> [(rest, new_s, danger, line)]
+    # COPS-2717: whether the file that buffered each provision is an actual
+    # environment. The routine-line path already draws this distinction; the
+    # provision path did not, and reported `gcp/aec/config.yaml` as "1
+    # environment provisions a NEW linux VM" (acme-config-prod #4449).
+    _prov_env_file = {}  # (env, domain) -> bool
     for f in (changed_files or []):
         clean = posixpath.normpath(f.lstrip("/"))
         if clean in seen or not clean.endswith((".yaml", ".yml")):
@@ -9014,6 +9048,7 @@ def _summarize_vm_changes(changed_files, pr_sha, base_sha, path_map,
                 # prevent.
                 _prov_pending.setdefault((env_name, domain), []).append(
                     (rest, new_s, danger, line))
+                _prov_env_file[(env_name, domain)] = _env_file
                 continue
             if danger:
                 dangerous_lines.append(line)
@@ -9041,6 +9076,7 @@ def _summarize_vm_changes(changed_files, pr_sha, base_sha, path_map,
     # group; clean ones group by signature — same domain, same key/value
     # set — so eight environments enabling the same VM read as one fact.
     _prov_groups = {}    # (domain, frozenset((rest, new_s))) -> [envs]
+    _render_vm = None
     for (env, domain), entries in sorted(_prov_pending.items()):
         if any(d for _, _, d, _ in entries):
             for rest, new_s, d, line in entries:
@@ -9049,6 +9085,24 @@ def _summarize_vm_changes(changed_files, pr_sha, base_sha, path_map,
                 else:
                     routine_lines.append((env, line))
             continue
+        # COPS-2717: a cohort/ancestor config.yaml is not an environment and
+        # provisions nothing by itself -- a role block still needs its own
+        # `enabled: true` to render a machine. Say it as a routine change,
+        # but ONLY when the render agrees there is no new machine anywhere,
+        # so an ancestor file that really does provision keeps its warning.
+        # Narrow on purpose: untainted entries only (a dangerous key took the
+        # branch above), and computed once, lazily, so PRs with no ancestor
+        # provision pay nothing.
+        if not _prov_env_file.get((env, domain), True):
+            if _render_vm is None:
+                _render_vm = _render_creates_a_kcc_vm(app_results)
+            if not _render_vm:
+                for _r, _v, _d, line in entries:
+                    # None: the scope in the line already names the ancestor
+                    # file and says it is inherited, and tagging one
+                    # environment would be the same lie in a quieter place.
+                    routine_lines.append((None, line))
+                continue
         sig = (domain, frozenset((r_, v_) for r_, v_, _, _ in entries))
         _prov_groups.setdefault(sig, []).append(env)
     _prov_envs = {e for envs in _prov_groups.values() for e in envs}
