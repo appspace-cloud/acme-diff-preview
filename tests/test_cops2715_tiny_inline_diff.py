@@ -225,3 +225,91 @@ def test_a_hunk_cannot_shadow_the_base_token(monkeypatch):
         "the real base token must be the last one, or the freshness check "
         "either re-renders every poll or freezes a stale comment")
     assert "deadbeef" in found, "the bait really was earlier in the body"
+
+
+# ── the [base:] reader, through the real process_pr seam ─────────────────
+#
+# The assertions above look at the rendered BODY, which proves the footer is
+# last but not that the READER follows it: a first-match reader passes them
+# unchanged. This drives process_pr, where the token actually decides
+# whether the comment is recomputed.
+
+import diff_ui      # noqa: E402
+import logsink      # noqa: E402
+
+
+REPO = "acme-config-prod"
+CHANGED = "gcp/prod/public-cloud/na1-a/cl-prod-b/constellation/customer.yaml"
+PR_SHA = "489e5a8f05ab"
+BASE_SHA = "9eab6d1e4444"
+
+
+def _reset():
+    m._seen.clear()
+    m._force_recompute.clear()
+    with m._supersede_lock:
+        m._pr_superseded.clear()
+        m._pr_supersede_aborts.clear()
+        m._base_superseded.clear()
+        m._base_observed.clear()
+    diff_ui.reset_pending_uploads()
+
+
+def _existing_comment_with_bait():
+    """A previous comment for THIS sha whose inlined hunk carries a decoy
+    [base:] token, with the real one in the footer where it is written."""
+    return (
+        "## \U0001f52d ACME Diff Preview\n\n"
+        f"**Commit** `{PR_SHA[:8]}` → `main` | `{REPO}`\n\n"
+        "```diff\n"
+        "-        - name: note\n"
+        '-          value: "[base:deadbeef]"\n'
+        "```\n\n"
+        "---\n"
+        "**Status:** ⚠️ 1 resource(s) will change\n"
+        f"*2026-08-28 09:00 UTC — acme-diff-preview [clean] "
+        f"[base:{BASE_SHA[:8]}]*"
+    )
+
+
+@pytest.fixture()
+def _pr_world(monkeypatch):
+    sinks = {"upserts": [], "statuses": []}
+    _reset()
+    monkeypatch.setattr(logsink, "log", lambda *a, **k: None)
+    monkeypatch.setattr(logsink, "debug", lambda *a, **k: None)
+    monkeypatch.setattr(m, "get_pr_changed_files",
+                        lambda pr_id, repo=None: ([CHANGED], {}))
+    monkeypatch.setattr(m, "find_existing_comment",
+                        lambda pr_id, repo=None:
+                        (1, PR_SHA[:8], _existing_comment_with_bait()))
+    monkeypatch.setattr(m, "upsert_comment",
+                        lambda pr_id, body, existing_id=None, repo=None,
+                        artifact_url="", **kw:
+                        sinks["upserts"].append(body) or 1)
+    monkeypatch.setattr(m, "post_build_status",
+                        lambda *a, **k: sinks["statuses"].append(a))
+    monkeypatch.setattr(m, "fix_stuck_inprogress", lambda *a, **k: None)
+    monkeypatch.setattr(m, "_touch_progress", lambda: None)
+    monkeypatch.setattr(m, "_bb_fetch_status",
+                        lambda path, sha, repo=None: (None, m.BB_NOT_FOUND))
+    monkeypatch.setattr(m, "argocd_diff",
+                        lambda *a, **k: m.DiffResult("", [], 0, False, "",
+                                                     m.OUT_NO_DIFF, "clean"))
+    yield sinks
+    _reset()
+
+
+def test_a_decoy_base_token_in_a_hunk_does_not_force_a_rerun(_pr_world):
+    """The comment already answers for this (pr, base) pair, so process_pr
+    must short-circuit. Reading the FIRST [base:] finds the decoy, decides
+    main has advanced, and re-renders on every single poll forever."""
+    pr = {"id": 4437, "title": "[COPS-2715] probe",
+          "source": {"commit": {"hash": PR_SHA},
+                     "branch": {"name": "feature/x"}},
+          "destination": {"branch": {"name": "main"}}}
+    m.process_pr(pr, {CHANGED: ["cl-prod-b-ms"]},
+                 base_sha=BASE_SHA, repo=REPO)
+    assert _pr_world["upserts"] == [], (
+        "the decoy token in the hunk beat the footer and triggered a "
+        "needless re-render")
