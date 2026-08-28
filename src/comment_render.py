@@ -11,7 +11,7 @@ from the service and must stay that way.
 import re
 
 import diff_ui
-from manifest import _is_kcc_blocking_artifact
+from manifest import _is_kcc_blocking_artifact, _hpa_headers
 from vocabulary import (
     OUT_DIFF,
     OUT_ERROR,
@@ -267,6 +267,33 @@ _DECOM_FLAG_TYPO_HDR = (
     "arms nothing (or not what you expect).**")
 
 
+def _pingscaler_reclass(results) -> dict:
+    """{app: set(deleted HPA headers)} explained by a ping-scaler being
+    CREATED in the same environment by this same PR.
+
+    Cross-app on purpose: the Deployment lands in {env}-ss while the HPAs
+    leave {env}-ms (the first 2.106.0 render of acme-config-prod #4444
+    proved a same-app pairing never fires). Still narrow: exact Deployment
+    name (detected at diff time), HPA kinds only, same environment -- an
+    activation in pv-a never explains a deletion in pv-b.
+    """
+    activated = {e for a, r in results.items()
+                 if getattr(r, "pingscaler_created", None)
+                 for e in _envs_from_apps([a])}
+    if not activated:
+        return {}
+    out = {}
+    for a, r in results.items():
+        if not getattr(r, "deleted_resources", None):
+            continue
+        if not set(_envs_from_apps([a])) & activated:
+            continue
+        hpas = _hpa_headers(r.deleted_resources)
+        if hpas:
+            out[a] = set(hpas)
+    return out
+
+
 # COPS-2714: where the ping-scaler handover is documented for operators.
 # Page-id URL on purpose (Confluence "3. Environments: charts and
 # configuration", section "Replica control"): it survives page renames.
@@ -436,8 +463,7 @@ def _build_merge_summary(results, rollup_by_sig, vm_change_lines,
         # COPS-2714: HPAs removed because this same PR enables the
         # ping-scaler are the chart's documented contract, not a destroy.
         # They get their own REVIEW line below instead of the BLOCK count.
-        ps_hdrs = {a: set(getattr(results[a], "pingscaler_takeover", None)
-                          or ()) for a in deleted_apps}
+        ps_hdrs = _pingscaler_reclass(results)
         hard_n = 0
         hard_apps = []
         orphan_n = 0
