@@ -243,6 +243,15 @@ spec:
             - name: AI_SUMMARY_ENABLED
               value: {{ .enabled | quote }}
             {{- end }}
+            {{- with .Values.comment }}
+            {{- if .smallDiffInlineBytes }}
+            # COPS-2715: below this many rendered section bytes the comment
+            # carries the diff inline instead of only linking it. Unset/0
+            # keeps the phase E summary-only shape.
+            - name: COMMENT_SMALL_DIFF_INLINE_BYTES
+              value: {{ .smallDiffInlineBytes | int64 | quote }}
+            {{- end }}
+            {{- end }}
           envFrom:
             - secretRef:
                 name: {{ include "acme-diff-preview.fullname" . }}-creds

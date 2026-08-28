@@ -25,6 +25,16 @@ leaderElection:
 # section). Purely additive to the deterministic diff/warnings sections,
 # which render identically either way. Disabling it also skips the Vertex
 # AI call entirely (not just its output), so it costs nothing while off.
+# COPS-2715: a pull request whose whole rendered change is this small gets
+# its diff in the comment, not just a link to it. acme-config-prod #4437
+# (remove one env var) and #4436 (add it back) produced byte-identical
+# comments before this. Measured over 120 live artifacts the rendered hunk
+# bytes are bimodal (p25 482 B, p50 9,350 B), so a low-thousands threshold
+# separates the readable changes from the ones the full-diff page exists
+# for. 0 disables it and keeps the summary-only comment.
+comment:
+  smallDiffInlineBytes: 0
+
 aiSummary:
   enabled: true
 
@@ -70,7 +80,7 @@ image:
   # Kept in sync with Chart.yaml appVersion (RELEASING.md). This default had
   # drifted since v2.7.0; it never bit us because acme-infrastructure pins the
   # tag explicitly, but anyone installing the chart as-is got a stale image.
-  tag: "2.108.0"
+  tag: "2.109.0"
   pullPolicy: IfNotPresent
 
 # Log verbosity for the diff-preview service. Set to DEBUG to emit the full
