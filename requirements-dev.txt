@@ -13,7 +13,7 @@ PyYAML==6.0.3
 cydifflib==1.2.0
 zstandard==0.25.0
 # Property-based tests (tests/test_property_based.py) run in CI's `test` job.
-hypothesis==6.165.7
+hypothesis==6.165.10
 # Mutation testing (local, opt-in): `mutmut run` — config in pyproject.toml.
 mutmut==3.7.0
 # COPS-2595: suite speed and safety.
