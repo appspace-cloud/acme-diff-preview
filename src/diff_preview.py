@@ -64,6 +64,7 @@ import logsink  # structured logging seam (same-dir module, stdlib only)
 import fleet_health  # COPS-2694 fleet health gauges (same-dir module, stdlib only)
 import user_content  # COPS-2697 shared user-content identity (same-dir module, stdlib only)
 import blast_radius  # COPS-2693 Plan B blast-radius assessment (same-dir module, stdlib only)
+import values_redundancy  # COPS-2721 higher-layer redundant value callout
 import render_cache  # three-tier main-render cache (same-dir module)
 from render_cache import (  # re-exported: the suite reaches these on the hub
     MAIN_RENDER_CACHE_DIR,
@@ -167,6 +168,7 @@ from comment_render import (  # comment rendering (same-dir module, stdlib only)
     _DECOM_PUBLIC_CLOUD_NOOP_HDR,
     _DECOM_PUBLIC_CLOUD_WHY,
     _BLAST_RADIUS_HDR,
+    _VALUES_REDUNDANCY_HDR,
     _DECOM_VM_STRIP_HDR,
     _DECOM_FLAG_TYPO_HDR,
     _SHUTDOWN_MIN_WORKLOADS,
@@ -8257,6 +8259,110 @@ def _blast_radius_lines(changed_files, pr_sha, base_sha, path_map,
                                      DIFF_BLAST_ENVS, DIFF_BLAST_SPOKES)
 
 
+def _value_file_parent_chain(changed_path: str, apps, sha: str,
+                             repo=None) -> list:
+    """Ordered (path, flat) for every value file helm applies BEFORE the
+    changed file, for the first app that lists it.
+
+    Falls back to walking ancestor `config.yaml` directories (same shape
+    `_merged_kcc_flat_for_env` uses) when the app's valueFiles list is
+    missing or does not include the changed path — discovery can lag a
+    brand-new env, and a quiet panel is better than a wrong one.
+    """
+    clean = posixpath.normpath(changed_path.lstrip("/"))
+    ordered = []
+    for app in apps or []:
+        vfs = (_app_value_files_map or {}).get(app) or []
+        cleaned = [vf.split("$config/", 1)[-1].lstrip("/") for vf in vfs]
+        if clean in cleaned:
+            ordered = cleaned[:cleaned.index(clean)]
+            break
+    if not ordered:
+        # Path-walk fallback: every config.yaml above the changed file's dir.
+        probe = posixpath.dirname(clean)
+        ancestors = []
+        while "/" in probe:
+            probe = probe.rsplit("/", 1)[0]
+            ancestors.append(f"{probe}/config.yaml")
+        ancestors.reverse()
+        ordered = ancestors
+
+    chain = []
+    for path in ordered:
+        content, status = _bb_fetch_cached(path, sha, repo=repo)
+        if status == BB_ERROR:
+            return None  # fail closed for this file — caller skips it
+        if status != BB_OK or not content:
+            continue
+        try:
+            flat = _flatten_yaml(_yaml_safe_load(content) or {})
+        except Exception:
+            return None
+        chain.append((path, flat))
+    return chain
+
+
+def _values_redundancy_lines(changed_files, pr_sha, base_sha, path_map,
+                             repo=None) -> list:
+    """COPS-2721: call out value-file edits already identical in a parent.
+
+    Only identity / yaml value files that exist on BOTH sides are candidates
+    (same gate as `_summarize_input_changes`). Fail-open: a fetch or parse
+    miss skips that file; a total failure returns [] so process_pr's
+    try/except is belt-and-braces, not the only guard.
+    """
+    findings = []
+    seen = set()
+    for f in changed_files or []:
+        clean = posixpath.normpath(f.lstrip("/"))
+        if clean in seen:
+            continue
+        if not clean.endswith((".yaml", ".yml")):
+            continue
+        seen.add(clean)
+        # Prefer apps that own this path; fall back to empty so the
+        # ancestor walk still runs for a shared config.yaml edit.
+        apps = list(path_map.get(clean) or [])
+        if not apps:
+            # Shared config.yaml: any app whose valueFiles list contains it.
+            for app, vfs in (_app_value_files_map or {}).items():
+                cleaned = [vf.split("$config/", 1)[-1].lstrip("/")
+                           for vf in (vfs or [])]
+                if clean in cleaned:
+                    apps.append(app)
+                    if len(apps) >= 3:  # enough to resolve the chain
+                        break
+
+        new_txt, st_new = _bb_fetch_cached(clean, pr_sha, repo=repo)
+        old_txt, st_old = _bb_fetch_cached(clean, base_sha, repo=repo)
+        if st_new != BB_OK or st_old != BB_OK:
+            continue
+        try:
+            new_flat = _flatten_yaml(_yaml_safe_load(new_txt) or {})
+            old_flat = _flatten_yaml(_yaml_safe_load(old_txt) or {})
+        except yaml.YAMLError:
+            continue
+
+        chain = _value_file_parent_chain(clean, apps, pr_sha, repo=repo)
+        if chain is None:
+            continue
+        finding = values_redundancy.assess(clean, old_flat, new_flat, chain)
+        if finding:
+            findings.append(finding)
+    return values_redundancy.render_lines(findings, _VALUES_REDUNDANCY_HDR)
+
+
+def _clean_status_description(has_redundancy: bool,
+                              has_input_changes: bool) -> str:
+    """SUCCESSFUL build-status text when every evaluated app is unchanged.
+
+    COPS-2721: keep SUCCESSFUL (nothing failed) but stop the status reading
+    like a silent miss when the PR clearly edited YAML that a higher layer
+    already set, or that the chart did not consume.
+    """
+    return values_redundancy.noop_status_hint(has_redundancy, has_input_changes)
+
+
 def _flag_typo_status_description(appspace_state_lines) -> str:
     """The Bitbucket build-status line for a misspelled teardown flag.
 
@@ -10460,7 +10566,12 @@ def format_comment(pr_sha, app_results, skipped_apps=None, base_sha="",
         status = (f"\u2754 Diff incomplete \u2014 {len(unknown_apps)} app(s) could not "
                   f"be evaluated (NOT confirmed unchanged)")
     else:
-        status = "\u2705 No manifest changes"
+        # COPS-2721: a quiet render next to real YAML edits must not read as
+        # "nothing happened". Keep the green tick; name the reason.
+        _joined_state = "\n".join(appspace_state_lines or [])
+        status = "\u2705 " + _clean_status_description(
+            has_redundancy=_VALUES_REDUNDANCY_HDR in _joined_state,
+            has_input_changes=bool(input_change_lines))
 
     # v2.5.8: the downgrade must also be visible in the one-line status —
     # including the case where manifests are identical but the chart
@@ -11369,6 +11480,14 @@ def process_pr(pr, path_map, base_sha="", repo=None):
         except Exception as e:  # informational panel must never break the comment
             logsink.log(f"    [comment] blast-radius panel failed: {e}", "WARNING")
         try:
+            # COPS-2721: same channel — REVIEW verdict when customer.yaml
+            # re-states values a parent config.yaml already sets.
+            appspace_state_lines += _values_redundancy_lines(
+                changed, pr_sha, base_sha, path_map, repo=repo)
+        except Exception as e:
+            logsink.log(f"    [comment] values-redundancy panel failed: {e}",
+                        "WARNING")
+        try:
             vm_change_lines = _summarize_vm_changes(
                 changed, render_sha, base_sha, path_map, app_results, repo=repo)
         except Exception as e:  # VM panel must never break the comment
@@ -11652,7 +11771,14 @@ def process_pr(pr, path_map, base_sha="", repo=None):
                     f"No manifest changes to existing apps | +{len(new_env_candidates)} "
                     f"new environment(s) will be created{decom_extra}", pr_id=pr_id)
             else:
-                post_build_status(pr_sha, "SUCCESSFUL", f"No manifest changes{decom_extra}", pr_id=pr_id)
+                # COPS-2721: SUCCESSFUL stays (nothing failed), but the
+                # description names why the render is quiet when YAML moved.
+                _joined = "\n".join(appspace_state_lines or [])
+                _clean = _clean_status_description(
+                    has_redundancy=_VALUES_REDUNDANCY_HDR in _joined,
+                    has_input_changes=bool(input_change_lines))
+                post_build_status(pr_sha, "SUCCESSFUL",
+                                  f"{_clean}{decom_extra}", pr_id=pr_id)
 
         # Mark as seen logic:
         # - Clean run (no error, no indeterminate): mark seen -> skip next iteration

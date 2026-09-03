@@ -231,6 +231,11 @@ _DECOM_SHARED_UC_HDR = "**SHARED USER CONTENT - DO NOT MERGE WITHOUT CHECKING.**
 # via diff_preview), matched here for the REVIEW verdict line. Same one-constant
 # wiring as the headers above.
 _BLAST_RADIUS_HDR = "**Blast radius.**"
+# COPS-2721: written by values_redundancy.render_lines via diff_preview,
+# matched here for the REVIEW verdict line. Same one-constant wiring as
+# blast radius: a quiet render caused by copying parent values into
+# customer.yaml must not read as "the tool missed the change".
+_VALUES_REDUNDANCY_HDR = "**Higher-layer values.**"
 
 # COPS-2668: and a third state. The summary used to know only purge-vs-not,
 # so an environment with NO cascade armed — where the Applications go and
@@ -745,6 +750,17 @@ def _build_merge_summary(results, rollup_by_sig, vm_change_lines,
                              + _reach +
                              "; changes to shared config bypass cohort "
                              "staging (see the blast-radius note)"))
+        # COPS-2721: customer.yaml (or another leaf) re-states values a
+        # parent config.yaml already sets identically. Manifests stay
+        # byte-identical; without this line the verdict says Routine /
+        # "No manifest changes" and operators conclude Diff Preview missed
+        # the edit (acme-config-prod #4520).
+        if _VALUES_REDUNDANCY_HDR in txt:
+            findings.append((_SEV_REVIEW,
+                             "\U0001f4da **Higher-layer values already cover "
+                             "part of this PR** \u2014 some keys match an "
+                             "ancestor config.yaml, so they do not change "
+                             "rendered manifests (see the higher-layer note)"))
     if new_env_lines:
         findings.append((_SEV_REVIEW if new_env_structural else _SEV_ROUTINE,
                          "\U0001f195 **New environment** in this PR"
