@@ -7,9 +7,10 @@ name: Deploy Helm chart index to Pages
 # later" error requiring a manual re-run (hit on v2.5.6, v2.5.10, v2.5.13,
 # v2.5.14). An in-workflow retry (see the Deploy to GitHub Pages steps
 # below) was added so this self-heals instead of needing a manual re-run.
-# This workflow deploys the SAME gh-pages branch content (chart .tgz files +
-# index.yaml, published by chart-releaser-action in release.yml) via the
-# modern GitHub Actions Pages deployment method — same final URL
+# This workflow deploys the gh-pages branch content (index.yaml, published by
+# chart-releaser-action in release.yml; the chart .tgz files themselves are
+# release assets) plus the static landing page in pages/, via the modern
+# GitHub Actions Pages deployment method — same final URL
 # (https://appspace-cloud.github.io/acme-diff-preview/), no change for
 # ArgoCD/helm consumers of the chart repo.
 #
@@ -63,6 +64,23 @@ jobs:
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: gh-pages
+
+      # gh-pages holds only index.yaml, so the site root 404s. Ship the
+      # landing page from the default branch next to it. Explicit ref: on a
+      # workflow_run event the checkout default is the triggering run's ref,
+      # not necessarily a branch that has pages/.
+      - name: Checkout landing page from the default branch
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.event.repository.default_branch }}
+          path: .landing
+          sparse-checkout: pages
+          sparse-checkout-cone-mode: false
+
+      - name: Add landing page
+        run: |
+          cp .landing/pages/index.html index.html
+          rm -rf .landing
 
       - name: Upload Pages artifact
         uses: actions/upload-pages-artifact@fc324d3547104276b827a68afc52ff2a11cc49c9 # v5.0.0
