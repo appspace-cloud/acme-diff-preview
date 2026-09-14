@@ -121,6 +121,7 @@ from vocabulary import (  # diff outcome vocabulary (same-dir module, stdlib onl
     OUT_INDETERMINATE,
     OUT_ERROR,
     OUT_DECOMMISSIONED,
+    OUT_LEFTOVER_DECOMMISSIONED,
     REASON_OCI_NOT_FOUND,
     SELF_RESOLVING_REASONS,
     REASON_OCI_PULL,
@@ -134,6 +135,7 @@ from vocabulary import (  # diff outcome vocabulary (same-dir module, stdlib onl
     REASON_TEMPLATE,
     REASON_MISSING_REQUIRED,
     REASON_SCHEMA_INVALID,
+    REASON_LEFTOVER_DECOMMISSION,
     RETRYABLE_REASONS,
     PERMANENT_REASONS,
 )
@@ -6719,6 +6721,110 @@ def _apps_to_skip_for_decommission(candidates: list, confirmed_envs: list) -> se
     return {a for c in candidates if c["env_name"] in confirmed for a in c["apps"]}
 
 
+def _identity_file_for_app(app: str, path_map: dict):
+    """Return this app's environment identity file, or None.
+
+    Same env_name-prefix rule as `_detect_env_decommission_candidates` and
+    `_paused_apps_for`: only a customer.yaml/config.yaml whose directory
+    basename prefixes the app name counts. Shared ancestor defaults
+    (gcp/config.yaml, cohort config.yaml, …) are excluded so a missing
+    shared file can never be mistaken for a leftover decommission.
+    """
+    if not app or not path_map:
+        return None
+    short = app.split("/")[-1]
+    for ident, mapped in path_map.items():
+        if posixpath.basename(ident) not in _IDENTITY_BASENAMES:
+            continue
+        members = mapped or []
+        if app not in members and not any(
+                a.split("/")[-1] == short for a in members):
+            continue
+        env_name = posixpath.basename(posixpath.dirname(ident))
+        if _is_public_cloud_env(ident):
+            constellation = _public_cloud_env_name(ident)
+            if constellation and constellation != env_name:
+                env_name = constellation
+        if short.startswith(env_name + "-"):
+            return ident
+    return None
+
+
+def _apps_to_skip_as_leftover_decommission(
+        affected, path_map, base_sha, pr_sha, repo=None,
+        already_skipped=None) -> dict:
+    """Apps whose identity file is absent on BOTH base and PR head.
+
+    COPR-32434: a mid-prune Argo Application after an earlier decommission
+    stays in `discover_path_app_map()`. Its identity file is not among this
+    PR's changed files, so `_detect_env_decommission_candidates` never sees
+    it, and the app enters the normal render pipeline. Helm then fails on
+    `required` (no customerName) and every unrelated PR is blocked with
+    RENDER BLOCKED / MISSING REQUIRED VALUE.
+
+    Fail closed: only skip when BOTH fetches return BB_NOT_FOUND. BB_ERROR
+    or BB_OK on either side keeps today's blocking behaviour. No resolvable
+    identity file also keeps today's behaviour — absence cannot be proven.
+
+    Distinct from OUT_DECOMMISSIONED / confirmed_decommission: that means
+    *this* PR deleted the env. A leftover must not blame the PR author.
+
+    Returns {app: identity_file} for apps to skip.
+    """
+    already = set(already_skipped or ())
+    out = {}
+    status_cache = {}
+    for app in affected or []:
+        if app in already:
+            continue
+        ident = _identity_file_for_app(app, path_map)
+        if not ident:
+            continue
+        statuses = []
+        for sha in (base_sha, pr_sha):
+            key = (ident, sha)
+            if key not in status_cache:
+                _c, st = _bb_fetch_cached(ident, sha, repo=repo)
+                status_cache[key] = st
+            statuses.append(status_cache[key])
+        if all(st == BB_NOT_FOUND for st in statuses):
+            out[app] = ident
+    return out
+
+
+def _leftover_decommission_lines(leftover_apps: dict) -> list:
+    """Markdown panel for leftover Argo apps from a prior decommission.
+
+    Visible enough that someone unblocks the stuck Application; never framed
+    as something this PR did (unlike the confirmed-decommission warning).
+    """
+    if not leftover_apps:
+        return []
+    by_ident = {}
+    for app, ident in leftover_apps.items():
+        by_ident.setdefault(ident, []).append(app)
+    lines = [
+        "## \U0001f9f9 Leftover ArgoCD Application(s) from a prior decommission",
+        "",
+        "These Applications are still live in ArgoCD, but their identity "
+        "file is already gone on both `main` and this PR. **This PR did not "
+        "delete them** — they are leftovers from an earlier decommission that "
+        "has not finished pruning. They were skipped (not rendered) so they "
+        "do not block this PR.",
+        "",
+        "**Action:** finish deleting or unblock the stuck Application(s) in "
+        "ArgoCD so they stop appearing in the path map "
+        "(`argocd.argoproj.io/manifest-generate-paths`).",
+        "",
+    ]
+    for ident, apps in sorted(by_ident.items()):
+        env = posixpath.basename(posixpath.dirname(ident))
+        apps_md = ", ".join(f"`{a}`" for a in sorted(apps))
+        lines.append(f"- `{env}` (`{ident}`): {apps_md}")
+    lines.append("")
+    return lines
+
+
 def _rebase_value_files(value_files: list, old_env_dir: str, new_env_dir: str) -> list:
     """Return value_files with the old env dir prefix replaced by the new one.
 
@@ -9522,7 +9628,8 @@ def _app_sort_key(app: str, r) -> tuple:
 
 def format_comment(pr_sha, app_results, skipped_apps=None, base_sha="",
                     new_env_lines=None, new_env_structural=False, new_env_desc="",
-                    decommission_lines=None, input_change_lines=None,
+                    decommission_lines=None, leftover_lines=None,
+                    input_change_lines=None,
                     appspace_state_lines=None, appendix_lines=None,
                     vm_change_lines=None, artifact_url="",
                     readable_budget=None, profile=None, paused_apps=None):
@@ -9866,6 +9973,11 @@ def format_comment(pr_sha, app_results, skipped_apps=None, base_sha="",
     if decommission_lines:
         lines += decommission_lines
 
+    # COPR-32434: leftover Argo apps from a PRIOR decommission. Informational
+    # (does not blame this PR), but visible so someone finishes the prune.
+    if leftover_lines:
+        lines += leftover_lines
+
     # ── VM infrastructure changes ─────────────────────────────────────
     # Between the decommission warning (whole-environment destruction
     # outranks a field change) and the downgrade shout: a botched VM
@@ -10066,14 +10178,15 @@ def format_comment(pr_sha, app_results, skipped_apps=None, base_sha="",
     # adding pure scroll with zero review value. A one-line count replaces
     # them, and a PR whose every app is unchanged renders no table at all.
     _table_rendered = any(
-        r.outcome in (OUT_DIFF, OUT_DECOMMISSIONED, OUT_INDETERMINATE,
-                      OUT_ERROR)
+        r.outcome in (OUT_DIFF, OUT_DECOMMISSIONED, OUT_LEFTOVER_DECOMMISSIONED,
+                      OUT_INDETERMINATE, OUT_ERROR)
         for r in results.values())
     if quiet_render_block and _table_rendered:
         # COPS-2676: overview table is pure scroll on a fleet render miss.
         _n_apps = sum(
             1 for r in results.values()
-            if r.outcome in (OUT_DIFF, OUT_DECOMMISSIONED, OUT_INDETERMINATE,
+            if r.outcome in (OUT_DIFF, OUT_DECOMMISSIONED,
+                             OUT_LEFTOVER_DECOMMISSIONED, OUT_INDETERMINATE,
                              OUT_ERROR))
         lines += [
             f"#### Changeset overview collapsed ({_n_apps} apps) "
@@ -10129,6 +10242,9 @@ def format_comment(pr_sha, app_results, skipped_apps=None, base_sha="",
                             f"| {label} |")
             elif r.outcome == OUT_DECOMMISSIONED:
                 rows.append(f"| `{app}` | \U0001f5d1\ufe0f decommissioned | \u2014 | \u2014 |")
+            elif r.outcome == OUT_LEFTOVER_DECOMMISSIONED:
+                rows.append(f"| `{app}` | \U0001f9f9 leftover (prior decommission) "
+                            f"| \u2014 | \u2014 |")
             elif r.outcome == OUT_INDETERMINATE:
                 rows.append(f"| `{app}` | \u2754 diff unavailable | \u2014 | \u2014 |")
             elif r.outcome == OUT_ERROR:
@@ -10214,6 +10330,19 @@ def format_comment(pr_sha, app_results, skipped_apps=None, base_sha="",
             # unresolved problem when this is a settled, understood fact.
             lines += [f"\U0001f5d1\ufe0f **`{app}`** \u2014 environment decommissioned "
                       f"(see warning above)", ""]
+
+        elif r.outcome == OUT_LEFTOVER_DECOMMISSIONED:
+            # COPR-32434: prior decommission leftover. Informational only —
+            # never "diff unavailable" / MISSING REQUIRED (that blocked
+            # unrelated PRs). The panel above already lists the identity
+            # file and the Argo unblock action.
+            ident = (r.error or "").strip()
+            detail = f" (`{ident}`)" if ident else ""
+            lines += [
+                f"\U0001f9f9 **`{app}`** \u2014 leftover ArgoCD Application "
+                f"from a prior decommission{detail} (skipped; see panel above)",
+                "",
+            ]
 
         elif r.outcome == OUT_INDETERMINATE:
             any_unknown = True
@@ -11096,6 +11225,14 @@ def process_pr(pr, path_map, base_sha="", repo=None):
         # non-retried, non-blocking result directly instead.
         decommissioned_apps = _apps_to_skip_for_decommission(
             decommission_candidates, decommissioned_envs)
+        # COPR-32434: same skip for leftovers of an EARLIER decommission —
+        # identity gone on both base and PR head, but this PR did not touch
+        # the identity file so the detector above never saw them. Fail
+        # closed inside the helper (BB_NOT_FOUND on both shas only).
+        leftover_apps = _apps_to_skip_as_leftover_decommission(
+            affected, path_map, base_sha, render_sha, repo=repo,
+            already_skipped=decommissioned_apps)
+        leftover_lines = _leftover_decommission_lines(leftover_apps)
         app_results = {}
         if decommissioned_apps:
             logsink.log(f"PR #{pr_id}: skipping normal diff for {len(decommissioned_apps)} "
@@ -11105,6 +11242,16 @@ def process_pr(pr, path_map, base_sha="", repo=None):
                 app_results[app] = DiffResult(
                     "", [], 0, False, None, OUT_DECOMMISSIONED, "confirmed_decommission")
             affected = [a for a in affected if a not in decommissioned_apps]
+        if leftover_apps:
+            logsink.log(f"PR #{pr_id}: skipping normal diff for {len(leftover_apps)} "
+                        f"leftover-decommissioned app(s) (prior teardown still "
+                        f"in ArgoCD): {sorted(leftover_apps)}",
+                        pr=pr_id, event="leftover_decommission_skip")
+            for app, ident in leftover_apps.items():
+                app_results[app] = DiffResult(
+                    "", [], 0, False, ident, OUT_LEFTOVER_DECOMMISSIONED,
+                    REASON_LEFTOVER_DECOMMISSION)
+            affected = [a for a in affected if a not in leftover_apps]
 
         skipped_apps = []
         _record_affected_apps(len(affected))
@@ -11121,8 +11268,9 @@ def process_pr(pr, path_map, base_sha="", repo=None):
         # pre-populated in app_results, so they must still count toward the
         # expected total or a genuine partial-batch abort on the REMAINING
         # apps would go undetected (len(app_results) would look "complete"
-        # too early).
-        total_apps_this_run = len(affected) + len(decommissioned_apps)
+        # too early). COPR-32434: leftovers count the same way.
+        total_apps_this_run = (len(affected) + len(decommissioned_apps)
+                               + len(leftover_apps))
 
         app_results   = app_results  # pre-populated above with any confirmed-decommission results
         any_hard_error = False   # OUT_ERROR — unexpected failure
@@ -11132,9 +11280,9 @@ def process_pr(pr, path_map, base_sha="", repo=None):
         any_unknown    = False   # OUT_INDETERMINATE — diff not computable
         outcome_counts = Counter()
         reason_counts  = Counter()
-        # Seed with the pre-populated confirmed-decommission results (never
-        # went through run_diff, so the normal per-app counting loop below
-        # never sees them).
+        # Seed with the pre-populated confirmed-decommission / leftover
+        # results (never went through run_diff, so the normal per-app
+        # counting loop below never sees them).
         for _r in app_results.values():
             outcome_counts[_r.outcome] += 1
 
@@ -11507,6 +11655,7 @@ def process_pr(pr, path_map, base_sha="", repo=None):
             new_env_structural=bool(structural_envs or moves_missing_cohort),
             new_env_desc=new_env_desc,
             decommission_lines=decommission_lines or None,
+            leftover_lines=leftover_lines or None,
             input_change_lines=input_change_lines or None,
             appspace_state_lines=appspace_state_lines or None,
             appendix_lines=((decom_full_lines or [])
@@ -11622,6 +11771,10 @@ def process_pr(pr, path_map, base_sha="", repo=None):
         decom_extra = (
             f" | \U0001f5d1\ufe0f {len(decommissioned_envs)} environment(s) being decommissioned"
             if decommissioned_envs else "")
+        leftover_extra = (
+            f" | \U0001f9f9 {len(leftover_apps)} leftover app(s) from prior decommission"
+            if leftover_apps else "")
+        status_extra = decom_extra + leftover_extra
 
         # v2.5.4 (Finding 1): traffic-light rule agreed with Marcos — green ONLY
         # when the diff was actually computed (with or without changes); ANY
@@ -11758,18 +11911,18 @@ def process_pr(pr, path_map, base_sha="", repo=None):
             # below); only the color is different now.
             extra = f" | {sections_total} resource(s) confirmed changed" if sections_total else ""
             post_build_status(pr_sha, "FAILED",
-                f"Diff unavailable for {n_unknown} app(s){extra}{decom_extra} - review comment "
+                f"Diff unavailable for {n_unknown} app(s){extra}{status_extra} - review comment "
                 f"(will retry automatically if transient)", pr_id=pr_id)
         elif sections_total > 0:
             extra = f" | +{len(new_env_candidates)} new environment(s) will be created" if new_env_candidates else ""
             post_build_status(pr_sha, "SUCCESSFUL",
-                f"{sections_total} resource(s) will change{extra}{decom_extra} - review comment",
+                f"{sections_total} resource(s) will change{extra}{status_extra} - review comment",
                 pr_id=pr_id)
         else:
             if new_env_candidates:
                 post_build_status(pr_sha, "SUCCESSFUL",
                     f"No manifest changes to existing apps | +{len(new_env_candidates)} "
-                    f"new environment(s) will be created{decom_extra}", pr_id=pr_id)
+                    f"new environment(s) will be created{status_extra}", pr_id=pr_id)
             else:
                 # COPS-2721: SUCCESSFUL stays (nothing failed), but the
                 # description names why the render is quiet when YAML moved.
@@ -11778,7 +11931,7 @@ def process_pr(pr, path_map, base_sha="", repo=None):
                     has_redundancy=_VALUES_REDUNDANCY_HDR in _joined,
                     has_input_changes=bool(input_change_lines))
                 post_build_status(pr_sha, "SUCCESSFUL",
-                                  f"{_clean}{decom_extra}", pr_id=pr_id)
+                                  f"{_clean}{status_extra}", pr_id=pr_id)
 
         # Mark as seen logic:
         # - Clean run (no error, no indeterminate): mark seen -> skip next iteration
