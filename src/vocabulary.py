@@ -15,6 +15,9 @@ OUT_NO_DIFF       = "no_diff"
 OUT_INDETERMINATE = "indeterminate"
 OUT_ERROR         = "error"
 OUT_DECOMMISSIONED = "decommissioned"
+# COPR-32434: Argo Application still live after an earlier decommission
+# finished deleting the identity file. Informational; never blocks.
+OUT_LEFTOVER_DECOMMISSIONED = "leftover_decommissioned"
 
 
 REASON_OCI_NOT_FOUND = "oci_not_found"      # version absent in registry — PERMANENT, blocks PR
@@ -36,6 +39,9 @@ REASON_MISSING_REQUIRED = "missing_required"  # v2.6.2: helm `required`/nil-dere
 REASON_SCHEMA_INVALID   = "schema_invalid"     # COPS-2554: values.schema.json validation failed
 REASON_TEMPLATE      = "template_failed"       # COPS-2661: template EXECUTION failed on these
                                                # values — deterministic, never resolves on retry
+# COPR-32434: identity gone on both base and PR head — not this PR's doing.
+# Must stay out of BOTH buckets (same contract as confirmed_decommission).
+REASON_LEFTOVER_DECOMMISSION = "leftover_decommission"
 
 
 RETRYABLE_REASONS = {REASON_OCI_PULL, REASON_METADATA, REASON_TIMEOUT, REASON_RENDER}

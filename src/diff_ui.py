@@ -82,6 +82,7 @@ _OUTCOME_LABELS = {
     "indeterminate": "unavailable",
     "error": "errors",
     "decommissioned": "decommissioned",
+    "leftover_decommissioned": "leftover (prior decommission)",
 }
 
 # Bitbucket repo slugs are lowercase alphanumerics plus ._- ; PR ids are

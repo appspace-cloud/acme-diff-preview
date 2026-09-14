@@ -139,6 +139,11 @@ def _reset_state():
         m._base_observed.clear()
     with m._main_render_lock:
         m._main_render_cache.clear()
+    # COPR-32434: leftover detection caches BB_NOT_FOUND answers. A prior
+    # test's blank 404 must not make every later app look decommissioned.
+    with m._vf_cache_lock:
+        m._vf_cache.clear()
+        m._vf_inflight.clear()
     diff_ui.reset_pending_uploads()
 
 
@@ -181,9 +186,22 @@ def world(monkeypatch):
     monkeypatch.setattr(m, "fix_stuck_inprogress", lambda *a, **k: None)
     monkeypatch.setattr(m, "_touch_progress", lambda: None)
 
-    # No Bitbucket: every file read is a clean 404 unless a test serves it.
-    monkeypatch.setattr(m, "_bb_fetch_status",
-                        lambda path, sha, repo=None: (None, m.BB_NOT_FOUND))
+    # Live apps still have their identity file on main (and usually the PR).
+    # A blanket 404 for every path looks exactly like a COPR-32434 leftover
+    # and would skip every app before argocd_diff runs. Serve the identity
+    # at the shas this world uses; everything else stays a clean 404.
+    _live_identity = "appspace:\n  customerName: cov671\n"
+    _default_files = {
+        (IDENTITY, BASE_SHA): _live_identity,
+        (IDENTITY, PR_SHA): _live_identity,
+        (IDENTITY, NEWER_BASE): _live_identity,
+    }
+
+    def _default_fetch(path, sha, repo=None):
+        v = _default_files.get((path, sha))
+        return (v, m.BB_OK) if v is not None else (None, m.BB_NOT_FOUND)
+
+    monkeypatch.setattr(m, "_bb_fetch_status", _default_fetch)
 
     plan = {}
 
@@ -199,9 +217,22 @@ def world(monkeypatch):
 
 
 def _serve(monkeypatch, files):
-    """Serve a {(path, sha): content} map through the Bitbucket fetch seam."""
+    """Serve a {(path, sha): content} map through the Bitbucket fetch seam.
+
+    Merges with the world fixture's live-identity defaults so a test that
+    only stubs one side (e.g. PR-sha autosync) does not accidentally make
+    the base look like a prior decommission (COPR-32434).
+    """
+    _live_identity = "appspace:\n  customerName: cov671\n"
+    merged = {
+        (IDENTITY, BASE_SHA): _live_identity,
+        (IDENTITY, PR_SHA): _live_identity,
+        (IDENTITY, NEWER_BASE): _live_identity,
+    }
+    merged.update(files)
+
     def fake(path, sha, repo=None):
-        v = files.get((path, sha))
+        v = merged.get((path, sha))
         return (v, m.BB_OK) if v is not None else (None, m.BB_NOT_FOUND)
     monkeypatch.setattr(m, "_bb_fetch_status", fake)
 
