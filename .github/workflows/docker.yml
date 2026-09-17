@@ -60,8 +60,11 @@ jobs:
           platforms: linux/amd64
           push: true
           tags: ${{ env.JFROG_REGISTRY }}/${{ env.IMAGE_NAME }}:${{ steps.meta.outputs.version }}
+          # ARGOCD_VERSION is deliberately NOT passed here: the Dockerfile ARG is
+          # the single source of truth. It was pinned in both places, so this
+          # value silently overrode the Dockerfile and shipped 2.114.0 with the
+          # old CLI while every check stayed green (COPS-2723).
           build-args: |
-            ARGOCD_VERSION=v3.4.3
             APP_VERSION=${{ steps.meta.outputs.version }}
           # No registry cache — avoids the manifest write that triggers an
           # overwrite-permission error on JFrog when the tag already exists.

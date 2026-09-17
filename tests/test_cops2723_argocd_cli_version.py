@@ -18,6 +18,7 @@ import pathlib
 
 ROOT = pathlib.Path(__file__).resolve().parent.parent
 DOCKERFILE = ROOT / "Dockerfile"
+WORKFLOWS = ROOT / ".github" / "workflows"
 
 
 def _arg(name):
@@ -43,4 +44,28 @@ def test_helm_version_untouched_by_this_bump():
     assert _parts(_arg("HELM_VERSION"))[0] == 3, (
         "HELM_VERSION left the 3.x line; re-read the render-cache salt section "
         "of RELEASING.md before shipping"
+    )
+
+
+def test_no_workflow_overrides_the_dockerfile_argocd_pin():
+    """The bug this test exists for.
+
+    docker.yml passed `ARGOCD_VERSION=v3.4.3` as a build-arg, which overrides
+    the Dockerfile ARG. Bumping the Dockerfile alone therefore shipped 2.114.0
+    with the OLD CLI while every check — unit tests, helm lint, kind, CodeQL,
+    the image build itself — stayed green. The version lived in two places and
+    only one of them was obvious.
+
+    The Dockerfile is the single source of truth. A workflow may not pin a
+    different value behind its back.
+    """
+    dockerfile_pin = _arg("ARGOCD_VERSION")
+    offenders = []
+    for wf in sorted(WORKFLOWS.glob("*.y*ml")):
+        for m in re.finditer(r"ARGOCD_VERSION\s*[=:]\s*(\S+)", wf.read_text()):
+            if m.group(1).strip("\"'") != dockerfile_pin:
+                offenders.append(f"{wf.name}: {m.group(0).strip()}")
+    assert not offenders, (
+        "workflow pins ARGOCD_VERSION differently from the Dockerfile "
+        f"({dockerfile_pin}); it would silently win at build time: " + "; ".join(offenders)
     )
