@@ -14,6 +14,7 @@ os.environ.setdefault("BB_USER", "t")
 os.environ.setdefault("BB_TOKEN", "t")
 os.environ.setdefault("ARGOCD_PASS", "t")
 
+import pytest
 import yaml
 
 import values_redundancy as vr
@@ -161,7 +162,9 @@ def _wire(monkeypatch, old_customer, new_customer, parent_yaml):
     return {CUSTOMER: [app]}
 
 
-def test_panel_fires_on_pasted_hpa_metrics_already_in_gcp_config(monkeypatch):
+# owned=False: a file no app owns in path_map; the app comes from its valueFiles list.
+@pytest.mark.parametrize("owned", [True, False])
+def test_panel_fires_on_pasted_hpa_metrics_already_in_gcp_config(monkeypatch, owned):
     parent = yaml.dump({
         "appspace": {"microservices": {"definitions": {"network": {"hpa": {
             "metrics": HPA_METRICS,
@@ -186,7 +189,7 @@ def test_panel_fires_on_pasted_hpa_metrics_already_in_gcp_config(monkeypatch):
     })
     path_map = _wire(monkeypatch, old, new, parent)
     lines = m._values_redundancy_lines(
-        [CUSTOMER], PR_SHA, BASE_SHA, path_map, repo="acme-config-prod")
+        [CUSTOMER], PR_SHA, BASE_SHA, path_map if owned else {}, repo="acme-config-prod")
     body = "\n".join(lines)
     assert _VALUES_REDUNDANCY_HDR in body
     assert GCP_CFG in body

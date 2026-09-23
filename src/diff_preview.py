@@ -3243,6 +3243,14 @@ def _bb_fetch_status(filepath, sha, repo=None):
                     return r.read().decode("utf-8", errors="replace"), BB_OK
         except urllib.error.HTTPError as e:
             if e.code == 404:
+                # A sha Bitbucket does not know (the merge preview lives only in
+                # our mirror) is a failed read, not an absent file: never cache it.
+                try:
+                    unknown_commit = b"Commit not found" in e.read(4096)
+                except (OSError, ValueError, _http_client.HTTPException):
+                    unknown_commit = True  # cannot tell it from absence: do not cache
+                if unknown_commit:
+                    return None, BB_ERROR
                 return None, BB_NOT_FOUND   # genuinely absent at this sha
             if e.code in (429, 500, 502, 503, 504) and attempt < 2:
                 if e.code == 429:
@@ -4725,6 +4733,10 @@ def _detect_new_env_candidates(changed_files: list, path_map: dict, renames: dic
                 logsink.debug(f"new-env identity fetch failed for {cf}: {e}; "
                               f"keeping candidate")
                 continue
+            if _st == BB_ERROR:  # a failed read is not "declares no customerName"
+                raise ValueFileUnreadable(
+                    f"value file unreadable at sha {pr_sha[:8]} "
+                    f"(Bitbucket transport, not absence): {cf}")
             cname, _suffix = _extract_appspace_identity(content or "")
             if cname is None:
                 logsink.log(f"new-env candidate '{info['name']}' skipped: {cf} "
@@ -5074,6 +5086,10 @@ def _render_new_env_diff(env_info: dict, pr_sha: str) -> tuple:
 
     # 1. Fetch config to get appspace.version
     raw_config, status = _bb_fetch_cached(config_file, pr_sha)
+    if status == BB_ERROR:  # retried, never a "structural problem" verdict
+        raise ValueFileUnreadable(
+            f"value file unreadable at sha {pr_sha[:8]} "
+            f"(Bitbucket transport, not absence): {config_file}")
     if status != BB_OK or not raw_config:
         return None, f"could not fetch {config_file} from Bitbucket", 0, None
     version = _extract_chart_version(raw_config)
@@ -5096,6 +5112,10 @@ def _render_new_env_diff(env_info: dict, pr_sha: str) -> tuple:
             ancestors.append(f"{probe}/config.yaml")
         for anc in ancestors:
             raw_anc, st_anc = _bb_fetch_cached(anc, pr_sha)
+            if st_anc == BB_ERROR:  # not "no version found"
+                raise ValueFileUnreadable(
+                    f"value file unreadable at sha {pr_sha[:8]} "
+                    f"(Bitbucket transport, not absence): {anc}")
             if st_anc == BB_OK and raw_anc:
                 v = _extract_chart_version(raw_anc)
                 if v:
@@ -5594,6 +5614,7 @@ def _rename_identity_confirmed(old_clean: str, new_clean: str,
     try:
         old_content, _old_status = _bb_fetch_cached(old_clean, main_sha)
         new_content, _new_status = _bb_fetch_cached(new_clean, pr_sha)
+        fetch_failed = BB_ERROR in (_old_status, _new_status)  # a guess, like a raise
     except Exception as e:
         logsink.debug(f"identity check fetch failed for {old_clean} -> {new_clean}: {e}")
         old_content = new_content = None
@@ -11191,11 +11212,7 @@ def process_pr(pr, path_map, base_sha="", repo=None):
 
         # COPR-32566: same hard block for a clone whose names miss its token.
         # A fix push is a new sha, so the check runs again and edits this comment.
-        try:
-            token_hits = _detect_partition_token_misses(changed, render_sha, repo=repo, base_sha=base_sha)
-        except ValueFileUnreadable:
-            _backoff_register_transient(sk, pr_sha)  # COPS-2546: space out the retries
-            raise
+        token_hits = _detect_partition_token_misses(changed, render_sha, repo=repo, base_sha=base_sha)
         if token_hits:
             desc, body = _partition_token_block(token_hits, pr_sha, base_sha)
             post_build_status(pr_sha, "FAILED", desc, pr_id=pr_id)
@@ -12095,6 +12112,8 @@ def process_pr(pr, path_map, base_sha="", repo=None):
         # message, since a reviewer needs the outcome, not our stack.
         _transient = _is_transient_exception(e)
         _tok = "transient" if _transient else "permanent"
+        if _transient:
+            _backoff_register_transient(sk, pr_sha)  # COPS-2546, as in the normal path
         logsink.log(f"[ERROR] PR #{pr_id}: {e} ({_tok})\n"
                     f"{traceback.format_exc()}", "ERROR")
         try:
