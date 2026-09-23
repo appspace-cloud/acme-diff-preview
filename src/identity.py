@@ -179,8 +179,8 @@ _FOLDER_TOKEN_RE = re.compile(r"--(aec|sbx)(\d+)(?=-|$)")
 def _expected_partition_token(path):
     """The token (`--aec1`, `--sbx1`) a clone's names must carry, or None.
 
-    A clone lives under `<cloud>/aec/` or `*/sandbox/`, or has a token in
-    its folder name. The tree gives the word, the folder its number (`--aec2`).
+    Under aec/ or sandbox/ the path sets the word; a folder token only sets
+    the number (`--aec2`).
     """
     parts = path.split("/")
     m = _FOLDER_TOKEN_RE.search(parts[-2] if len(parts) > 1 else "")
@@ -218,14 +218,14 @@ def _partition_token_misses(path, doc):
         return None, []
     names = []
     for field, keys in _TOKEN_FIELDS:
-        v = doc.get("appspace") if isinstance(doc, dict) else None
-        for k in keys:
+        v = doc
+        for k in ("appspace", *keys):
             v = v.get(k) if isinstance(v, dict) else None
         # mongo/rabbit instances: each item is a VM name, or {name: ...}
-        for n in v if isinstance(v, list) else [v]:
-            n = n.get("name") if isinstance(n, dict) else n
+        for item in v if isinstance(v, list) else [v]:
+            n = item.get("name") if isinstance(item, dict) else item
             # Helm's `default` treats false, 0 and "" as unset, and so does this.
-            if isinstance(n, (str, int)) and not isinstance(n, bool) and n not in ("", 0):
+            if n and isinstance(n, (str, int)):
                 names.append((field, str(n)))
     folder = path.split("/")[-2]
     near = _near_token_re(tok)

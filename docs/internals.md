@@ -51,18 +51,30 @@ or it reuses production's names: acme-config-prod PR #4671 cloned NBC with
 `customerName: nbc` (COPR-32566).
 
 A clone is a value file under `<cloud>/aec/` (`--aec1`) or `*/sandbox/`
-(`--sbx1`), or in a folder that already has an `--aec<n>` / `--sbx<n>` token.
-The tree gives the word and the folder its number (`--aec2`). For each changed
-clone value file (any of them: `cicd-versions.yaml` is merged last) the guard
-reads `customerName`, `customerSubdomain`, `instanceName`,
-`infra.deployLinuxServicesK8s.svc.instanceName`, each name in
-`infra.deployLinuxServicesK8s.mongo.instances` / `rabbit.instances` (KCC and ASO
-name those VMs directly) and `microservices.acmePingScaler.pingHost`, plus the
-folder name for a `customer.yaml`. Any value set without the token blocks the
-PR, with the fixed name for each one. An empty or absent value is not checked.
-The old side of a move (a 404) is skipped. Any other failed read gives a red,
-retried status (with the COPS-2546 backoff), never a pass. The check runs again
-on every new commit and edits the same comment.
+(`--sbx1`), or in a folder with an `--aec<n>` / `--sbx<n>` token. Under `aec/`
+or `sandbox/` the path sets the word; a folder token only sets the number
+(`--aec2`).
+
+The guard reads every changed clone value file (`cicd-versions.yaml` too: it is
+merged last), and only its first YAML document, as Helm does. These must carry
+the token when they are set:
+
+- the folder name, for a `customer.yaml`
+- `customerName`, `customerSubdomain` and `instanceName`
+- `infra.deployLinuxServicesK8s.svc.instanceName`
+- each name in `infra.deployLinuxServicesK8s.mongo.instances` and
+  `rabbit.instances` (KCC and ASO give these names to the VMs)
+- `microservices.acmePingScaler.pingHost`
+
+A missing value, or one Helm treats as unset (`""`, `false`, `0`), is not
+checked. The comment gives the fixed name for each value. The old side of a
+move (a 404) is skipped. Any other failed read gives a red status that is
+retried with the COPS-2546 backoff, never a pass. Every new commit is checked
+again, and the same comment is edited.
+
+The guard checks the file as it is after the merge, not only the lines the PR
+changed. So a miss that is already on `main` blocks every PR that edits that
+file until someone fixes it. Direct pushes to `main` are not checked.
 
 ### Handling mass version bumps (hundreds of apps in one PR)
 

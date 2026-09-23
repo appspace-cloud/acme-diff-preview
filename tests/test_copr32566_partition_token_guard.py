@@ -28,6 +28,7 @@ USB = f"{AEC}/pv-usbank-c/customer.yaml"
 USB_BAD = ("appspace:\n  customerName: usbank\n  suffix: c\n  instanceName: pv-usbank-c\n"
            "  infra:\n    deployLinuxServicesK8s:\n      svc:\n"
            "        instanceName: pv-usbank-svc-c\n")
+USB_DESC = "BLOCKED: pv-usbank-c needs --aec1 in folder, customerName, instanceName, svc.instanceName \u2014 fix and push"
 USB_FIXED = f"{AEC}/pv-usbank--aec1-c/customer.yaml"
 USB_GOOD = ("appspace:\n  customerName: usbank--aec1\n  suffix: c\n"
             "  instanceName: pv-usbank--aec1-c\n  infra:\n    deployLinuxServicesK8s:\n"
@@ -76,10 +77,13 @@ def test_the_nbc_incident_is_flagged():
     ("gcp/aec/private-cloud/na2-a/pv-heb-a/customer.yaml",
      "appspace:\n  customerName: heb--aec1\n  instanceName: pv-heb-a\n",
      [("folder", "pv-heb-a", "pv-heb--aec1-a"), ("instanceName", "pv-heb-a", "pv-heb--aec1-a")]),
+    # b9a272e90: the folder and customerName were production's.
+    (USB, "appspace:\n  customerName: usbank\n  suffix: a\n  instanceName: pv-usbank--aec1-a\n",
+     [("folder", "pv-usbank-c", "pv-usbank--aec1-c"), ("customerName", "usbank", "usbank--aec1")]),
     # a7e35d012: a new clone with production's names.
     ("gcp/aec/private-cloud/na2-a/weekly/pv-blackrock-a/customer.yaml",
-     "appspace:\n  customerName: blackrock\n  instanceName: pv-blackrock-a\n"
-     "  infra:\n    deployLinuxServicesK8s:\n      svc:\n        enabled: true\n",
+     ("appspace:\n  customerName: blackrock\n  instanceName: pv-blackrock-a\n"
+      "  infra:\n    deployLinuxServicesK8s:\n      svc:\n        enabled: true\n"),
      [("folder", "pv-blackrock-a", "pv-blackrock--aec1-a"),
       ("customerName", "blackrock", "blackrock--aec1"),
       ("instanceName", "pv-blackrock-a", "pv-blackrock--aec1-a")]),
@@ -196,9 +200,12 @@ def test_a_name_too_long_for_the_token_gets_no_other_suggestion():
 def test_the_shorten_line_starts_above_14_characters(name, shorten):
     path = f"{AEC}/pv-{name}-a/customer.yaml"
     hits = [(path, "--aec1", _misses(path, f"appspace:\n  customerName: {name}\n"))]
-    _, body = dp._partition_token_block(hits, "aabbccddeeff", BASE_SHA)
-    assert ("shorten the customer name" in body) is shorten
+    _, body = dp._partition_token_block(hits, "aabbccddeeff", "")
+    line = (f"- `customerName`: `{name}` \u2192 shorten the customer name to 14 characters "
+            f"or less, then add `--aec1`")
+    assert (line in body.splitlines()) is shorten
     assert (f"`{name}--aec1`" in body) is not shorten
+    assert "[base:" not in body
 
 
 def test_a_near_miss_before_a_dot_is_not_doubled():
@@ -295,7 +302,7 @@ def _apply(path, doc, misses):
         return new.get(str(node), node) if isinstance(node, (str, int)) else node
 
     folder = path.split("/")[-2]
-    fixed = dict((v, n) for f, v, n in misses if f == "folder").get(folder, folder)
+    fixed = next((n for f, _, n in misses if f == "folder"), folder)
     return path.replace(f"/{folder}/", f"/{fixed}/"), swap(doc)
 
 
@@ -341,14 +348,44 @@ def test_detector_checks_cicd_versions_too(monkeypatch):
         (cicd, "--aec1", [("instanceName", "pv-usbank-c", "pv-usbank--aec1-c")])]
 
 
+def test_detector_flags_only_what_the_pr_adds(monkeypatch):
+    # usbank's folder miss is already on main; the PR adds a bare instanceName.
+    main = "appspace:\n  customerName: usbank--aec1\n"
+    head = main + "  instanceName: pv-usbank-c\n"
+    monkeypatch.setattr(dp, "_bb_fetch_cached", lambda path, sha, repo=None: (
+        (main if sha == "base1" else head), dp.BB_OK))
+    assert dp._detect_partition_token_misses([USB], "sha1", base_sha="base1") == [
+        (USB, "--aec1", [("instanceName", "pv-usbank-c", "pv-usbank--aec1-c")])]
+    monkeypatch.setattr(dp, "_bb_fetch_cached", lambda path, sha, repo=None: (main, dp.BB_OK))
+    assert dp._detect_partition_token_misses([USB], "sha1", base_sha="base1") == []
+
+
+def test_detector_retries_when_main_cannot_be_read(monkeypatch):
+    monkeypatch.setattr(dp, "_bb_fetch_cached", lambda path, sha, repo=None: (
+        (None, dp.BB_ERROR) if sha == "base1" else (USB_BAD, dp.BB_OK)))
+    with pytest.raises(dp.ValueFileUnreadable):
+        dp._detect_partition_token_misses([USB], "sha1", base_sha="base1")
+
+
 def test_detector_skips_the_old_side_of_a_move(monkeypatch):
     monkeypatch.setattr(dp, "_bb_fetch_cached", _fetch({USB_FIXED: (USB_GOOD, dp.BB_OK)}))
     assert dp._detect_partition_token_misses([USB, USB_FIXED], "sha1") == []
 
 
-def test_detector_skips_malformed_yaml(monkeypatch):
-    monkeypatch.setattr(dp, "_bb_fetch_cached", _fetch({USB: ("appspace: [\n", dp.BB_OK)}))
-    assert dp._detect_partition_token_misses([USB], "sha1") == []
+@pytest.mark.parametrize("body", ["appspace: [\n", "appspace:\n  customerName: usbank--aec1\n  day: 2026-02-30\n"])
+def test_detector_skips_what_pyyaml_cannot_read(monkeypatch, body):
+    # A bad date is a ValueError, not a YAMLError; it must not end the PR as an error.
+    monkeypatch.setattr(dp, "_bb_fetch_cached", _fetch({USB_FIXED: (body, dp.BB_OK)}))
+    assert dp._detect_partition_token_misses([USB_FIXED], "sha1") == []
+
+
+@pytest.mark.parametrize("extra", ["---\n", "---\nappspace:\n  customerName: usbank--aec1\n", "---\n: : bad [\n"])
+def test_detector_reads_the_first_document_like_helm(monkeypatch, extra):
+    # Helm and the ApplicationSet use only the first document, so a later one hides nothing.
+    body = "appspace:\n  customerName: usbank\n" + extra
+    monkeypatch.setattr(dp, "_bb_fetch_cached", _fetch({USB_FIXED: (body, dp.BB_OK)}))
+    assert dp._detect_partition_token_misses([USB_FIXED], "sha1") == [
+        (USB_FIXED, "--aec1", [("customerName", "usbank", "usbank--aec1")])]
 
 
 def test_an_unreadable_file_is_retried_never_passed(monkeypatch):
@@ -359,6 +396,7 @@ def test_an_unreadable_file_is_retried_never_passed(monkeypatch):
     assert USB in str(exc.value)
 
 
+@pytest.mark.local_components
 @pytest.mark.parametrize("repo", ["acme-config-prod", "acme-config-stage", "acme-config-dev"])
 def test_current_main_of_the_config_repos_has_no_hits(repo):
     root = os.path.expanduser(f"~/gitprojects/{repo}")
@@ -382,11 +420,10 @@ def test_current_main_of_the_config_repos_has_no_hits(repo):
 # --- the message --------------------------------------------------------------
 
 def test_blocked_comment_tells_what_to_fix():
-    hits = [(USB, "--aec1", identity._partition_token_misses(USB, yaml.safe_load(USB_BAD))[1])]
+    hits = [(USB, "--aec1", _misses(USB, USB_BAD))]
     desc, body = dp._partition_token_block(hits, "aabbccddeeff", BASE_SHA)
-    assert desc == ("BLOCKED: pv-usbank-c needs --aec1 in folder, customerName, instanceName, "
-                    "svc.instanceName \u2014 fix and push")
-    for line in ("\u26d4 **Blocked: this clone uses production names.**",
+    assert desc == USB_DESC
+    for line in ("\u26d4 **Blocked: this clone is missing `--aec1`.**",
                  f"`{USB}`",
                  "- folder: `pv-usbank-c` \u2192 `pv-usbank--aec1-c`",
                  "- `customerName`: `usbank` \u2192 `usbank--aec1`",
@@ -395,22 +432,13 @@ def test_blocked_comment_tells_what_to_fix():
                  f"git mv {AEC}/pv-usbank-c {AEC}/pv-usbank--aec1-c",
                  ("Fix these, commit, and push again. This check runs again by itself "
                   "on the new commit."),
-                 "**Status:** \u26d4 Blocked \u2014 clone names miss `--aec1`"):
+                 "**Status:** \u26d4 Blocked \u2014 clone is missing `--aec1`"):
         assert line in body.splitlines(), line
     assert _extract_status_token(body) == "blocked"
     assert _extract_comment_sha(body) == "aabbccdd"
     assert body.rstrip().endswith(f"[blocked] [base:{BASE_SHA[:8]}]*")
     # Never the one render error the new-env path turns green.
     assert "missing required value" not in body.lower()
-
-
-def test_a_name_too_long_for_the_token_says_to_shorten_it():
-    path = f"{AEC}/pv-westinghousenuclear--aec1-a/customer.yaml"
-    hits = [(path, "--aec1", [("customerName", "westinghousenuclear", "westinghousenuclear--aec1")])]
-    _, body = dp._partition_token_block(hits, "aabbccddeeff", "")
-    assert ("- `customerName`: `westinghousenuclear` \u2192 shorten the customer name "
-            "to 14 characters or less, then add `--aec1`") in body.splitlines()
-    assert "[base:" not in body
 
 
 def test_without_a_suggestion_it_says_where_the_token_goes():
@@ -422,7 +450,7 @@ def test_without_a_suggestion_it_says_where_the_token_goes():
     assert "- `instanceName`: `pv-other-a` \u2192 add `--aec1` after the customer name" in body
     assert "- folder: `pv-odd` \u2192 add `--sbx1` after the customer name" in body
     assert "git mv" not in body
-    assert desc == ("BLOCKED: pv-acme--aec1-a, pv-ecudev--sbx1-a needs --aec1 or --sbx1 "
+    assert desc == ("BLOCKED: pv-acme--aec1-a, pv-ecudev--sbx1-a need --aec1 or --sbx1 "
                     "in instanceName, folder \u2014 fix and push")
     assert "Without `--aec1` or `--sbx1` it can reuse" in body
 
@@ -442,7 +470,7 @@ def test_many_environments_fit_the_status_and_the_comment():
             for i in range(40)]
     desc, body = dp._partition_token_block(hits, "aabbccddeeff", BASE_SHA)
     assert desc == ("BLOCKED: pv-customer000-long-name-a, pv-customer001-long-name-a (+38 more) "
-                    "needs --aec1 in folder, customerName \u2014 fix and push")
+                    "need --aec1 in folder, customerName \u2014 fix and push")
     wide = [(f"{AEC}/{'p' * 300}{i}/customer.yaml", "--aec1", [("folder", f"{'p' * 300}{i}", None)])
             for i in range(3)]
     wide_desc, _ = dp._partition_token_block(wide, "aabbccddeeff", "")
@@ -455,8 +483,10 @@ def test_many_environments_fit_the_status_and_the_comment():
 
 @pytest.fixture()
 def clone_pr(world, monkeypatch):
-    """A PR world whose comment persists between runs, like Bitbucket's."""
-    sinks, plan = world
+    """A PR world whose comment persists between runs, like Bitbucket's.
+
+    `files[path]` is the PR side; `files[("main", path)]` is main (default: absent)."""
+    sinks, _ = world
     store = {"ids": []}
 
     def upsert(pr_id, body, existing_id=None, repo=None, **kw):
@@ -472,8 +502,8 @@ def clone_pr(world, monkeypatch):
     files = {}
     monkeypatch.setattr(dp, "upsert_comment", upsert)
     monkeypatch.setattr(dp, "find_existing_comment", find)
-    monkeypatch.setattr(dp, "_bb_fetch_status",
-                        lambda path, sha, repo=None: files.get(path, (None, dp.BB_NOT_FOUND)))
+    monkeypatch.setattr(dp, "_bb_fetch_status", lambda path, sha, repo=None: files.get(
+        ("main", path) if sha == BASE_SHA else path, (None, dp.BB_NOT_FOUND)))
     monkeypatch.setattr(dp, "_vf_cache", {})
     monkeypatch.setattr(dp, "_retry_backoff", {})
     path_map = {p: ["pv-orch-a-ms", "pv-orch-a-ss"] for p in (USB, USB_FIXED)}
@@ -490,8 +520,7 @@ def test_process_pr_blocks_before_any_diff(clone_pr, monkeypatch):
     _changed(monkeypatch, [USB])
     dp.process_pr(_mk_pr(pr_id=4671), path_map, base_sha=BASE_SHA)
     state, desc = sinks.statuses[-1]
-    assert (state, desc) == ("FAILED", "BLOCKED: pv-usbank-c needs --aec1 in folder, customerName, "
-                                       "instanceName, svc.instanceName \u2014 fix and push")
+    assert (state, desc) == ("FAILED", USB_DESC)
     assert "[blocked]" in store["body"] and "pv-usbank--aec1-c" in store["body"]
     assert sinks.diff_calls == [], "a blocked clone must not be rendered"
     assert list(dp._seen.values()) == [(_mk_pr()["source"]["commit"]["hash"], BASE_SHA)]
@@ -503,9 +532,20 @@ def test_process_pr_blocks_a_new_environment_before_the_new_env_logic(clone_pr, 
     files[USB] = (USB_BAD, dp.BB_OK)
     _changed(monkeypatch, [USB])
     dp.process_pr(_mk_pr(pr_id=4671), {}, base_sha=BASE_SHA)
-    assert sinks.statuses == [("FAILED", "BLOCKED: pv-usbank-c needs --aec1 in folder, customerName, "
-                                         "instanceName, svc.instanceName \u2014 fix and push")]
-    assert "this clone uses production names" in store["body"]
+    assert sinks.statuses == [("FAILED", USB_DESC)]
+    assert "this clone is missing `--aec1`" in store["body"]
+
+
+def test_process_pr_a_miss_already_on_main_does_not_block(clone_pr, monkeypatch):
+    # The env is live with that name: blocking every PR that touches the file
+    # would stop fleet deploys and ask for a rename that needs a migration.
+    sinks, store, files, path_map = clone_pr
+    files[("main", USB)] = (USB_BAD, dp.BB_OK)
+    files[USB] = (USB_BAD + "  version: 2603.2.19\n", dp.BB_OK)
+    _changed(monkeypatch, [USB])
+    dp.process_pr(_mk_pr(pr_id=4671), path_map, base_sha=BASE_SHA)
+    assert sinks.statuses[-1][0] == "SUCCESSFUL"
+    assert _extract_status_token(store["body"]) == "clean"
 
 
 def test_process_pr_moving_production_into_aec_is_blocked(clone_pr, monkeypatch):

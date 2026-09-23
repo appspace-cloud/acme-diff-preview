@@ -4540,26 +4540,38 @@ def _detect_wiped_definitions(changed_files: list, sha: str, repo=None) -> list:
     return hits
 
 
-def _detect_partition_token_misses(changed_files: list, sha: str, repo=None) -> list:
+def _read_token_misses(path, sha, repo=None):
+    """_partition_token_misses for `path` at `sha`; (None, []) when it is absent
+    or PyYAML cannot read it. A failed read raises, so the PR is retried."""
+    body, status = _bb_fetch_cached(path, sha, repo=repo)
+    if status == BB_NOT_FOUND:
+        return None, []
+    if status != BB_OK:
+        raise ValueFileUnreadable(
+            f"value file unreadable at sha {sha[:8]} "
+            f"(Bitbucket transport, not absence): {path}")
+    try:
+        # Helm and the ApplicationSet read only the first document.
+        doc = next(yaml.load_all(body, Loader=_YAML_SAFE_LOADER), None)
+    except (yaml.YAMLError, ValueError):
+        return None, []  # PyYAML cannot read it (bad YAML, or a date like 2026-02-30)
+    return _partition_token_misses(path, doc)
+
+
+def _detect_partition_token_misses(changed_files: list, sha: str, repo=None, base_sha=None) -> list:
     """COPR-32566: (path, token, misses) for each changed clone value file at
-    `sha` whose names miss the token. A 404 is the old side of a move; any
-    other failed read raises, so the PR is retried instead of passed."""
+    `sha` whose names miss the token and did not miss it at `base_sha`. A 404
+    is a new file or the old side of a move."""
     hits = []
     for f in changed_files:
         if not f.endswith(_VALUE_FILE_SUFFIXES) or not _expected_partition_token(f):
             continue
-        body, status = _bb_fetch_cached(f, sha, repo=repo)
-        if status == BB_NOT_FOUND:
-            continue
-        if status != BB_OK:
-            raise ValueFileUnreadable(
-                f"value file unreadable at sha {sha[:8]} "
-                f"(Bitbucket transport, not absence): {f}")
-        try:
-            doc = _yaml_safe_load(body)
-        except yaml.YAMLError:
-            continue  # the render reports malformed YAML with its own message
-        tok, misses = _partition_token_misses(f, doc)
+        tok, misses = _read_token_misses(f, sha, repo)
+        if misses and base_sha:
+            # A miss already on main is live: renaming it needs a migration, and
+            # it must not block every PR that touches the file.
+            old = {m[:2] for m in _read_token_misses(f, base_sha, repo)[1]}
+            misses = [m for m in misses if m[:2] not in old]
         if misses:
             hits.append((f, tok, misses))
     return hits
@@ -4573,7 +4585,8 @@ def _partition_token_block(hits: list, pr_sha: str, base_sha: str):
     envs = list(dict.fromkeys(path.split("/")[-2] for path, _, _ in hits))
     where = ", ".join(envs[:2]) + (f" (+{len(envs) - 2} more)" if len(envs) > 2 else "")
     tail = " \u2014 fix and push"
-    desc = f"BLOCKED: {where} needs {' or '.join(toks)} in {fields}"[:255 - len(tail)] + tail
+    verb = "needs" if len(envs) == 1 else "need"
+    desc = f"BLOCKED: {where} {verb} {' or '.join(toks)} in {fields}"[:255 - len(tail)] + tail
 
     def short(v):
         return v if len(v) <= 100 else v[:99] + "\u2026"
@@ -4599,14 +4612,14 @@ def _partition_token_block(hits: list, pr_sha: str, base_sha: str):
     body = (
         f"## \U0001f52d {STATUS_NAME}\n\n"
         f"{_comment_header(pr_sha)}\n\n"
-        f"\u26d4 **Blocked: this clone uses production names.**\n\n"
+        f"\u26d4 **Blocked: this clone is missing {toks_md}.**\n\n"
         + "\n".join(out) +
         f"\n**Why:** a clone runs on the same cluster and cloud project as "
         f"production. Without {toks_md} it can reuse the production tenant's "
         f"namespace, VM and host names.\n\n"
         f"Fix these, commit, and push again. This check runs again by itself "
         f"on the new commit.\n\n"
-        f"---\n**Status:** \u26d4 Blocked \u2014 clone names miss {toks_md}\n"
+        f"---\n**Status:** \u26d4 Blocked \u2014 clone is missing {toks_md}\n"
         f"*{_ts()} \u2014 {COMMENT_MARKER} [blocked]"
         + (f" [base:{base_sha[:8]}]" if base_sha else "") + "*"
     )
@@ -11179,7 +11192,7 @@ def process_pr(pr, path_map, base_sha="", repo=None):
         # COPR-32566: same hard block for a clone whose names miss its token.
         # A fix push is a new sha, so the check runs again and edits this comment.
         try:
-            token_hits = _detect_partition_token_misses(changed, render_sha, repo=repo)
+            token_hits = _detect_partition_token_misses(changed, render_sha, repo=repo, base_sha=base_sha)
         except ValueFileUnreadable:
             _backoff_register_transient(sk, pr_sha)  # COPS-2546: space out the retries
             raise
