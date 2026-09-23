@@ -40,7 +40,7 @@ The guard flags a `definitions` key that is present but null/empty. A
 **missing** `definitions` key is safe (the chart's own map is kept intact) and
 is deliberately **not** blocked. To remove per-env overrides, delete the
 `definitions:` key entirely — never leave it present but empty. See
-[`docs/microservices-definitions-guard.md`](docs/microservices-definitions-guard.md)
+[`docs/microservices-definitions-guard.md`](microservices-definitions-guard.md)
 for the full incident write-up and the exact detection rule.
 
 ### Why a clone without its `--aec1` token is blocked
