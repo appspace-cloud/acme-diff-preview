@@ -167,6 +167,9 @@ def test_process_pr_new_env_branch_renders_and_reports(world, monkeypatch):
     monkeypatch.setattr(m, "_evaluate_new_envs",
                         lambda cands, pr_sha, **k:
                         (["- `pv-new-x-a`: renders cleanly (12 resources)"], [], 1, []))
+    # COPR-32578 reads main to see the env is new: it is absent there.
+    monkeypatch.setattr(m, "_vf_cache", {})
+    monkeypatch.setattr(m, "_bb_fetch_status", lambda path, sha, repo=None: (None, m.BB_NOT_FOUND))
     m.process_pr(_mk_pr(pr_id=993), PATH_MAP, base_sha=BASE_SHA)
     assert any("pv-new-x-a" in b for b in sinks.upserts), sinks.upserts[:1]
     states = [s for s, _ in sinks.statuses]
@@ -187,6 +190,9 @@ def test_process_pr_structural_new_env_blocks_the_pr(world, monkeypatch):
                         lambda cands, pr_sha, **k:
                         (["- `pv-new-y-a`: missing required value appspace.version"],
                          ["pv-new-y-a"], 1, []))
+    # COPR-32578 reads main to see the env is new: it is absent there.
+    monkeypatch.setattr(m, "_vf_cache", {})
+    monkeypatch.setattr(m, "_bb_fetch_status", lambda path, sha, repo=None: (None, m.BB_NOT_FOUND))
     m.process_pr(_mk_pr(pr_id=994), PATH_MAP, base_sha=BASE_SHA)
     states = [s for s, _ in sinks.statuses]
     assert states[-1] == "FAILED", sinks.statuses

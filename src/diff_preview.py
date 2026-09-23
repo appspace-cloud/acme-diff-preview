@@ -171,6 +171,7 @@ from comment_render import (  # comment rendering (same-dir module, stdlib only)
     _DECOM_PUBLIC_CLOUD_WHY,
     _BLAST_RADIUS_HDR,
     _VALUES_REDUNDANCY_HDR,
+    _IDENTITY_MIGRATION_HDR,
     _DECOM_VM_STRIP_HDR,
     _DECOM_FLAG_TYPO_HDR,
     _SHUTDOWN_MIN_WORKLOADS,
@@ -306,6 +307,10 @@ from identity import (  # environment identity and rename detection
     _check_customer_name,
     _expected_partition_token,
     _partition_token_misses,
+    _appset_identity,
+    _appset_param,
+    _go_str,
+    _confirmed_renames,
     _is_rename_of,
     _split_renames_from_deletions,
     _same_env_identity,
@@ -4548,22 +4553,31 @@ def _detect_wiped_definitions(changed_files: list, sha: str, repo=None) -> list:
     return hits
 
 
-def _read_token_misses(path, sha, repo=None):
-    """_partition_token_misses for `path` at `sha`; (None, []) when it is absent
-    or PyYAML cannot read it. A failed read raises, so the PR is retried."""
+def _read_first_doc(path, sha, repo=None, lenient=False):
+    """(first YAML document, state) of `path` at `sha`, state "ok", "absent" or
+    "unparsable". A failed read raises, so the PR is retried. `lenient` reads
+    a bad date or an unknown tag as text, like ArgoCD's Go YAML does."""
     body, status = _bb_fetch_cached(path, sha, repo=repo)
     if status == BB_NOT_FOUND:
-        return None, []
+        return None, "absent"
     if status != BB_OK:
         raise ValueFileUnreadable(
             f"value file unreadable at sha {sha[:8]} "
             f"(Bitbucket transport, not absence): {path}")
-    try:
-        # Helm and the ApplicationSet read only the first document.
-        doc = next(yaml.load_all(body, Loader=_YAML_SAFE_LOADER), None)
-    except (yaml.YAMLError, ValueError):
-        return None, []  # PyYAML cannot read it (bad YAML, or a date like 2026-02-30)
-    return _partition_token_misses(path, doc)
+    for loader in (_YAML_SAFE_LOADER, yaml.BaseLoader) if lenient else (_YAML_SAFE_LOADER,):
+        try:
+            # Helm and the ApplicationSet read only the first document.
+            return next(yaml.load_all(body, Loader=loader), None), "ok"
+        except (yaml.YAMLError, ValueError):
+            pass  # bad YAML, or a date like 2026-02-30
+    return None, "unparsable"
+
+
+def _read_token_misses(path, sha, repo=None):
+    """_partition_token_misses for `path` at `sha`; (None, []) when it is absent
+    or PyYAML cannot read it."""
+    doc, state = _read_first_doc(path, sha, repo)
+    return _partition_token_misses(path, doc) if state == "ok" else (None, [])
 
 
 def _detect_partition_token_misses(changed_files: list, sha: str, repo=None, base_sha=None) -> list:
@@ -4633,6 +4647,342 @@ def _partition_token_block(hits: list, pr_sha: str, base_sha: str):
     )
     return desc, body
 
+
+class PrCommitsUnreadable(ValueFileUnreadable):
+    """The commit messages of a PR could not be read; retried like a value file."""
+
+
+def _cohort_of(env_file):
+    return posixpath.dirname(posixpath.dirname(env_file)) + "/config.yaml"
+
+
+def _is_pv_file(path, name):
+    # The private-cloud ApplicationSets read <cloud>/<tier>/private-cloud/<spoke>/**;
+    # a spoke config.yaml is the cohort of an env right under the spoke.
+    p = path.split("/")
+    return p[0] in ("gcp", "azure") and len(p) >= (6 if name == "customer.yaml" else 5) \
+        and p[2] == "private-cloud" and p[-1] == name
+
+
+def _is_pv_env_file(path):
+    return _is_pv_file(path, "customer.yaml")
+
+
+def _detect_live_identity_changes(changed, renames, path_map, sha, base_sha, repo=None):
+    """Private-cloud envs on main whose ArgoCD apps and namespace this PR renames.
+
+    The ApplicationSet names them pv-<customerName>-<suffix> and deletes the old
+    apps without pruning (preserveResourcesOnDeletion), so the old namespace keeps
+    running (COPR-32565). A move counts only when it also changes the identity.
+    """
+    if not base_sha:
+        return []
+    renames = renames or {}
+    moved = set(renames) | set(renames.values())
+    pairs = {f: f for f in changed if _is_pv_env_file(f) and f not in moved}
+    pairs.update({o: n for o, n in renames.items() if _is_pv_env_file(o) and _is_pv_env_file(n)})
+    via = {}  # env file -> the changed cohort config.yaml that renames it
+    for cohort in {f for f in changed if _is_pv_file(f, "config.yaml") and f not in moved}:
+        # A cohort key renames every env below it that does not set the key itself.
+        if _appset_identity({}, _read_first_doc(cohort, base_sha, repo, True)[0]) != \
+                _appset_identity({}, _read_first_doc(cohort, sha, repo, True)[0]):
+            via.update({p: cohort for p in path_map if _is_pv_env_file(p)
+                        and p not in moved and p not in changed and _cohort_of(p) == cohort})
+    pairs.update({p: p for p in via})
+    hits = []
+    for old_path, new_path in sorted(pairs.items()):
+        old_doc, old_state = _read_first_doc(old_path, base_sha, repo, True)
+        if old_state != "ok":
+            continue  # a new env, or YAML that neither PyYAML nor Helm can read
+        old_cohort, old_cohort_state = _read_first_doc(_cohort_of(old_path), base_sha, repo, True)
+        if old_cohort_state == "absent":
+            continue  # no cohort config.yaml: the ApplicationSet makes no apps for it
+        new_doc, new_state = _read_first_doc(new_path, sha, repo, True)
+        if new_state != "ok":
+            continue  # a decommission, or YAML that neither PyYAML nor Helm can read
+        new_cohort = _read_first_doc(_cohort_of(new_path), sha, repo, True)[0]
+        old, new = _appset_identity(old_doc, old_cohort), _appset_identity(new_doc, new_cohort)
+        if {old[0], new[0]} & {"", "<no value>"}:
+            continue  # no customerName: unknown, and the render fails on it (`required`)
+        # Cloud, tier and spoke folder pick the ApplicationSet and cluster (#4517).
+        where = [(o, n) for o, n in zip(old_path.split("/")[:4], new_path.split("/")[:4])
+                 if o != n]
+        if old == new and not where:
+            continue
+        old_at, new_at = "/".join(o for o, _ in where), "/".join(n for _, n in where)
+
+        def eff(doc, cohort, key):
+            return _go_str(_appset_param(doc, cohort, key))
+        decommission = any(eff(d, c, k).lower() == "true"
+                           for d, c in ((old_doc, old_cohort), (new_doc, new_cohort))
+                           for k in ("decommission", "decommissionPurgeData"))
+        if old == new and where in ([("prod", "aec")], [("aec", "prod")]) and not decommission:
+            continue  # prod and aec share the spoke cluster: the same apps take over
+        old_ns, new_ns = "pv-%s-%s" % old, "pv-%s-%s" % new
+        apps = sorted(path_map.get(old_path) or [])
+        hits.append({
+            "path": new_path, "moved_from": old_path if old_path != new_path else None,
+            "via": via.get(old_path),
+            "old": old, "new": new, "old_ns": old_ns, "new_ns": new_ns,
+            # What a Confirm-Rename line names; the folder part only when it changes.
+            "old_id": f"{old_at}/{old_ns}" if where else old_ns,
+            "new_id": f"{new_at}/{new_ns}" if where else new_ns,
+            "apps": apps,
+            # The cascade finalizer would delete the old resources, shared GCP objects too.
+            "decommission": decommission,
+            # Only a pause already on main stops the old apps syncing the new names
+            # into the old namespace before they are removed. Same test as the template.
+            "paused_base": eff(old_doc, old_cohort, "autosync") == "false",
+            "paused_head": eff(new_doc, new_cohort, "autosync") == "false",
+            # Names are global on the hub: another env may already own the new ones.
+            "taken": sorted(a for a, ns in (_app_namespace_map or {}).items()
+                            if ns == new_ns and a not in apps
+                            and a.split("/")[-1].startswith(new_ns + "-")),
+        })
+    return hits
+
+
+def _identity_block_reason(hit, confirmed):
+    """Why a live-env rename stays blocked, or None when it may merge."""
+    if hit["decommission"]:
+        return "decommission"  # no override: remove it first
+    if (hit["old_id"], hit["new_id"]) not in confirmed:
+        return "unconfirmed"
+    if not hit["paused_base"]:
+        return "pause_first"
+    return None if hit["paused_head"] else "keep_paused"
+
+
+def _pr_commit_messages(repo, pr_id, base_sha, pr_sha):
+    """Commit messages of the PR (base_sha..pr_sha): the mirror first, else the API."""
+    path = _mirror_path(repo) if repo else ""
+    if (GIT_MIRROR_ENABLED and not _mirror_disabled and path and base_sha
+            and os.path.isdir(os.path.join(path, "objects"))
+            and _mirror_has_sha(repo, pr_sha) and _mirror_has_sha(repo, base_sha)):
+        r = _git_run(["--git-dir", path, "log", "--format=%B%x00",
+                      f"{base_sha}..{pr_sha}"], timeout=30)
+        if r is not None and r.returncode == 0:
+            return r.stdout.split("\x00")
+    commits, page, base = [], f"pullrequests/{pr_id}/commits?pagelen=100", _bb_api_base(repo)
+    for _ in range(_BB_MAX_PAGES):
+        try:
+            data = bb("GET", page, repo=repo)
+        except urllib.error.HTTPError as e:
+            if not _is_transient_exception(e):
+                raise  # a 4xx is not a blip: fail, do not retry forever
+            raise PrCommitsUnreadable(f"commit messages of PR #{pr_id} unreadable: {e}") from e
+        except (OSError, ValueError) as e:
+            raise PrCommitsUnreadable(f"commit messages of PR #{pr_id} unreadable: {e}") from e
+        commits += data.get("values", [])
+        page = (data.get("next") or "").replace(f"{base}/", "")
+        if not page:
+            break
+    else:
+        raise PrCommitsUnreadable(f"commit messages of PR #{pr_id}: too many pages")
+    # Right after a push the list can still miss the new head: retry, never "unconfirmed".
+    if not any((c.get("hash") or "").startswith(pr_sha) for c in commits):
+        raise PrCommitsUnreadable(f"commit list of PR #{pr_id} does not have {pr_sha[:8]} yet")
+    return [c.get("message") or "" for c in commits]
+
+
+_IDENTITY_SECRETS = ("dm-ui, mongodb-password, rabbitmq-password, redis-password, "
+                     "mail-secret, library-secret, signschannel-secret, "
+                     "contentintelligence-secret")
+
+
+def _identity_spokes(h):
+    """(old folder, new folder) for a move to another cloud, tier or spoke, else None."""
+    if h["old_id"] == h["old_ns"]:
+        return None
+    return h["old_id"].rsplit("/", 1)[0], h["new_id"].rsplit("/", 1)[0]
+
+
+def _identity_old_where(h):
+    spokes = _identity_spokes(h)
+    if not spokes:
+        return f"`{h['old_ns']}`"
+    return (f"`{h['old_ns']}` in the old `{spokes[0]}` (check your kubectl context: "
+            f"the new environment uses the same name in `{spokes[1]}`)")
+
+
+def _identity_secret_steps(hits):
+    return [f"In Secret Manager, copy the 8 secrets `{h['old_ns']}-<name>` to "
+            f"`{h['new_ns']}-<name>` with the same values: {_IDENTITY_SECRETS}. "
+            f"Without them the new environment gets new passwords and keys."
+            for h in hits if h["old_ns"] != h["new_ns"]]
+
+
+def _identity_data_note(hits):
+    if not any(h["old"][0] != h["new"][0] for h in hits):
+        return []
+    return ["A `customerName` change makes a new, empty content bucket and BigQuery "
+            "dataset. It also makes a new host, unless `customerSubdomain` is set. The "
+            "customer data stays in the old bucket and dataset: plan how to copy it "
+            "before you merge."]
+
+
+def _identity_before_merge_steps(hits):
+    """The runbook steps that must happen before the rename PR merges."""
+    files = ", ".join(f"`{h['moved_from'] or h['path']}`" for h in hits)
+    steps = [f"Open a separate PR first. In {files}, add `autosync: false` under "
+             f"`appspace:`. If `instanceName` is missing, add it too, with the value it "
+             f"has now. Merge that PR. Then check on the spoke cluster that the old apps "
+             f"have `spec.syncPolicy.automated.enabled: false`."]
+    steps += _identity_secret_steps(hits) + _identity_data_note(hits)
+    steps.append("Update this branch from `main`, so it has `autosync: false`, and keep "
+                 "it. Then confirm the rename with an empty commit:")
+    return [f"{i}. {s}" for i, s in enumerate(steps, 1)] + [
+        "", "```",
+        *[f'git commit --allow-empty -m "Confirm-Rename: {h["old_id"]} -> {h["new_id"]}"'
+          for h in hits],
+        "git push", "```"]
+
+
+def _identity_after_merge_steps(hits):
+    olds = ", ".join(_identity_old_where(h) for h in hits)
+    step4 = ("4. Later, in a reviewed ticket, delete only what the old environment alone "
+             "used: old GCP objects (the old public IP last), old secrets and the IAM "
+             "bindings of the old namespace. Keep the old content bucket and BigQuery "
+             "dataset until their data is copied. Then remove "
+             "`helm.sh/resource-policy: keep` and delete the old namespace. Check each "
+             "object by its real identity and creation date, never by name: the new "
+             "environment uses some of the same GCP objects (COPR-32565).")
+    if any(_identity_spokes(h) for h in hits):
+        step4 += (" After a move to another cluster, the secrets and most GCP objects keep "
+                  "their names: they belong to the new environment.")
+    return [
+        f"1. Start the maintenance window. Check that the old apps are gone and the new "
+        f"apps are not synced. In the old namespace ({olds}): scale `acme-ping-scaler` "
+        f"to 0 (if it exists), then every Deployment. Add "
+        f"`cnrm.cloud.google.com/deletion-policy=abandon` to every KCC resource and read "
+        f"it again on each one. Then delete each KCC resource by exact kind and name. "
+        f"With `abandon`, this deletes nothing in GCP. Do not delete the namespace now.",
+        "2. Sync the new apps by hand (ss, ms, glb) and check that every KCC resource is "
+        "UpToDate. If the public IP changed, point the DNS record of the public host "
+        "(zone appspace-com, project appspace-dns) to the new IP.",
+        "3. Remove `autosync: false` in a new PR.",
+        step4,
+    ]
+
+
+def _identity_hit_lines(h):
+    ids = " and ".join(f"`{k}` `{o}` → `{n}`" for k, o, n in
+                       zip(("customerName", "suffix"), h["old"], h["new"]) if o != n)
+    spokes = _identity_spokes(h)
+    if h.get("via"):
+        head = f"`{h['path']}` gets {ids} from `{h['via']}`"
+    elif h["moved_from"]:
+        head = (f"`{h['moved_from']}` moves to `{h['path']}`"
+                + (f" (another cluster, `{spokes[0]}` → `{spokes[1]}`)" if spokes else "")
+                + (f" and changes {ids}" if ids else ""))
+    else:
+        head = f"`{h['path']}` changes {ids}"
+    on = (f" in `{spokes[0]}`", f" in `{spokes[1]}`") if spokes else ("", "")
+    out = [head + ":", "",
+           f"- namespace `{h['old_ns']}`{on[0]} → `{h['new_ns']}`{on[1]}"]
+    if h["apps"]:
+        new_apps = [h["new_ns"] + a[len(h["old_ns"]):] if a.startswith(h["old_ns"] + "-")
+                    else "?" for a in h["apps"]]
+        out.append("- apps " + ", ".join(f"`{a}`" for a in h["apps"]) + " → "
+                   + ", ".join(f"`{a}`" for a in new_apps))
+    if h["taken"]:
+        out.append(f"- ⚠️ live apps already use `{h['new_ns']}`: "
+                   + ", ".join(f"`{a}`" for a in h["taken"][:6])
+                   + ". Do not merge: two environments would share one namespace. "
+                     "Choose another name.")
+    return out + [""]
+
+
+def _identity_reason_text(h):
+    """What still blocks a confirmed rename, or a decommission; "" otherwise."""
+    secrets = (f" Before you merge, check that the 8 secrets are copied to "
+               f"`{h['new_ns']}-<name>`." if h["old_ns"] != h["new_ns"] else "")
+    return {
+        "decommission": "⛔ `decommission` is on, so ArgoCD would **delete** the old "
+                        "resources, including GCP objects that the new environment still "
+                        "uses. Never rename with `decommission: true` or "
+                        "`decommissionPurgeData: true`. To replace the environment, "
+                        "remove the old one in its own PR, and add the new one in a "
+                        "later PR.",
+        "pause_first": f"The rename is confirmed, but auto-sync is not paused on `main`. "
+                       f"Without the pause, the old apps can sync the new values into the "
+                       f"old namespace before ArgoCD removes them. First merge a separate "
+                       f"PR that adds `autosync: false` under `appspace:` in "
+                       f"`{h['moved_from'] or h['path']}`." + secrets,
+        "keep_paused": f"The rename is confirmed, but `{h['path']}` does not have "
+                       f"`autosync: false`. Add it under `appspace:`, so the new apps do "
+                       f"not sync before you remove the old KCC resources." + secrets,
+    }.get(h["reason"], "")
+
+
+def _identity_change_block(hits: list, pr_sha: str, base_sha: str):
+    """(build status description, comment body) for blocked live-env renames;
+    each hit carries its "reason" (see _identity_block_reason)."""
+    worst = next(r for r in ("decommission", "pause_first", "keep_paused", "unconfirmed")
+                 if any(h["reason"] == r for h in hits))
+    what = {"decommission": "remove decommission first",
+            "pause_first": "pause auto-sync in a separate PR first",
+            "keep_paused": "keep autosync: false in this PR",
+            "unconfirmed": "revert, or follow the migration steps in the comment"}[worst]
+    names = ", ".join(f"{h['old_id']} to {h['new_id']}" for h in hits[:2])
+    more = f" (+{len(hits) - 2} more)" if len(hits) > 2 else ""
+    tail = f" — {what}"
+    desc = f"BLOCKED: renames live env {names}{more}"[:255 - len(tail)] + tail
+    out = []
+    for h in hits:
+        out += _identity_hit_lines(h)
+        if _identity_reason_text(h):
+            out += [_identity_reason_text(h), ""]
+    unconfirmed = [h for h in hits if h["reason"] == "unconfirmed"]
+    if unconfirmed:
+        azure = (["These steps are for GCP. For Azure, ask CloudOps before you merge.", ""]
+                 if any(h["path"].startswith("azure/") for h in unconfirmed) else [])
+        other = (", or in the same namespace on another cluster"
+                 if any(_identity_spokes(h) for h in unconfirmed) else "")
+        out += [
+            "**What happens on merge:** ArgoCD deletes the old apps but not their "
+            f"resources, and creates new apps in a new namespace{other}. The old "
+            "namespace keeps running, and some of its resources manage the same GCP "
+            "objects as the new environment (409 errors, IAM policies overwritten). "
+            "This is what happened in COPR-32565.", "",
+            "**If this is a mistake,** revert the change and push again. If this PR "
+            "removes one environment and adds a different one, split it into two PRs.", "",
+            "**If the rename is planned,** it is a migration with downtime. Do the steps "
+            "in this order:", "", *azure,
+            *_identity_before_merge_steps(unconfirmed), "",
+            "After the merge:", "",
+            *_identity_after_merge_steps(unconfirmed), ""]
+    many = len(hits) > 1
+    body = (
+        f"## \U0001f52d {STATUS_NAME}\n\n"
+        f"{_comment_header(pr_sha)}\n\n"
+        + (f"⛔ **Blocked: this PR renames {len(hits)} live environments.**\n\n" if many
+           else "⛔ **Blocked: this PR renames a live environment.**\n\n")
+        + "\n".join(out) +
+        "\nThis check runs again by itself on a new commit, or when `main` changes.\n\n"
+        f"---\n**Status:** ⛔ Blocked — renames live environment{'s' if many else ''} "
+        + ", ".join(f"`{h['old_id']}`" for h in hits) + "\n"
+        f"*{_ts()} — {COMMENT_MARKER} [blocked]"
+        + (f" [base:{base_sha[:8]}]" if base_sha else "") + "*"
+    )
+    return desc, body
+
+
+def _identity_migration_lines(hits: list) -> list:
+    """Notice for confirmed, paused renames; shares the appspace_state_lines channel."""
+    if not hits:
+        return []
+    lines = ["### \U0001f500 Planned rename of a live environment", "",
+             _IDENTITY_MIGRATION_HDR + " A `Confirm-Rename` commit confirms it, and "
+             "auto-sync is paused. ArgoCD deletes the old apps but not their "
+             "resources: what the diff below shows as deleted stays in the old "
+             "namespace until you clean it up.", ""]
+    for h in hits:
+        lines += _identity_hit_lines(h)
+    before = [f"Before you merge, check that the 8 secrets are copied to `{h['new_ns']}-<name>`."
+              for h in hits if h["old_ns"] != h["new_ns"]] + _identity_data_note(hits)
+    return lines + ([*before, ""] if before else []) + [
+        "After the merge:", "", *_identity_after_merge_steps(hits), ""]
 
 def _detect_new_env_candidates(changed_files: list, path_map: dict, renames: dict = None, pr_sha: str = None, repo: str = None) -> list:
     """Scan changed files for patterns that indicate a brand-new environment.
@@ -11234,6 +11584,25 @@ def process_pr(pr, path_map, base_sha="", repo=None):
         # new-env exclusion and the decommission detector all see the move.
         renames = _augment_renames_with_identity_moves(
             changed, renames, path_map, base_sha, render_sha, repo=repo)
+
+        # Renaming a live env orphans its namespace (COPR-32565): block it unless
+        # a commit in the PR confirms it as a planned migration. After the pairing
+        # above, so a same-name move seen as delete + add is checked too. Without a
+        # merge preview render_sha is the branch tip, which can only over-block.
+        identity_hits = _detect_live_identity_changes(changed, renames, path_map, render_sha,
+                                                      base_sha, repo=repo)
+        if identity_hits:
+            confirmed = _confirmed_renames(_pr_commit_messages(repo, pr_id, base_sha, pr_sha))
+            for h in identity_hits:
+                h["reason"] = _identity_block_reason(h, confirmed)
+            todo = [h for h in identity_hits if h["reason"]]
+            if todo:
+                desc, body = _identity_change_block(todo, pr_sha, base_sha)
+                post_build_status(pr_sha, "FAILED", desc, pr_id=pr_id)
+                upsert_comment(pr_id, body, existing_id, repo=repo)
+                with _seen_lock:
+                    _seen[sk] = (pr_sha, base_sha)
+                return
         new_env_candidates = _detect_new_env_candidates(changed, path_map, renames, pr_sha=render_sha, repo=repo)
         if new_env_candidates:
             logsink.log(f"PR #{pr_id}: {len(new_env_candidates)} new env candidate(s): "
@@ -11740,6 +12109,7 @@ def process_pr(pr, path_map, base_sha="", repo=None):
         except Exception as e:  # state-flag panel must never break the comment
             logsink.log(f"    [comment] appspace-state panel failed: {e}", "WARNING")
             appspace_state_lines = []
+        appspace_state_lines += _identity_migration_lines(identity_hits)
         try:
             # COPS-2693 Plan B: shares the appspace_state_lines channel so the
             # verdict scan in comment_render sees it without new plumbing.

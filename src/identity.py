@@ -241,6 +241,46 @@ def _partition_token_misses(path, doc):
                  for f, v in misses]
 
 
+
+def _go_str(v):
+    # How the ApplicationSet's Go template prints a value (missingkey=zero).
+    if v is None:
+        return "<no value>"
+    if isinstance(v, bool):
+        return "true" if v else "false"
+    return str(v)
+
+
+def _appset_param(customer_doc, cohort_doc, key):
+    """appspace.<key> as the private-cloud ApplicationSet sees it: its generator
+    merges customer.yaml over the cohort config.yaml, and a key present in
+    customer.yaml wins even when empty (mergo WithOverride, ArgoCD v3.5.2)."""
+    def appspace(doc):
+        a = doc.get("appspace") if isinstance(doc, dict) else None
+        return a if isinstance(a, dict) else {}
+    own = appspace(customer_doc)
+    return own[key] if key in own else appspace(cohort_doc).get(key)
+
+
+def _appset_identity(customer_doc, cohort_doc):
+    """(customerName, suffix) that name a private-cloud env's ArgoCD apps and
+    namespace `pv-<customerName>-<suffix>`; the template writes
+    `or .appspace.suffix "a"`."""
+    sfx = _appset_param(customer_doc, cohort_doc, "suffix")
+    return (_go_str(_appset_param(customer_doc, cohort_doc, "customerName")),
+            _go_str(sfx) if sfx else "a")
+
+
+_CONFIRM_RENAME_RE = re.compile(
+    r"^[\s*>]*`?confirm-rename:\s*`?([^\s`]+)`?\s*(?:->|\u2192)\s*`?([^\s`]+)`?\s*$",
+    re.IGNORECASE)
+
+
+def _confirmed_renames(messages):
+    """{(old, new)} from `Confirm-Rename: <old> -> <new>` lines in commit messages."""
+    return {(m[1].rstrip("."), m[2].rstrip(".")) for msg in messages
+            for line in (msg or "").splitlines() for m in [_CONFIRM_RENAME_RE.match(line)] if m}
+
 def _is_rename_of(old_header: str, new_header: str) -> bool:
     """True when two headers plausibly name the SAME resource renamed.
 
