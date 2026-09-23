@@ -520,7 +520,12 @@ ENV_INFO = {"name": "pv-newenv-a",
 
 
 def test_render_new_env_config_fetch_failure(monkeypatch):
+    # A failed read is retried (COPR-32566 follow-up); only an absent file is a verdict.
     monkeypatch.setattr(m, "_bb_fetch_status", lambda p, s: (None, m.BB_ERROR))
+    with pytest.raises(m.ValueFileUnreadable):
+        m._render_new_env_diff(dict(ENV_INFO), "prsha")
+    m._vf_cache.clear()
+    monkeypatch.setattr(m, "_bb_fetch_status", lambda p, s: (None, m.BB_NOT_FOUND))
     text, err, n, ver = m._render_new_env_diff(dict(ENV_INFO), "prsha")
     assert text is None and "could not fetch" in err and ver is None
 

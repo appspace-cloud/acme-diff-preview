@@ -100,7 +100,10 @@ API used to fetch value files. What keeps it fast and reliable:
   429s log at `WARNING` **with the endpoint**, and a value file that could not
   be read is reported separately from one that is genuinely absent — the two
   used to share a single `debug()` line, which made rate limiting
-  indistinguishable from a real gap in the values hierarchy.
+  indistinguishable from a real gap in the values hierarchy. A 404 that says
+  `Commit not found` is a failed read too: the merge preview exists only in
+  the local mirror, so when the mirror cannot answer, Bitbucket does not know
+  the commit. It is never cached as an absent file, and the PR is retried.
 - **Retry with backoff + jitter** — transient reasons (`oci_pull_failed`,
   `metadata_pending`, `timeout`) retry in-process up to `DIFF_RETRIES` times.
 - **AI summary at scale** — only the `AI_MAX_APPS` apps with the most changed

@@ -596,7 +596,7 @@ def test_process_pr_unreadable_file_is_red_and_retried(clone_pr, monkeypatch):
     assert _extract_status_token(store["body"]) == "transient"
     assert not dp._seen, "a transient failure must stay unseen so it retries"
     # COPS-2546: the retry is spaced out, not repeated every iteration.
-    assert [bo[2] for bo in dp._retry_backoff.values()] == [_mk_pr()["source"]["commit"]["hash"]]
+    assert list(dp._retry_backoff.values()) == [[1, 2, _mk_pr()["source"]["commit"]["hash"]]]
     posted = len(sinks.statuses)
     dp.process_pr(_mk_pr(pr_id=4671), path_map, base_sha=BASE_SHA)
     assert len(sinks.statuses) == posted
