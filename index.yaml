@@ -2,6 +2,29 @@ apiVersion: v1
 entries:
   acme-diff-preview:
   - apiVersion: v2
+    appVersion: 2.117.0
+    created: "2026-09-23T19:13:04.973765665Z"
+    description: ACME Diff Preview — posts Kubernetes manifest diffs as Bitbucket
+      PR comments with AI-generated summaries via Vertex AI Gemini.
+    digest: bc7c879f14a903dfa2a585f7864cf9e38c4d2bbf7e7cae24b54eb2a951d9f0d1
+    home: https://github.com/appspace-cloud/acme-diff-preview
+    keywords:
+    - argocd
+    - gitops
+    - diff-preview
+    - bitbucket
+    kubeVersion: '>=1.28.0-0'
+    maintainers:
+    - name: Appspace CloudOps
+      url: https://github.com/appspace-cloud
+    name: acme-diff-preview
+    sources:
+    - https://github.com/appspace-cloud/acme-diff-preview
+    type: application
+    urls:
+    - https://github.com/appspace-cloud/acme-diff-preview/releases/download/acme-diff-preview-2.117.0/acme-diff-preview-2.117.0.tgz
+    version: 2.117.0
+  - apiVersion: v2
     appVersion: 2.116.0
     created: "2026-09-23T17:04:06.070685388Z"
     description: ACME Diff Preview — posts Kubernetes manifest diffs as Bitbucket
@@ -5016,4 +5039,4 @@ entries:
     urls:
     - https://github.com/appspace-cloud/acme-diff-preview/releases/download/argocd-diff-preview-1.0.4/argocd-diff-preview-1.0.4.tgz
     version: 1.0.4
-generated: "2026-09-23T17:04:06.071085857Z"
+generated: "2026-09-23T19:13:04.974162881Z"
