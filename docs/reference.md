@@ -124,7 +124,7 @@ one complete representative diff plus the full list of environments it
 applies to, instead of a separate, arbitrarily-truncated copy per app.
 Deletions and replica zeroings get a reserved share of the display order, so
 the resources the shouty blocks name are the ones you actually see first.
-Details in [docs/internals.md](docs/internals.md#which-resources-make-it-into-the-comment-body).
+Details in [docs/internals.md](internals.md#which-resources-make-it-into-the-comment-body).
 
 The same idea then runs INSIDE each app, because the most common change in
 `acme-config-prod` is a platform version bump to a single environment, and
@@ -298,7 +298,7 @@ before any diff, that no rendered diff would make obvious to a reviewer.
 | Guard | What it catches | Why it is dangerous |
 |---|---|---|
 | Structural new-env failure | a new environment missing a required value (e.g. `appspace.version`) | the environment cannot render at all on merge |
-| **Empty `microservices.definitions`** | a value file (typically `cicd-versions.yaml`) with `appspace.microservices.definitions` present but **null/empty** | silently deletes every microservice on merge ([details](docs/internals.md#why-an-empty-microservicesdefinitions-is-blocked)) |
+| **Empty `microservices.definitions`** | a value file (typically `cicd-versions.yaml`) with `appspace.microservices.definitions` present but **null/empty** | silently deletes every microservice on merge ([details](internals.md#why-an-empty-microservicesdefinitions-is-blocked)) |
 | **Clone without its tier token** | an AEC or sandbox value file whose folder or names (`customerName`, `instanceName`, the mongo/rabbit VM names, ...) miss `--aec1` / `--sbx1` | the clone runs in the same cluster and cloud project as production, so it can reuse production's names and VMs ([details](internals.md#why-a-clone-without-its---aec1-token-is-blocked)) |
 
 **The red status names the failure, not its category** (COPS-2709). Bitbucket
@@ -321,7 +321,7 @@ the author to fix and push would send them to change a version that is
 probably correct. Apps failing the same way are grouped, so a fleet PR reads
 as one problem with an environment count rather than fifty lines.
 
-See [docs/internals.md](docs/internals.md) for the reasoning behind each guard,
+See [docs/internals.md](internals.md) for the reasoning behind each guard,
 how mass version bumps are handled, the secret-leak hardening, and the
 full-diff web UI.
 
@@ -338,7 +338,7 @@ full-diff web UI.
 | `DIFF_RETRIES` | `diff.retries` | `5` | Attempts per diff (backoff + jitter) |
 | `WARM_WORKERS` | `diff.warmWorkers` | `4` | Parallel chart warm-up pulls |
 | `WARM_THRESHOLD` | `diff.warmThreshold` | `8` | Min apps before warm-up kicks in |
-| `SUPERSEDE_ABORT_ENABLED` | `diff.supersedeAbortEnabled` | `true` | Let a newer push abort a render already in flight ([details](docs/internals.md#superseding-an-in-flight-render)). Off = the pre-COPS-2575 behaviour, a dead commit is rendered to completion and published |
+| `SUPERSEDE_ABORT_ENABLED` | `diff.supersedeAbortEnabled` | `true` | Let a newer push abort a render already in flight ([details](internals.md#superseding-an-in-flight-render)). Off = the pre-COPS-2575 behaviour, a dead commit is rendered to completion and published |
 | `SUPERSEDE_MAX_CONSECUTIVE_ABORTS` | `diff.supersedeMaxConsecutiveAborts` | `3` | Livelock guard: after this many consecutive aborts on one PR, the run finishes regardless so the PR always eventually gets a comment |
 | `KUBE_VERSION` | `kubeVersion` | `1.35.5` | `--kube-version` passed to `helm template`. Matches the real GKE clusters; keep it in step with them |
 | `BB_API_CONCURRENCY` | — | `30` | Max concurrent Bitbucket API calls |
@@ -353,7 +353,7 @@ full-diff web UI.
 | `DIFF_OCI_FAIL_ERROR_THRESHOLD` | — | `3` | Consecutive systemic chart-pull failures after which failures log at ERROR instead of WARNING |
 | `DIFF_IGNORE_RESOURCES` | — | *(empty)* | Extra comma-separated resource-name substrings to hide from every diff, on top of the built-in `micro-versions-info` |
 | `DIFF_HTTP_POOLING` | — | `on` | HTTP keep-alive pooling: one persistent TLS connection per worker thread and host. `off` routes every request through plain `urlopen`. Auto-defers to `urlopen` when a proxy is configured. Visible in `/diff-preview/stats` (`http_pool_reuses`/`http_pool_fresh_conns`/`http_pool_fallbacks`) |
-| `DIFF_UI_ENABLED` | `diffUi.enabled` | `true` | Full-diff web UI ([details](docs/internals.md#full-diff-web-ui-atlantis-style)). Persists artifacts + serves `/diff/*` in-cluster; safe by default since no ingress path exposes it externally |
+| `DIFF_UI_ENABLED` | `diffUi.enabled` | `true` | Full-diff web UI ([details](internals.md#full-diff-web-ui-atlantis-style)). Persists artifacts + serves `/diff/*` in-cluster; safe by default since no ingress path exposes it externally |
 | `DIFF_UI_BASE_URL` | `diffUi.baseUrl` | *(empty)* | External base URL the build status deep-links to. Empty = status keeps linking to the comment |
 | `DIFF_UI_DIR` | `diffUi.dir` | `/tmp/acme-diff-ui` | Artifact directory (bounded, pruned oldest-first) |
 | `DIFF_UI_MAX_ARTIFACTS` | `diffUi.maxArtifacts` | `500` | Max artifacts in the **local cache** before pruning oldest-first. Not a retention policy: `DIFF_UI_GCS_BUCKET` is the durable copy and its bucket lifecycle sets how long a page really lives |
@@ -369,7 +369,7 @@ full-diff web UI.
 | `COMMENT_INLINE_EVIDENCE_LINES` | — | `0` | With inline diffs off, still show this many lines of evidence for **risk-flagged** applications only (deletions, zeroed replicas, VM facts), so a reviewer never leaves the comment to see *why* something is dangerous — only to see the rest. `0` means the comment ships with no fenced block at all |
 | `COMMENT_SMALL_DIFF_INLINE_BYTES` | — | `0` | When a pull request's TOTAL rendered section bytes are at or below this, the comment carries the diff inline instead of only linking it. For the changes it targets the whole evidence is a few hundred bytes: acme-config-prod #4437 (remove one env var) and #4436 (add it back) rendered **byte-identical** comments before this. Measured over 120 live artifacts the distribution is bimodal — p25 = 482 B, p50 = 9,350 B — so a threshold in the low thousands separates cleanly. Scoped to the diff block alone: the clean-application roll-up, the input panel and every other `inline_diffs` behaviour are unaffected. `0` disables it |
 | `FULL_PAGE_UNCAPPED` | — | `true` | The full-diff page never cuts a resource body. `false` restores the pre-2.33.0 page (bodies cut at 6,000 chars with a marker). **Rollback order matters, see below** |
-| — | `diffUi.ingress.enabled` | `false` | Externally reachable, IAP-gated Service + BackendConfig for the UI ([details](docs/internals.md#full-diff-web-ui-atlantis-style)) |
+| — | `diffUi.ingress.enabled` | `false` | Externally reachable, IAP-gated Service + BackendConfig for the UI ([details](internals.md#full-diff-web-ui-atlantis-style)) |
 
 
 
@@ -475,7 +475,7 @@ The suite is organized in layers, roughly in the order they were built:
   silently skipped its own target) — a reminder that a green assertion only
   proves what it checks.
 
-The discipline that keeps this trustworthy is in [RELEASING.md](RELEASING.md):
+The discipline that keeps this trustworthy is in [RELEASING.md](../RELEASING.md):
 every change ships with a regression test written first and confirmed
 failing, then the full suite, then live pod verification.
 
@@ -583,7 +583,7 @@ single-instance one: the pod trivially elects itself.
 | Push to `main` | Helm chart published to GitHub Pages |
 | Tag `v*` | Docker image built and pushed to JFrog |
 
-See [RELEASING.md](RELEASING.md) for the full release process and the rule
+See [RELEASING.md](../RELEASING.md) for the full release process and the rule
 about never overwriting an existing image tag.
 
 ### GitHub Actions secrets required
