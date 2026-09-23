@@ -7,6 +7,7 @@ here is required to use the tool; it is for people changing it or debugging it.
 
 - [Why an empty `microservices.definitions` is blocked](#why-an-empty-microservicesdefinitions-is-blocked)
 - [Why a clone without its `--aec1` token is blocked](#why-a-clone-without-its---aec1-token-is-blocked)
+- [Why renaming a live environment is blocked](#why-renaming-a-live-environment-is-blocked)
 - [Handling mass version bumps](#handling-mass-version-bumps-hundreds-of-apps-in-one-pr)
 - [The two surfaces: comment and page](#the-two-surfaces-comment-and-page)
 - [Which resources make it into the comment body](#which-resources-make-it-into-the-comment-body)
@@ -72,9 +73,86 @@ move (a 404) is skipped. Any other failed read gives a red status that is
 retried with the COPS-2546 backoff, never a pass. Every new commit is checked
 again, and the same comment is edited.
 
-The guard checks the file as it is after the merge, not only the lines the PR
-changed. So a miss that is already on `main` blocks every PR that edits that
-file until someone fixes it. Direct pushes to `main` are not checked.
+The guard reads the file as it is after the merge, but it blocks only the misses
+that are not on `main` yet. A miss already on `main` is a live environment, and
+fixing it is a rename (see the next section). Direct pushes to `main` are not
+checked.
+
+### Why renaming a live environment is blocked
+
+The private-cloud ApplicationSets name an environment's apps and namespace
+`pv-<customerName>-<suffix>`, with suffix `a` when it is not set. They read the
+two keys from `customer.yaml`, and from the `config.yaml` one folder up only when
+`customer.yaml` does not have the key (even an empty value in `customer.yaml`
+wins). So a change of one of them on a live environment is not an in-place
+change. ArgoCD creates new apps in a new namespace and deletes the old apps
+without pruning (`preserveResourcesOnDeletion: true`). Before ArgoCD removes the
+old apps, they can sync the new values into the old namespace. The old namespace
+keeps running, and its KCC resources manage the same GCP objects as the new
+environment. acme-config-prod PR #4672 did this (`nbc` to `nbc--aec1`,
+COPR-32565).
+
+The guard (COPR-32578) checks every live `customer.yaml` under
+`<gcp|azure>/<tier>/private-cloud/<spoke>/`. Live means it exists on `main` with
+its cohort `config.yaml`. It blocks a PR to `main` when the file:
+
+- changes its `customerName` or `suffix` (removing `suffix: b` renames the env
+  to `-a`),
+- moves to another cloud, tier or spoke folder (another ApplicationSet or
+  cluster, like #4517), or moves to a folder where it gets another
+  `customerName` or `suffix`,
+- or gets a changed `customerName` or `suffix` from its cohort `config.yaml`.
+
+A move between `prod` and `aec` in the same spoke keeps the cluster and the
+namespace, so the new apps take over. It is blocked only with `decommission`.
+
+It compares `main` with the merge preview, first YAML document only. A bad date
+or an unknown tag is read as text, as ArgoCD does. A file without
+`customerName`, or YAML that nothing can read, is left to the render, which
+fails on it. A failed read is red and retried, never a pass.
+
+A planned rename passes only as a migration:
+
+1. A separate PR first adds `autosync: false` under `appspace:` (and
+   `instanceName` if it is missing) and is merged. A pause added in the rename
+   PR itself does not reach the old apps.
+2. The rename PR keeps `autosync: false` and has a commit with the line
+   `Confirm-Rename: <old namespace> -> <new namespace>`. For a move to another
+   cluster, each side starts with the folder part that changes, like
+   `na4-a/<namespace>`. The comment gives the exact command.
+
+`decommission: true` or `decommissionPurgeData: true`, on `main` or in the PR,
+always blocks: the old apps would delete GCP objects that the new environment
+still uses.
+
+The confirmation is a commit because Bitbucket Cloud PRs have no labels, and a
+new commit is a new sha, so the check runs again by itself. Merging the pause PR
+moves `main`, which also runs it again. The blocked comment lists the steps in
+order: the 8 secrets to copy (without them the new environment gets new
+passwords and keys), and for a `customerName` change the new, empty content
+bucket and BigQuery dataset. When the rename passes, the comment shows the steps
+after the merge.
+
+Limits:
+
+- An empty commit keeps earlier approvals (smart approval reset), so approve
+  after the confirmation.
+- Direct pushes to `main` are not checked. On prod the Azure DevOps build
+  status also counts, so a merge in the seconds between a push and this check
+  is possible.
+- Deleting a cohort `config.yaml` that still has envs below it has the same
+  effect, and is not blocked.
+- Bitbucket pairs renamed files by similar content. A PR that removes one env
+  and adds a different, similar one can look like a rename: split it into two
+  PRs.
+- A live env that leaves the ApplicationSets is not blocked: a rename to
+  `Customer.yaml`, a move out of `<cloud>/<tier>/private-cloud/`, or a delete +
+  add with a new name that Bitbucket does not pair. ArgoCD then removes the
+  apps without pruning, like any deletion without `decommission` (a plain
+  deletion only gets a warning in the decommission panel). A move to a folder
+  without a cohort `config.yaml` is blocked by COPS-2552.
+- Without a merge preview the guard reads the branch tip, which can only
+  over-block.
 
 ### Handling mass version bumps (hundreds of apps in one PR)
 

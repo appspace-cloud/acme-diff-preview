@@ -300,6 +300,7 @@ before any diff, that no rendered diff would make obvious to a reviewer.
 | Structural new-env failure | a new environment missing a required value (e.g. `appspace.version`) | the environment cannot render at all on merge |
 | **Empty `microservices.definitions`** | a value file (typically `cicd-versions.yaml`) with `appspace.microservices.definitions` present but **null/empty** | silently deletes every microservice on merge ([details](internals.md#why-an-empty-microservicesdefinitions-is-blocked)) |
 | **Clone without its tier token** | an AEC or sandbox value file whose folder or names (`customerName`, `instanceName`, the mongo/rabbit VM names, ...) miss `--aec1` / `--sbx1` | the clone runs in the same cluster and cloud project as production, so it can reuse production's names and VMs ([details](internals.md#why-a-clone-without-its---aec1-token-is-blocked)) |
+| **Rename of a live environment** | a change of `customerName` or `suffix` of a live private-cloud env, also by a move or through its cohort `config.yaml`, or a move to another cloud, tier or spoke | ArgoCD creates a new namespace and leaves the old one running on the same GCP objects; a planned rename needs a pause on `main` and a `Confirm-Rename:` commit ([details](internals.md#why-renaming-a-live-environment-is-blocked)) |
 
 **The red status names the failure, not its category** (COPS-2709). Bitbucket
 shows the description and nothing else, so it is the whole message for anyone

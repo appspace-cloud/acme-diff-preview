@@ -236,6 +236,9 @@ _BLAST_RADIUS_HDR = "**Blast radius.**"
 # blast radius: a quiet render caused by copying parent values into
 # customer.yaml must not read as "the tool missed the change".
 _VALUES_REDUNDANCY_HDR = "**Higher-layer values.**"
+# Written by the identity-change guard in diff_preview for a confirmed rename of
+# a live environment, matched here for the REVIEW verdict line.
+_IDENTITY_MIGRATION_HDR = "**Planned rename.**"
 
 # COPS-2668: and a third state. The summary used to know only purge-vs-not,
 # so an environment with NO cascade armed — where the Applications go and
@@ -750,6 +753,11 @@ def _build_merge_summary(results, rollup_by_sig, vm_change_lines,
                              + _reach +
                              "; changes to shared config bypass cohort "
                              "staging (see the blast-radius note)"))
+        if _IDENTITY_MIGRATION_HDR in txt:
+            findings.append((_SEV_REVIEW,
+                             "\U0001f500 **Planned rename of a live environment** "
+                             "\u2014 the old namespace keeps running until you clean "
+                             "it up by hand (see the rename note)"))
         # COPS-2721: customer.yaml (or another leaf) re-states values a
         # parent config.yaml already sets identically. Manifests stay
         # byte-identical; without this line the verdict says Routine /
