@@ -6,6 +6,7 @@ here is required to use the tool; it is for people changing it or debugging it.
 ## Contents
 
 - [Why an empty `microservices.definitions` is blocked](#why-an-empty-microservicesdefinitions-is-blocked)
+- [Why a clone without its `--aec1` token is blocked](#why-a-clone-without-its---aec1-token-is-blocked)
 - [Handling mass version bumps](#handling-mass-version-bumps-hundreds-of-apps-in-one-pr)
 - [The two surfaces: comment and page](#the-two-surfaces-comment-and-page)
 - [Which resources make it into the comment body](#which-resources-make-it-into-the-comment-body)
@@ -41,6 +42,39 @@ is deliberately **not** blocked. To remove per-env overrides, delete the
 `definitions:` key entirely — never leave it present but empty. See
 [`docs/microservices-definitions-guard.md`](docs/microservices-definitions-guard.md)
 for the full incident write-up and the exact detection rule.
+
+### Why a clone without its `--aec1` token is blocked
+
+A clone environment runs on the same cluster and cloud project as the
+production tenant it copies. Its names must carry a token (`--aec1`, `--sbx1`),
+or it reuses production's names: acme-config-prod PR #4671 cloned NBC with
+`customerName: nbc` (COPR-32566).
+
+A clone is a value file under `<cloud>/aec/` (`--aec1`) or `*/sandbox/`
+(`--sbx1`), or in a folder with an `--aec<n>` / `--sbx<n>` token. Under `aec/`
+or `sandbox/` the path sets the word; a folder token only sets the number
+(`--aec2`).
+
+The guard reads every changed clone value file (`cicd-versions.yaml` too: it is
+merged last), and only its first YAML document, as Helm does. These must carry
+the token when they are set:
+
+- the folder name, for a `customer.yaml`
+- `customerName`, `customerSubdomain` and `instanceName`
+- `infra.deployLinuxServicesK8s.svc.instanceName`
+- each name in `infra.deployLinuxServicesK8s.mongo.instances` and
+  `rabbit.instances` (KCC and ASO give these names to the VMs)
+- `microservices.acmePingScaler.pingHost`
+
+A missing value, or one Helm treats as unset (`""`, `false`, `0`), is not
+checked. The comment gives the fixed name for each value. The old side of a
+move (a 404) is skipped. Any other failed read gives a red status that is
+retried with the COPS-2546 backoff, never a pass. Every new commit is checked
+again, and the same comment is edited.
+
+The guard checks the file as it is after the merge, not only the lines the PR
+changed. So a miss that is already on `main` blocks every PR that edits that
+file until someone fixes it. Direct pushes to `main` are not checked.
 
 ### Handling mass version bumps (hundreds of apps in one PR)
 
