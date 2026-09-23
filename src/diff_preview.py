@@ -304,6 +304,8 @@ from identity import (  # environment identity and rename detection
     CUSTOMER_NAME_MAX,
     _CUSTOMER_NAME_RE,
     _check_customer_name,
+    _expected_partition_token,
+    _partition_token_misses,
     _is_rename_of,
     _split_renames_from_deletions,
     _same_env_identity,
@@ -4536,6 +4538,79 @@ def _detect_wiped_definitions(changed_files: list, sha: str, repo=None) -> list:
         if _values_wipes_definitions(body):
             hits.append(f)
     return hits
+
+
+def _detect_partition_token_misses(changed_files: list, sha: str, repo=None) -> list:
+    """COPR-32566: (path, token, misses) for each changed clone value file at
+    `sha` whose names miss the token. A 404 is the old side of a move; any
+    other failed read raises, so the PR is retried instead of passed."""
+    hits = []
+    for f in changed_files:
+        if not f.endswith(_VALUE_FILE_SUFFIXES) or not _expected_partition_token(f):
+            continue
+        body, status = _bb_fetch_cached(f, sha, repo=repo)
+        if status == BB_NOT_FOUND:
+            continue
+        if status != BB_OK:
+            raise ValueFileUnreadable(
+                f"value file unreadable at sha {sha[:8]} "
+                f"(Bitbucket transport, not absence): {f}")
+        try:
+            doc = _yaml_safe_load(body)
+        except yaml.YAMLError:
+            continue  # the render reports malformed YAML with its own message
+        tok, misses = _partition_token_misses(f, doc)
+        if misses:
+            hits.append((f, tok, misses))
+    return hits
+
+
+def _partition_token_block(hits: list, pr_sha: str, base_sha: str):
+    """(build status description, comment body) for _detect_partition_token_misses hits."""
+    toks = list(dict.fromkeys(tok for _, tok, _ in hits))
+    toks_md = " or ".join(f"`{t}`" for t in toks)
+    fields = ", ".join(dict.fromkeys(m[0] for _, _, ms in hits for m in ms))
+    envs = list(dict.fromkeys(path.split("/")[-2] for path, _, _ in hits))
+    where = ", ".join(envs[:2]) + (f" (+{len(envs) - 2} more)" if len(envs) > 2 else "")
+    tail = " \u2014 fix and push"
+    desc = f"BLOCKED: {where} needs {' or '.join(toks)} in {fields}"[:255 - len(tail)] + tail
+
+    def short(v):
+        return v if len(v) <= 100 else v[:99] + "\u2026"
+
+    out = []
+    for path, tok, misses in hits:
+        out += [f"`{path}`", ""]
+        moves = []
+        for field, cur, new in misses:
+            label = "folder" if field == "folder" else f"`{field}`"
+            if field == "customerName" and len(new) > CUSTOMER_NAME_MAX:
+                fix = (f"shorten the customer name to {CUSTOMER_NAME_MAX - len(tok)} "
+                       f"characters or less, then add `{tok}`")
+            else:
+                fix = f"`{short(new)}`" if new else f"add `{tok}` after the customer name"
+            out.append(f"- {label}: `{short(cur)}` \u2192 {fix}")
+            if field == "folder" and new:
+                d = path.rsplit("/", 2)[0]
+                moves.append(f"git mv {d}/{cur} {d}/{new}")
+        if moves:
+            out += ["", "Rename the folder (it is not a value in the file):", "```", *moves, "```"]
+        out.append("")
+    body = (
+        f"## \U0001f52d {STATUS_NAME}\n\n"
+        f"{_comment_header(pr_sha)}\n\n"
+        f"\u26d4 **Blocked: this clone uses production names.**\n\n"
+        + "\n".join(out) +
+        f"\n**Why:** a clone runs on the same cluster and cloud project as "
+        f"production. Without {toks_md} it can reuse the production tenant's "
+        f"namespace, VM and host names.\n\n"
+        f"Fix these, commit, and push again. This check runs again by itself "
+        f"on the new commit.\n\n"
+        f"---\n**Status:** \u26d4 Blocked \u2014 clone names miss {toks_md}\n"
+        f"*{_ts()} \u2014 {COMMENT_MARKER} [blocked]"
+        + (f" [base:{base_sha[:8]}]" if base_sha else "") + "*"
+    )
+    return desc, body
 
 
 def _detect_new_env_candidates(changed_files: list, path_map: dict, renames: dict = None, pr_sha: str = None, repo: str = None) -> list:
@@ -11096,6 +11171,21 @@ def process_pr(pr, path_map, base_sha="", repo=None):
                 f"*{_ts()} \u2014 {COMMENT_MARKER} [blocked]"
                 + (f" [base:{base_sha[:8]}]" if base_sha else "") + "*"
             )
+            upsert_comment(pr_id, body, existing_id, repo=repo)
+            with _seen_lock:
+                _seen[sk] = (pr_sha, base_sha)
+            return
+
+        # COPR-32566: same hard block for a clone whose names miss its token.
+        # A fix push is a new sha, so the check runs again and edits this comment.
+        try:
+            token_hits = _detect_partition_token_misses(changed, render_sha, repo=repo)
+        except ValueFileUnreadable:
+            _backoff_register_transient(sk, pr_sha)  # COPS-2546: space out the retries
+            raise
+        if token_hits:
+            desc, body = _partition_token_block(token_hits, pr_sha, base_sha)
+            post_build_status(pr_sha, "FAILED", desc, pr_id=pr_id)
             upsert_comment(pr_id, body, existing_id, repo=repo)
             with _seen_lock:
                 _seen[sk] = (pr_sha, base_sha)

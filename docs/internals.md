@@ -6,6 +6,7 @@ here is required to use the tool; it is for people changing it or debugging it.
 ## Contents
 
 - [Why an empty `microservices.definitions` is blocked](#why-an-empty-microservicesdefinitions-is-blocked)
+- [Why a clone without its `--aec1` token is blocked](#why-a-clone-without-its---aec1-token-is-blocked)
 - [Handling mass version bumps](#handling-mass-version-bumps-hundreds-of-apps-in-one-pr)
 - [The two surfaces: comment and page](#the-two-surfaces-comment-and-page)
 - [Which resources make it into the comment body](#which-resources-make-it-into-the-comment-body)
@@ -41,6 +42,27 @@ is deliberately **not** blocked. To remove per-env overrides, delete the
 `definitions:` key entirely — never leave it present but empty. See
 [`docs/microservices-definitions-guard.md`](docs/microservices-definitions-guard.md)
 for the full incident write-up and the exact detection rule.
+
+### Why a clone without its `--aec1` token is blocked
+
+A clone environment runs on the same cluster and cloud project as the
+production tenant it copies. Its names must carry a token (`--aec1`, `--sbx1`),
+or it reuses production's names: acme-config-prod PR #4671 cloned NBC with
+`customerName: nbc` (COPR-32566).
+
+A clone is a value file under `<cloud>/aec/` (`--aec1`) or `*/sandbox/`
+(`--sbx1`), or in a folder that already has an `--aec<n>` / `--sbx<n>` token.
+The tree gives the word and the folder its number (`--aec2`). For each changed
+clone value file (any of them: `cicd-versions.yaml` is merged last) the guard
+reads `customerName`, `customerSubdomain`, `instanceName`,
+`infra.deployLinuxServicesK8s.svc.instanceName`, each name in
+`infra.deployLinuxServicesK8s.mongo.instances` / `rabbit.instances` (KCC and ASO
+name those VMs directly) and `microservices.acmePingScaler.pingHost`, plus the
+folder name for a `customer.yaml`. Any value set without the token blocks the
+PR, with the fixed name for each one. An empty or absent value is not checked.
+The old side of a move (a 404) is skipped. Any other failed read gives a red,
+retried status (with the COPS-2546 backoff), never a pass. The check runs again
+on every new commit and edits the same comment.
 
 ### Handling mass version bumps (hundreds of apps in one PR)
 

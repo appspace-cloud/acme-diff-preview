@@ -13,6 +13,9 @@ environment.
 `_check_customer_name` and `_extract_appspace_identity` supply the identity
 facts those comparisons read.
 
+`_partition_token_misses` (COPR-32566) checks that a clone's names carry
+its `--aec1` / `--sbx1` token.
+
 `_section_kind` comes from manifest.py, which is where the header format it
 decodes is built (`_diff_resources`). Phase 4's closure had parked it in
 vm_analysis because the workload detectors happened to read it first.
@@ -157,6 +160,85 @@ def _check_customer_name(name):
             f"hyphen. It becomes part of a GCP service account id, which GCP "
             f"validates strictly.")
     return "ok", None
+
+
+# COPR-32566: a clone runs on the same cluster and cloud project as production,
+# so each name it derives must carry its token, or it reuses production's.
+_TOKEN_FIELDS = (
+    ("customerName", ("customerName",)),
+    ("customerSubdomain", ("customerSubdomain",)),
+    ("instanceName", ("instanceName",)),
+    ("svc.instanceName", ("infra", "deployLinuxServicesK8s", "svc", "instanceName")),
+    ("mongo.instances", ("infra", "deployLinuxServicesK8s", "mongo", "instances")),
+    ("rabbit.instances", ("infra", "deployLinuxServicesK8s", "rabbit", "instances")),
+    ("pingHost", ("microservices", "acmePingScaler", "pingHost")),
+)
+_FOLDER_TOKEN_RE = re.compile(r"--(aec|sbx)(\d+)(?=-|$)")
+
+
+def _expected_partition_token(path):
+    """The token (`--aec1`, `--sbx1`) a clone's names must carry, or None.
+
+    A clone lives under `<cloud>/aec/` or `*/sandbox/`, or has a token in
+    its folder name. The tree gives the word, the folder its number (`--aec2`).
+    """
+    parts = path.split("/")
+    m = _FOLDER_TOKEN_RE.search(parts[-2] if len(parts) > 1 else "")
+    word = ("aec" if parts[1:2] == ["aec"] else
+            "sbx" if "sandbox" in parts[:-1] else m and m.group(1))
+    if not word:
+        return None
+    return f"--{word}{m.group(2) if m and m.group(1) == word else '1'}"
+
+
+def _near_token_re(tok):
+    # Any `--<word><n>` (a typo, or the other tier's token) and `-aec1`, never
+    # a plain `-aec` that is part of a real name (pv-sami-aec-a).
+    word = re.escape(tok.strip("-").rstrip("0123456789"))
+    return re.compile(rf"(?:--[a-z]+\d*|-{word}\d+)(?=-|\.|$)")
+
+
+def _with_token(field, value, stem, tok):
+    """`value` with `tok` where the convention puts it, or None if unsure."""
+    base = _near_token_re(tok).sub("", value)
+    if field in ("customerName", "customerSubdomain"):
+        return base + tok
+    i = base.find(f"-{stem}-") if stem else -1
+    if i < 0:
+        return None
+    j = i + 1 + len(stem)
+    return base[:j] + tok + base[j:]
+
+
+def _partition_token_misses(path, doc):
+    """(token, [(field, value, suggestion)]) for a clone value file's names
+    that miss the token. The folder counts for a customer.yaml."""
+    tok = _expected_partition_token(path)
+    if not tok:
+        return None, []
+    names = []
+    for field, keys in _TOKEN_FIELDS:
+        v = doc.get("appspace") if isinstance(doc, dict) else None
+        for k in keys:
+            v = v.get(k) if isinstance(v, dict) else None
+        # mongo/rabbit instances: each item is a VM name, or {name: ...}
+        for n in v if isinstance(v, list) else [v]:
+            n = n.get("name") if isinstance(n, dict) else n
+            # Helm's `default` treats false, 0 and "" as unset, and so does this.
+            if isinstance(n, (str, int)) and not isinstance(n, bool) and n not in ("", 0):
+                names.append((field, str(n)))
+    folder = path.split("/")[-2]
+    near = _near_token_re(tok)
+    cn = dict(names).get("customerName")
+    stem = near.sub("", cn) if cn else "-".join(near.sub("", folder).split("-")[1:-1])
+    misses = [(f, v) for f, v in names if tok not in v]
+    if path.endswith("/customer.yaml") and tok not in folder:
+        misses.insert(0, ("folder", folder))
+    # A stem too long for the token must be shortened first; the next push
+    # then gets exact suggestions for the other names.
+    long = len(stem + tok) > CUSTOMER_NAME_MAX
+    return tok, [(f, v, None if long and f != "customerName" else _with_token(f, v, stem, tok))
+                 for f, v in misses]
 
 
 def _is_rename_of(old_header: str, new_header: str) -> bool:

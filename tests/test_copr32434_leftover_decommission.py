@@ -145,6 +145,8 @@ def test_process_pr_skips_leftover_apps_before_normal_diff(world, monkeypatch):
     def fake_fetch(path, sha, repo=None):
         if path == IDENTITY:
             return None, m.BB_NOT_FOUND
+        if path == SHARED:  # a cohort config carries no customer names
+            return "appspace:\n  version: 1.0.0\n", m.BB_OK
         return "appspace:\n  customerName: alive\n  version: 1.0.0\n", m.BB_OK
 
     monkeypatch.setattr(m, "_bb_fetch_cached", fake_fetch)
