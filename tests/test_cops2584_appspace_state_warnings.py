@@ -312,8 +312,8 @@ def test_process_pr_end_to_end_posts_the_pause_warning(monkeypatch):
                                changed_paths=None, renames=None:
                         m.DiffResult("", [], 0, False, "", m.OUT_NO_DIFF, ""))
     monkeypatch.setattr(m, "_bb_fetch_status", _mk_fetch({
-        (_ORCH_IDENTITY, _ORCH_BASE_SHA): "appspace:\n  customerName: orch-b\n",
-        (_ORCH_IDENTITY, _ORCH_PR_SHA):   "appspace:\n  autosync: false\n  customerName: orch-b\n",
+        (_ORCH_IDENTITY, _ORCH_BASE_SHA): "appspace:\n  customerName: orch-b\n  version: 2603.2.16-dev\n",
+        (_ORCH_IDENTITY, _ORCH_PR_SHA):   "appspace:\n  autosync: false\n  customerName: orch-b\n  version: 2603.2.16-dev\n",
     }))
 
     try:

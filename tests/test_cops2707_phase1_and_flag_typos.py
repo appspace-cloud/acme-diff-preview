@@ -585,8 +585,8 @@ def test_process_pr_fails_the_build_on_a_misspelled_flag(monkeypatch):
     ident = "gcp/dev/private-cloud/ap1/custom/pv-typo-a/customer.yaml"
     apps = ["pv-typo-a-ms"]
     files = {
-        (ident, base): "appspace:\n  customerName: t\n" + VM_BLOCK,
-        (ident, sha): ("appspace:\n  decomission: true\n  customerName: t\n"
+        (ident, base): "appspace:\n  customerName: t\n  version: 2603.2.16-dev\n" + VM_BLOCK,
+        (ident, sha): ("appspace:\n  decomission: true\n  customerName: t\n  version: 2603.2.16-dev\n"
                        + VM_BLOCK),
     }
     statuses = []

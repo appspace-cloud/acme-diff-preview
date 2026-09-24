@@ -189,6 +189,7 @@ def test_scope_filter_mixed_pr_sees_only_gcp_files(stage_world, monkeypatch):
                         lambda pr_id, repo=None: (list(files), {}))
     # Not about renames (COPR-32578 has its own tests): keep this run on the diff path.
     monkeypatch.setattr(m, "_detect_live_identity_changes", lambda *a, **k: [])
+    monkeypatch.setattr(m, "_detect_frozen_versions", lambda *a, **k: [])
     # Diff engine short-circuit: report clean no-diff for the matched app.
     monkeypatch.setattr(m, "argocd_diff",
                         lambda *a, **k: m.DiffResult("", [], 0, False, "",

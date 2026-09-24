@@ -74,6 +74,7 @@ NEWER_BASE = "9911eeff7744"
 # is supposed to act through.
 LIVE_VM_YAML = """appspace:
   customerName: cov671
+  version: 2603.2.16-dev
   infra:
     deployLinuxServicesK8s:
       enabled: true
@@ -84,6 +85,7 @@ LIVE_VM_YAML = """appspace:
 """
 STRIPPED_YAML = """appspace:
   customerName: cov671
+  version: 2603.2.16-dev
   decommission: true
   infra:
     deployLinuxServicesK8s:
@@ -93,6 +95,7 @@ STRIPPED_YAML = """appspace:
 # The runbook-correct arming commit: same intent, VM block kept intact.
 ARMED_OK_YAML = """appspace:
   customerName: cov671
+  version: 2603.2.16-dev
   decommission: true
   infra:
     deployLinuxServicesK8s:
@@ -190,7 +193,7 @@ def world(monkeypatch):
     # A blanket 404 for every path looks exactly like a COPR-32434 leftover
     # and would skip every app before argocd_diff runs. Serve the identity
     # at the shas this world uses; everything else stays a clean 404.
-    _live_identity = "appspace:\n  customerName: cov671\n"
+    _live_identity = "appspace:\n  customerName: cov671\n  version: 2603.2.16-dev\n"
     _default_files = {
         (IDENTITY, BASE_SHA): _live_identity,
         (IDENTITY, PR_SHA): _live_identity,
@@ -223,7 +226,7 @@ def _serve(monkeypatch, files):
     only stubs one side (e.g. PR-sha autosync) does not accidentally make
     the base look like a prior decommission (COPR-32434).
     """
-    _live_identity = "appspace:\n  customerName: cov671\n"
+    _live_identity = "appspace:\n  customerName: cov671\n  version: 2603.2.16-dev\n"
     merged = {
         (IDENTITY, BASE_SHA): _live_identity,
         (IDENTITY, PR_SHA): _live_identity,

@@ -62,6 +62,7 @@ def stage_world(monkeypatch):
     monkeypatch.setattr(m, "_touch_progress", lambda: None)
     # Not about renames (COPR-32578 has its own tests): keep runs on the diff path.
     monkeypatch.setattr(m, "_detect_live_identity_changes", lambda *a, **k: [])
+    monkeypatch.setattr(m, "_detect_frozen_versions", lambda *a, **k: [])
     m._seen.clear(); m._force_recompute.clear()
     yield sinks
     m._seen.clear(); m._force_recompute.clear()
