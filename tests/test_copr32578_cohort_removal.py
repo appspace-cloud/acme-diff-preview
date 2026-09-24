@@ -20,7 +20,7 @@ import diff_preview as dp  # noqa: E402
 from app_meta import _extract_status_token  # noqa: E402
 from test_coverage_orchestration import world, BASE_SHA, PR_SHA  # noqa: E402,F401
 from test_copr32578_live_identity_guard import (  # noqa: E402,F401
-    repo, rename_pr, _detect, _pr, ERR, AEC, COHORT, COHORT_BODY, NBC, NBC_MAIN,
+    repo, rename_pr, _pr, ERR, AEC, COHORT, COHORT_BODY, NBC, NBC_MAIN,
     ENV, ENV_COHORT, ORCH, HEAD)
 
 KID = f"{AEC}/pv-kid-a/customer.yaml"
