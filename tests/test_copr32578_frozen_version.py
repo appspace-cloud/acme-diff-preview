@@ -19,7 +19,7 @@ import diff_preview as dp  # noqa: E402
 from app_meta import _extract_status_token  # noqa: E402
 from test_coverage_orchestration import world, BASE_SHA, PR_SHA  # noqa: E402,F401
 from test_copr32578_live_identity_guard import (  # noqa: E402,F401
-    repo, rename_pr, _pr, ERR, AEC, COHORT, COHORT_BODY, NBC, ENV, ENV_COHORT, ORCH, HEAD)
+    repo, rename_pr, _pr, ERR, AEC, COHORT, COHORT_BODY, NBC, ENV, ENV_COHORT, HEAD)
 
 OWN = "appspace:\n  customerName: nbc--aec1\n  version: 2603.1.38\n"
 BARE = "appspace:\n  customerName: nbc--aec1\n"
