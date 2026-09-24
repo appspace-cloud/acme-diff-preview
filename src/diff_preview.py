@@ -4984,6 +4984,66 @@ def _identity_migration_lines(hits: list) -> list:
     return lines + ([*before, ""] if before else []) + [
         "After the merge:", "", *_identity_after_merge_steps(hits), ""]
 
+def _detect_orphaning_cohort_removals(changed, renames, path_map, sha, repo=None):
+    """Cohort config.yaml files this PR removes while live envs below them stay.
+
+    The ApplicationSet makes an env's apps from its customer.yaml and the
+    config.yaml one folder up. Without that file it makes none, so ArgoCD
+    deletes them without pruning and the namespaces keep running (COPR-32565).
+    An empty cohort still makes the apps, so only an absent one counts.
+    """
+    hits = []
+    for cohort in sorted({f for f in changed if _is_pv_file(f, "config.yaml")}):
+        if _read_first_doc(cohort, sha, repo)[1] != "absent":
+            continue
+        # path_map can keep apps whose customer.yaml is already gone: read it.
+        envs = sorted(p for p in path_map if _is_pv_env_file(p) and _cohort_of(p) == cohort
+                      and p not in (renames or {}) and _read_first_doc(p, sha, repo)[1] != "absent")
+        if envs:
+            hits.append({"cohort": cohort, "envs": [posixpath.basename(posixpath.dirname(p))
+                                                    for p in envs]})
+    return hits
+
+
+def _cohort_removal_block(hits: list, pr_sha: str, base_sha: str):
+    """(build status description, comment body) for removed cohorts that live envs use."""
+    n, many = sum(len(h["envs"]) for h in hits), len(hits) > 1
+    tail = " — keep the files" if many else " — keep the file"
+    more = f" (+{len(hits) - 1} more)" if many else ""
+    uses = ("envs still use " if n > 1 else "env still uses ") + ("them" if many else "it")
+    desc = f"BLOCKED: removes cohort {hits[0]['cohort']}{more}, {n} live {uses}"[:255 - len(tail)] + tail
+    out = []
+    for h in hits:
+        k = len(h["envs"])
+        shown = ", ".join(f"`{e}`" for e in h["envs"][:10])
+        extra = f" (+{k - 10} more)" if k > 10 else ""
+        out.append(f"- `{h['cohort']}`: {k} live "
+                   + ("environments still use it: " if k > 1 else "environment still uses it: ")
+                   + shown + extra)
+    what = (f"removes {len(hits)} cohort `config.yaml` files" if many
+            else "removes a cohort `config.yaml`")
+    who = "a live environment still uses" if n == 1 else "live environments still use"
+    body = (
+        f"## \U0001f52d {STATUS_NAME}\n\n"
+        f"{_comment_header(pr_sha)}\n\n"
+        f"⛔ **Blocked: this PR {what} that {who}.**\n\n"
+        + "\n".join(out) + "\n\n"
+        "**Why:** the ApplicationSet makes the apps of each environment from its "
+        "`customer.yaml` and the `config.yaml` one folder up. Without that file it makes "
+        "no apps for them, and ArgoCD deletes their apps. Without `decommission: true` it "
+        "keeps their resources, so the namespaces keep running and nobody manages them "
+        "(like COPR-32565).\n\n"
+        "**Fix:** keep the file where it is. If these environments move, move them in "
+        "this PR too. If they go away, remove the file in the same PR that removes them, "
+        "after their decommission.\n\n"
+        "This check runs again by itself on a new commit, or when `main` changes.\n\n"
+        f"---\n**Status:** ⛔ Blocked — removes cohort{'s' if many else ''} "
+        + ", ".join(f"`{h['cohort']}`" for h in hits) + "\n"
+        f"*{_ts()} — {COMMENT_MARKER} [blocked]"
+        + (f" [base:{base_sha[:8]}]" if base_sha else "") + "*"
+    )
+    return desc, body
+
 def _detect_new_env_candidates(changed_files: list, path_map: dict, renames: dict = None, pr_sha: str = None, repo: str = None) -> list:
     """Scan changed files for patterns that indicate a brand-new environment.
 
@@ -6129,6 +6189,8 @@ def _moves_missing_cohort(renames: dict, pr_sha: str, repo: str = None) -> list:
         parts = new.split("/")
         if len(parts) < 5 or parts[-1] not in _IDENTITY_BASENAMES:
             continue
+        if _is_pv_file(new, "config.yaml"):
+            continue  # a moved private-cloud cohort, not an env: its envs are checked
         env_dir = new.rsplit("/", 1)[0]
         if "/" not in env_dir:
             continue
@@ -11584,6 +11646,17 @@ def process_pr(pr, path_map, base_sha="", repo=None):
         # new-env exclusion and the decommission detector all see the move.
         renames = _augment_renames_with_identity_moves(
             changed, renames, path_map, base_sha, render_sha, repo=repo)
+
+        # A removed cohort config.yaml orphans every live env below it: no override.
+        cohort_hits = _detect_orphaning_cohort_removals(changed, renames, path_map, render_sha,
+                                                        repo=repo)
+        if cohort_hits:
+            desc, body = _cohort_removal_block(cohort_hits, pr_sha, base_sha)
+            post_build_status(pr_sha, "FAILED", desc, pr_id=pr_id)
+            upsert_comment(pr_id, body, existing_id, repo=repo)
+            with _seen_lock:
+                _seen[sk] = (pr_sha, base_sha)
+            return
 
         # Renaming a live env orphans its namespace (COPR-32565): block it unless
         # a commit in the PR confirms it as a planned migration. After the pairing

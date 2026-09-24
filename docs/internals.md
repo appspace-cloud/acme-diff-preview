@@ -8,6 +8,7 @@ here is required to use the tool; it is for people changing it or debugging it.
 - [Why an empty `microservices.definitions` is blocked](#why-an-empty-microservicesdefinitions-is-blocked)
 - [Why a clone without its `--aec1` token is blocked](#why-a-clone-without-its---aec1-token-is-blocked)
 - [Why renaming a live environment is blocked](#why-renaming-a-live-environment-is-blocked)
+- [Why removing a cohort `config.yaml` is blocked](#why-removing-a-cohort-configyaml-is-blocked)
 - [Handling mass version bumps](#handling-mass-version-bumps-hundreds-of-apps-in-one-pr)
 - [The two surfaces: comment and page](#the-two-surfaces-comment-and-page)
 - [Which resources make it into the comment body](#which-resources-make-it-into-the-comment-body)
@@ -141,7 +142,7 @@ Limits:
   status also counts, so a merge in the seconds between a push and this check
   is possible.
 - Deleting a cohort `config.yaml` that still has envs below it has the same
-  effect, and is not blocked.
+  effect. It is blocked too (next section).
 - Bitbucket pairs renamed files by similar content. A PR that removes one env
   and adds a different, similar one can look like a rename: split it into two
   PRs.
@@ -160,6 +161,40 @@ renaming an environment (`customerName`, `suffix`, or a folder move), deleting
 a `customer.yaml`, or deleting a cohort `config.yaml`. The pipeline commits on
 `main` only change versions (`version`, `cicd-versions.yaml`): they never
 touch these keys, and never add, delete or move a file.
+
+### Why removing a cohort `config.yaml` is blocked
+
+The private-cloud ApplicationSets make an environment's apps from its
+`customer.yaml` and the `config.yaml` one folder up (its cohort; for an env
+right under a spoke, the spoke `config.yaml`). When that file is missing, they
+make no apps for the environments below it, and ArgoCD deletes their apps.
+Without `decommission: true` it keeps their resources, so the namespaces keep
+running with nobody to manage them, like a rename (COPR-32565). The `customer.yaml` files stay in the repo, so the
+repo still says the environments exist.
+
+So a PR to `main` is blocked (COPR-32578) when it removes a private-cloud
+`config.yaml` (deletes or moves it) while live environments below it stay:
+their `customer.yaml` has live apps and is still there in the merge preview.
+There is no override. History has 4 such cases (acme-config-prod #768 and
+#1354, acme-config-stage #1996, and a direct push in acme-config-dev), all by
+mistake inside a change about something else, found between 32 hours and 18 months
+later. The 46 real cohort removals moved or removed their environments in the
+same change, which this check allows.
+
+The fix is to keep the file where it is. If those environments move, move
+them in the same PR. If they go away, remove the file in the same PR that
+removes them, after their decommission. Do not leave the file empty instead:
+most environments take `appspace.version` from the cohort, and without it their
+apps stop syncing. This check does not block an empty file or bad YAML,
+because then ArgoCD does not delete the apps. The render reports bad YAML.
+
+Limits:
+
+- The live environments come from the app list, which refreshes every few
+  minutes (`PATH_MAP_TTL`). An environment merged to `main` just before may not
+  be counted yet.
+- Public-cloud `cl-*/config.yaml` files are not part of this check. Removing
+  one gets the public-cloud teardown panel.
 
 ### Handling mass version bumps (hundreds of apps in one PR)
 
