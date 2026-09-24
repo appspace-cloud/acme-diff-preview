@@ -154,6 +154,13 @@ Limits:
 - Without a merge preview the guard reads the branch tip, which can only
   over-block.
 
+**Always use a PR for these changes.** A direct push to `main` skips every
+check, and ArgoCD applies it at once. So never push these to `main` directly:
+renaming an environment (`customerName`, `suffix`, or a folder move), deleting
+a `customer.yaml`, or deleting a cohort `config.yaml`. The pipeline commits on
+`main` only change versions (`version`, `cicd-versions.yaml`): they never
+touch these keys, and never add, delete or move a file.
+
 ### Handling mass version bumps (hundreds of apps in one PR)
 
 Bumping a chart `version:` across many clusters in a single PR is a normal
