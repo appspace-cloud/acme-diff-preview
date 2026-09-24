@@ -5044,6 +5044,102 @@ def _cohort_removal_block(hits: list, pr_sha: str, base_sha: str):
     )
     return desc, body
 
+_CL_ENV_RE = re.compile(r"^gcp/[^/]+/public-cloud/[^/]+/(cl-[^/]+)/config\.yaml$")
+_CL_APP_RE = re.compile(r"^gcp/[^/]+/public-cloud/[^/]+/(cl-[^/]+)/([^/]+)/customer\.yaml$")
+
+
+def _generator_file(path, path_map):
+    """(path, its cohort or None) when an ApplicationSet generator reads `path`
+    for a chart version, else None. Public cloud counts only when live: a cl
+    config.yaml with apps, or <app>/customer.yaml of a live <cl-x>-<app>-glb app."""
+    if _is_pv_env_file(path):
+        return path, _cohort_of(path)
+    m = _CL_APP_RE.match(path)
+    if m and any(a.split("/")[-1] == f"{m[1]}-{m[2]}-glb" for a in path_map.get(path, [])):
+        return path, posixpath.dirname(posixpath.dirname(path)) + "/config.yaml"
+    if _CL_ENV_RE.match(path) and path in path_map:
+        return path, None
+    return None
+
+
+def _detect_frozen_versions(changed, renames, path_map, sha, repo=None):
+    """Envs this PR leaves with no chart version, or with a file the generator cannot use.
+
+    The ApplicationSets set targetRevision to appspace.version from the generator
+    file (customer.yaml over the config.yaml one folder up), else to watch-only:
+    the apps go Sync Unknown and stop syncing. A customer.yaml that is empty or
+    whose appspace is not a map stops the whole ApplicationSet instead.
+    """
+    renames = renames or {}
+    todo = {g for f in changed if f not in renames for g in [_generator_file(f, path_map)] if g}
+    for f in changed:
+        cl = _CL_ENV_RE.match(f)
+        if not (_is_pv_file(f, "config.yaml") or cl) or f in renames:
+            continue
+        kids = {g for p in path_map for g in [_generator_file(p, path_map)]
+                if g and g[1] == f and p not in renames}
+        if kids and not _appset_param({}, _read_first_doc(f, sha, repo, True)[0], "version"):
+            todo |= kids  # the kids without their own version lose this one
+    hits = []
+    for path, cohort in sorted(todo):
+        doc, state = _read_first_doc(path, sha, repo, True)
+        if state != "ok":
+            continue  # removed (a decommission) or YAML that the render reports
+        if not isinstance(doc, dict) or not isinstance(doc.get("appspace", {}), dict):
+            hits.append({"path": path, "cohort": cohort, "why": "shape"})
+            continue
+        own = doc.get("appspace") or {}
+        cdoc = _read_first_doc(cohort, sha, repo, True)[0] if cohort else None
+        v = _appset_param(doc, cdoc, "version")
+        if not v or _go_str(v) == "watch-only":
+            why = "watch-only" if v else ("empty" if "version" in own else "missing")
+            hits.append({"path": path, "cohort": cohort, "why": why})
+    return hits
+
+
+_FROZEN_WHY = {
+    "shape": "the file is empty or `appspace` is not a map: the whole ApplicationSet "
+             "of this spoke stops",
+    "empty": "an empty `version:` here hides the cohort value",
+    "watch-only": "`version` is set to `watch-only`",
+}
+
+
+def _frozen_version_block(hits: list, pr_sha: str, base_sha: str):
+    """(build status description, comment body) for envs left with no chart version."""
+    n = len(hits)
+    what = (f"{n} env files" if n > 1 else f"{posixpath.basename(posixpath.dirname(hits[0]['path']))}")
+    tail = " — see PR comment"
+    desc = (f"BLOCKED: {what} would get no appspace.version "
+            f"(ArgoCD uses watch-only, the apps stop)")[:255 - len(tail)] + tail
+    out = []
+    for h in hits:
+        why = _FROZEN_WHY.get(h["why"]) or (
+            f"no `version` here or in `{h['cohort']}`" if h["cohort"] else "no `version` here")
+        out.append(f"- `{h['path']}`: {why}")
+    body = (
+        f"## \U0001f52d {STATUS_NAME}\n\n"
+        f"{_comment_header(pr_sha)}\n\n"
+        f"⛔ **Blocked: after this PR, ArgoCD gets no chart version for "
+        f"{'these environments' if n > 1 else 'this environment'}.**\n\n"
+        + "\n".join(out) + "\n\n"
+        "**Why:** the ApplicationSet takes `appspace.version` from the `customer.yaml` "
+        "and the `config.yaml` one folder up (for public cloud, also from "
+        "`cl-*/config.yaml` alone). With no version it sets `targetRevision: watch-only`. "
+        "The apps go Sync Unknown and stop: no sync, no self-heal, and no later change "
+        "reaches them. Nothing is deleted. The diff below this check would render with "
+        "the old chart and look normal.\n\n"
+        "**Fix:** set `appspace.version` in the file or in its cohort `config.yaml`. An "
+        "empty `version:` line hides the cohort value: delete the line. Keep `appspace:` "
+        "a map.\n\n"
+        "This check runs again by itself on a new commit, or when `main` changes.\n\n"
+        f"---\n**Status:** ⛔ Blocked — no chart version for "
+        + ", ".join(f"`{h['path']}`" for h in hits[:5]) + (" ..." if n > 5 else "") + "\n"
+        f"*{_ts()} — {COMMENT_MARKER} [blocked]"
+        + (f" [base:{base_sha[:8]}]" if base_sha else "") + "*"
+    )
+    return desc, body
+
 def _detect_new_env_candidates(changed_files: list, path_map: dict, renames: dict = None, pr_sha: str = None, repo: str = None) -> list:
     """Scan changed files for patterns that indicate a brand-new environment.
 
@@ -11676,6 +11772,15 @@ def process_pr(pr, path_map, base_sha="", repo=None):
                 with _seen_lock:
                     _seen[sk] = (pr_sha, base_sha)
                 return
+        # No chart version for a live env: ArgoCD sets watch-only and the apps freeze.
+        frozen_hits = _detect_frozen_versions(changed, renames, path_map, render_sha, repo=repo)
+        if frozen_hits:
+            desc, body = _frozen_version_block(frozen_hits, pr_sha, base_sha)
+            post_build_status(pr_sha, "FAILED", desc, pr_id=pr_id)
+            upsert_comment(pr_id, body, existing_id, repo=repo)
+            with _seen_lock:
+                _seen[sk] = (pr_sha, base_sha)
+            return
         new_env_candidates = _detect_new_env_candidates(changed, path_map, renames, pr_sha=render_sha, repo=repo)
         if new_env_candidates:
             logsink.log(f"PR #{pr_id}: {len(new_env_candidates)} new env candidate(s): "

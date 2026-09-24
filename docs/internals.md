@@ -9,6 +9,7 @@ here is required to use the tool; it is for people changing it or debugging it.
 - [Why a clone without its `--aec1` token is blocked](#why-a-clone-without-its---aec1-token-is-blocked)
 - [Why renaming a live environment is blocked](#why-renaming-a-live-environment-is-blocked)
 - [Why removing a cohort `config.yaml` is blocked](#why-removing-a-cohort-configyaml-is-blocked)
+- [Why an environment without a chart version is blocked](#why-an-environment-without-a-chart-version-is-blocked)
 - [Handling mass version bumps](#handling-mass-version-bumps-hundreds-of-apps-in-one-pr)
 - [The two surfaces: comment and page](#the-two-surfaces-comment-and-page)
 - [Which resources make it into the comment body](#which-resources-make-it-into-the-comment-body)
@@ -195,6 +196,33 @@ Limits:
   be counted yet.
 - Public-cloud `cl-*/config.yaml` files are not part of this check. Removing
   one gets the public-cloud teardown panel.
+
+### Why an environment without a chart version is blocked
+
+The ApplicationSets set the chart `targetRevision` to `appspace.version`, taken
+from the generator file: `customer.yaml` over the `config.yaml` one folder up.
+For public cloud, the constellation apps (ms, ss) read `cl-*/config.yaml`
+alone, and each GLB app reads `cl-*/<app>/customer.yaml` over it. When there is
+no version, the template writes `watch-only`, a value that never resolves. The
+apps go Sync Unknown and stop: no sync, no self-heal, and no later change
+reaches them. Nothing is deleted. This happened on acme-config-prod #4042 (15
+apps, 3 h 53 min). The render of this service would use the old chart and look
+normal, so the check runs before it.
+
+A PR to `main` is blocked (COPR-32578) when, after the merge, a generator file
+has no usable version. A key present in `customer.yaml` wins even when it is
+empty, so `version: ""`, `version:`, `~`, `false` and `0` all hide the cohort
+value. The literal `watch-only` counts too. It is also blocked when a
+`customer.yaml` is empty or its `appspace` is not a map: then the whole
+ApplicationSet of the spoke stops. There is no override.
+
+It checks the changed or moved `customer.yaml` files, new private-cloud
+environments, and, when a cohort `config.yaml` has no version after the PR, the
+live environments below it. In public cloud it checks only files the generator
+really reads and that have live apps: `cl-*/config.yaml`, and
+`cl-*/<app>/customer.yaml` of a live `<cl-*>-<app>-glb` app (not
+`constellation/customer.yaml`, which is only a Helm values file). A removed
+environment is not checked: that is a decommission.
 
 ### Handling mass version bumps (hundreds of apps in one PR)
 
