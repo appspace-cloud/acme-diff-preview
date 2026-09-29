@@ -4703,12 +4703,19 @@ _SLIP_FIX = {
 }
 
 
+def _status_path(path):
+    """The file as a build status names it: its folder and name, and under a
+    cl-* env also the env, so cl-x/app3/customer.yaml says which one."""
+    parts = path.split("/")
+    return "/".join(parts[-3:] if len(parts) > 2 and parts[-3].startswith("cl-") else parts[-2:])
+
+
 def _yaml_slip_block(hits: list, pr_sha: str, base_sha: str):
     """(build status description, comment body) for _detect_yaml_slips hits."""
     h = hits[0]
     more = f" (+{len(hits) - 1} more)" if len(hits) > 1 else ""
     tail = " - see PR comment"
-    desc = (f"BLOCKED: YAML slip in {'/'.join(h['path'].split('/')[-2:])} line {h['line']}: "
+    desc = (f"BLOCKED: YAML slip in {_status_path(h['path'])} line {h['line']}: "
             + _SLIP_DESC[h["kind"]].format(**h) + more)[:255 - len(tail)] + tail
     kinds = [k for k in _SLIP_WHY if any(x["kind"] == k for x in hits)]
     paths = list(dict.fromkeys(x["path"] for x in hits))
@@ -5512,7 +5519,7 @@ def _inert_key_block(hits: list, pr_sha: str, base_sha: str):
     more = f" (+{len(hits) - 1} more)" if len(hits) > 1 else ""
     what = "is not a string" if h["why"] == "type" else "is never read by the ApplicationSet"
     tail = " - see PR comment"
-    desc = (f"BLOCKED: appspace.{h['key']} in {'/'.join(h['path'].split('/')[-2:])} "
+    desc = (f"BLOCKED: appspace.{h['key']} in {_status_path(h['path'])} "
             f"{what}{more}")[:255 - len(tail)] + tail
     kinds = [k for k in _INERT_WHY if any(kind(x) == k for x in hits)]
     head = ("sets `appspace.version` to a value that is not a string" if kinds == ["type"]

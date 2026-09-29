@@ -288,8 +288,8 @@ def _hit(path, key, value, why="inert"):
 
 def test_the_status_names_the_key_and_the_file():
     desc, body = m._inert_key_block([_hit(CL_CONST, "autosync", False)], PR_SHA, BASE_SHA)
-    assert desc == ("BLOCKED: appspace.autosync in constellation/customer.yaml is never read "
-                    "by the ApplicationSet - see PR comment")
+    assert desc == ("BLOCKED: appspace.autosync in cl-prod-b/constellation/customer.yaml is never "
+                    "read by the ApplicationSet - see PR comment")
     assert f"- `{CL_CONST}`: `appspace.autosync: false`. The ApplicationSet reads it only from " \
            "`cl-*/config.yaml` (the whole environment) or `cl-*/appN/customer.yaml` " \
            "(one app type)." in body
@@ -299,6 +299,20 @@ def test_the_status_names_the_key_and_the_file():
     assert f"**Status:** ⛔ Blocked: `appspace.autosync` in `{CL_CONST}`\n" in body
     assert m._extract_status_token(body) == "blocked" and f"[base:{BASE_SHA[:8]}]" in body
     assert "—" not in body and "–" not in body
+
+
+@pytest.mark.parametrize("path,want", [
+    (CL_CONST, "cl-prod-b/constellation/customer.yaml"),
+    (CL_APP3, "cl-prod-b/app3/customer.yaml"),
+    (CL_ENV, "cl-prod-b/config.yaml"),
+    (CICD, "pv-x-a/cicd-versions.yaml"),
+    ("x.yaml", "x.yaml"),
+])
+def test_a_status_names_the_cl_env_of_a_public_cloud_file(path, want):
+    assert m._status_path(path) == want
+    assert f" in {want} " in m._inert_key_block([_hit(path, "autosync", False)], PR_SHA, None)[0]
+    slip = {"path": path, "kind": "null", "key": "appspace.probes", "line": 2, "first_line": None}
+    assert f" in {want} line 2: " in m._yaml_slip_block([slip], PR_SHA, None)[0]
 
 
 def test_a_decommission_says_the_chart_still_reads_it():

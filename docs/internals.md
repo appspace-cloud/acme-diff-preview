@@ -544,7 +544,7 @@ The replay found no hit in 1023 acme-config-prod PRs (6 months) and 525
 acme-config-stage PRs, and one in 525 acme-config-dev PRs (#6845).
 
 ```
-BLOCKED: appspace.autosync in constellation/customer.yaml is never read by the ApplicationSet - see PR comment
+BLOCKED: appspace.autosync in cl-prod-b/constellation/customer.yaml is never read by the ApplicationSet - see PR comment
 BLOCKED: appspace.version in pv-x-a/customer.yaml is not a string - see PR comment
 ```
 
