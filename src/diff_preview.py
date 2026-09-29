@@ -5517,7 +5517,7 @@ def _evaluate_new_envs(new_env_candidates: list, pr_sha: str,
         lines.append(f"#### `{sec['name']}` (chart `{sec['version']}`)")
         lines.append("")
         if sec["files"]:
-            lines.append("**Files added:**")
+            lines += ["**Files added:**", ""]  # COPS-2605: or the list renders inline
             for f in sorted(sec["files"])[:15]:
                 lines.append(f"- `{f}`")
             if len(sec["files"]) > 15:
@@ -7481,7 +7481,7 @@ def _evaluate_env_decommissions(candidates: list, pr_sha: str, main_sha: str,
 
 
 def _merge_gates(decommission_candidates, renames=None, path_map=None,
-                 vm_change_lines=None, app_results=None) -> list:
+                 vm_change_lines=None, app_results=None, extra=()) -> list:
     """COPS-2766: the merge gates of this PR, one per kind and env, none lifted.
 
     From the teardowns _evaluate_env_decommissions confirmed. Arming the flag
@@ -7492,6 +7492,7 @@ def _merge_gates(decommission_candidates, renames=None, path_map=None,
     is `shrink`, one per env (the first name in backticks of its line), and
     nothing lifts it. An app that releases a static IP or a DNS record is
     `ip`, lifted by `Confirm-IP-Release: <env>`.
+    `extra` holds gates the caller built itself.
     """
     found = [g for c in decommission_candidates or () for g in c.get("gates", ())]
     found += [{"kind": "cl_rename", "env": _CL_ENV_RE.match(old)[1],
@@ -7502,10 +7503,22 @@ def _merge_gates(decommission_candidates, renames=None, path_map=None,
               for line in vm_change_lines or () if _VM_SHRINK_REASON in line]
     found += [{"kind": "ip", "env": _envs_from_apps([app])[0]}
               for app, r in (app_results or {}).items() if getattr(r, "ip_released", None)]
+    found += extra
     gates = {}
     for g in found:
         gates.setdefault((g["kind"], g["env"]), {"arg": g["env"], **g, "lifted": False})
     return list(gates.values())
+
+
+def _lift_gates(gates, repo, pr_id, base_sha, pr_sha) -> list:
+    """COPS-2766: lift the gates a Confirm-* line in a commit message names.
+    The commits are read only when a gate has a trailer, so a PR with none
+    never pays for it. PrCommitsUnreadable propagates: a retry, never a lift."""
+    if any(gate_trailer(g) for g in gates):
+        confirmed = _confirmations(_pr_commit_messages(repo, pr_id, base_sha, pr_sha))
+        for g in gates:
+            g["lifted"] = gate_trailer(g).lower() in confirmed
+    return gates
 
 
 def _rebuild_hint_lines(candidates) -> list:
@@ -11710,6 +11723,47 @@ def format_comment(pr_sha, app_results, skipped_apps=None, base_sha="",
         deduped.append(ln)
     return "\n".join(deduped)
 
+
+def format_new_env_comment(pr_sha, new_env_lines, new_env_full_lines,
+                           structural_envs, gates, n_envs, total_new,
+                           base_sha=""):
+    """COPS-2766: (body, state, desc) for a PR that only adds environments.
+
+    The merge summary and the gates of a diff comment, with the same token
+    and status rules. A structural problem stays [blocked] with its old
+    description; an open gate comes next. Pure, like format_comment."""
+    token = "blocked" if structural_envs else (gate_token(gates) or "clean")
+    lines = [f"## \U0001f52d {STATUS_NAME}", "", _comment_header(pr_sha), ""]
+    green = token == "clean"
+    lines += _build_merge_summary({}, {}, None, None, None, new_env_lines,
+                                  bool(structural_envs), gates=gates, green=green)
+    lines += ["---", ""] + build_marks(new_env_lines, green)
+    # v2.25.0: complete rendered output after the summary. The comment
+    # inlines what fits (footer-preserving truncation in upsert_comment);
+    # the full-diff artifact keeps it all.
+    if new_env_full_lines:
+        lines += ["---"] + new_env_full_lines
+    if structural_envs:
+        desc = (f"{len(structural_envs)} new environment(s) have a structural "
+                f"config problem: {', '.join(structural_envs)}")
+        status = ("\u274c New environment(s) with a structural problem that "
+                  "must be fixed before merge: "
+                  + ", ".join(f"`{e}`" for e in structural_envs))
+    else:
+        desc = f"{n_envs} new environment(s), ~{total_new} resource(s) to create"
+        status = "\u2705 New environment(s) - all resources will be created on merge"
+    status += gate_footer(gates)
+    lines += [
+        "---",
+        f"**Status:** {status}",
+        f"*{_ts()} \u2014 {COMMENT_MARKER} [{token}]"
+        + (f" [base:{base_sha[:8]}]" if base_sha else "") + "*",
+    ]
+    body = "\n".join(lines)
+    if green:
+        return body, "SUCCESSFUL", join_status_lead(status_lead(body), desc)
+    return body, "FAILED", (desc if structural_envs else gate_status_description(gates))
+
 # ── Per-PR processing (isolated) ──────────────────────────────────────
 def process_pr(pr, path_map, base_sha="", repo=None):
     """Process one PR. All exceptions are caught so other PRs are not affected.
@@ -12118,40 +12172,11 @@ def process_pr(pr, path_map, base_sha="", repo=None):
                 new_env_lines, structural_envs, total_new, new_env_full_lines = \
                     _evaluate_new_envs(new_env_candidates, render_sha,
                                        with_full_output=True)
-
-                lines = [
-                    f"## \U0001f52d {STATUS_NAME}", "",
-                    _comment_header(pr_sha), "",
-                ] + new_env_lines
-
-                # v2.25.0: complete rendered output after the summary. The
-                # comment inlines what fits (footer-preserving truncation in
-                # upsert_comment); the full-diff artifact below keeps it all.
-                if new_env_full_lines:
-                    lines += ["---"] + new_env_full_lines
-
-                if structural_envs:
-                    state = "FAILED"
-                    desc = (f"{len(structural_envs)} new environment(s) have a "
-                            f"structural config problem: {', '.join(structural_envs)}")
-                    status_line = (
-                        f"**Status:** \u274c New environment(s) with a structural "
-                        f"problem that must be fixed before merge: "
-                        f"{', '.join(f'`{e}`' for e in structural_envs)}")
-                    clean_tag = "[blocked]"
-                else:
-                    state = "SUCCESSFUL"
-                    desc = f"{len(new_env_candidates)} new environment(s), ~{total_new} resource(s) to create"
-                    status_line = (
-                        f"**Status:** \u2705 New environment(s) - all resources "
-                        f"will be created on merge")
-                    clean_tag = "[clean]"
-                lines += [
-                    "---",
-                    status_line,
-                    f"*{_ts()} \u2014 {COMMENT_MARKER} {clean_tag}" + (f" [base:{base_sha[:8]}]" if base_sha else "") + "*",
-                ]
-                body = "\n".join(lines)
+                gates = _lift_gates(_merge_gates((), extra=()),
+                                    repo, pr_id, base_sha, pr_sha)
+                body, state, desc = format_new_env_comment(
+                    pr_sha, new_env_lines, new_env_full_lines, structural_envs,
+                    gates, len(new_env_candidates), total_new, base_sha)
                 # v2.25.0: this path never persisted a full-diff artifact, so
                 # new-env-only PRs had no full-output page at all. Save it
                 # BEFORE the final build status so the status icon deep-links
@@ -12160,7 +12185,10 @@ def process_pr(pr, path_map, base_sha="", repo=None):
                                        base_sha=base_sha)
                 st = post_build_status(pr_sha, state, desc, pr_id=pr_id, repo=repo)
                 cm = upsert_comment(pr_id, body, existing_id, repo=repo)
-                _seen_after_writes(sk, pr_sha, base_sha, st, cm)
+                if _extract_status_token(body) == "transient":
+                    _backoff_register_transient(sk, pr_sha)
+                else:
+                    _seen_after_writes(sk, pr_sha, base_sha, st, cm)
                 return
 
             # No apps affected and no new env pattern found.
@@ -12619,15 +12647,11 @@ def process_pr(pr, path_map, base_sha="", repo=None):
                 raise  # COPS-2766: but a failed read retries the PR
             logsink.log(f"    [comment] vm-changes panel failed: {e}", "WARNING")
             vm_change_lines = []
-        # COPS-2766: merge gates. The commits are read only when a gate can be
-        # lifted, so a PR with none never pays for it. PrCommitsUnreadable goes
-        # to the catch-all below: a retry, never a lift.
+        # COPS-2766: merge gates. PrCommitsUnreadable goes to the catch-all
+        # below: a retry, never a lift.
         gates = _merge_gates(decommission_candidates, renames, path_map,
                              vm_change_lines, app_results)
-        if any(gate_trailer(g) for g in gates):
-            confirmed = _confirmations(_pr_commit_messages(repo, pr_id, base_sha, pr_sha))
-            for g in gates:
-                g["lifted"] = gate_trailer(g).lower() in confirmed
+        _lift_gates(gates, repo, pr_id, base_sha, pr_sha)
         # Direct permalink into the full-diff view for this exact commit.
         # Only built when the view is reachable from outside the cluster
         # (base URL set), so the comment never links to something a
