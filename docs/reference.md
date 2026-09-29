@@ -73,6 +73,8 @@ and QA apps when CI publishes a new chart, so they pick it up past the OCI cache
 | 🔗 Legacy backends come back | The effective `appspace.loadBalancers.gatewayApi.legacyBackends` of a live GCP private-cloud environment goes from `false` to `true` (unset reads as `true`, the chart default), by an edit or a move. The chart creates the legacy BackendServices again in `-glb`, with NEGs from `-ms`, and KCC reports them as not ready until both apps are Synced. Check `kubectl get svcneg` and that every BackendService is UpToDate. A ⚠️ review item, and the build stays green. |
 | 📉 Capacity cut | A workload whose render changes loses capacity (COPR-32597). Four rules: an HPA `minReplicas` under 2 with `maxReplicas` over 1, when the base had no such HPA; a smaller floor on a connection service (`devicegateway`, `signschannel`, `signschannelgateway`, `pushnotification`); a cut of 4 replicas or more on any workload (acme-config-prod #4608, 12 to 8); a main container CPU request under 30m that is new or lower in the PR (a raise, 10m to 20m, is not listed). The floor compares fixed replicas with an HPA min, so 10 replicas to an HPA with min 6 is a cut (#4523). A cut to 0 is the zeroed-replicas finding, and a workload with no floor (acme-ping-scaler) is not compared. A ⚠️ review item only, and the build stays green: a planned right-sizing looks the same, and it is listed too, by decision. |
 | 🔁 Fixed replicas released | A Deployment or StatefulSet had `replicas: N` (N > 1) and the PR renders it with no `replicas` field, because an HPA or acme-ping-scaler takes over. On sync the field goes away, and Kubernetes runs 1 replica until the new owner scales it back (acme-config-prod #4523, 10 to 1). With N = 1 nothing drops, so it is not listed. Merge in a quiet window. A ⚠️ review item, and the build stays green. |
+| 🔻 CHART VERSION DOWNGRADE | The chart goes to a lower version. When the same PR moves 3 or more environments and some go up, the banner and the summary say how many go up, because that is how a stale branch looks (#3315). The build status adds `CHART DOWNGRADE in N environment(s)`. |
+| 🧪 -dev chart next to release charts | A PR moves an environment onto a new `-dev` chart while other environments in it take release charts (#4382). A -dev tag is mutable. Warning only. |
 
 The one rule the tool never breaks: **a failure is never reported as "no changes".**
 If a diff could not be computed, the status says so and the PR is not marked clean.
@@ -436,6 +438,11 @@ back from our own merge summary in the posted comment, so the recovery of a
 stuck or missing status writes the same lead. Its tail is rebuilt from the
 comment and is shorter: no decommission or leftover count, and no
 higher-layer wording. FAILED descriptions do not change.
+
+A chart downgrade also adds ` | CHART DOWNGRADE in N environment(s)` to the
+green description, so the status names it when another finding leads
+(#4549). The recovery of a stuck status does not add it, like the
+decommission count.
 
 **noCore turning off.** Turning noCore off deletes `bs-pcs` and `hc-pcs`
 (acme-config-prod #4667, a 5 h outage). A move that turns noCore off only

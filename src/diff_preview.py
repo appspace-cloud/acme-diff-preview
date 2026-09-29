@@ -163,6 +163,7 @@ from comment_render import (  # comment rendering (same-dir module, stdlib only)
     _SEV_BLOCK,
     _VERDICTS,
     _fmt_env_list,
+    _downgrade_mix_note,
     _build_merge_summary,
     build_marks,
     status_lead,
@@ -12242,6 +12243,9 @@ def format_comment(pr_sha, app_results, skipped_apps=None, base_sha="",
             "intentional before merging.**",
             "",
         ]
+        _mix = _downgrade_mix_note(results)
+        if _mix:
+            lines += [_mix, ""]
         for app, (cur_v, new_v) in downgrades:
             lines.append(f"### \U0001f53b `{app}`: `{cur_v}` \u2192 **`{new_v}`**")
         lines += [""]
@@ -14106,7 +14110,15 @@ def process_pr(pr, path_map, base_sha="", repo=None):
         leftover_extra = (
             f" | \U0001f9f9 {len(leftover_apps)} leftover app(s) from prior decommission"
             if leftover_apps else "")
-        status_extra = decom_extra + leftover_extra
+        # COPS-2766: the status names a downgrade even when another finding
+        # leads it (#4549). Like decom_extra, fix_stuck_inprogress does not
+        # rebuild it.
+        _dg_envs = _envs_from_apps(
+            a for a, v in app_results.items() if _result(v).version_change
+            and _is_version_downgrade(*_result(v).version_change))
+        downgrade_extra = (f" | CHART DOWNGRADE in {len(_dg_envs)} environment(s)"
+                           if _dg_envs else "")
+        status_extra = decom_extra + leftover_extra + downgrade_extra
         # COPS-2766: the tenant reach goes only on a green status, so no
         # FAILED text changes.
         green_extra = status_extra + (

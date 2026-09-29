@@ -447,6 +447,20 @@ def build_marks(lines, green):
     return [_RED_MARKS_RE.sub("\u26a0\ufe0f", l) for l in lines]
 
 
+def _downgrade_mix_note(results) -> str:
+    """COPS-2766: a PR that moves 3+ environments, some down and some up,
+    is how a stale branch looks (#3315 reverted a bump merged 1 h before).
+    '' otherwise."""
+    vcs = {a: r.version_change for a, r in results.items() if r.version_change}
+    down = set(_envs_from_apps(a for a, vc in vcs.items() if _is_version_downgrade(*vc)))
+    up = set(_envs_from_apps(a for a, vc in vcs.items()
+                             if _is_version_downgrade(vc[1], vc[0]))) - down
+    if not (down and up and len(down | up) >= 3):
+        return ""
+    return (f"{len(up)} other environment(s) in this PR move up: check that "
+            f"the branch is not out of date.")
+
+
 # COPS-2766: merge gates. A gate fails the build until a Confirm-* line in a
 # commit message of the PR lifts it. A kind with no trailer cannot be lifted:
 # its fix says what to do. A transient kind is checked again by itself.
@@ -810,9 +824,24 @@ def _build_merge_summary(results, rollup_by_sig, vm_change_lines,
         _dg = ", ".join(f"`{o}` \u2192 `{n}`" for o, n in
                         sorted({results[a].version_change
                                 for a in downgraded}))
+        _mix = _downgrade_mix_note(results)
         findings.append((_SEV_REVIEW,
                          f"\u2b07\ufe0f **Chart version downgrade** {_dg} in "
-                         f"{_fmt_env_list(downgraded)}"))
+                         f"{_fmt_env_list(downgraded)}"
+                         + (f". {_mix}" if _mix else "")))
+    # COPS-2766: a new -dev chart in a PR that also takes release charts
+    # (#4382). A -dev tag is mutable. A lone -dev pin is normal testing.
+    dev_new = sorted(a for a, r in results.items() if r.version_change
+                     and str(r.version_change[1]).endswith("-dev")
+                     and not str(r.version_change[0]).endswith("-dev"))
+    if dev_new and any(r.version_change and not str(r.version_change[1]).endswith("-dev")
+                       for r in results.values()):
+        _vers = ", ".join(f"`{v}`" for v in sorted({results[a].version_change[1]
+                                                     for a in dev_new}))
+        findings.append((_SEV_REVIEW,
+                         f"\U0001f9ea **-dev chart next to release charts** {_vers} "
+                         f"in {_fmt_env_list(dev_new)}. A -dev tag can be pushed "
+                         f"again at any time: check that it belongs in this PR."))
     # COPS-2632 / COPS-2677: a rendered `%!s(<nil>)` or `<no value>` is a
     # value the chart read and this environment does not set. Live proof:
     # pv-stage1-a shipped `hosting-id: hst-%!s(<nil>)` and KCC rejected every
