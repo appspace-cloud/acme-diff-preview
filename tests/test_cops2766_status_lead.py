@@ -234,6 +234,61 @@ def test_the_lead_never_says_do_not_merge():
     assert lead.startswith("\U0001f6a8 SHARED DATA"), lead
 
 
+# ── the order inside REVIEW: a cause leads its effect ────────────────────
+
+def _bullets(results, state=None):
+    lines = cr._build_merge_summary(results, {}, None, None, state, None, False)
+    return [l[2:] for l in lines if l.startswith("- ")]
+
+
+def test_a_downgrade_leads_the_deletions_it_causes():
+    """#4549 and #4542: the lead named '4 Service deleted', not the
+    downgrade 2603.1.32 -> 2603.0.21-rev1 behind it."""
+    results = {"pv-x-a-ms": m.DiffResult(
+        "d", [], 4, True, "", m.OUT_DIFF, "",
+        ("2603.1.32", "2603.0.21-rev1"),
+        [f"/v1/Service pv-x-a/s-{i}" for i in range(4)])}
+    b = _bullets(results)
+    assert b[0].startswith("\u2b07\ufe0f **Chart version downgrade**"), b
+    assert b[1].startswith("\U0001f5d1\ufe0f **4 resource(s) deleted**"), b
+    assert cr.status_lead("\n".join(cr._build_merge_summary(
+        results, {}, None, None, None, None, False))).startswith(
+        "\u26a0\ufe0f Chart version downgrade"), "the green status follows"
+
+
+def test_a_shutdown_leads_the_hpas_it_deletes():
+    """#4567 and #4571: '22 HorizontalPodAutoscaler...' led, not
+    'Environment shutting down (109 workloads to 0)'."""
+    results = {"pv-x-a-ms": m.DiffResult(
+        "d", [], 131, True, "", m.OUT_DIFF, "", None,
+        [f"/autoscaling/v2/HorizontalPodAutoscaler pv-x-a/h-{i}"
+         for i in range(22)], True,
+        shutdown_stats={"workloads": 109, "zeroed": 109})}
+    b = _bullets(results)
+    assert b[0].startswith("\U0001f6d1 **Environment shutting down**"), b
+    assert b[1].startswith("\U0001f5d1\ufe0f **22 resource(s) deleted**"), b
+
+
+def test_the_higher_layer_note_is_the_last_review_item():
+    results = {
+        "pv-x-a-ms": m.DiffResult("", [], 0, False, "", m.OUT_INDETERMINATE,
+                                  m.REASON_TIMEOUT),
+        "pv-y-a-ms": m.DiffResult("d", [], 1, True, "", m.OUT_DIFF, "", None,
+                                  ["/v1/Secret pv-y-a/s"])}
+    b = _bullets(results, [cr._VALUES_REDUNDANCY_HDR])
+    assert [x[:1] for x in b] == ["\U0001f5d1", "\u2754", "\U0001f4da"], b
+
+
+def test_block_findings_keep_their_order():
+    """The rank is only inside REVIEW: a BLOCK finding still leads."""
+    results = {"pv-x-a-ms": m.DiffResult(
+        "d", [], 1, True, "", m.OUT_DIFF, "", ("2603.1.0", "2603.0.0"),
+        ["/v1/Secret pv-x-a/s"])}
+    b = _bullets(results, [cr._DECOM_FLAG_TYPO_HDR])
+    assert b[0].startswith("\U0001f6a8 **Teardown flag misspelled"), b
+    assert b[1].startswith("\u2b07"), b
+
+
 # ── join_status_lead ─────────────────────────────────────────────────────
 
 def test_no_lead_keeps_the_description():

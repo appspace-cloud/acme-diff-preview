@@ -335,6 +335,26 @@ _DATA_KINDS = frozenset({
 })
 
 
+# COPS-2766: inside REVIEW a cause leads its effect, so the first line (and
+# the green status) names the downgrade or the shutdown, not the deletions
+# or HPAs they cause (#4549, #4567). Keyed by the finding's emoji. Others
+# (could not be diffed, new env) come after these, and the higher-layer
+# note always last: it changes no manifest.
+_REVIEW_RANK = {
+    "\u23f8": 0, "\u25b6": 0,      # paused, auto-sync paused / resumed
+    "\u2b07": 1,                   # chart downgrade
+    "\U0001f6d1": 2,               # environment shutting down
+    "\U0001f4a5": 3,               # wide-reach config change
+    "\U0001f500": 4,               # planned rename
+    "\U0001f5d1": 5,               # resources deleted
+    "\U0001f9ca": 6,               # replicas scaled to zero
+    "\U0001f39a": 7,               # ping-scaler activated
+    "\U0001f5a5": 8,               # KCC resources unmanaged
+    "\U0001f9ec": 9,               # unresolved chart value
+    "\U0001f4da": 99,              # higher-layer values
+}
+
+
 def _deletion_finding(headers, n_envs, envs) -> str:
     """The deletion bullet, kinds with counts. Data kinds come first in the
     text, so the ~30 characters Bitbucket shows of the status say it.
@@ -911,7 +931,8 @@ def _build_merge_summary(results, rollup_by_sig, vm_change_lines,
     if sev >= _SEV_REVIEW:
         verdict += f" ({n_check} item(s))"
     order = {_SEV_BLOCK: 0, _SEV_REVIEW: 1, _SEV_ROUTINE: 2}
-    findings.sort(key=lambda f: order[f[0]])
+    findings.sort(key=lambda f: (order[f[0]], _REVIEW_RANK.get(f[1][:1], 10)
+                                 if f[0] == _SEV_REVIEW else 0))
     return [MERGE_SUMMARY_HDR, "", verdict, ""] + \
            [f"- {line}" for _s, line in findings] + [""]
 
