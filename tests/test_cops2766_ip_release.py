@@ -94,6 +94,19 @@ def test_argocd_diff_counts_a_renamed_address_as_released(monkeypatch):
     assert set(r.deleted_resources) == {CA, DNS} and not r.renamed_resources
 
 
+def test_argocd_diff_reads_ip_released_past_the_section_cap(monkeypatch):
+    """An address cut by the storage cap still counts: the gate reads the
+    full list, like every other safety fact."""
+    dep = "/apps/Deployment pv-orch-a/web"
+    diff = "".join(f"===== {h} =====\n{b}" for h, b in [
+        (dep, _gone("Deployment")), (CA, _gone("ComputeAddress", "delete"))])
+    monkeypatch.setattr(m, "_run_one_diff", lambda *a, **k: (diff, None, None))
+    monkeypatch.setattr(m.render_profile, "FULL_SECTIONS_MAX_PER_APP", 1)
+    r = m.argocd_diff("pv-orch-a-glb", PR_SHA, BASE_SHA)
+    assert [h for h, _ in r.sections] == [dep], "the address is past the cut"
+    assert r.ip_released == [CA]
+
+
 def test_ip_released_defaults_to_none():
     assert m.DiffResult("", [], 0, False, None, m.OUT_NO_DIFF, "").ip_released is None
 
