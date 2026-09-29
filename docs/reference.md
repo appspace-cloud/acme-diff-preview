@@ -324,10 +324,12 @@ the author to fix and push would send them to change a version that is
 probably correct. Apps failing the same way are grouped, so a fleet PR reads
 as one problem with an environment count rather than fifty lines.
 
-**The green status leads with the top finding** (COPS-2766). People approve
-from the merge dialog, and the green status there used to say only
-`N resource(s) will change - review comment` (acme-config-prod #4684 was
-approved seconds later, with its deletions only in the comment). When the
+**The green status leads with the top finding** (COPS-2766). The Builds
+panel on the PR page shows the status description, and a green one used to
+say only `N resource(s) will change - review comment` (acme-config-prod #4684
+was approved seconds later, with its deletions only in the comment). The
+panel shows about 30 to 50 characters before `...`, with the full text on
+hover; whether the merge dialog shows it too is not checked yet. When the
 merge summary is not routine, the description now starts with its first
 finding as plain text, then ` | ` and the text it had before:
 
@@ -338,12 +340,14 @@ finding as plain text, then ` | ` and the text it had before:
 
 🚨 means the comment verdict is ⛔, and ⚠️ means review. A routine PR keeps
 the old text, and so does a PR whose only finding is the higher-layer note:
-keys that change no manifest are no reason for a warning sign. The status never says DO NOT MERGE, because the build is green.
-The whole description fits in 255 UTF-8 bytes, so it fits whatever unit
-Bitbucket counts. Only the finding is cut (it ends in `...`), never the old
-text. The finding is read back from our own merge summary in the posted
-comment, so the recovery of a stuck INPROGRESS status writes the same text.
-FAILED descriptions do not change.
+keys that change no manifest are no reason for a warning sign. The status
+never says DO NOT MERGE, because the build is green. The whole description
+fits in 255 UTF-8 bytes, so it fits whatever unit Bitbucket counts. Only the
+finding is cut (it ends in `...`), never the old text. The finding is read
+back from our own merge summary in the posted comment, so the recovery of a
+stuck or missing status writes the same lead. Its tail is rebuilt from the
+comment and is shorter: no decommission or leftover count, and no
+higher-layer wording. FAILED descriptions do not change.
 
 See [docs/internals.md](internals.md) for the reasoning behind each guard,
 how mass version bumps are handled, the secret-leak hardening, and the

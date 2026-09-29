@@ -12729,7 +12729,7 @@ def process_pr(pr, path_map, base_sha="", repo=None):
                 state, desc = "SUCCESSFUL", f"{_clean}{status_extra}"
         if state == "SUCCESSFUL":
             # COPS-2766: lead with the top finding of the comment just
-            # posted; fix_stuck_inprogress rebuilds the same text from it.
+            # posted; fix_stuck_inprogress rebuilds the same lead from it.
             desc = join_status_lead(status_lead(body), desc)
         st = post_build_status(pr_sha, state, desc, pr_id=pr_id, repo=repo)
 

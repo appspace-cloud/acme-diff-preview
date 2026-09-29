@@ -1,7 +1,7 @@
 """COPS-2766: the green build status leads with the top merge-summary finding.
 
-Bitbucket shows the status description in the merge dialog, and approvers
-merge from there: acme-config-prod #4684 was approved seconds after a green
+The Builds panel on the PR page shows the status description:
+acme-config-prod #4684 was approved seconds after a green
 "129 resource(s) will change - review comment", with the deletions only in
 the comment. A SUCCESSFUL description is now
 
@@ -12,7 +12,7 @@ the comment. A SUCCESSFUL description is now
   * 255 UTF-8 bytes at most, which fits whatever unit Bitbucket counts.
     Only the lead is cut, never the old text.
   * The lead is read from the posted comment by one pure function, so
-    process_pr and fix_stuck_inprogress write the same text.
+    process_pr and fix_stuck_inprogress write the same lead.
   * FAILED descriptions do not change.
 """
 import glob

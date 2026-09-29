@@ -941,8 +941,8 @@ def _build_merge_summary(results, rollup_by_sig, vm_change_lines,
 
 
 # COPS-2766: a green build status leads with the top finding of the merge
-# summary. Bitbucket shows the status in the merge dialog, where approvers
-# look: #4684 was approved seconds after a green "129 resource(s) will change".
+# summary. The Builds panel on the PR page shows the status: #4684 was
+# approved seconds after a green "129 resource(s) will change".
 # The build is green, so the marker never says DO NOT MERGE.
 _STATUS_MARKS = {"\u26d4": "\U0001f6a8", "\u26a0": "\u26a0\ufe0f"}
 
@@ -953,7 +953,7 @@ def status_lead(comment_md) -> str:
 
     Reads only our own summary, before the first '---' of the comment, so
     author content further down cannot fake it. Pure: process_pr and
-    fix_stuck_inprogress call it on the same comment and get the same text."""
+    fix_stuck_inprogress call it on the same comment and get the same lead."""
     lines = (comment_md or "").split("\n---\n", 1)[0].splitlines()
     if MERGE_SUMMARY_HDR not in lines:
         return ""
