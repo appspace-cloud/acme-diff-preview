@@ -6619,8 +6619,8 @@ def _cascade_finalizer_live(apps):
     reads appspace.decommission out of a file in git, which says what was
     DECLARED, not what ArgoCD has applied. Between the arming PR merging
     and ArgoCD syncing, the panel reports Phase 2 done while the finalizer
-    is not there -- and if the environment is also paused
-    (appspace.autosync: false) it never will be.
+    is not there. A pause does not stop it: the ApplicationSet writes the
+    finalizer whatever the auto-sync is (COPS-2766).
 
     None means "could not tell", and it is deliberately not False. False
     drives a block; treating an unreachable ArgoCD as False would stop
@@ -6684,9 +6684,7 @@ def _cascade_mismatch_note(env_name, apps, cascade: bool) -> list:
         "orphaned exactly as if the cascade had never been armed** \u2014 "
         "still running, still costing money, still holding IPs and disks.",
         "",
-        "Let the arming change SYNC before removing the folder. If the "
-        "environment is paused (`appspace.autosync: false`) it will never "
-        "sync at all, so the pause has to be lifted first (COPS-2583).",
+        "Let the arming change SYNC before removing the folder.",
         "",
     ]
 
