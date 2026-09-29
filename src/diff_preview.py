@@ -5089,8 +5089,8 @@ def _identity_block_reason(hit, confirmed):
     return None if hit["paused_head"] else "keep_paused"
 
 
-def _pr_commits(repo, pr_id):
-    """The commits of the PR from the API, every page."""
+def _pr_commits(repo, pr_id, pr_sha):
+    """The commits of the PR from the API, every page, up to the head pr_sha."""
     commits, page, base = [], f"pullrequests/{pr_id}/commits?pagelen=100", _bb_api_base(repo)
     for _ in range(_BB_MAX_PAGES):
         try:
@@ -5098,15 +5098,18 @@ def _pr_commits(repo, pr_id):
         except urllib.error.HTTPError as e:
             if not _is_transient_exception(e):
                 raise  # a 4xx is not a blip: fail, do not retry forever
-            raise PrCommitsUnreadable(f"commits of PR #{pr_id} unreadable: {e}") from e
+            raise PrCommitsUnreadable(f"commit messages of PR #{pr_id} unreadable: {e}") from e
         except (OSError, ValueError) as e:
-            raise PrCommitsUnreadable(f"commits of PR #{pr_id} unreadable: {e}") from e
+            raise PrCommitsUnreadable(f"commit messages of PR #{pr_id} unreadable: {e}") from e
         commits += data.get("values", [])
         page = (data.get("next") or "").replace(f"{base}/", "")
         if not page:
             break
     else:
-        raise PrCommitsUnreadable(f"commits of PR #{pr_id}: too many pages")
+        raise PrCommitsUnreadable(f"commit messages of PR #{pr_id}: too many pages")
+    # Right after a push the list can still miss the new head: retry, never "unconfirmed".
+    if not any((c.get("hash") or "").startswith(pr_sha) for c in commits):
+        raise PrCommitsUnreadable(f"commit list of PR #{pr_id} does not have {pr_sha[:8]} yet")
     return commits
 
 
@@ -5120,28 +5123,25 @@ def _pr_commit_messages(repo, pr_id, base_sha, pr_sha):
                       f"{base_sha}..{pr_sha}"], timeout=30)
         if r is not None and r.returncode == 0:
             return r.stdout.split("\x00")
-    commits = _pr_commits(repo, pr_id)
-    # Right after a push the list can still miss the new head: retry, never "unconfirmed".
-    if not any((c.get("hash") or "").startswith(pr_sha) for c in commits):
-        raise PrCommitsUnreadable(f"commit list of PR #{pr_id} does not have {pr_sha[:8]} yet")
-    return [c.get("message") or "" for c in commits]
+    return [c.get("message") or "" for c in _pr_commits(repo, pr_id, pr_sha)]
 
 
-def _pr_commit_authors(repo, pr):
+def _pr_commit_authors(repo, pr, pr_sha):
     """COPS-2766: the other people who wrote commits in the PR, by name.
 
     API only: the mirror has git names and emails, not the Bitbucket account.
-    It does not wait for a new head the list does not have yet: the older
-    commits are still right, and the next render reads the head."""
+    A list without the head pr_sha raises, so the comment says it could not
+    read the authors: the head author could be the one that is missing. The
+    same head is not rendered again until a push or a move of main."""
     me = pr.get("author") or {}
     bot = me.get("type") == "app_user"  # a repository access token
     if not bot and not me.get("account_id"):
         raise PrCommitsUnreadable(f"PR #{pr['id']} has no author")
     mine = {(me.get(k) or "").casefold() for k in ("display_name", "nickname")}
     names = set()
-    for c in _pr_commits(repo, pr["id"]):
+    for c in _pr_commits(repo, pr["id"], pr_sha):
         if len(c.get("parents") or ()) > 1:
-            continue  # a merge of main brings no change of its own
+            continue  # a merge commit brings no change of its own
         a = c.get("author") or {}
         u = a.get("user") or {}
         name = u.get("display_name") or (a.get("raw") or "").split(" <")[0]
@@ -14145,7 +14145,7 @@ def process_pr(pr, path_map, base_sha="", repo=None):
         # COPS-2766: an approval from someone who wrote commits here is not
         # independent. Informational: a failed read says so and changes nothing else.
         try:
-            _authors = _pr_commit_authors(repo, pr)
+            _authors = _pr_commit_authors(repo, pr, pr_sha)
         except Exception as e:
             logsink.log(f"    [comment] commit authors unreadable: {e}", "WARNING")
             _authors = None

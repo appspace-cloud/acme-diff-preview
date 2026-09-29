@@ -14,8 +14,10 @@ the footer token and the build status do not change.
   * A PR opened by a bot token (app_user): only a commit by a human account
     counts, because the bot commits carry another git name.
   * When the commits cannot be read, the line says so.
-  * Right after a push the list can miss the new head. The older commits
-    are still right, so the authors read does not wait for it.
+  * Right after a push the list can miss the new head. Then the line says
+    it could not read the authors, because the head author could be the one
+    that is missing. The same head is not rendered again until a push or a
+    move of main, so staying silent would read as "no other author".
 """
 import os
 import sys
@@ -81,8 +83,8 @@ def _serve(monkeypatch, *pages, pr_id=7):
     return calls
 
 
-def _authors(author, pr_id=7):
-    return m._pr_commit_authors(REPO, {"id": pr_id, "author": author})
+def _authors(author, pr_id=7, head="h1"):
+    return m._pr_commit_authors(REPO, {"id": pr_id, "author": author}, head)
 
 
 # ── who counts as another author ─────────────────────────────────────────
@@ -157,15 +159,22 @@ def test_next_pages_are_read(monkeypatch):
     assert calls == ["pullrequests/7/commits?pagelen=100", "pullrequests/7/commits?page=2"]
 
 
-def test_a_list_without_the_new_head_still_gives_the_older_authors(monkeypatch):
-    # The messages wait for the head (a gate is lifted by them); the authors
-    # are information, and the next render sees the head.
+def test_a_list_without_the_new_head_is_unreadable(monkeypatch):
+    # The head author could be the missing one, and the same head is not
+    # rendered again until a push or a move of main: say so, do not guess.
     monkeypatch.setattr(m, "GIT_MIRROR_ENABLED", False)
-    _serve(monkeypatch, [_commit("old1", "bsoto <b@x>", BEA)])
-    assert _authors(ANA) == ["Bea Soto"]
-    _serve(monkeypatch, [_commit("old1", "bsoto <b@x>", BEA)], pr_id=1)
+    _serve(monkeypatch, [_commit("old1", "ana <a@x>", ANA)])
+    with pytest.raises(m.PrCommitsUnreadable, match="does not have head1"):
+        _authors(ANA, head="head1")
+    # The messages read the same list and wait for the head too.
+    _serve(monkeypatch, [_commit("old1", "ana <a@x>", ANA)], pr_id=1)
     with pytest.raises(m.PrCommitsUnreadable, match="does not have head1"):
         m._pr_commit_messages(REPO, 1, "base1", "head1")
+
+
+def test_a_short_head_matches_the_full_hash(monkeypatch):
+    _serve(monkeypatch, [_commit("h1ffffff", "bsoto <b@x>", BEA)])
+    assert _authors(ANA, head="h1ff") == ["Bea Soto"]
 
 
 @pytest.mark.parametrize("error", [OSError("reset"), ValueError("bad json"),
@@ -300,6 +309,14 @@ def test_process_pr_names_a_co_author_and_keeps_the_green_status(world, monkeypa
 def test_process_pr_with_only_own_commits_has_no_line(world, monkeypatch):
     body, status = _run(world, monkeypatch, [_commit(PR_SHA, "ana <a@x>", ANA)])
     assert "\U0001f465" not in body
+    assert status == GREEN
+
+
+def test_process_pr_says_when_the_list_has_no_head_yet(world, monkeypatch):
+    body, status = _run(world, monkeypatch, [_commit("c1", "bsoto <b@x>", BEA)])
+    lines = body.splitlines()
+    assert lines[lines.index(HDR) + 4] == UNREADABLE
+    assert "Bea Soto" not in body
     assert status == GREEN
 
 
