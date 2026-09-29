@@ -5304,7 +5304,9 @@ def _cohort_removal_block(hits: list, pr_sha: str, base_sha: str):
     return desc, body
 
 _CL_ENV_RE = re.compile(r"^gcp/[^/]+/public-cloud/[^/]+/(cl-[^/]+)/config\.yaml$")
-_CL_APP_RE = re.compile(r"^gcp/[^/]+/public-cloud/[^/]+/(cl-[^/]+)/([^/]+)/customer\.yaml$")
+# COPS-2766: only the glb-appN sets read an app folder; the fixed api, cloud and
+# user-content sets and the constellation read cl-*/config.yaml alone.
+_CL_APP_RE = re.compile(r"^gcp/[^/]+/public-cloud/[^/]+/(cl-[^/]+)/(app\d+)/customer\.yaml$")
 
 
 def _generator_file(path, path_map):
@@ -5398,6 +5400,134 @@ def _frozen_version_block(hits: list, pr_sha: str, base_sha: str):
         + (f" [base:{base_sha[:8]}]" if base_sha else "") + "*"
     )
     return desc, body
+
+
+_GENERATOR_KEYS = ("version", "autosync", "decommission")
+
+
+def _generator_reads(path, sha, path_map, changed, repo=None):
+    """True when an ApplicationSet generator reads appspace.version, autosync and
+    decommission from `path`, False when none does, None out of scope (aws/ has
+    no ApplicationSet, and nothing outside gcp/ and azure/ is env config).
+
+    Private cloud reads <spoke>/**/customer.yaml and the config.yaml one folder
+    up; public cloud reads cl-*/config.yaml and cl-*/appN/customer.yaml.
+    """
+    if path.split("/")[0] not in ("gcp", "azure"):
+        return None
+    if _is_pv_env_file(path):
+        return True
+    if _is_pv_file(path, "config.yaml"):
+        # The cohort of an env is read. Next to a customer.yaml it is an env folder
+        # file, and no generator reads it. A cohort with no env below yet counts
+        # as read, so a fleet bump stays green.
+        if any(_is_pv_env_file(p) and _cohort_of(p) == path for p in (*path_map, *changed)):
+            return True
+        sib = posixpath.dirname(path) + "/customer.yaml"
+        return not (sib in path_map or sib in changed or _value_body(sib, sha, repo) is not None)
+    return bool(_CL_ENV_RE.match(path) or _CL_APP_RE.match(path))
+
+
+def _detect_inert_generator_keys(changed, renames, path_map, sha, base_sha, repo=None) -> list:
+    """COPS-2766: appspace.version, autosync or decommission that this PR sets in
+    a file the ApplicationSet does not read (why "inert"), or a version that is
+    not a string (why "type", in any file), as hits {path, key, value, why}.
+
+    A removed key, or one with the same value at `base_sha` (under the old name
+    of a move), is not a hit. With no base every key counts. A public-cloud
+    decommission stays block 2's warning, and a falsy version in a generator
+    file is the frozen check's.
+    """
+    old_of = {new: old for old, new in (renames or {}).items()}
+
+    def appspace(path, at):
+        doc = _read_first_doc(path, at, repo, True)[0]
+        a = doc.get("appspace") if isinstance(doc, dict) else None
+        return a if isinstance(a, dict) else {}
+
+    hits = []
+    for f in changed:
+        if not f.endswith(_VALUE_FILE_SUFFIXES):
+            continue
+        own = appspace(f, sha)
+        keys = [k for k in _GENERATOR_KEYS if k in own]
+        reads = _generator_reads(f, sha, path_map, changed, repo) if keys else None
+        if reads is None:
+            continue
+        found = []
+        for k in keys:
+            if not reads and not (k == "decommission" and "/public-cloud/" in f):
+                found.append((k, "inert"))
+            elif k == "version" and own[k] and not isinstance(own[k], str):
+                found.append((k, "type"))
+        if found and base_sha:
+            old = appspace(old_of.get(f, f), base_sha)
+            found = [(k, why) for k, why in found if not (k in old and old[k] == own[k])]
+        hits += [{"path": f, "key": k, "value": own[k], "why": why} for k, why in found]
+    return hits
+
+
+_INERT_WHERE = ("the environment `customer.yaml`, or the cohort `config.yaml` one folder up",
+                "`cl-*/config.yaml` (the whole environment) or `cl-*/appN/customer.yaml` "
+                "(one app type)")
+_INERT_WHY = {
+    "inert": "In any other file, `version` and `autosync` do nothing: no new chart, no "
+             "pause. The diff stays quiet, and the PR looks done (COPS-2684).",
+    "decommission": "In any other file, `decommission` adds no cascade finalizer, but the "
+                    "chart still reads it: the static IP deletion policy, and the data purge "
+                    "with `decommissionPurgeData`. The teardown is only half armed.",
+    "type": "A YAML number is printed as a number, not as the text you wrote (`2604.0` "
+            "becomes `2604`), so ArgoCD can ask for a chart that does not exist.",
+}
+_INERT_FIX = {
+    "inert": "Move the key to the file named above, or delete it.",
+    "decommission": "Move `decommission` to the environment `customer.yaml`, or delete it.",
+    "type": "Quote the version.",
+}
+
+
+def _inert_key_block(hits: list, pr_sha: str, base_sha: str):
+    """(build status description, comment body) for _detect_inert_generator_keys hits."""
+    def kind(x):
+        return "decommission" if x["key"] == "decommission" else x["why"]
+
+    def line(x):
+        v = json.dumps(x["value"], default=str)
+        # acme-config-dev #6845 wrote version.AppVersion for versions.AppVersion.
+        tip = (" For the chart's app versions, the key is `appspace.versions`."
+               if x["key"] == "version" and isinstance(x["value"], dict) else "")
+        if x["why"] == "type":
+            return (f"- `{x['path']}`: `appspace.version: {v}` is not a string in YAML."
+                    + (tip or f" Quote it: `version: \"{v}\"`."))
+        return (f"- `{x['path']}`: `appspace.{x['key']}: {v}`. The ApplicationSet reads it "
+                f"only from {_INERT_WHERE['/public-cloud/' in x['path']]}." + tip)
+
+    h = hits[0]
+    more = f" (+{len(hits) - 1} more)" if len(hits) > 1 else ""
+    what = "is not a string" if h["why"] == "type" else "is never read by the ApplicationSet"
+    tail = " - see PR comment"
+    desc = (f"BLOCKED: appspace.{h['key']} in {'/'.join(h['path'].split('/')[-2:])} "
+            f"{what}{more}")[:255 - len(tail)] + tail
+    kinds = [k for k in _INERT_WHY if any(kind(x) == k for x in hits)]
+    head = ("sets `appspace.version` to a value that is not a string" if kinds == ["type"]
+            else "sets a key where ArgoCD does not read it")
+    body = (
+        f"## \U0001f52d {STATUS_NAME}\n\n"
+        f"{_comment_header(pr_sha)}\n\n"
+        f"⛔ **Blocked: this PR {head}.**\n\n"
+        + "\n".join(line(x) for x in hits) + "\n\n"
+        "**Why:** the ApplicationSet takes `appspace.version`, `autosync` and "
+        "`decommission` only from the files its generator lists, not from every value "
+        "file, and it prints each value as text.\n\n"
+        + "".join(f"- {_INERT_WHY[k]}\n" for k in kinds) + "\n"
+        "**Fix:** " + " ".join(_INERT_FIX[k] for k in kinds) + "\n\n"
+        "This check runs again by itself on a new commit, or when `main` changes.\n\n"
+        f"---\n**Status:** ⛔ Blocked: `appspace.{h['key']}` in `{h['path']}`{more}\n"
+        f"*{_ts()} - {COMMENT_MARKER} [blocked]"
+        + (f" [base:{base_sha[:8]}]" if base_sha else "") + "*"
+    )
+    return desc, body
+
 
 def _detect_new_env_candidates(changed_files: list, path_map: dict, renames: dict = None, pr_sha: str = None, repo: str = None) -> list:
     """Scan changed files for patterns that indicate a brand-new environment.
@@ -12727,6 +12857,16 @@ def process_pr(pr, path_map, base_sha="", repo=None):
         frozen_hits = _detect_frozen_versions(changed, renames, path_map, render_sha, repo=repo)
         if frozen_hits:
             desc, body = _frozen_version_block(frozen_hits, pr_sha, base_sha)
+            st = post_build_status(pr_sha, "FAILED", desc, pr_id=pr_id, repo=repo)
+            cm = upsert_comment(pr_id, body, existing_id, repo=repo)
+            _seen_after_writes(sk, pr_sha, base_sha, st, cm)
+            return
+        # COPS-2766: a generator key where the ApplicationSet does not read it, or a
+        # version that is not a string. The fix is always to move, quote or delete it.
+        inert_hits = _detect_inert_generator_keys(changed, renames, path_map, render_sha,
+                                                  base_sha, repo=repo)
+        if inert_hits:
+            desc, body = _inert_key_block(inert_hits, pr_sha, base_sha)
             st = post_build_status(pr_sha, "FAILED", desc, pr_id=pr_id, repo=repo)
             cm = upsert_comment(pr_id, body, existing_id, repo=repo)
             _seen_after_writes(sk, pr_sha, base_sha, st, cm)

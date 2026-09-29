@@ -138,7 +138,7 @@ def test_comment_skipped_when_not_leader(monkeypatch, failures):
     assert calls == [] and m._diff_stats["bb_write_failures"] == 0
 
 
-# ── process_pr: the 8 early exits ────────────────────────────────────────
+# ── process_pr: the early exits ────────────────────────────────────────
 
 COHORT = "gcp/dev/private-cloud/ap1/custom/config.yaml"
 SLIP = {"path": IDENTITY, "kind": "wipe", "key": "appspace.microservices.definitions",
@@ -184,6 +184,9 @@ EXITS = {
     "frozen": (lambda mp: _force(mp, "_detect_frozen_versions", [
         {"path": IDENTITY, "cohort": COHORT, "why": "missing"}]),
                "blocked", "watch-only"),
+    "inert_key": (lambda mp: _force(mp, "_detect_inert_generator_keys", [
+        {"path": IDENTITY, "key": "autosync", "value": False, "why": "inert"}]),
+                  "blocked", "does not read it"),
     "new_env": (_new_env, "clean", "New Environment(s) Detected"),
     "no_apps": (lambda mp: mp.setattr(m, "get_pr_changed_files", lambda pr_id, repo=None:
                                       (["docs/README.md"], {})),
