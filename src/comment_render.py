@@ -449,6 +449,8 @@ GATES = {
                      "blocked", "Use git mv, or choose another customerName or suffix"),
     "ashn_copy": ("A clone reuses the ashn of another environment", None, "blocked",
                   "Give the clone its own ashn"),
+    "vm_disk": ("An n4 or c4 machine with a pd- disk, GCP rejects it", None, "blocked",
+                "Use hyperdisk-balanced on a new VM, or keep the machine family"),
 }
 
 

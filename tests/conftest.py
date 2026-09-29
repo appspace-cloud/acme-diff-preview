@@ -186,3 +186,21 @@ def _no_fleet_reads(request, monkeypatch):
     import diff_preview as _m
     monkeypatch.setattr(_m, "_fleet_own_identities", lambda repo, base_sha: ({}, []))
     yield
+
+
+# ── COPS-2766: no new-env VM check unless a test asks for it ────────────────
+#
+# Block 3 checks the value chain of each new GCP env for its VMs, and warns
+# when no VM renders. Most old new-env fixtures are minimal customer.yaml
+# files with no VM role, so the real check would turn their verdict to Review
+# while they assert only part of the body. The default here is no finding,
+# which is what those fixtures saw before. A test of these checks opts back
+# in with @pytest.mark.prereq_reads.
+@pytest.fixture(autouse=True)
+def _no_prereq_reads(request, monkeypatch):
+    if request.node.get_closest_marker("prereq_reads"):
+        yield          # this test runs the VM checks on purpose
+        return
+    import diff_preview as _m
+    monkeypatch.setattr(_m, "_new_env_prereqs", lambda *a, **k: ([], {}))
+    yield

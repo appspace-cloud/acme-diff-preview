@@ -261,6 +261,10 @@ from vm_analysis import (  # VM/KCC infrastructure analysis (same-dir module)
     _kcc_role_value,
     _detect_kcc_adoption,
     _kcc_move_disk_shrink,
+    _VM_DISK_FAMILY_REASON,
+    _VM_DISK_FAMILY_LEAVES,
+    _vm_disk_family_changes,
+    _new_env_prereq_findings,
     _kcc_adoption_card,
     _VM_PANEL_CLEAN_HDR,
     _VM_REPEAT_RE,
@@ -5433,7 +5437,7 @@ def _detect_new_env_candidates(changed_files: list, path_map: dict, renames: dic
 
 def _evaluate_new_envs(new_env_candidates: list, pr_sha: str,
                        with_full_output: bool = False, base_sha: str = "",
-                       repo: str = None, changed=(), renames=None) -> tuple:
+                       repo: str = None, changed=(), renames=None, prereqs=None) -> tuple:
     """Render and classify a list of new-environment candidates.
 
     v2.5.4 (Finding 4): extracted from process_pr's inline logic so the same
@@ -5456,7 +5460,8 @@ def _evaluate_new_envs(new_env_candidates: list, pr_sha: str,
                           all successfully-rendered new environments.
 
     COPS-2766: with `base_sha`, each env section also lists the GCP objects
-    it shares with a live env (_new_env_shared_lines), as check lines.
+    it shares with a live env (_new_env_shared_lines), as check lines. The
+    `prereqs` lines of _new_env_prereqs go first.
     """
     new_env_sections = []
     full_sections = []      # (name, version, n_res, redacted manifest)
@@ -5562,7 +5567,8 @@ def _evaluate_new_envs(new_env_candidates: list, pr_sha: str,
             })
             continue
         # COPS-2766: the GCP objects it shares with a live env, a warning.
-        checks = _new_env_shared_lines(env_info, pr_sha, base_sha, repo, changed, renames)
+        checks = (prereqs or {}).get(env_info["config_file"], []) + _new_env_shared_lines(
+            env_info, pr_sha, base_sha, repo, changed, renames)
         render_result = _render_new_env_diff(env_info, pr_sha)
         # Returns (rendered_manifest, error [, n_res [, version]])
         rendered   = render_result[0]
@@ -7351,6 +7357,27 @@ def _new_env_shared_lines(env_info, sha, base_sha, repo=None, changed=(), rename
     return lines
 
 
+def _new_env_prereqs(new_env_candidates, sha, repo=None) -> tuple:
+    """COPS-2766 (C21): (vm_disk gates, {config_file: lines}) for the new GCP
+    private-cloud envs, where KCC renders the VMs, from the value chain at the
+    head. A failed read raises, so the PR is retried."""
+    gates, lines = [], {}
+    for c in new_env_candidates or ():
+        path = c.get("config_file", "")
+        if not (path.startswith("gcp/") and _is_pv_env_file(path)):
+            continue
+        flat = _merged_kcc_flat_for_env(path, sha, repo, strict=True)
+        if flat is None:
+            lines[path] = [f"{_NEW_ENV_CHECK_PREFIX}`{c['name']}`: the VM checks did not run, "
+                           "because its values cannot be parsed."]
+            continue
+        errors, lines[path] = _new_env_prereq_findings(flat, c["name"])
+        if errors:
+            role, mt, disk, t = errors[0]
+            gates.append({"kind": "vm_disk", "env": c["name"], "why": f"{role} {mt}, {disk} {t}"})
+    return gates, lines
+
+
 def _env_declares_live_kcc_vms(identity_file: str, sha: str,
                                repo: str = None) -> tuple:
     """(declares_live_vms, allowDeletion_armed) from the merged hierarchy.
@@ -7851,6 +7878,8 @@ def _merge_gates(decommission_candidates, renames=None, path_map=None,
     nothing lifts it. An app that releases a static IP or a DNS record is
     `ip`, lifted by `Confirm-IP-Release: <env>`.
     `extra` holds gates the caller built itself.
+    An n4 or c4 machine with a pd- disk in the VM panel is `vm_disk`, like
+    `shrink`.
     """
     found = [g for c in decommission_candidates or () for g in c.get("gates", ())]
     found += [{"kind": "cl_rename", "env": _CL_ENV_RE.match(old)[1],
@@ -7859,6 +7888,8 @@ def _merge_gates(decommission_candidates, renames=None, path_map=None,
               if _CL_ENV_RE.match(old) and (path_map or {}).get(old)]
     found += [{"kind": "shrink", "env": (re.findall(r"`([^`]+)`", line) or [""])[0]}
               for line in vm_change_lines or () if _VM_SHRINK_REASON in line]
+    if any(_VM_DISK_FAMILY_REASON in line for line in vm_change_lines or ()):
+        found.append({"kind": "vm_disk", "env": ""})
     found += [{"kind": "ip", "env": _envs_from_apps([app])[0]}
               for app, r in (app_results or {}).items() if getattr(r, "ip_released", None)]
     found += extra
@@ -10368,6 +10399,16 @@ def _summarize_vm_changes(changed_files, pr_sha, base_sha, path_map,
         if not keys:
             continue
         env_name = posixpath.basename(posixpath.dirname(clean))
+        # COPS-2766 (C21): an n4 or c4 machine with a pd- disk that this change
+        # adds. Only a GCP private-cloud env: KCC renders its VMs.
+        if clean.startswith("gcp/") and _is_pv_env_file(clean) and any(
+                k.startswith((_KCC_PREFIX, _LEGACY_PREFIX))
+                and k.rsplit(".", 1)[-1] in _VM_DISK_FAMILY_LEAVES for k in keys):
+            dangerous_lines += [
+                f"- \U0001f6a8 `{env_name}` \u00b7 **linux VM (KCC) \u00b7 {role}**: {text}"
+                for role, text in _vm_disk_family_changes(
+                    _merged_kcc_flat_for_env(clean, base_sha, repo, strict=True),
+                    _merged_kcc_flat_for_env(clean, pr_sha, repo, strict=True))]
         # COPS-2608: classify the whole file before scoring individual keys.
         # A Terraform -> KCC ownership transfer moves the same machineType
         # from one key tree to the other; scoring the removal and the
@@ -12506,6 +12547,8 @@ def process_pr(pr, path_map, base_sha="", repo=None):
         # A clone with the ashn of another env: nothing lifts it either.
         ashn_gates, ashn_notes = _detect_copied_clone_ashn(changed, renames, render_sha,
                                                            base_sha, repo=repo)
+        # A new GCP env on an n4 or c4 machine with a pd- disk: GCP rejects it.
+        disk_gates, prereqs = _new_env_prereqs(new_env_candidates, render_sha, repo=repo)
 
         # v2.5.10 (explicit request): detect FULL environment decommissions
         # (identity file deleted, no successor anywhere — distinct from a
@@ -12539,8 +12582,9 @@ def process_pr(pr, path_map, base_sha="", repo=None):
                 new_env_lines, structural_envs, total_new, new_env_full_lines = \
                     _evaluate_new_envs(new_env_candidates, render_sha,
                                        with_full_output=True, base_sha=base_sha, repo=repo,
-                                       changed=changed, renames=renames)
-                gates = _lift_gates(_merge_gates((), extra=clone_gates + dup_gates + ashn_gates),
+                                       changed=changed, renames=renames, prereqs=prereqs)
+                gates = _lift_gates(_merge_gates((), extra=clone_gates + dup_gates + ashn_gates
+                                                 + disk_gates),
                                     repo, pr_id, base_sha, pr_sha)
                 body, state, desc = format_new_env_comment(
                     pr_sha, _clone_wake_lines(gates) + _dup_identity_lines(gates, dup_unchecked)
@@ -12962,7 +13006,7 @@ def process_pr(pr, path_map, base_sha="", repo=None):
             new_env_lines, structural_envs, total_new, new_env_full_lines = \
                 _evaluate_new_envs(new_env_candidates, render_sha,
                                    with_full_output=True, base_sha=base_sha, repo=repo,
-                                   changed=changed, renames=renames)
+                                   changed=changed, renames=renames, prereqs=prereqs)
         new_env_desc = (
             f"{len(structural_envs)} new environment(s) have a structural "
             f"config problem: {', '.join(structural_envs)}"
@@ -13021,7 +13065,8 @@ def process_pr(pr, path_map, base_sha="", repo=None):
         # COPS-2766: merge gates. PrCommitsUnreadable goes to the catch-all
         # below: a retry, never a lift.
         gates = _merge_gates(decommission_candidates, renames, path_map,
-                             vm_change_lines, app_results, clone_gates + dup_gates + ashn_gates)
+                             vm_change_lines, app_results,
+                             clone_gates + dup_gates + ashn_gates + disk_gates)
         _lift_gates(gates, repo, pr_id, base_sha, pr_sha)
         appspace_state_lines = (_clone_wake_lines(gates) + _dup_identity_lines(gates, dup_unchecked)
                                 + _ashn_copy_lines(gates, ashn_notes) + appspace_state_lines)
