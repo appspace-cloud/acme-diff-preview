@@ -714,3 +714,25 @@ def test_past_prod_renames_are_caught(monkeypatch, sha, old, new):
         changed += f[1:]
     hits = dp._detect_live_identity_changes(changed, renames, {}, sha, f"{sha}^1")
     assert [(h["old_ns"], h["new_ns"]) for h in hits] == [(old, new)]
+
+
+MOVED = ENV.replace("pv-orch-a", "pv-orch2-a")
+
+
+def test_process_pr_a_confirmed_paused_git_mv_rename_is_green(rename_pr, monkeypatch):
+    """COPS-2766: the Planned rename notice covers the old namespace, so the
+    orphan teardown gate does not block the old path of a confirmed rename."""
+    sinks, store, mains, files, path_map = rename_pr
+    store["messages"] = [CONFIRM]
+    mains[BASE_SHA][ENV] = ORCH + PAUSE
+    del files[ENV]
+    files[MOVED] = ORCH2 + PAUSE
+    monkeypatch.setattr(dp, "get_pr_changed_files",
+                        lambda pr_id, repo=None: ([ENV, MOVED], {ENV: MOVED}))
+    monkeypatch.setattr(dp, "_render_main_side_resources", lambda app, sha: {})
+    dp.process_pr(_pr(), path_map, base_sha=BASE_SHA)
+    assert "Planned rename of a live environment" in store["body"]
+    assert "ENVIRONMENT DECOMMISSION" in store["body"], "the old env still goes"
+    assert "Confirm-Teardown" not in store["body"]
+    assert _extract_status_token(store["body"]) == "clean"
+    assert sinks.statuses[-1][0] == "SUCCESSFUL", sinks.statuses[-1]

@@ -239,7 +239,10 @@ It fails closed:
 When the PR also adds an environment, the decommission panel adds one 💡 line:
 it looks like a rebuild or a rename of the old env, so arm decommission on the
 old env, or use `git mv` with `Confirm-Rename`. On `cl-*` the flag arms
-nothing, so there the line only names `git mv`.
+nothing, so there the line only names `git mv`. A `git mv` that the rename
+guard lets through (`Confirm-Rename`, paused on `main`) needs no
+`Confirm-Teardown` for its old folder: the Planned rename note already says
+the old namespace keeps running.
 
 Replay on the acme-config-prod history: the teardown gates would have
 stopped one PR that was fine, of 525 (#4396). About one Phase 3 PR a month

@@ -12040,6 +12040,9 @@ def process_pr(pr, path_map, base_sha="", repo=None):
                 cm = upsert_comment(pr_id, body, existing_id, repo=repo)
                 _seen_after_writes(sk, pr_sha, base_sha, st, cm)
                 return
+        # COPS-2766: the Planned rename notice covers the old namespace of a
+        # confirmed rename, so removing its old path is no orphan teardown.
+        renamed_ok = {h["moved_from"] for h in identity_hits if not h["reason"]}
         # No chart version for a live env: ArgoCD sets watch-only and the apps freeze.
         frozen_hits = _detect_frozen_versions(changed, renames, path_map, render_sha, repo=repo)
         if frozen_hits:
@@ -12068,6 +12071,9 @@ def process_pr(pr, path_map, base_sha="", repo=None):
             decommission_lines, decommissioned_envs, decom_full_lines = \
                 _evaluate_env_decommissions(decommission_candidates, render_sha,
                                             base_sha, with_full_output=True)
+            for c in decommission_candidates:
+                if c["identity_file"] in renamed_ok:
+                    c["gates"] = [g for g in c.get("gates", ()) if g["kind"] != "orphan"]
             if decommissioned_envs:
                 logsink.log(f"PR #{pr_id}: environment decommission detected: "
                             f"{decommissioned_envs}", "WARNING", pr=pr_id)
