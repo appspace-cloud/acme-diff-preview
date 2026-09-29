@@ -384,6 +384,43 @@ def test_apps_over_the_cap_stay_red_after_a_failed_status_write(
     assert m._seen.get(SK) == (PR_SHA, BASE_SHA)
 
 
+def test_a_block_whose_status_write_fails_turns_an_old_green_red(world, monkeypatch):
+    """The early exits post no INPROGRESS. When their FAILED did not land,
+    the commit kept the SUCCESSFUL of a render against an older main, and
+    the recovery left it: a green gate under a [blocked] comment."""
+    from test_coverage_orchestration import IDENTITY
+    monkeypatch.setattr(m, "_detect_wiped_definitions", lambda *a, **k: [IDENTITY])
+    bb = _bitbucket(world, monkeypatch, "SUCCESSFUL", ["FAILED"])
+    body = _render_then_recover(world, monkeypatch)
+    assert m._extract_status_token(body) == "blocked"
+    assert bb["state"] == "FAILED"
+    assert world[0].statuses[-1] == (
+        "FAILED", "Blocked - merging would break the environment (see comment)")
+    assert m._seen.get(SK) == (PR_SHA, BASE_SHA)
+
+
+_BLOCKED = f"x\n*ts — {m.COMMENT_MARKER} [blocked]*"
+_PERMANENT = f"x\n*ts — {m.COMMENT_MARKER} [permanent]*"
+
+
+@pytest.mark.parametrize("comment", [_BLOCKED, _PERMANENT])
+def test_fix_stuck_turns_a_green_status_under_a_red_comment_red(monkeypatch, comment):
+    posted = _stuck(monkeypatch, {"state": "SUCCESSFUL"})
+    assert m.fix_stuck_inprogress("a" * 12, 10, comment) == "ok"
+    assert [s for s, _d, _r in posted] == ["FAILED"]
+
+
+@pytest.mark.parametrize("state,comment", [
+    ("FAILED", CLEAN),        # never unblock from text rebuilt from a comment
+    ("FAILED", _BLOCKED),
+    ("STOPPED", _BLOCKED),
+])
+def test_fix_stuck_never_touches_a_red_or_stopped_status(monkeypatch, state, comment):
+    posted = _stuck(monkeypatch, {"state": state})
+    assert m.fix_stuck_inprogress("a" * 12, 10, comment) == "ok"
+    assert posted == []
+
+
 # ── every status write names its repo ────────────────────────────────────
 
 def test_every_post_build_status_call_passes_repo():

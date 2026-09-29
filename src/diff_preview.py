@@ -8372,8 +8372,9 @@ def fix_stuck_inprogress(pr_sha, pr_id, comment_raw, repo=None):
     the comment but before posting the final SUCCESSFUL/FAILED status.
 
     COPS-2766: a 404 means no status at all (the INPROGRESS and the final
-    post both failed), so that commit gets one from the comment too. Returns
-    the write result, or "ok" when the status is already final.
+    post both failed), so that commit gets one from the comment too. So does
+    a green status under a red comment (see below). Returns the write
+    result, or "ok" when the status is already right.
     """
     try:
         try:
@@ -8385,8 +8386,7 @@ def fix_stuck_inprogress(pr_sha, pr_id, comment_raw, repo=None):
             if e.code != 404:
                 raise
             st = None
-        if st is not None and st.get("state") != "INPROGRESS":
-            return "ok"
+        cur = None if st is None else st.get("state")
         # Derive correct state from the machine-readable token first (1.9.1+,
         # fixed for real in this version - see _extract_status_token), then
         # fall back to parsing the human-readable comment text.
@@ -8442,11 +8442,18 @@ def fix_stuck_inprogress(pr_sha, pr_id, comment_raw, repo=None):
             state, desc = "FAILED", "Diff unavailable - review comment"
         else:
             state, desc = "SUCCESSFUL", "No manifest changes"
+        # COPS-2766: a final status stays, except SUCCESSFUL under a red
+        # comment. The early exits post no INPROGRESS, so a lost FAILED left
+        # the green of an older render. Never the other way: text rebuilt
+        # from the comment must not unblock a PR.
+        if st is not None and cur != "INPROGRESS" and not (
+                cur == "SUCCESSFUL" and state == "FAILED"):
+            return "ok"
         if state == "SUCCESSFUL":
             desc = join_status_lead(status_lead(comment_raw), desc)
         res = post_build_status(pr_sha, state, desc, pr_id=pr_id, repo=repo)
         if res == "ok":
-            logsink.log(f"Fixed {'stuck INPROGRESS' if st else 'missing'} status "
+            logsink.log(f"Fixed {'missing' if st is None else cur} status "
                         f"for PR #{pr_id} -> {state}",
                         pr=pr_id, event="stuck_inprogress_fixed")
         return res
