@@ -85,6 +85,7 @@ _diff_stats:      dict          = {
     "section_cap_trims": 0,
     "diff_retries": 0,             # per-diff transient retries performed
     "futures_cancelled": 0,        # subtask futures cancelled on abnormal exit
+    "bb_write_failures": 0,        # COPS-2766: comment/status writes that failed
     # v2.5.20 (E1): HTTP connection-pool observability. reuses vs fresh
     # tells whether keep-alive is actually paying off in production;
     # fallbacks counts requests the pool could not serve (redirects,
@@ -95,8 +96,10 @@ _diff_stats:      dict          = {
     # v2.5.25 (post-403-incident L1/L2): OCI-path health, previously
     # invisible — a pod could be Ready with 100% of pulls failing.
     "oci_selfcheck": None,         # ok / failed / skipped — periodic helm show chart
+    "oci_selfcheck_ok": None,      # COPS-2766: 1 / 0 after a check, None before
     "oci_selfcheck_at": None,      # ISO timestamp of the last self-check
     "oci_consecutive_pull_failures": 0,  # systemic pull failures since last success
+    "poll_consecutive_failures": 0,  # COPS-2766: leader polls that failed for every repo
     "last_iteration_s": None,# seconds taken by most recent iteration
     "last_iteration_at": None,
     # COPS-2631 stage 0: per-stage cumulative wall time on the hot path.

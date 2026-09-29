@@ -9,9 +9,10 @@ A leaf on the hub, though it may use the other leaves. It imports nothing
 from the service and must stay that way.
 """
 import re
+from collections import Counter
 
 import diff_ui
-from manifest import _is_kcc_blocking_artifact, _hpa_headers
+from manifest import _is_kcc_blocking_artifact, _hpa_headers, _section_kind
 from vocabulary import (
     OUT_DIFF,
     OUT_ERROR,
@@ -236,9 +237,19 @@ _BLAST_RADIUS_HDR = "**Blast radius.**"
 # blast radius: a quiet render caused by copying parent values into
 # customer.yaml must not read as "the tool missed the change".
 _VALUES_REDUNDANCY_HDR = "**Higher-layer values.**"
+# COPS-2766: its merge-summary line. status_lead skips it: keys that change
+# no manifest are no reason for a warning sign on a green status.
+_HIGHER_LAYER_FINDING = ("\U0001f4da **Higher-layer values already cover "
+                         "part of this PR**")
 # Written by the identity-change guard in diff_preview for a confirmed rename of
 # a live environment, matched here for the REVIEW verdict line.
 _IDENTITY_MIGRATION_HDR = "**Planned rename.**"
+# COPS-2766: the auto-sync panel headers, written in diff_preview and matched
+# here. The summary used `"PAUSED" in txt.upper()`, which also matched the
+# resume panel ("drifted while paused") and the "remains paused" reminder, so
+# every resume was announced as a pause.
+_AUTOSYNC_PAUSED_HDR = "Auto-sync PAUSED for"
+_AUTOSYNC_RESUMED_HDR = "Auto-sync RESUMED for"
 
 # COPS-2668: and a third state. The summary used to know only purge-vs-not,
 # so an environment with NO cascade armed — where the Applications go and
@@ -308,12 +319,71 @@ def _pingscaler_reclass(results) -> dict:
 PINGSCALER_DOCS_URL = ("https://appspace.atlassian.net/wiki/spaces/cops/"
                        "pages/1181089800")
 
+MERGE_SUMMARY_HDR = "## \u2139\ufe0f Merge summary"
 _SEV_ROUTINE, _SEV_REVIEW, _SEV_BLOCK = 0, 1, 2
 _VERDICTS = {
     _SEV_BLOCK: "\u26d4 **DO NOT MERGE** without checking the item(s) below",
     _SEV_REVIEW: "\u26a0\ufe0f **Review before merging**",
     _SEV_ROUTINE: "\u2705 **Routine** \u2014 nothing dangerous detected",
 }
+
+
+# COPS-2766: kinds whose deletion loses data or a public address. The
+# deletion bullet leads with them, all of them, so a bucket cannot hide among
+# 60 IAM bindings under "68 resource(s) deleted".
+_DATA_KINDS = frozenset({
+    "StorageBucket", "BigQueryDataset", "BigQueryTable", "ComputeDisk",
+    "ComputeSnapshot", "SQLInstance", "SQLDatabase", "RedisInstance",
+    "SecretManagerSecret", "ComputeAddress", "DNSRecordSet", "DNSManagedZone",
+    "PersistentVolumeClaim", "PersistentVolume", "StorageAccount",
+})
+
+
+# COPS-2766: inside REVIEW a cause leads its effect, so the first line (and
+# the green status) names the downgrade or the shutdown, not the deletions
+# or HPAs they cause (#4549, #4567). Keyed by the finding's emoji. Others
+# (could not be diffed, new env) come after these, and the higher-layer
+# note always last: it changes no manifest.
+_REVIEW_RANK = {
+    "\u23f8": 0, "\u25b6": 0,      # paused, auto-sync paused / resumed
+    "\u2b07": 1,                   # chart downgrade
+    "\U0001f6d1": 2,               # environment shutting down
+    "\U0001f4a5": 3,               # wide-reach config change
+    "\U0001f500": 4,               # planned rename
+    "\U0001f5d1": 5,               # resources deleted
+    "\U0001f9ca": 6,               # replicas scaled to zero
+    "\U0001f39a": 7,               # ping-scaler activated
+    "\U0001f5a5": 8,               # KCC resources unmanaged
+    "\U0001f9ec": 9,               # unresolved chart value
+    "\U0001f4da": 99,              # higher-layer values
+}
+
+
+def _is_kcc_header(header) -> bool:
+    """'/compute.cnrm.cloud.google.com/v1beta1/X ns/name' -> True: the API
+    group of the header ends in .cnrm.cloud.google.com."""
+    group = header.split(" ", 1)[0].lstrip("/").split("/", 1)[0]
+    return group.endswith(".cnrm.cloud.google.com")
+
+
+def _deletion_finding(headers, n_envs, envs) -> str:
+    """The deletion bullet, kinds with counts. Data kinds come first in the
+    text, so the ~30 characters Bitbucket shows of the status say it.
+    Otherwise GCP (KCC) kinds rank before the others, then by count: the
+    top two, or all three when there are three. A BackendService (#4684)
+    must not hide in "+1 kind(s)" behind Secrets and ConfigMaps."""
+    n = Counter(_section_kind(h) for h in headers)
+    gcp = {_section_kind(h) for h in headers if _is_kcc_header(h)}
+    kinds = sorted(n, key=lambda k: (k not in gcp, -n[k], k))
+    count = f"{len(headers)} resource(s)"
+    data = [f"{n[k]} {k}" for k in kinds if k in _DATA_KINDS]
+    if data:
+        return (f"\U0001f5d1\ufe0f **Data or IP deleted: {', '.join(data)}** "
+                f"({count} in {n_envs} environment(s)): {envs}")
+    shown = kinds if len(kinds) <= 3 else kinds[:2]
+    more = f", +{len(kinds) - 2} kind(s)" if len(kinds) > 3 else ""
+    return (f"\U0001f5d1\ufe0f **{count} deleted** in {n_envs} environment(s) "
+            f"({', '.join(f'{n[k]} {k}' for k in shown)}{more}): {envs}")
 
 
 def _fmt_env_list(apps, shown=8) -> str:
@@ -458,9 +528,9 @@ def _build_merge_summary(results, rollup_by_sig, vm_change_lines,
     if deleted_apps:
         # COPS-2682: KCC CRs leaving the render under deletion-policy
         # abandon (or snapshot attachments that only drop the schedule
-        # binding) are not GCP destroys. Pull them out of the BLOCK
+        # binding) are not GCP destroys. Pull them out of the
         # "resource(s) deleted" count so unmanage PRs stop looking like
-        # DO NOT MERGE destroy changes (acme-config-prod #4326).
+        # destroy changes (acme-config-prod #4326).
         orphan_hdrs = set()
         for r in results.values():
             for f in (getattr(r, "vm_changes", None) or []):
@@ -470,29 +540,31 @@ def _build_merge_summary(results, rollup_by_sig, vm_change_lines,
                     orphan_hdrs.add(f.get("header"))
         # COPS-2714: HPAs removed because this same PR enables the
         # ping-scaler are the chart's documented contract, not a destroy.
-        # They get their own REVIEW line below instead of the BLOCK count.
+        # They get their own REVIEW line below instead of the deletion count.
         ps_hdrs = _pingscaler_reclass(results)
-        hard_n = 0
+        hard_hdrs = []
         hard_apps = []
         orphan_n = 0
         for a in deleted_apps:
             hard = [h for h in (results[a].deleted_resources or [])
                     if h not in orphan_hdrs and h not in ps_hdrs.get(a, ())]
             if hard:
-                hard_n += len(hard)
+                hard_hdrs += hard
                 hard_apps.append(a)
             orphan_n += sum(
                 1 for h in (results[a].deleted_resources or [])
                 if h in orphan_hdrs)
-        if hard_n:
+        if hard_hdrs:
             # COPS-2683: count environments to match `_fmt_env_list` (same
             # class of app-vs-env lie as COPS-2675 on the render-blocked
             # headline). Orphan/abandon wording above is unchanged.
-            n_envs = len(set(_envs_from_apps(hard_apps)))
-            findings.append((_SEV_BLOCK,
-                             f"\u274c **{hard_n} resource(s) deleted** in "
-                             f"{n_envs} environment(s): "
-                             f"{_fmt_env_list(hard_apps)}"))
+            #
+            # COPS-2766: REVIEW, not BLOCK. The build never went red for a
+            # deletion, and a stop sign on every planned cleanup taught
+            # approvers to skip it. The kinds say what goes instead.
+            findings.append((_SEV_REVIEW, _deletion_finding(
+                hard_hdrs, len(set(_envs_from_apps(hard_apps))),
+                _fmt_env_list(hard_apps))))
         if orphan_n:
             findings.append((_SEV_REVIEW,
                              f"\U0001f5a5\ufe0f **{orphan_n} KCC resource(s) "
@@ -731,11 +803,11 @@ def _build_merge_summary(results, rollup_by_sig, vm_change_lines,
             findings.append((_SEV_ROUTINE,
                              "\U0001f513 decommission disarmed (safe "
                              "direction)"))
-        if "PAUSED" in txt.upper():
+        if _AUTOSYNC_PAUSED_HDR in txt:
             findings.append((_SEV_REVIEW,
                              "\u23f8\ufe0f **ArgoCD auto-sync paused** for an "
                              "environment \u2014 changes stop being applied"))
-        elif "RESUMED" in txt.upper():
+        elif _AUTOSYNC_RESUMED_HDR in txt:
             findings.append((_SEV_REVIEW,
                              "\u25b6\ufe0f **ArgoCD auto-sync resumed** \u2014 "
                              "pending drift will be applied"))
@@ -765,8 +837,7 @@ def _build_merge_summary(results, rollup_by_sig, vm_change_lines,
         # the edit (acme-config-prod #4520).
         if _VALUES_REDUNDANCY_HDR in txt:
             findings.append((_SEV_REVIEW,
-                             "\U0001f4da **Higher-layer values already cover "
-                             "part of this PR** \u2014 some keys match an "
+                             _HIGHER_LAYER_FINDING + " \u2014 some keys match an "
                              "ancestor config.yaml, so they do not change "
                              "rendered manifests (see the higher-layer note)"))
     if new_env_lines:
@@ -869,9 +940,65 @@ def _build_merge_summary(results, rollup_by_sig, vm_change_lines,
     if sev >= _SEV_REVIEW:
         verdict += f" ({n_check} item(s))"
     order = {_SEV_BLOCK: 0, _SEV_REVIEW: 1, _SEV_ROUTINE: 2}
-    findings.sort(key=lambda f: order[f[0]])
-    return ["## \u2139\ufe0f Merge summary", "", verdict, ""] + \
+    findings.sort(key=lambda f: (order[f[0]], _REVIEW_RANK.get(f[1][:1], 10)
+                                 if f[0] == _SEV_REVIEW else 0))
+    return [MERGE_SUMMARY_HDR, "", verdict, ""] + \
            [f"- {line}" for _s, line in findings] + [""]
+
+
+# COPS-2766: a green build status leads with the top finding of the merge
+# summary. The Builds panel on the PR page shows the status: #4684 was
+# approved seconds after a green "129 resource(s) will change".
+# The build is green, so the marker never says DO NOT MERGE.
+_STATUS_MARKS = {"\u26d4": "\U0001f6a8", "\u26a0": "\u26a0\ufe0f"}
+
+
+def status_lead(comment_md) -> str:
+    """'<marker> <first finding as plain text>', or '' when the verdict is
+    routine or there is no summary.
+
+    Reads only our own summary, before the first '---' of the comment, so
+    author content further down cannot fake it. Pure: process_pr and
+    fix_stuck_inprogress call it on the same comment and get the same lead."""
+    lines = (comment_md or "").split("\n---\n", 1)[0].splitlines()
+    if MERGE_SUMMARY_HDR not in lines:
+        return ""
+    rest = [l for l in lines[lines.index(MERGE_SUMMARY_HDR) + 1:] if l.strip()]
+    mark = _STATUS_MARKS.get(rest[0][:1]) if rest else None
+    bullet = next((l[2:] for l in rest[1:] if l.startswith("- ")), "")
+    if bullet.startswith(_HIGHER_LAYER_FINDING):
+        return ""       # it sorts last, so nothing else needs a review
+    text = re.sub(r"\[([^\]]*)\]\([^)]*\)", r"\1", bullet)
+    text = text.replace("**", "").replace("`", "").strip()
+    emoji, _, after = text.partition(" ")
+    if not re.search(r"[A-Za-z0-9]", emoji):
+        text = after.strip()
+    text = re.sub(r"(?i)do\s+not\s+merge", "review", text)
+    return f"{mark} {text}" if mark and text else ""
+
+
+def _utf8_len(s) -> int:
+    return len(s.encode("utf-8", "surrogatepass"))
+
+
+def join_status_lead(lead, description, limit=255) -> str:
+    """'<lead> | <description>' in `limit` UTF-8 bytes. We do not know the
+    unit Bitbucket counts, and bytes are the largest one, so this fits any.
+    Only the lead is cut, ending in '...'. The description is never cut:
+    when it leaves no room for a lead, it comes back unchanged."""
+    if not lead:
+        return description
+    tail = f" | {description}"
+    room = limit - _utf8_len(tail)
+    if _utf8_len(lead) <= room:
+        return lead + tail
+    cut, n = "", 3                       # 3 for the "..."
+    for c in lead:
+        n += _utf8_len(c)
+        if n > room:
+            break
+        cut += c
+    return f"{cut.rstrip()}...{tail}" if cut.strip() else description
 
 
 _SHUTDOWN_MIN_WORKLOADS = 2

@@ -301,11 +301,11 @@ def test_process_pr_end_to_end_posts_the_pause_warning(monkeypatch):
     monkeypatch.setattr(m, "find_existing_comment", lambda pr_id, repo=None: (None, "", ""))
     monkeypatch.setattr(m, "upsert_comment",
                         lambda pr_id, body, existing_id=None, repo=None,
-                        artifact_url="": upserts.append(body) or 1)
+                        artifact_url="": upserts.append(body) or "ok")
     monkeypatch.setattr(m, "post_build_status",
                         lambda pr_sha, state, description, pr_id=None, repo=None:
-                        statuses.append((state, description)))
-    monkeypatch.setattr(m, "fix_stuck_inprogress", lambda *a, **k: None)
+                        statuses.append((state, description)) or "ok")
+    monkeypatch.setattr(m, "fix_stuck_inprogress", lambda *a, **k: "ok")
     monkeypatch.setattr(m, "_touch_progress", lambda: None)
     monkeypatch.setattr(m, "argocd_diff",
                         lambda app, pr_sha, main_sha, chart_revision=None,

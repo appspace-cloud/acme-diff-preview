@@ -170,13 +170,13 @@ def test_process_pr_threads_the_audit_appendix_through(monkeypatch):
     pm = {_ID: ["pv-audit-a-ms"]}
     monkeypatch.setattr(m, "get_pr_changed_files", lambda pr_id, repo=None: ([_ID], {}))
     monkeypatch.setattr(m, "find_existing_comment", lambda pr_id, repo=None: (None, "", ""))
-    monkeypatch.setattr(m, "fix_stuck_inprogress", lambda *a, **k: None)
+    monkeypatch.setattr(m, "fix_stuck_inprogress", lambda *a, **k: "ok")
     monkeypatch.setattr(m, "_touch_progress", lambda: None)
     monkeypatch.setattr(m, "upsert_comment",
                         lambda pr_id, body, existing_id=None, repo=None,
                         artifact_url="":
-                        sinks["upserts"].append(body) or 1)
-    monkeypatch.setattr(m, "post_build_status", lambda *a, **k: None)
+                        sinks["upserts"].append(body) or "ok")
+    monkeypatch.setattr(m, "post_build_status", lambda *a, **k: "ok")
     monkeypatch.setattr(m, "_save_diff_ui_artifact",
                         lambda repo, pr_id, pr_sha, body, **kw:
                         sinks["artifacts"].append(body))

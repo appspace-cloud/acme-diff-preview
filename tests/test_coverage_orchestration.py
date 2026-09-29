@@ -24,6 +24,7 @@ import concurrency
 
 ENV_DIR   = "gcp/dev/private-cloud/ap1/custom/pv-orch-a"
 IDENTITY  = f"{ENV_DIR}/customer.yaml"
+IDENTITY_YAML = "appspace:\n  customerName: orch\n  version: 2603.0.1-dev\n"
 ANCILLARY = f"{ENV_DIR}/cicd-versions.yaml"
 PATH_MAP  = {
     IDENTITY:  ["pv-orch-a-ms", "pv-orch-a-ss"],
@@ -69,12 +70,17 @@ def world(monkeypatch):
     monkeypatch.setattr(m, "find_existing_comment", lambda pr_id, repo=None: (None, "", ""))
     monkeypatch.setattr(m, "upsert_comment",
                         lambda pr_id, body, existing_id=None, repo=None, **kw:
-                        sinks.upserts.append(body) or 123)
+                        sinks.upserts.append(body) or "ok")
     monkeypatch.setattr(m, "post_build_status",
                         lambda pr_sha, state, description, pr_id=None, repo=None:
-                        sinks.statuses.append((state, description)))
-    monkeypatch.setattr(m, "fix_stuck_inprogress", lambda *a, **k: None)
+                        sinks.statuses.append((state, description)) or "ok")
+    monkeypatch.setattr(m, "fix_stuck_inprogress", lambda *a, **k: "ok")
     monkeypatch.setattr(m, "_touch_progress", lambda: None)
+    # Value reads never reach the network. The env's customer.yaml exists, so
+    # its apps are live (not a leftover decommission); other files are absent.
+    monkeypatch.setattr(m, "_bb_fetch_status",
+                        lambda path, sha, repo=None: (IDENTITY_YAML, m.BB_OK)
+                        if path.endswith(IDENTITY) else (None, m.BB_NOT_FOUND))
 
     # Scripted diff results, keyed by app; default = clean no-diff.
     plan = {}
@@ -105,6 +111,7 @@ def test_process_pr_happy_diff_posts_comment_and_successful_status(world):
     assert len(sinks.upserts) == 1
     body = sinks.upserts[0]
     assert "pv-orch-a-ms" in body and "Deployment/webx" in body
+    assert m._extract_status_token(body) == "clean", "not the transient catch-all"
     states = [s for s, _ in sinks.statuses]
     assert states[0] == "INPROGRESS" and states[-1] == "SUCCESSFUL", states
 
@@ -112,6 +119,8 @@ def test_process_pr_happy_diff_posts_comment_and_successful_status(world):
 def test_process_pr_dedup_skips_unchanged_sha_on_second_run(world):
     sinks, plan = world
     m.process_pr(_mk_pr(), PATH_MAP, base_sha=BASE_SHA)
+    # Skipped by _seen, not by a transient backoff.
+    assert m._extract_status_token(sinks.upserts[-1]) == "clean"
     first_upserts, first_calls = len(sinks.upserts), len(sinks.diff_calls)
     m.process_pr(_mk_pr(), PATH_MAP, base_sha=BASE_SHA)
     assert len(sinks.upserts) == first_upserts, "same sha must not recompute/re-post"
@@ -141,6 +150,7 @@ def test_process_pr_indeterminate_render_failure_blocks_with_failed_status(world
     states = [s for s, _ in sinks.statuses]
     assert states[-1] == "FAILED", states
     assert len(sinks.upserts) == 1
+    assert "bad values" in sinks.upserts[0], "the red comes from the render, not the catch-all"
 
 
 def test_process_pr_all_no_diff_is_green(world):
@@ -149,6 +159,7 @@ def test_process_pr_all_no_diff_is_green(world):
     states = [s for s, _ in sinks.statuses]
     assert states[-1] == "SUCCESSFUL", states
     assert len(sinks.upserts) == 1
+    assert m._extract_status_token(sinks.upserts[0]) == "clean"
 
 
 def test_process_pr_downgrade_warning_is_visible_but_not_blocking(world):
@@ -162,6 +173,7 @@ def test_process_pr_downgrade_warning_is_visible_but_not_blocking(world):
     m.process_pr(_mk_pr(), PATH_MAP, base_sha=BASE_SHA)
     body = sinks.upserts[0]
     assert "downgrade" in body.lower(), body[:400]
+    assert m._extract_status_token(body) == "clean"
     states = [s for s, _ in sinks.statuses]
     assert states[-1] == "SUCCESSFUL", states
 

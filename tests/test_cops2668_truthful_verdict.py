@@ -74,7 +74,8 @@ def test_stuck_inprogress_with_blocked_comment_resolves_failed(monkeypatch):
     monkeypatch.setattr(m, "http", lambda *a, **k: {"state": "INPROGRESS"})
     captured = {}
     monkeypatch.setattr(m, "post_build_status",
-                        lambda sha, state, desc, pr_id=None: captured.update(state=state))
+                        lambda sha, state, desc, pr_id=None, repo=None:
+                        captured.update(state=state) or "ok")
 
     m.fix_stuck_inprogress("deadbeef01234567", 999, _blocked_comment())
     assert captured["state"] == "FAILED", (
@@ -87,7 +88,8 @@ def test_stuck_inprogress_legacy_blocked_text_without_token_resolves_failed(monk
     monkeypatch.setattr(m, "http", lambda *a, **k: {"state": "INPROGRESS"})
     captured = {}
     monkeypatch.setattr(m, "post_build_status",
-                        lambda sha, state, desc, pr_id=None: captured.update(state=state))
+                        lambda sha, state, desc, pr_id=None, repo=None:
+                        captured.update(state=state) or "ok")
 
     legacy = ("## Diff Preview\n\n**Commit** `deadbeef`\n\n"
               "---\n**Status:** ⛔ Blocked — empty "
@@ -101,7 +103,8 @@ def test_clean_comment_still_resolves_successful(monkeypatch):
     monkeypatch.setattr(m, "http", lambda *a, **k: {"state": "INPROGRESS"})
     captured = {}
     monkeypatch.setattr(m, "post_build_status",
-                        lambda sha, state, desc, pr_id=None: captured.update(state=state))
+                        lambda sha, state, desc, pr_id=None, repo=None:
+                        captured.update(state=state) or "ok")
 
     clean = ("## Diff Preview\n\n**Commit** `deadbeef`\n\n"
              "✅ No manifest changes\n"

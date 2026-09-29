@@ -138,6 +138,7 @@ def test_sha_repo_map_is_bounded():
 
 STAGE_ENV  = "gcp/stage/private-cloud/na1/custom/pv-stage1-a"
 STAGE_MAP  = {f"{STAGE_ENV}/customer.yaml": ["pv-stage1-a-ms"]}
+STAGE_YAML = "appspace:\n  customerName: stage1\n  version: 2603.0.1-dev\n"
 
 
 def _mk_pr(pr_id, sha="e" * 12):
@@ -154,13 +155,18 @@ def stage_world(monkeypatch):
     monkeypatch.setattr(m, "find_existing_comment",
                         lambda pr_id, repo=None: (None, "", ""))
     monkeypatch.setattr(m, "upsert_comment",
-                        lambda pr_id, body, existing_id=None, repo=None:
-                        sinks["upserts"].append((repo, body)))
+                        lambda pr_id, body, existing_id=None, repo=None, **kw:
+                        sinks["upserts"].append((repo, body)) or "ok")
     monkeypatch.setattr(m, "post_build_status",
                         lambda sha, st, d, pr_id=None, repo=None:
-                        sinks["statuses"].append((repo, st)))
-    monkeypatch.setattr(m, "fix_stuck_inprogress", lambda *a, **k: None)
+                        sinks["statuses"].append((repo, st)) or "ok")
+    monkeypatch.setattr(m, "fix_stuck_inprogress", lambda *a, **k: "ok")
     monkeypatch.setattr(m, "_touch_progress", lambda: None)
+    # Value reads stay off the network: the live env's customer.yaml exists.
+    monkeypatch.setattr(m, "_bb_fetch_status",
+                        lambda path, sha, repo=None: (STAGE_YAML, m.BB_OK)
+                        if path.endswith(f"{STAGE_ENV}/customer.yaml")
+                        else (None, m.BB_NOT_FOUND))
     m._seen.clear(); m._force_recompute.clear()
     yield sinks
     m._seen.clear(); m._force_recompute.clear()
@@ -198,6 +204,7 @@ def test_scope_filter_mixed_pr_sees_only_gcp_files(stage_world, monkeypatch):
     assert seen_by_matcher["files"] == [f"{STAGE_ENV}/customer.yaml"], \
         "azure/ file must be filtered out before app matching"
     assert stage_world["statuses"], "in-scope file must still produce a run"
+    assert m._extract_status_token(stage_world["upserts"][-1][1]) == "clean"
 
 
 # ── (repo, pr_id) keying: same id in two repos is independent state ─────
@@ -397,9 +404,9 @@ def test_cohort_bump_renders_every_chart_type_with_new_revision(monkeypatch):
     monkeypatch.setattr(m, "find_existing_comment",
                         lambda pr_id, repo=None: (None, "", ""))
     monkeypatch.setattr(m, "upsert_comment",
-                        lambda pr_id, body, existing_id=None, repo=None: None)
-    monkeypatch.setattr(m, "post_build_status", lambda *a, **k: None)
-    monkeypatch.setattr(m, "fix_stuck_inprogress", lambda *a, **k: None)
+                        lambda pr_id, body, existing_id=None, repo=None, **kw: "ok")
+    monkeypatch.setattr(m, "post_build_status", lambda *a, **k: "ok")
+    monkeypatch.setattr(m, "fix_stuck_inprogress", lambda *a, **k: "ok")
     monkeypatch.setattr(m, "_touch_progress", lambda: None)
     monkeypatch.setattr(m, "_bb_fetch_status",
                         lambda path, sha, repo=None:

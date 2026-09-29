@@ -44,9 +44,9 @@ and QA apps when CI publishes a new chart, so they pick it up past the OCI cache
 | ✅ no manifest changes | Rendered output is byte-identical. Safe. When the PR still edited YAML, the status and a Higher-layer panel explain why (values already set by an ancestor `config.yaml`, or the chart did not consume the keys) — COPS-2721 / acme-config-prod #4520. |
 | ⚠️ N resource(s) will change | Normal diff. Review it. |
 | ❔ diff unavailable | **Not** the same as "no changes". Something failed and the app was NOT evaluated. |
-| 🧭 Merge summary | **Always present, always first.** One verdict — ⛔ do not merge / ⚠️ review / ✅ routine — followed by one line per finding: decommissions, deletions, dangerous VM changes, downgrades, zeroed replicas, auto-sync toggles, new environments and the environments jumping version. It is built from the same deterministic facts as the panels below, so it can never disagree with the detail. |
+| 🧭 Merge summary | **Always present, always first.** One verdict — ⛔ do not merge / ⚠️ review / ✅ routine — followed by one line per finding: decommissions, deletions, dangerous VM changes, downgrades, zeroed replicas, auto-sync toggles, new environments and the environments jumping version. It is built from the same deterministic facts as the panels below, so it can never disagree with the detail. ⛔ items come first, then ⚠️ items with a cause before its effect (a downgrade or a shutdown before the deletions it causes) and the higher-layer note last (COPS-2766). |
 | 📚 Higher-layer values | `customer.yaml` (or another leaf) re-states keys an ancestor already sets identically (`gcp/config.yaml`, cohort `config.yaml`, …). Manifests stay quiet on purpose; the panel names the ancestor and the keys so "No manifest changes" is not misread as a missed diff (COPS-2721). |
-| 🗑️ RESOURCE(S) DELETED | Resources disappear from the rendered output entirely, with **no replacement in this PR**. Sensitive kinds are always listed in full and never truncated away. |
+| 🗑️ RESOURCE(S) DELETED | Resources disappear from the rendered output entirely, with **no replacement in this PR**. Sensitive kinds are always listed in full and never truncated away. In the merge summary a deletion is a ⚠️ review item, not ⛔ (COPS-2766): the build never went red for a deletion, so the stop sign only taught people to merge past it. The summary line names the kinds with their counts: GCP (KCC) kinds first, then the most common, two of them (all three when there are three). When a data or public-address kind is deleted (bucket, BigQuery dataset or table, disk, snapshot, SQL, Redis, Secret Manager secret, IP address, DNS, volume, storage account), the line starts with `Data or IP deleted:` and names those kinds instead, all of them, so the few characters Bitbucket shows of the green status say it. |
 | 🎚️ acme-ping-scaler takes over replica control | The PR enables `acme-ping-scaler` in an environment, and the HPAs it deletes are the chart's own contract (`hpa.yaml` skips all HPA rendering while a ping-scaler is on, so the two never fight over replicas). The activation and the HPAs live in **different apps of the same environment** (the Deployment renders in `{env}-ss`, the HPAs leave `{env}-ms`), so the pairing is per environment. Said calmly as REVIEW with a docs link, instead of the deletion block: the HPAs come back on the next sync after `acmePingScaler.enabled` goes back to `false`. An HPA deleted any *other* way — or any other kind deleted alongside — still lands in the deletion block unchanged. |
 | 🖥️ VM infrastructure (KCC linux-services) | A change under `deployLinuxServicesK8s`. A **cohort** `config.yaml` gaining a role block is reported as a provision only when the render actually creates a ComputeInstance — a key written there provisions nothing on its own, but `svc.enabled: true` at that level would build a VM in every environment below, so the warning survives whenever the render agrees or cannot be read. An environment's own `customer.yaml` is unchanged. |
 | 🔄 resource(s) RENAMED | Deleted and recreated under a new name in the same PR, so nothing is lost. Typically a name carrying a content hash, or a resource moving to a new identity. These are deliberately kept **out** of the deletion count. |
@@ -324,6 +324,50 @@ the author to fix and push would send them to change a version that is
 probably correct. Apps failing the same way are grouped, so a fleet PR reads
 as one problem with an environment count rather than fifty lines.
 
+**The green status leads with the top finding** (COPS-2766). The Builds
+panel on the PR page shows the status description, and a green one used to
+say only `N resource(s) will change - review comment` (acme-config-prod #4684
+was approved seconds later, with its deletions only in the comment). The
+panel shows about 30 to 50 characters before `...`, with the full text on
+hover; whether the merge dialog shows it too is not checked yet. When the
+merge summary is not routine, the description now starts with its first
+finding as plain text, then ` | ` and the text it had before:
+
+```
+⚠️ 1 resource(s) deleted in 1 environment(s) (1 Secret): pv-uwm-a | 3 resource(s) will change - review comment
+🚨 VM infrastructure change flagged dangerous — see the VM section | 6 resource(s) will change - review comment
+```
+
+🚨 means the comment verdict is ⛔, and ⚠️ means review. A routine PR keeps
+the old text, and so does a PR whose only finding is the higher-layer note:
+keys that change no manifest are no reason for a warning sign. The status
+never says DO NOT MERGE, because the build is green. The whole description
+fits in 255 UTF-8 bytes, so it fits whatever unit Bitbucket counts. Only the
+finding is cut (it ends in `...`), never the old text. The finding is read
+back from our own merge summary in the posted comment, so the recovery of a
+stuck or missing status writes the same lead. Its tail is rebuilt from the
+comment and is shorter: no decommission or leftover count, and no
+higher-layer wording. FAILED descriptions do not change.
+
+**Known gap: noCore turning off.** Turning noCore off deletes `bs-pcs` and
+`hc-pcs` (acme-config-prod #4667, a 5 h outage). The ⛔ deletion verdict was
+the only stop sign for that shape, and now its ⚠️ line reads like a routine
+backend cleanup. A FAILED status when noCore goes from true to false is
+planned (COPS-2766 block 5). Until it ships, check a PR that deletes `*-pcs`
+backends by hand.
+
+**Known gap: a value file Bitbucket always refuses.** When a value file
+cannot be read (any failure that is not a plain 404), the build is FAILED with
+`Diff unavailable (infrastructure) - will retry: value file unreadable ...`
+(the error names the file) and the PR is retried after the backoff (at most
+every 8 iterations), with no end. This fails closed, but when the refusal is
+stable (a 400 or 403, or a commit Bitbucket does not know) the text blames
+the infrastructure and the retries cost a full render each. The read returns
+no HTTP code, so a retry cap could not tell this from a long Bitbucket
+outage, and would turn every PR polled during the outage into a red that
+needs a push. So there is no cap yet: if the same file stays in that status,
+ask CloudOps.
+
 See [docs/internals.md](internals.md) for the reasoning behind each guard,
 how mass version bumps are handled, the secret-leak hardening, and the
 full-diff web UI.
@@ -351,7 +395,7 @@ full-diff web UI.
 | `AI_MAX_APPS` | — | `40` | Max changed apps included in the AI summary prompt |
 | `FULL_SECTIONS_MAX_PER_APP` | — | `5000` | Max changed resources **stored** per app, shared by the comment, the diff-group fingerprint and the full-diff page. A memory bound, not a display cutoff: what it drops is gone from both surfaces, so hitting it increments `section_cap_trims`, logs a warning, and makes the page state the shortfall instead of claiming completeness |
 | `COMMENT_READABLE_BYTES` | — | `30000` | Readability budget for the **bulk** region of a comment. Past it, ordinary diff blocks fold into a pointer at the full-diff page and the overview table caps its rows. Panels and risk-flagged apps are never affected, and the full-diff page itself is always rendered with folding off. `0` disables folding entirely |
-| `DIFF_OCI_SELFCHECK_INTERVAL` | — | `900` | Seconds between periodic OCI self-checks (`helm show chart` against a known-good ref). First check ~60s after start; `0` disables. Result in `/diff-preview/stats` as `oci_selfcheck` |
+| `DIFF_OCI_SELFCHECK_INTERVAL` | — | `900` | Seconds between periodic OCI self-checks (`helm show chart` against a known-good ref). First check ~60s after start; `0` disables. Result in `/diff-preview/stats` as `oci_selfcheck`, and in `/metrics` as `oci_selfcheck_ok` (1 or 0, absent before the first check) |
 | `DIFF_OCI_SELFCHECK_REF` | — | *(last successful pull)* | Optional fixed reference `registry/chart:version` for the self-check |
 | `DIFF_OCI_FAIL_ERROR_THRESHOLD` | — | `3` | Consecutive systemic chart-pull failures after which failures log at ERROR instead of WARNING |
 | `DIFF_IGNORE_RESOURCES` | — | *(empty)* | Extra comma-separated resource-name substrings to hide from every diff, on top of the built-in `micro-versions-info` |

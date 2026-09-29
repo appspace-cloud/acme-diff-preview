@@ -6,8 +6,8 @@
 
 ⛔ **DO NOT MERGE** without checking the item(s) below (2 item(s))
 
-- ❌ **2 resource(s) deleted** in 2 environment(s): pv-advocate-b, pv-aexp-a
 - ⛔ **4 environment(s) cannot render** — **Missing Image Tag on => platform**: pv-adl-a, pv-asi-b, pv-atea-a, pv-ato-c
+- 🗑️ **2 resource(s) deleted** in 2 environment(s) (2 Deployment): pv-advocate-b, pv-aexp-a
 - ⬆️ **2 environment(s) bump** `2603.0.19` → `2603.2.0`: pv-advocate-b, pv-aexp-a
 
 ---

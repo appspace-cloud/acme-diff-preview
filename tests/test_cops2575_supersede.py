@@ -406,6 +406,7 @@ def test_a_matching_hint_does_not_abort_the_run_it_belongs_to(world):
     m._record_supersede_hint(m.BB_REPO, 991, PR_SHA)
     m.process_pr(_mk_pr(), PATH_MAP, base_sha=BASE_SHA)
     assert len(sinks.upserts) == 1, "same-sha hint must be consumed, not acted on"
+    assert m._extract_status_token(sinks.upserts[0]) == "clean"
 
 
 def test_completing_a_run_clears_the_abort_streak(world):

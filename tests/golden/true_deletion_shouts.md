@@ -6,9 +6,9 @@
 
 ## ℹ️ Merge summary
 
-⛔ **DO NOT MERGE** without checking the item(s) below (1 item(s))
+⚠️ **Review before merging** (1 item(s))
 
-- ❌ **1 resource(s) deleted** in 1 environment(s): pv-acme-a
+- 🗑️ **1 resource(s) deleted** in 1 environment(s) (1 Service): pv-acme-a
 
 ---
 

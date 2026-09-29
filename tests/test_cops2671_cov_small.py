@@ -344,29 +344,33 @@ def test_a_repeat_group_of_unnameable_resources_prints_no_empty_list():
 
 # ══ 5 ── the auto-sync resume verdict ════════════════════════════════════
 
-def test_a_resume_panel_is_reported_as_a_resume_not_a_pause():
+_QA88 = "gcp/dev/private-cloud/ap1/custom/pv-qa88-a/customer.yaml"
+
+
+def _real_state_panel(monkeypatch, old, new):
+    """The panel `_summarize_appspace_state_changes` really emits for one
+    customer.yaml going from `old` to `new`."""
+    files = {"base": old, "pr": new}
+    monkeypatch.setattr(m, "_bb_fetch_status",
+                        lambda path, sha, repo=None: (files[sha], m.BB_OK))
+    return m._summarize_appspace_state_changes(
+        [_QA88], "pr", "base", {_QA88: ["pv-qa88-a-ss"]})
+
+
+def test_a_resume_panel_is_reported_as_a_resume_not_a_pause(monkeypatch):
     """Resuming applies whatever drift accumulated while the environment was
     frozen, so it is a REVIEW item -- but of the opposite kind to a pause,
     and a verdict that names the wrong direction is worse than none.
 
-    NOTE for the reader, not for this assertion: the panel
-    `_summarize_appspace_state_changes` actually emits for a resume also
-    contains the sentence "If this environment drifted while paused", and
-    the pause test above this branch is `"PAUSED" in txt.upper()` -- so
-    today every real resume is announced as a pause. Same class of defect as
-    COPS-2668's purge verdict (a denial matching the warning's keyword), and
-    it belongs to whoever fixes that ordering, not to a coverage test that
-    would have to pin the wrong behaviour to reach the line.
-    """
-    panel = [
-        "### ▶️ Auto-sync RESUMED for `pv-qa88-a`",
-        "",
-        # One panel line, split for width -- parenthesised so it cannot be
-        # read (by a human or by CodeQL) as a list entry missing its comma.
-        ("`appspace.autosync: false` was removed from this environment's "
-         "`customer.yaml`. Automated sync resumes for `pv-qa88-a-ss`."),
-        "",
-    ]
+    COPS-2766: the real resume panel says "drifted while paused", and the
+    summary used `"PAUSED" in txt.upper()`, so every real resume was
+    announced as a pause. This test used a synthetic panel without that
+    sentence and passed. It reads the panel the service really writes."""
+    panel = _real_state_panel(
+        monkeypatch,
+        "appspace:\n  autosync: false\n  customerName: qa88\n",
+        "appspace:\n  customerName: qa88\n")
+    assert "while paused" in "\n".join(panel)       # precondition
     out = "\n".join(cr._build_merge_summary({}, {}, None, None, panel,
                                             None, False))
     assert "**ArgoCD auto-sync resumed**" in out, out
@@ -374,6 +378,31 @@ def test_a_resume_panel_is_reported_as_a_resume_not_a_pause():
     assert "auto-sync paused" not in out, (
         "a resume must never be announced as its opposite:\n" + out)
     assert "Review before merging" in out
+
+
+def test_a_real_pause_panel_is_still_reported_as_a_pause(monkeypatch):
+    panel = _real_state_panel(
+        monkeypatch,
+        "appspace:\n  customerName: qa88\n",
+        "appspace:\n  autosync: false\n  customerName: qa88\n")
+    out = "\n".join(cr._build_merge_summary({}, {}, None, None, panel,
+                                            None, False))
+    assert "**ArgoCD auto-sync paused**" in out, out
+    assert "auto-sync resumed" not in out
+
+
+def test_an_env_that_stays_paused_is_not_a_new_pause(monkeypatch):
+    """The "remains paused" reminder is not a toggle. The paused-and-changing
+    finding (COPS-2655) covers that environment when it has changes."""
+    panel = _real_state_panel(
+        monkeypatch,
+        "appspace:\n  autosync: false\n  version: 1.0.0\n",
+        "appspace:\n  autosync: false\n  version: 1.0.1\n")
+    assert "remains paused" in "\n".join(panel)     # precondition
+    out = "\n".join(cr._build_merge_summary({}, {}, None, None, panel,
+                                            None, False))
+    assert "auto-sync paused" not in out, out
+    assert "auto-sync resumed" not in out
 
 
 # ══ 6 ── the storage-cap notes ═══════════════════════════════════════════

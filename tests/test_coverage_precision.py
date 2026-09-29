@@ -202,6 +202,7 @@ def test_process_pr_prewarm_future_generic_exception_is_swallowed(world, monkeyp
     monkeypatch.setattr(m, "_ensure_chart", boom)
     m.process_pr(_mk_pr(pr_id=708), PATH_MAP, base_sha=BASE_SHA)  # must not raise
     assert sinks.statuses, "a pre-warm crash must never take down the PR run"
+    assert m._extract_status_token(sinks.upserts[-1]) == "clean"
 
 
 # ── _run_one_diff: a rename-tracking loop alongside a plain changed file ──
@@ -511,6 +512,7 @@ def test_process_pr_all_affected_apps_decommissioned_calls_batch_with_empty_list
                         lambda candidates, envs: {"pv-orch-a-ms", "pv-orch-a-ss"})
     m.process_pr(_mk_pr(pr_id=709), PATH_MAP, base_sha=BASE_SHA)  # must not raise
     assert sinks.statuses, "a fully-decommissioned affected set must still reach a terminal status"
+    assert m._extract_status_token(sinks.upserts[-1]) == "clean"
 
 
 # ── _ensure_chart: stale dev dir parking fails with OSError -> rmtree fallback ──
