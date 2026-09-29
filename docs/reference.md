@@ -448,7 +448,8 @@ green description, so the status names it when another finding leads
 decommission count. An image downgrade adds
 ` | IMAGE DOWNGRADE in N environment(s)` in the same way. Like the
 decommission count, both also go on the red `Diff unavailable` description.
-No other FAILED description changes.
+No other FAILED description changes. When the description would pass 255
+bytes, both are left out, so the text we had before is never cut.
 
 **noCore turning off.** Turning noCore off deletes `bs-pcs` and `hc-pcs`
 (acme-config-prod #4667, a 5 h outage). A move that turns noCore off only

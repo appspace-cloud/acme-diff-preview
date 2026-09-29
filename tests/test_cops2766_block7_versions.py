@@ -217,6 +217,31 @@ def test_other_failed_descriptions_do_not_change(world):
                                   "Diff failed: helm exploded - check PR comment")
 
 
+# Review: a decommission, leftovers and both downgrades in one PR.
+BIG_EXTRA = (" | \U0001f5d1️ 3 environment(s) being decommissioned"
+             " | \U0001f9f9 4 leftover app(s) from prior decommission")
+BOTH_NOTES = (" | CHART DOWNGRADE in 2 environment(s)"
+              " | IMAGE DOWNGRADE in 1 environment(s)")
+
+
+@pytest.mark.parametrize("head,tail", [
+    ("Diff unavailable for 12 app(s) | 600 resource(s) confirmed changed",
+     " - review comment (will retry automatically if transient)"),
+    ("600 resource(s) will change | +2 new environment(s) will be created",
+     " - review comment"),
+])
+def test_the_downgrade_notes_give_way_past_255_bytes(head, tail):
+    desc = m._fit_downgrade_notes(head + BIG_EXTRA + BOTH_NOTES + tail, BOTH_NOTES)
+    assert desc == head + BIG_EXTRA + tail
+    full = cr.join_status_lead("⚠️ Chart version downgrade", desc)
+    assert cr._utf8_len(full) <= 255 and full.endswith(tail)
+
+
+def test_the_downgrade_notes_stay_when_they_fit():
+    desc = "1 resource(s) will change" + BOTH_NOTES + " - review comment"
+    assert m._fit_downgrade_notes(desc, BOTH_NOTES) == desc
+
+
 # ── -revN on release tags (open decision row 20) ─────────────────────────
 
 @pytest.mark.parametrize("current,new,down", [

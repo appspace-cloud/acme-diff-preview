@@ -11771,6 +11771,14 @@ def _permanent_failure_status_description(app_results) -> str:
     return f"{error}{suffix}"
 
 
+def _fit_downgrade_notes(desc, notes, limit=255):
+    """COPS-2766: `desc` without the downgrade `notes` when it passes
+    `limit` UTF-8 bytes, so the text we had before is never cut."""
+    if notes and len(desc.encode("utf-8", "surrogatepass")) > limit:
+        return desc.replace(notes, "", 1)
+    return desc
+
+
 def _permanent_failure_top_panel(results, failure_group_for_app, quiet: bool) -> list:
     """Error-first panel(s) for permanent render failures (COPS-2676).
 
@@ -14368,6 +14376,7 @@ def process_pr(pr, path_map, base_sha="", repo=None):
                     has_input_changes=bool(input_change_lines),
                     has_inert=_INERT_EDIT_HDR in _joined)
                 state, desc = "SUCCESSFUL", f"{_clean}{green_extra}"
+        desc = _fit_downgrade_notes(desc, downgrade_extra + image_extra)
         if state == "SUCCESSFUL":
             # COPS-2766: lead with the top finding of the comment just
             # posted; fix_stuck_inprogress rebuilds the same lead from it.
