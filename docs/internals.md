@@ -568,6 +568,24 @@ Both cases share `_supersede_lock`, `_sha_eq` normalisation, and the
 merge train would starve a large PR out of ever publishing anything, which is
 worse than publishing slightly stale.
 
+#### A PR that is already merged (COPS-2766)
+
+A merged PR can still be in the open-PR list when `main` already has its merge
+commit. The poll then rendered the PR against its own merge commit and replaced
+the verdict the reviewers saw: 7 of 525 merges were re-rendered this way, and
+#4504 got a false FAILED. So right after the destination check, `process_pr`
+asks the mirror `git merge-base --is-ancestor pr_sha base_sha`. On True the PR
+is skipped: no comment, no status, no `_seen`, and one
+`pr_skipped_already_merged` log line per head sha. False and None (mirror off,
+sha not fetched yet, git error) render as before. Only True and False are
+cached, because a missing sha can arrive with the next fetch.
+
+Limits. A squash merge makes a new commit, so the head is not an ancestor and
+the PR renders as before (acme-config-dev had 5 of those since 2026-08-01,
+stage and prod none). A PR merged while it renders still posts its pre-merge
+verdict, which is honest. An open PR whose head is already in `main` (a stacked
+branch) keeps its last status, and merging it changes nothing.
+
 #### The PR's-own-branch case
 
 Two pushes landing on the same PR inside one render window used to mean the

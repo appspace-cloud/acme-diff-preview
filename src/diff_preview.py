@@ -3080,6 +3080,36 @@ def _mirror_has_sha(repo: str, sha: str) -> bool:
     return ok
 
 
+_mirror_ancestor_cache = {}   # (repo, anc, desc) -> bool
+_already_merged_logged = set()   # (sk, pr_sha) skipped as merged, logged once
+
+
+def _mirror_is_ancestor(repo: str, anc: str, desc: str):
+    """Is `anc` in the history of `desc`? True or False from the mirror, or
+    None when the mirror cannot say (off, sha not fetched, git error).
+    Only True and False are cached: ancestry between two commits never
+    changes, but a missing sha can arrive with the next fetch."""
+    if not GIT_MIRROR_ENABLED or _mirror_disabled or not repo or not anc or not desc:
+        return None
+    key = (repo, anc, desc)
+    hit = _mirror_ancestor_cache.get(key)
+    if hit is not None:
+        return hit
+    path = _mirror_path(repo)
+    if not os.path.isdir(os.path.join(path, "objects")):
+        return None
+    if not _mirror_has_sha(repo, anc) or not _mirror_has_sha(repo, desc):
+        return None
+    r = _git_run(["--git-dir", path, "merge-base", "--is-ancestor", anc, desc],
+                 timeout=30)
+    if r is None or r.returncode not in (0, 1):
+        return None
+    if len(_mirror_ancestor_cache) > 512:
+        _mirror_ancestor_cache.clear()
+    _mirror_ancestor_cache[key] = r.returncode == 0
+    return r.returncode == 0
+
+
 def _git_read_file(repo: str, sha: str, filepath: str):
     """Read one file at one commit from the mirror.
 
@@ -11557,6 +11587,21 @@ def process_pr(pr, path_map, base_sha="", repo=None):
                     old_sha=(base_sha or "")[:12], new_sha=_newer_base[:12],
                     stage="entry")
         return  # _seen NOT set → rendered against the new base next pass
+
+    # COPS-2766: a merged PR can still be in the open list when main already
+    # has its merge commit. Rendering it against that commit replaced the
+    # reviewed verdict (#4504 got a false FAILED). Skip only on a sure True
+    # from the mirror; None goes on as before. Nothing is posted and _seen
+    # stays unset.
+    if _mirror_is_ancestor(repo, pr_sha, base_sha):
+        if (sk, pr_sha) not in _already_merged_logged:
+            if len(_already_merged_logged) > 512:
+                _already_merged_logged.clear()
+            _already_merged_logged.add((sk, pr_sha))
+            logsink.log(f"PR #{pr_id}: head {pr_sha[:8]} is already in main "
+                        f"({base_sha[:8]}), skipping", pr=pr_id, repo=repo,
+                        event="pr_skipped_already_merged")
+        return
 
     # A chart republish (JFrog webhook) can force this PR to recompute once,
     # bypassing both dedups below. Consume-once: if the recompute then fails,
