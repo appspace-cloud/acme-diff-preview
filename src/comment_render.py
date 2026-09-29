@@ -246,12 +246,14 @@ _BLAST_RADIUS_HDR = "**Blast radius.**"
 _NOCORE_FLIP_HDR = "**noCore changes.**"
 _NOCORE_COUNTS_RE = re.compile(
     r"noCore changes in (\d+) environment\(s\): on in (\d+), off in (\d+)")
+_NOCORE_NAMES_RE = re.compile(re.escape(_NOCORE_FLIP_HDR) + r" `[^`]+` goes from "
+                              r"`\w+` to `\w+` in \d+ environment\(s\): (.+?)\. ")
 _NOCORE_UNKNOWN = "noCore check unavailable"
 _NOCORE_UNKNOWN_RE = re.compile(re.escape(_NOCORE_UNKNOWN) + r" for (.+?): one of ")
 # COPS-2766: legacyBackends false to true, the same wiring.
 _LEGACY_BACKENDS_HDR = "**Legacy backends come back.**"
 _LEGACY_BACKENDS_RE = re.compile(
-    re.escape(_LEGACY_BACKENDS_HDR) + r".*? in (\d+) environment\(s\)")
+    re.escape(_LEGACY_BACKENDS_HDR) + r".*? in \d+ environment\(s\): (.+?)\. ")
 # COPS-2766: a prod cl-*-ms/-ss app serves every tenant of its constellation.
 _TENANT_WIDE_HDR = "**Reaches every public-cloud tenant.**"
 # COPS-2721: written by values_redundancy.render_lines via diff_preview,
@@ -1039,10 +1041,13 @@ def _build_merge_summary(results, rollup_by_sig, vm_change_lines,
         # it off, is the nocore_lost gate above.
         nc = _NOCORE_COUNTS_RE.search(txt)
         if nc:
+            # The names first: the Builds panel shows only the start.
+            names = (_panel_names(*_NOCORE_NAMES_RE.findall(txt))
+                     or f"{nc.group(1)} environment(s)")
             findings.append((_SEV_REVIEW,
-                             f"\U0001f50c **noCore changes in {nc.group(1)} "
-                             f"environment(s)**: on in {nc.group(2)}, off in "
-                             f"{nc.group(3)} (read the noCore note, COPS-2758)"))
+                             f"\U0001f50c **noCore changes** in {names}: on in "
+                             f"{nc.group(2)}, off in {nc.group(3)} (read the noCore "
+                             f"note, COPS-2758)"))
         if _NOCORE_UNKNOWN in txt:
             # Named envs when a value file is bad YAML, the PR when it crashed.
             unk = _NOCORE_UNKNOWN_RE.search(txt)
@@ -1054,7 +1059,7 @@ def _build_merge_summary(results, rollup_by_sig, vm_change_lines,
         if lb:
             findings.append((_SEV_REVIEW,
                              f"\U0001f517 **Legacy backends come back** in "
-                             f"{lb.group(1)} environment(s): sync `-ms` and `-glb`, "
+                             f"{_panel_names(lb.group(1))}: sync `-ms` and `-glb`, "
                              f"then check `kubectl get svcneg`"))
         # COPS-2766: routine, the reach is a fact and not a risk. The names
         # come from our own line only.

@@ -464,12 +464,29 @@ def test_a_flip_is_a_review_that_leads_the_deletions():
     verdict, b = _bullets(m._nocore_flip_lines([_change(old=True, new=False)]),
                           results=results)
     assert verdict.startswith("⚠️ **Review before merging** (2 item(s))")
-    assert b[0] == ("\U0001f50c **noCore changes in 1 environment(s)**: on in 0, off in 1 "
+    assert b[0] == ("\U0001f50c **noCore changes** in `pv-x-a`: on in 0, off in 1 "
                     "(read the noCore note, COPS-2758)")
     assert b[1].startswith("\U0001f5d1️ **2 resource(s) deleted**")
     lead = cr.status_lead("\n".join(cr._build_merge_summary(
         results, {}, None, None, m._nocore_flip_lines([_change()]), None, False)))
-    assert lead.startswith("⚠️ noCore changes in 1 environment(s): on in 1"), lead
+    assert lead.startswith("⚠️ noCore changes in pv-x-a: on in 1"), lead
+
+
+def test_the_summary_names_up_to_three_envs():
+    """The Builds panel shows only the start of the status, so the names
+    come before the counts. They come from the panel lines, every direction
+    and cloud, and the count goes past the 10 names of the panel."""
+    moved = _change(env="pv-m-a", path=NEW, moved_from=OLD, old=True, new=False,
+                    pinned=True, src=NEW)
+    state = m._nocore_flip_lines([_change(env=f"pv-e{i:02}-a") for i in range(13)] + [moved])
+    _verdict, b = _bullets(state)
+    assert b[0] == ("\U0001f50c **noCore changes** in `pv-e00-a`, `pv-e01-a`, `pv-e02-a` "
+                    "(+11 more): on in 13, off in 1 (read the noCore note, COPS-2758)")
+    _verdict, b = _bullets(m._nocore_flip_lines([moved]))
+    assert b[0].startswith("\U0001f50c **noCore changes** in `pv-m-a`: on in 0"), b
+    _verdict, b = _bullets(["### \U0001f50c noCore changes in 2 environment(s): "
+                            "on in 2, off in 0"])
+    assert b[0].startswith("\U0001f50c **noCore changes** in 2 environment(s): on in 2"), b
 
 
 def test_the_gate_is_do_not_merge():
@@ -477,7 +494,7 @@ def test_the_gate_is_do_not_merge():
     verdict, b = _bullets(m._nocore_flip_lines([gated]), gates=m._nocore_gates([gated]))
     assert verdict.startswith("⛔ **DO NOT MERGE**")
     assert b[0] == "⛔ **A move turns noCore off** in `pv-m-a`"
-    assert b[1].startswith("\U0001f50c **noCore changes in 1")
+    assert b[1].startswith("\U0001f50c **noCore changes** in `pv-m-a`: on in 0, off in 1")
 
 
 def test_an_unknown_is_a_review_not_a_routine():
@@ -547,7 +564,7 @@ def test_the_4667_shape_fails_the_build(move):
 def test_setting_it_in_the_moved_file_lifts_it(move):
     body, (state, desc), _reads = move(IDENTITY_YAML + "  infra:\n    noCore: false\n")
     assert state == "SUCCESSFUL", desc
-    assert desc.startswith("⚠️ noCore changes in 1 environment(s)"), desc
+    assert desc.startswith("⚠️ noCore changes in pv-orch-a: on in 0, off in 1"), desc
     assert m._extract_status_token(body) == "clean"
     assert "⛔" not in body.split("\n---\n")[0]
 
@@ -564,7 +581,7 @@ def test_a_cohort_flip_stays_green(move):
     body, (state, desc), _reads = move(changed=[f"{CUSTOM}/config.yaml"], renames={},
                                        files=files)
     assert state == "SUCCESSFUL" and m._extract_status_token(body) == "clean", desc
-    assert desc.startswith("⚠️ noCore changes in 1 environment(s): on in 0, off in 1")
+    assert desc.startswith("⚠️ noCore changes in pv-orch-a: on in 0, off in 1"), desc
     assert "⛔" not in body.split("\n---\n")[0]
 
 

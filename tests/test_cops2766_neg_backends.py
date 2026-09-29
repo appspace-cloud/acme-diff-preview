@@ -257,14 +257,18 @@ def test_other_keys_and_unknowns_are_ignored():
     assert m._legacy_backends_lines([base]) == [BACK_LINE, ""]
 
 
-def test_the_summary_finding_counts_the_envs():
+def test_the_summary_finding_names_the_envs():
     base = {"env": "pv-qa88-a", "path": QA88, "moved_from": None, "key": LK,
             "old": False, "new": True, "pinned": True, "src": QA88, "value": True}
     lines = m._legacy_backends_lines([base, dict(base, env="pv-qa89-a")])
     verdict, b = _bullets({}, state=lines)
     assert verdict.startswith("⚠️ **Review before merging** (1 item(s))"), verdict
-    assert b == ["\U0001f517 **Legacy backends come back** in 2 environment(s): sync "
-                 "`-ms` and `-glb`, then check `kubectl get svcneg`"]
+    assert b == ["\U0001f517 **Legacy backends come back** in `pv-qa88-a`, `pv-qa89-a`: "
+                 "sync `-ms` and `-glb`, then check `kubectl get svcneg`"]
+    lines = m._legacy_backends_lines([dict(base, env=f"pv-e{i:02}-a") for i in range(12)])
+    _verdict, b = _bullets({}, state=lines)
+    assert b[0].startswith("\U0001f517 **Legacy backends come back** in `pv-e00-a`, "
+                           "`pv-e01-a`, `pv-e02-a` (+9 more): sync"), b
 
 
 # ── (e) process_pr ───────────────────────────────────────────────────────
@@ -317,9 +321,9 @@ def test_legacy_backends_back_is_a_green_review(orch, monkeypatch):
     m.process_pr(_mk_pr(), PMAP, base_sha=BASE_SHA)
     body, (state, desc) = sinks.upserts[-1], sinks.statuses[-1]
     assert state == "SUCCESSFUL" and m._extract_status_token(body) == "clean", desc
-    assert "- \U0001f517 **Legacy backends come back** in 1 environment(s)" in body
+    assert "- \U0001f517 **Legacy backends come back** in `pv-orch-a`: sync" in body
     assert "goes from `false` to `true` in 1 environment(s): `pv-orch-a`." in body
-    assert desc.startswith("⚠️ Legacy backends come back in 1 environment(s)"), desc
+    assert desc.startswith("⚠️ Legacy backends come back in pv-orch-a: sync"), desc
 
 
 def _fail_on_legacy(monkeypatch, exc):
