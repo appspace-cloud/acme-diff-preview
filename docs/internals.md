@@ -1307,6 +1307,9 @@ blocks an unrelated PR, for example a fleet chart bump. An affinity
 `operator: In` is not in a `tolerations:` block, so it is never read.
 
 It fails the build as a render error. The comment shows it as SCHEMA
-VALIDATION FAILED, the red status names the resource and the value, and it is
-not retried. There is no trailer, because the fix is always a config change:
-correct the value in `customer.yaml`, or in the cohort `config.yaml`.
+VALIDATION FAILED, but each line says that the Kubernetes API rejects the
+value, and a hint says that helm and `values.schema.json` do not check it. The
+red status names the resource and the value, and it is not retried. There is
+no trailer, because the fix is a change of the value: in `customer.yaml`, or
+in the cohort `config.yaml`. When the bad value comes from the chart itself,
+for example in a chart bump, the fix goes in the chart.

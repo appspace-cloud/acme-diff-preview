@@ -161,8 +161,14 @@ _TOLERATION_ENUMS = {
 _TOLERATIONS_RE = re.compile(r"^(\s*)(- )?tolerations:\s*(?:#.*)?$")
 _TOLERATION_FIELD_RE = re.compile(r"^\s*(?:- )?(operator|effect):\s*(.*?)\s*$")
 _TOLERATION_ERRORS_SHOWN = 3
-_TOLERATION_HEADER = ("Kubernetes rejects these tolerations when ArgoCD "
-                      "syncs, helm renders them:")
+# Short: each line says the cause, and three lines must fit in the cut.
+_TOLERATION_HEADER = "Kubernetes rejects these tolerations:"
+# The panel label says schema, so the hint says where the check really is.
+_TOLERATION_HINT = (
+    "> **Why:** helm and `values.schema.json` do not check a toleration "
+    "value, so the render passes and Kubernetes rejects it when ArgoCD "
+    "syncs. If the bad value comes from the chart and not from the values, "
+    "the fix goes in the chart.")
 
 
 def _toleration_value(raw: str):
@@ -217,8 +223,10 @@ def _toleration_errors(resources: dict, main_resources: dict = None) -> str:
                 continue
             ok = _TOLERATION_ENUMS[field]
             want = ", ".join(f"`{v}`" for v in ok[:-1]) + f" or `{ok[-1]}`"
+            # The cause is in the line: the comment keeps only `- ` lines.
             found.append(f"- at `{key[0].rsplit('/', 1)[-1]} {key[2]}`: "
-                         f"toleration {field} `{value}`, want {want}")
+                         f"the Kubernetes API rejects toleration {field} "
+                         f"`{value}`, want {want}")
     if not found:
         return ""
     # Whole lines only: the stored detail is cut at _HELM_ERROR_MAX, and 30
@@ -245,10 +253,11 @@ def _schema_fix_hints(err: str) -> list:
     because deployment/vpa/pdb/iamPolicyMember all range over that map, so a
     missing key deletes the microservice from the environment.
     """
+    hints = [_TOLERATION_HINT] if "rejects toleration" in (err or "") else []
     nulls = _NULL_VIOLATION_RE.findall(err or "")
     if not nulls:
-        return []
-    hints = [
+        return hints
+    hints += [
         f"> **Why:** {len(nulls)} of these are `null`, which is what YAML "
         f"gives a key whose body was deleted or commented out.",
         "> **Fix:** write an explicit empty map to keep the entry with pure "

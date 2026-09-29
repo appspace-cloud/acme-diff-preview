@@ -19,10 +19,9 @@ import schema_errors  # noqa: E402
 from schema_errors import _toleration_errors  # noqa: E402
 
 KEY = ("apps/Deployment", "pv-statestreet-c", "appspace-mediatransform")
-HEADER = ("Kubernetes rejects these tolerations when ArgoCD syncs, "
-          "helm renders them:")
-OP_LINE = ("- at `Deployment appspace-mediatransform`: toleration operator "
-           "`equal`, want `Equal` or `Exists`")
+HEADER = "Kubernetes rejects these tolerations:"
+OP_LINE = ("- at `Deployment appspace-mediatransform`: the Kubernetes API "
+           "rejects toleration operator `equal`, want `Equal` or `Exists`")
 
 
 def _deploy(tolerations, image="img:1", name="appspace-mediatransform"):
@@ -91,8 +90,9 @@ def test_wrong_case_operator_is_flagged():
 def test_wrong_case_effect_is_flagged():
     out = _errors(_deploy(_tol(effect="noschedule")))
     assert out.splitlines()[1] == (
-        "- at `Deployment appspace-mediatransform`: toleration effect "
-        "`noschedule`, want `NoSchedule`, `PreferNoSchedule` or `NoExecute`")
+        "- at `Deployment appspace-mediatransform`: the Kubernetes API "
+        "rejects toleration effect `noschedule`, want `NoSchedule`, "
+        "`PreferNoSchedule` or `NoExecute`")
 
 
 def test_affinity_operator_outside_the_block_is_not_read():
@@ -314,13 +314,33 @@ def test_comment_and_status_name_the_deployment(monkeypatch):
     assert m._extract_status_token(body) == "permanent"
     panel = body.split("RENDER BLOCKED", 1)[1]
     assert "SCHEMA VALIDATION FAILED" in panel
-    assert ("> at `Deployment appspace-mediatransform`: toleration operator "
-            "`equal`, want `Equal` or `Exists`") in panel
+    assert "> " + OP_LINE[2:] in panel
     desc = m._permanent_failure_status_description({APP: r})
-    assert desc.startswith(
-        "at `Deployment appspace-mediatransform`: toleration operator `equal`")
+    assert desc.startswith(OP_LINE[2:])
     assert "pv-statestreet-c" in desc
     assert desc.endswith("fix and push")
+
+
+def test_the_panel_says_the_api_and_not_the_schema_rejects_it(monkeypatch):
+    """The label says SCHEMA VALIDATION FAILED. The hint says that helm and
+    values.schema.json do not check the value, so nobody looks there, and
+    that a bad value from the chart needs a chart fix."""
+    r, _ = _diff(monkeypatch, _deploy(_tol(operator="equal")), _deploy(_tol()))
+    body = m.format_comment(PR_SHA, {APP: r}, base_sha=MAIN_SHA)
+    panel = body.split("RENDER BLOCKED", 1)[1]
+    assert schema_errors._TOLERATION_HINT in panel
+    assert panel.index(OP_LINE[2:]) < panel.index(
+        schema_errors._TOLERATION_HINT)
+    assert "`values.schema.json` do not check" in schema_errors._TOLERATION_HINT
+    assert "the fix goes in the chart" in schema_errors._TOLERATION_HINT
+
+
+def test_the_hint_is_only_for_a_toleration():
+    null = "- at '/a/b': got null, want object"
+    assert schema_errors._TOLERATION_HINT not in m._schema_fix_hints(null)
+    both = m._schema_fix_hints(null + "\n" + OP_LINE)
+    assert both[0] == schema_errors._TOLERATION_HINT and len(both) == 3
+    assert m._schema_fix_hints(OP_LINE) == [schema_errors._TOLERATION_HINT]
 
 
 def test_a_valid_toleration_change_stays_clean(monkeypatch):
