@@ -6324,6 +6324,10 @@ def _detect_env_move(value_files: list, renames: dict, main_sha: str = None, pr_
     Returns (old_env_dir, new_env_dir) when some rename's old side is one
     of this app's value files AND the directory actually changed AND (when
     shas are given) the identity check passes, else None.
+
+    COPS-2766: the outermost such rename. Bitbucket lists a cl-* folder move
+    in path order, api/customer.yaml before config.yaml, and the block dir
+    left config.yaml on the old path.
     """
     if not renames:
         return None
@@ -6331,6 +6335,7 @@ def _detect_env_move(value_files: list, renames: dict, main_sha: str = None, pr_
         posixpath.normpath(vf.replace("$config/", "").lstrip("/"))
         for vf in value_files
     }
+    moves = []
     for old_p, new_p in renames.items():
         if old_p not in clean_vfs:
             continue
@@ -6342,8 +6347,8 @@ def _detect_env_move(value_files: list, renames: dict, main_sha: str = None, pr_
             continue
         if main_sha and pr_sha and not _rename_identity_confirmed(old_p, new_p, main_sha, pr_sha):
             continue
-        return old_dir, new_dir
-    return None
+        moves.append((old_dir, new_dir))
+    return min(moves, key=lambda d: len(d[0]), default=None)
 
 
 def _moves_missing_cohort(renames: dict, pr_sha: str, repo: str = None) -> list:
