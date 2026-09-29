@@ -8,8 +8,15 @@ A live cl-*/config.yaml renamed or moved renames every Application of the
 constellation. It is not a pv identity hit, so the comment still shows the
 diff, but the build is [blocked] until a commit message has
 `Confirm-Rename: <old dir> -> <new dir>`.
+
+A cl-* folder move renders each block from the new folder. Bitbucket lists
+the diffstat in path order, so api/, app1/ and cloud/customer.yaml come
+before config.yaml. The move is the outermost identity rename, or those
+blocks render with the old config.yaml path and fail (live, acme-config-dev,
+2.122.0).
 """
 import os
+import posixpath
 import sys
 
 import pytest
@@ -180,3 +187,101 @@ def test_confirm_rename_lifts_a_cl_move(cl_move):
     assert m._extract_status_token(body) == "clean"
     assert state == "SUCCESSFUL", desc
     assert f"☑️ **Confirmed in a commit:** `{CL_TRAILER}`" in body
+
+
+# ── (c) a cl-* folder move renders every block from the new folder ───────
+
+QA_OLD = "gcp/qa/public-cloud/ap1/cl-qa-17-a"
+QA_NEW = "gcp/qa/public-cloud/ap1/cl-qa-97-a"
+# Bitbucket diffstat order: the blocks come before config.yaml.
+QA_RENAMES = {f"{QA_OLD}/{f}": f"{QA_NEW}/{f}" for f in (
+    "api/customer.yaml", "app1/customer.yaml", "cloud/customer.yaml", "config.yaml")}
+QA_TRAILER = f"Confirm-Rename: {QA_OLD} -> {QA_NEW}"
+QA_BLOCKS = ("api", "app1", "cloud")
+_REAL_ARGOCD_DIFF = m.argocd_diff
+
+
+def _block_vfs(block):
+    return ["$config/gcp/qa/public-cloud/ap1/config.yaml", f"$config/{QA_OLD}/config.yaml",
+            f"$config/{QA_OLD}/{block}/customer.yaml"]
+
+
+@pytest.mark.parametrize("block", QA_BLOCKS)
+def test_a_cl_folder_move_is_the_folder_not_the_block(block):
+    assert list(QA_RENAMES)[-1].endswith("/config.yaml"), "path order"
+    assert m._detect_env_move(_block_vfs(block), QA_RENAMES) == (QA_OLD, QA_NEW)
+
+
+PV_OLD = "gcp/qa/private-cloud/ap1/custom/pv-qa-13-a"
+PV_NEW = "gcp/qa/private-cloud/ap1/monthly/pv-qa-13-a"
+COHORT = "gcp/qa/private-cloud/ap1/custom"
+
+
+@pytest.mark.parametrize("renames,move", [
+    ({f"{PV_OLD}/cicd-versions.yaml": f"{PV_NEW}/cicd-versions.yaml",
+      f"{PV_OLD}/customer.yaml": f"{PV_NEW}/customer.yaml"}, (PV_OLD, PV_NEW)),
+    ({f"{PV_OLD}/customer.yaml": f"{COHORT}/pv-qa-13-b/customer.yaml"},
+     (PV_OLD, f"{COHORT}/pv-qa-13-b")),
+    ({f"{COHORT}/config.yaml": f"{COHORT}2/config.yaml",
+      f"{PV_OLD}/customer.yaml": f"{COHORT}2/pv-qa-13-a/customer.yaml"},
+     (COHORT, f"{COHORT}2")),
+    ({f"{PV_OLD}/cicd-versions.yaml": f"{PV_NEW}/cicd-versions.yaml"}, None),
+])
+def test_a_pv_move_is_detected_as_before(renames, move):
+    vfs = [f"$config/{PV_OLD}/../config.yaml", f"$config/{PV_OLD}/customer.yaml",
+           f"$config/{PV_OLD}/cicd-versions.yaml"]
+    assert m._detect_env_move(vfs, renames) == move
+
+
+@pytest.fixture()
+def qa_move(world, monkeypatch):
+    """git mv cl-qa-17-a cl-qa-97-a through the real diff. The helm stub fails
+    like the chart when customerName (set in config.yaml) is not in the values."""
+    sinks, _plan = world
+    monkeypatch.setattr(m, "argocd_diff", _REAL_ARGOCD_DIFF)
+    main = {"gcp/qa/public-cloud/ap1/config.yaml": "appspace: {}\n",
+            f"{QA_OLD}/config.yaml": "appspace:\n  customerName: qa-17\n"}
+    path_map = {f"{QA_OLD}/config.yaml": []}
+    for b in QA_BLOCKS:
+        app = f"cl-qa-17-a-{b}-glb"
+        for cache, value in ((m._app_chart_map, "appspace-glb"),
+                             (m._app_chart_revision_map, "2604.0.0-dev"),
+                             (m._app_chart_registry_map, "helm-oci-dev.repo.appspace.com"),
+                             (m._app_value_files_map, _block_vfs(b)),
+                             (m._app_namespace_map, "cl-qa-17-a")):
+            monkeypatch.setitem(cache, app, value)
+        main[f"{QA_OLD}/{b}/customer.yaml"] = f"appspace:\n  coreTypeName: {b}\n"
+        path_map[f"{QA_OLD}/config.yaml"].append(app)
+        path_map[f"{QA_OLD}/{b}/customer.yaml"] = [app]
+    files = {BASE_SHA: main, PR_SHA: {p.replace(QA_OLD, QA_NEW): t for p, t in main.items()}}
+
+    def fetch(path, sha, repo=None):
+        text = files.get(sha, {}).get(posixpath.normpath(path))
+        return (text, m.BB_OK) if text else (None, m.BB_NOT_FOUND)
+    monkeypatch.setattr(m, "_bb_fetch_status", fetch)
+    monkeypatch.setattr(m, "get_pr_changed_files", lambda pr_id, repo=None: (
+        [p for pair in QA_RENAMES.items() for p in pair], dict(QA_RENAMES)))
+    monkeypatch.setattr(m, "_ensure_chart", lambda reg, chart, ver: "/fake/appspace-glb")
+    monkeypatch.setattr(m, "_helm_template", lambda chart, release, ns, vals: (
+        ("apiVersion: v1\nkind: ConfigMap\nmetadata:\n  name: x\n", None)
+        if "customerName" in "".join(vals.values()) else
+        (None, "Error: execution error at (appspace-glb/templates/x.yaml:1:1): "
+               "A valid appspace.customerName entry required!")))
+
+    def run(messages):
+        m._seen.clear()
+        monkeypatch.setattr(m, "_pr_commit_messages", lambda *a: list(messages))
+        m.process_pr(_mk_pr(), path_map, base_sha=BASE_SHA)
+        return sinks.upserts[-1], sinks.statuses[-1]
+    return run
+
+
+def test_a_cl_folder_move_is_red_for_the_gate_not_a_render_error(qa_move):
+    body, (state, desc) = qa_move(["Move cl-qa-17-a to cl-qa-97-a"])
+    assert m._extract_status_token(body) == "blocked" and state == "FAILED"
+    assert desc == (f"Blocked - {cr.GATES['cl_rename'][0]} in cl-qa-17-a. To merge anyway, "
+                    f"add '{QA_TRAILER}' to a commit message (see PR comment)")
+    assert "customerName" not in body + desc
+    body, (state, desc) = qa_move([QA_TRAILER])
+    assert m._extract_status_token(body) == "clean"
+    assert state == "SUCCESSFUL", desc

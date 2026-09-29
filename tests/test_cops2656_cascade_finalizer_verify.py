@@ -15,10 +15,9 @@ The sequence that breaks:
 4. The Application is deleted without a finalizer, everything is
    orphaned, and the reviewer was actively reassured rather than warned.
 
-If the environment also has `appspace.autosync: false` (COPS-2583) the
-flag will NEVER sync, so the panel reads done indefinitely while the
-finalizer never arrives. Two individually correct features combine into
-a durable lie.
+A pause (`appspace.autosync: false`, COPS-2583) does not change this.
+The ApplicationSet writes the finalizer whatever the auto-sync is
+(COPS-2766, live on pv-qa88-a).
 
 Same failure mode as the backtick-link defect: verifying presence is not
 verifying meaning.

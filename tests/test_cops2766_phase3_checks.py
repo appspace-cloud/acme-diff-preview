@@ -8,8 +8,10 @@ three cases where the cascade does not do what the panel says:
   token [transient], so the PR clears itself after ArgoCD syncs. When the
   lookup fails (None) the panel shows one warning line and the build stays
   green;
-- the env is paused (`appspace.autosync: false` at base), so the finalizer
-  never arrives. The gate `paused` has no trailer;
+- the env is paused (`appspace.autosync: false` at base). This is not a gate:
+  the cascade still runs on delete (live on pv-qa88-a, 2026-09-29). The panel
+  has one warning line and the merge summary a review item, because what main
+  changed during the pause may not be live yet;
 - zeroPods or decommission has been true on main for less than 7 days. The
   gate `hold` is lifted by `Confirm-Decommission: <env>`. The history comes
   from the git mirror, first parent, and an unreadable history is never
@@ -42,6 +44,11 @@ LIVE = "appspace:\n  customerName: foo\n"
 ARMED = LIVE + "  decommission: true\n"
 STOPPED = LIVE + "  zeroPods: true\n"
 BOTH = STOPPED + "  decommission: true\n"
+PAUSED = "  autosync: false\n"
+PAUSED_LINE = ("⚠️ **Auto-sync is paused on main** for `{}`. The cascade still runs "
+               "when the folder goes, but changes made on main during the pause "
+               "(zeroPods, the purge policy) may not be live yet. Check the live "
+               "Applications before merging.")
 
 
 @pytest.fixture(autouse=True)
@@ -273,13 +280,14 @@ def test_finalizer_unknown_is_a_line_not_a_gate(monkeypatch):
     assert "⚠️ Could not verify the cascade finalizer on `pv-foo-c`" in text
 
 
-def test_paused_at_base_is_a_paused_gate_with_a_panel_line(monkeypatch):
-    gates, text, _ = _evaluate(monkeypatch, ARMED + "  autosync: false\n")
-    assert gates == [{"kind": "paused", "env": "pv-foo-c"}]
-    assert (f"🚨 **{cr._DECOM_PAUSED_HDR}.** `appspace.autosync: false` is set for "
-            "`pv-foo-c` on `main`") in text
-    assert "Resume auto-sync in a separate PR, let it sync, then remove the folder." in text
+def test_paused_at_base_is_a_warning_line_not_a_gate(monkeypatch):
+    gates, text, _ = _evaluate(monkeypatch, ARMED + PAUSED)
+    assert gates == []
+    assert PAUSED_LINE.format("pv-foo-c") in text
     _gates, text, _ = _evaluate(monkeypatch, ARMED)
+    assert cr._DECOM_PAUSED_HDR not in text
+    gates, text, _ = _evaluate(monkeypatch, LIVE + PAUSED)
+    assert [g["kind"] for g in gates] == ["orphan"], "no cascade, no pause line"
     assert cr._DECOM_PAUSED_HDR not in text
 
 
@@ -311,12 +319,8 @@ def _gate(kind):
      "in pv-x-a. Re-checked automatically (see PR comment)"),
     ("not_live", "Waiting - The cascade finalizer is not live in ArgoCD yet in pv-x-a. "
      "Re-checked automatically after ArgoCD syncs (see PR comment)"),
-    ("paused", "Blocked - Auto-sync is paused on main, so the cascade never runs in "
-     "pv-x-a. Resume auto-sync on main, let it sync, then remove the folder "
-     "(see PR comment)"),
 ])
 def test_the_status_says_the_way_out(kind, desc):
-    assert cr.GATES["paused"][0] == cr._DECOM_PAUSED_HDR
     assert cr.gate_status_description([_gate(kind)]) == desc
     mark = "⏳" if desc.startswith("Waiting") else "⛔"
     assert cr.gate_footer([_gate(kind)]) == f" | {mark} {desc}"
@@ -324,6 +328,10 @@ def test_the_status_says_the_way_out(kind, desc):
                                                 False, gates=[_gate(kind)]))
     assert f"- {mark} **{cr.gate_text(_gate(kind))}** in `pv-x-a`" in summary
     assert cr.gate_footer([]) == ""
+
+
+def test_a_pause_is_not_a_gate_kind():
+    assert "paused" not in cr.GATES
 
 
 # ── (d) process_pr ───────────────────────────────────────────────────────
@@ -379,15 +387,29 @@ def test_finalizer_unknown_stays_green_with_the_line(phase3):
     assert "Could not verify the cascade finalizer on `pv-orch-a`" in body
 
 
-def test_paused_at_base_is_blocked_and_no_trailer_lifts_it(phase3):
-    body, (state, desc) = phase3(extra="  autosync: false\n", messages=[
-        "Confirm-Decommission: pv-orch-a\nConfirm-Teardown: pv-orch-a"])
-    assert m._extract_status_token(body) == "blocked" and state == "FAILED"
-    assert desc == (f"Blocked - {cr._DECOM_PAUSED_HDR} in pv-orch-a. Resume auto-sync "
-                    "on main, let it sync, then remove the folder (see PR comment)")
-    assert f"⛔ **{cr._DECOM_PAUSED_HDR}** in `pv-orch-a`. Resume auto-sync" in body
-    assert f"🚨 **{cr._DECOM_PAUSED_HDR}.**" in body, "the panel says it too"
+PAUSED_REVIEW = (f"⏸️ **{cr._DECOM_PAUSED_HDR}** for an environment being removed: "
+                 "changes made on main during the pause may not be live yet")
+
+
+def test_paused_at_base_is_a_review_and_the_build_stays_green(phase3):
+    body, (state, desc) = phase3(extra=PAUSED)
+    assert m._extract_status_token(body) == "clean"
+    assert state == "SUCCESSFUL", desc
+    summary = body.split("\n---\n", 1)[0]
+    assert "⚠️ **Review before merging**" in summary and "⛔" not in summary
+    assert f"- {PAUSED_REVIEW}\n" in summary
+    assert PAUSED_LINE.format("pv-orch-a") in body
+    assert desc.startswith("⚠️ Auto-sync is paused on main for an environment being "
+                           "removed: changes made on main during the pause"), desc
     assert m._seen.get(SK) == (PR_SHA, BASE_SHA)
+
+
+def test_paused_with_another_open_gate_is_red_for_that_gate(phase3):
+    body, (state, desc) = phase3(extra=PAUSED, hold=False)
+    assert m._extract_status_token(body) == "blocked" and state == "FAILED"
+    assert desc.startswith("Blocked - " + cr.GATES["hold"][0]), desc
+    assert "(+1 more)" not in desc, "the pause is not a gate"
+    assert f"- {PAUSED_REVIEW}\n" in body and PAUSED_LINE.format("pv-orch-a") in body
 
 
 def test_hold_not_met_is_blocked_until_confirm_decommission(phase3):

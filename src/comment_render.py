@@ -288,8 +288,9 @@ _DECOM_FLAG_TYPO_HDR = (
 # finalizer. The panel writes it, the evaluator matches it for the gate.
 _DECOM_CASCADE_NOT_LIVE_HDR = ("**The cascade is armed in config but NOT live "
                                "in the cluster.**")
-# COPS-2766: a paused env never syncs, so its finalizer never arrives.
-_DECOM_PAUSED_HDR = "Auto-sync is paused on main, so the cascade never runs"
+# COPS-2766: a paused env still cascades on delete, but what main changed
+# during the pause may not be live. A warning, not a gate.
+_DECOM_PAUSED_HDR = "Auto-sync is paused on main"
 
 
 def _pingscaler_reclass(results) -> dict:
@@ -435,8 +436,6 @@ GATES = {
     "ip": ("A static IP or DNS record is released", "Confirm-IP-Release", "blocked", ""),
     "cl_rename": ("A live public-cloud environment is renamed or moved",
                   "Confirm-Rename", "blocked", ""),
-    "paused": (_DECOM_PAUSED_HDR, None, "blocked",
-               "Resume auto-sync on main, let it sync, then remove the folder"),
     "shrink": ("Disk shrink", None, "blocked",
                "GCP cannot shrink a disk in place, so keep the old size or grow it"),
     "not_live": ("The cascade finalizer is not live in ArgoCD yet", None, "transient",
@@ -616,6 +615,11 @@ def _build_merge_summary(results, rollup_by_sig, vm_change_lines,
         # of the verdict -- the operator believes the flag is set, and the
         # panel is the only place that can tell them otherwise. Its own
         # finding, because it survives whichever branch chose `_what`.
+        if _DECOM_PAUSED_HDR in txt:
+            findings.append((_SEV_REVIEW,
+                             f"\u23f8\ufe0f **{_DECOM_PAUSED_HDR}** for an environment "
+                             "being removed: changes made on main during the pause "
+                             "may not be live yet"))
         if _DECOM_FLAG_TYPO_HDR in txt:
             findings.append((_SEV_BLOCK,
                              "\U0001f6a8 **Teardown flag misspelled** "

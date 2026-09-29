@@ -6324,6 +6324,10 @@ def _detect_env_move(value_files: list, renames: dict, main_sha: str = None, pr_
     Returns (old_env_dir, new_env_dir) when some rename's old side is one
     of this app's value files AND the directory actually changed AND (when
     shas are given) the identity check passes, else None.
+
+    COPS-2766: the outermost such rename. Bitbucket lists a cl-* folder move
+    in path order, api/customer.yaml before config.yaml, and the block dir
+    left config.yaml on the old path.
     """
     if not renames:
         return None
@@ -6331,6 +6335,7 @@ def _detect_env_move(value_files: list, renames: dict, main_sha: str = None, pr_
         posixpath.normpath(vf.replace("$config/", "").lstrip("/"))
         for vf in value_files
     }
+    moves = []
     for old_p, new_p in renames.items():
         if old_p not in clean_vfs:
             continue
@@ -6342,8 +6347,8 @@ def _detect_env_move(value_files: list, renames: dict, main_sha: str = None, pr_
             continue
         if main_sha and pr_sha and not _rename_identity_confirmed(old_p, new_p, main_sha, pr_sha):
             continue
-        return old_dir, new_dir
-    return None
+        moves.append((old_dir, new_dir))
+    return min(moves, key=lambda d: len(d[0]), default=None)
 
 
 def _moves_missing_cohort(renames: dict, pr_sha: str, repo: str = None) -> list:
@@ -6614,8 +6619,8 @@ def _cascade_finalizer_live(apps):
     reads appspace.decommission out of a file in git, which says what was
     DECLARED, not what ArgoCD has applied. Between the arming PR merging
     and ArgoCD syncing, the panel reports Phase 2 done while the finalizer
-    is not there -- and if the environment is also paused
-    (appspace.autosync: false) it never will be.
+    is not there. A pause does not stop it: the ApplicationSet writes the
+    finalizer whatever the auto-sync is (COPS-2766).
 
     None means "could not tell", and it is deliberately not False. False
     drives a block; treating an unreachable ArgoCD as False would stop
@@ -6679,9 +6684,7 @@ def _cascade_mismatch_note(env_name, apps, cascade: bool) -> list:
         "orphaned exactly as if the cascade had never been armed** \u2014 "
         "still running, still costing money, still holding IPs and disks.",
         "",
-        "Let the arming change SYNC before removing the folder. If the "
-        "environment is paused (`appspace.autosync: false`) it will never "
-        "sync at all, so the pause has to be lifted first (COPS-2583).",
+        "Let the arming change SYNC before removing the folder.",
         "",
     ]
 
@@ -7234,16 +7237,14 @@ def _evaluate_env_decommissions(candidates: list, pr_sha: str, main_sha: str,
             # inventory it would otherwise appear to describe.
             _note = _cascade_mismatch_note(c["env_name"], c["apps"], cascade)
             lines += _note
-            # COPS-2766: the table says Phase 2 is done from the flag alone. A
-            # paused env never syncs, so the panel says so next to the table.
-            paused = cascade and _autosync_paused(
-                _flat_yaml_cached(c["identity_file"], main_sha))
-            if paused:
-                lines += [f"\U0001f6a8 **{_DECOM_PAUSED_HDR}.** `appspace.autosync: false` "
-                          f"is set for `{c['env_name']}` on `main`. A paused environment "
-                          "never syncs, so the cascade finalizer never arrives. Resume "
-                          "auto-sync in a separate PR, let it sync, then remove the "
-                          "folder.", ""]
+            # COPS-2766: a paused env keeps its finalizer and still cascades
+            # (live on pv-qa88-a), but main's latest changes may not be live.
+            if cascade and _autosync_paused(
+                    _flat_yaml_cached(c["identity_file"], main_sha)):
+                lines += [f"\u26a0\ufe0f **{_DECOM_PAUSED_HDR}** for `{c['env_name']}`. "
+                          "The cascade still runs when the folder goes, but changes made "
+                          "on main during the pause (zeroPods, the purge policy) may not "
+                          "be live yet. Check the live Applications before merging.", ""]
             # COPS-2707: the table above just reported Phase 2 as pending on
             # an environment whose file looks armed to a reader. Saying only
             # "not armed" is what left acme-config-prod #4377 arguing with
@@ -7297,8 +7298,6 @@ def _evaluate_env_decommissions(candidates: list, pr_sha: str, main_sha: str,
             # _note is set. The finalizer not live yet clears itself on a retry.
             if _DECOM_CASCADE_NOT_LIVE_HDR in "\n".join(_note):
                 c["gates"].append({"kind": "not_live", "env": c["env_name"]})
-            if paused:
-                c["gates"].append({"kind": "paused", "env": c["env_name"]})
             # A mirror blip is a retry, never a reason to override the hold.
             hold = _teardown_hold_met(c["identity_file"], main_sha)
             if hold is not True:

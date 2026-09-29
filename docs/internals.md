@@ -183,7 +183,6 @@ FAILED, the comment still shows the diff, and the merge summary starts with one
 | Shared user content | the purge is armed, and a surviving environment uses the same user content bucket and DNS record | `Confirm-Teardown: <env>` |
 | 7-day hold | the cascade is armed, and `zeroPods` or `decommission` has been true on `main` for less than 7 days | `Confirm-Decommission: <env>` |
 | Cascade not live | the cascade is armed in config, but ArgoCD has not put `resources-finalizer.argocd.argoproj.io` on the Applications | nothing, it clears itself |
-| Paused | the cascade is armed while `appspace.autosync: false` on `main`, so the finalizer never arrives. The panel says it next to the phase table. | nothing: resume auto-sync first, let it sync, then remove the folder |
 | Flag typo | a teardown flag that is misspelled or in the wrong place, so Phase 2 reads pending | nothing: fix the key on `main` in a separate PR, then rebase the removal |
 
 The same mechanism has three gates outside a teardown:
@@ -238,6 +237,14 @@ It fails closed:
   shows one ⚠️ line that asks you to check `argocd app get`, and the build stays
   green: a red build on every failed lookup would teach people to skip the
   panel.
+
+A pause on `main` (`appspace.autosync: false`) is not a gate. Live on
+pv-qa88-a (2026-09-29), the Applications kept
+`resources-finalizer.argocd.argoproj.io` while auto-sync was off, and ArgoCD
+runs the cascade on delete whatever the auto-sync is. The risk is different: a
+change made on `main` during the pause (zeroPods, the purge policy) may not be
+live yet. So the panel has one ⚠️ line next to the phase table, the merge
+summary has a ⏸️ review item, and the build stays green.
 
 When the PR also adds an environment, the decommission panel adds one 💡 line:
 it looks like a rebuild or a rename of the old env, so arm decommission on the
