@@ -415,6 +415,40 @@ def test_merge_names_a_boot_disk_size_once():
     assert out[0]["dangerous"] == [shrink, vma._BOOT_DISK_REASON]
 
 
+def test_the_4239_shape_says_the_field_once_and_does_not_call_it_untracked():
+    """#4239: the metadata label and the boot disk label move together. The
+    hunk sees two `hosting-id` lines with no path, the render names the boot
+    disk one with its path."""
+    old = _ci()
+    new = _ci(meta_id="hst-00000478", boot_id="hst-00000478")
+    hunk = "".join(
+        "-" + a + "\n+" + b + "\n" if a != b else " " + a + "\n"
+        for a, b in zip(old.splitlines(), new.splitlines()))
+    facts = vma._detect_vm_changes([(CI_HDR, hunk)])
+    assert facts[0]["untracked"] == ["hosting-id"]
+    assert facts[0]["notes"] == [vma._untracked_note(["hosting-id"])]
+    out = vma._merge_vm_facts(facts, _facts(CI_KEY, old, new))
+    assert out[0]["notes"] == [] and out[0]["untracked"] == []
+    assert out[0]["fields"] == [(HOSTING, "hst-00000000", "hst-00000478")]
+
+
+def test_merge_keeps_the_untracked_keys_the_render_does_not_name():
+    keys = ["hosting-id"] + ["k%d" % i for i in range(9)]
+    hunk = [_base(notes=["n1", vma._untracked_note(keys)])]
+    hunk[0]["untracked"] = keys
+    out = vma._merge_vm_facts(hunk, [_base(fields=[(HOSTING, "a", "b")])])
+    assert out[0]["untracked"] == keys[1:]
+    assert out[0]["notes"] == ["n1", vma._untracked_note(keys[1:])]
+    assert out[0]["notes"][1].endswith("`k7` and 1 more")
+
+
+def test_merge_leaves_the_note_when_the_render_names_another_key():
+    hunk = [_base(notes=[vma._untracked_note(["foo"])])]
+    hunk[0]["untracked"] = ["foo"]
+    out = vma._merge_vm_facts(hunk, [_base(fields=[(HOSTING, "a", "b")])])
+    assert out[0]["notes"] == [vma._untracked_note(["foo"])]
+
+
 def test_the_hub_re_exports_the_new_names():
     for name in ("_VM_RESIZE_REASON", "_VM_PARK_NOTE", "_VM_START_NOTE",
                  "_IMMUTABLE_RENDER_KINDS", "_render_immutable_facts",
@@ -497,6 +531,7 @@ def test_the_boot_disk_warning_reaches_the_panel_and_stays_clean(monkeypatch):
     text = "\n".join(lines)
     assert "`bootDisk.initializeParams.labels.hosting-id`" in text
     assert vma._BOOT_DISK_REASON in text
+    assert "not individually tracked" not in text, "the render names it"
     body = m.format_comment(PR_SHA, {APP: r}, base_sha=MAIN_SHA,
                             vm_change_lines=lines)
     assert m._extract_status_token(body) == "clean"

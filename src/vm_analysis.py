@@ -514,7 +514,7 @@ def _detect_vm_changes(sections: list) -> list:
 
     Returns a list of dicts:
       {header, kind, name, fields: [(field, old, new)], created, deleted,
-       dangerous: [reason, ...], notes: [note, ...]}
+       dangerous: [reason, ...], notes: [note, ...], untracked: [key, ...]}
 
     The severity rules come straight from the rendering templates and their
     runbook comments in acme-components:
@@ -706,19 +706,25 @@ def _detect_vm_changes(sections: list) -> list:
         # tell a taxonomy-label rollout from something worth opening the diff
         # for -- and guarantees the caller never renders "no changes" over a
         # section that visibly moved.
-        if untracked_keys and not deleted and not created:
-            shown = sorted(untracked_keys)
-            notes.append(
-                "other field(s) changed, not individually tracked by this "
-                "panel: %s%s" % (", ".join("`%s`" % k for k in shown[:8]),
-                                 "" if len(shown) <= 8
-                                 else " and %d more" % (len(shown) - 8)))
+        untracked = (sorted(untracked_keys)
+                     if not deleted and not created else [])
+        if untracked:
+            notes.append(_untracked_note(untracked))
         facts.append({"header": header, "kind": kind,
                       "name": _section_name(header), "fields": fields,
                       "created": created, "deleted": deleted,
                       "orphaned": orphaned,
-                      "dangerous": dangerous, "notes": notes})
+                      "dangerous": dangerous, "notes": notes,
+                      "untracked": untracked})
     return facts
+
+
+def _untracked_note(keys: list) -> str:
+    """The note that names the changed keys the tracked list cannot describe."""
+    return ("other field(s) changed, not individually tracked by this "
+            "panel: %s%s" % (", ".join("`%s`" % k for k in keys[:8]),
+                             "" if len(keys) <= 8
+                             else " and %d more" % (len(keys) - 8)))
 
 
 # COPS-2766: fields that render fine and that KCC rejects on sync. The hunk
@@ -842,6 +848,14 @@ def _merge_vm_facts(facts: list, extra) -> list:
         same = {(k.rsplit(".", 1)[1], o, n) for k, o, n in x["fields"]
                 if k.startswith("bootDisk.initializeParams.")}
         f["fields"] = [t for t in f["fields"] if t not in same]
+        # A key the render fact names by its path is tracked now (#4239).
+        named = {k.rsplit(".", 1)[-1] for k, _o, _n in x["fields"]}
+        untracked = f.get("untracked") or []
+        if named & set(untracked):
+            f["notes"].remove(_untracked_note(untracked))
+            f["untracked"] = [k for k in untracked if k not in named]
+            if f["untracked"]:
+                f["notes"].append(_untracked_note(f["untracked"]))
         for k in ("fields", "dangerous", "notes"):
             f[k] += [v for v in x[k] if v not in f[k]]
     return facts
