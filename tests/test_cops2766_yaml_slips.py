@@ -151,6 +151,19 @@ def test_a_definitions_that_is_not_a_non_empty_map_is_a_wipe(body):
     assert yh.slips(body)["lines"][("wipe", yh.DEFINITIONS)] == [(3, None)]
 
 
+def test_a_wipe_through_a_merge_key_is_a_wipe():
+    # 2.121.0 blocked it, because yaml.safe_load resolves `<<`.
+    body = "base: &b\n  definitions: {}\nappspace:\n  microservices:\n    <<: *b\n"
+    assert m._values_wipes_definitions(body) is True
+    assert yh.slips(body)["lines"][("wipe", yh.DEFINITIONS)] == [(2, None)]
+    over = body + "    definitions:\n      account: {}\n"
+    assert m._values_wipes_definitions(over) is False, "a key of its own wins over the merge"
+
+
+def test_a_merge_key_that_is_not_a_map_does_not_parse():
+    assert yh.slips("appspace:\n  microservices:\n    <<: 1\n") is None
+
+
 @pytest.mark.parametrize("body", [
     "appspace:\n  microservices:\n    definitions:\n      account:\n        image: {}\n",
     "appspace:\n  microservices: {}\n",

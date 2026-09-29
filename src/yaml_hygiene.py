@@ -11,15 +11,18 @@ import collections
 import yaml
 
 _LOADER = getattr(yaml, "CSafeLoader", yaml.SafeLoader)
+_MERGE = yaml.constructor.SafeConstructor()
 _NULL = "tag:yaml.org,2002:null"
 DEFINITIONS = "appspace.microservices.definitions"
 
 
 def _get(node, key):
-    """(key node, value node) of the last `key` in a mapping node, as a loader
-    keeps it, or (None, None)."""
+    """(key node, value node) of `key` in a mapping node as a loader keeps it:
+    `<<` merge keys resolved, the last copy wins. (None, None) when absent.
+    It resolves the merges in place, so call it after the walk."""
     found = (None, None)
     if isinstance(node, yaml.MappingNode):
+        _MERGE.flatten_mapping(node)
         for k, v in node.value:
             if isinstance(k, yaml.ScalarNode) and k.value == key:
                 found = (k, v)
@@ -39,9 +42,10 @@ def slips(body):
     {"dup": Counter, "null": Counter, "wipe": bool, "lines": {(kind, key): [(line, first_line)]}}.
 
     A key is a dotted path and a list index is `[]`, so moving list items does
-    not make an old slip look new. `<<` merge keys are skipped, and a node that
-    an alias reaches twice is walked once. An explicit `null` or `~` is not a
-    bare key: it removes a chart default on purpose.
+    not make an old slip look new. The walk skips `<<` merge keys, and a node
+    that an alias reaches twice is walked once. The wipe resolves them, as a
+    loader does. An explicit `null` or `~` is not a bare key: it removes a
+    chart default on purpose.
     """
     try:
         root = next(yaml.compose_all(body or "", Loader=_LOADER), None)
@@ -79,7 +83,10 @@ def slips(body):
                     add("null", p, line)
                 kids.append((v, p))
         todo += reversed(kids)
-    wiped = wipes_definitions_node(root)
+    try:
+        wiped = wipes_definitions_node(root)
+    except yaml.YAMLError:
+        return None     # a `<<` that is not a map: no loader reads the file
     if wiped is not None:
         # A bare `definitions:` is the wipe, reported once.
         out["null"].pop(DEFINITIONS, None)

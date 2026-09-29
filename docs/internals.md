@@ -55,7 +55,7 @@ merge preview and in the same file on `main` (the old name for a move), and
 blocks only on the difference. So a file with an old slip stays green, and a
 third copy of an old duplicate is new. A key path is dotted and a list item is
 `[]`, so moving list items does not make an old slip look new. `<<` merge keys
-are skipped. A new file, or one that does not parse on `main`, counts every
+are skipped here, but the wipe follows them, as Helm does. A new file, or one that does not parse on `main`, counts every
 slip. A move that Bitbucket did not pair is compared with the deleted file of
 the same env folder and name. Over 6 months of acme-config-prod this would
 have blocked 6 PRs, all real slips (#3245, #3289, #3299, #3411, #3583 and
