@@ -328,3 +328,92 @@ def test_process_pr_says_when_the_commits_cannot_be_read(world, monkeypatch):
     assert lines[lines.index(HDR) + 4] == UNREADABLE
     assert status == GREEN
     assert any("commit authors unreadable" in msg and a == ("WARNING",) for msg, a in warned)
+
+
+# ── process_pr: the comments before the diff ─────────────────────────────
+#
+# #4328 added a prod cohort config.yaml: no app was affected, so it got the
+# "No ArgoCD apps affected" comment. A new customer.yaml gets the new
+# environment comment. Both return before format_comment.
+
+NOTE = ("✅ **No ArgoCD apps are currently affected by the files changed "
+        "in this commit.**")
+
+
+def _no_apps(monkeypatch):
+    monkeypatch.setattr(m, "get_pr_changed_files", lambda pr_id, repo=None:
+                        (["gcp/prod/private-cloud/eu1-b/custom/config.yaml"], {}))
+
+
+def _new_env(monkeypatch):
+    monkeypatch.setattr(m, "get_pr_changed_files", lambda pr_id, repo=None: (
+        ["gcp/dev/private-cloud/ap1/custom/pv-new-a/customer.yaml"], {}))
+    monkeypatch.setattr(m, "_detect_new_env_candidates", lambda *a, **k: [{"name": "pv-new-a"}])
+    monkeypatch.setattr(m, "_evaluate_new_envs", lambda *a, **k: (
+        ["### \U0001f195 New Environment(s) Detected", ""], [], 5, []))
+
+
+EARLY = {
+    "no_apps": (_no_apps, ("SUCCESSFUL", "No ArgoCD apps affected by this PR")),
+    "new_env": (_new_env, ("SUCCESSFUL", "1 new environment(s), ~5 resource(s) to create")),
+}
+
+
+def _run_early(world, monkeypatch, name, commits):
+    sinks, _plan = world
+    setup, status = EARLY[name]
+    setup(monkeypatch)
+    paths = []
+
+    def bb(method, path, repo=None, **kw):
+        paths.append(path)
+        if isinstance(commits, Exception):
+            raise commits
+        return {"values": commits}
+    monkeypatch.setattr(m, "bb", bb)
+    pr = _mk_pr()
+    pr["author"] = ANA
+    m.process_pr(pr, PATH_MAP, base_sha=BASE_SHA)
+    assert paths == ["pullrequests/991/commits?pagelen=100"]
+    assert sinks.diff_calls == [], "an early exit renders nothing"
+    body = sinks.upserts[-1]
+    assert m._extract_status_token(body) == "clean", "not the transient path"
+    assert sinks.statuses[-1] == status
+    return body.splitlines()
+
+
+def _verdict_at(lines, name):
+    """The verdict of the no-apps comment, or the verdict of the merge
+    summary of the new environment comment (block 3 gives it one)."""
+    return lines.index(NOTE) if name == "no_apps" else lines.index(m.MERGE_SUMMARY_HDR) + 2
+
+
+def _under(lines, name):
+    """The line the authors line must follow: the verdict."""
+    at = _verdict_at(lines, name)
+    assert lines[at + 1] == ""
+    return lines[at + 2]
+
+
+@pytest.mark.parametrize("name", EARLY)
+def test_an_early_comment_names_a_co_author(world, monkeypatch, name):
+    lines = _run_early(world, monkeypatch, name, [
+        _commit(PR_SHA, "bsoto <b@x>", BEA), _commit("c1", "ana <a@x>", ANA)])
+    assert _under(lines, name) == LINE
+    assert lines[lines.index(LINE) + 1] == ""
+
+
+@pytest.mark.parametrize("name", EARLY)
+@pytest.mark.parametrize("commits", [OSError("reset"), [_commit("c1", "bsoto <b@x>", BEA)]])
+def test_an_early_comment_says_when_the_commits_cannot_be_read(world, monkeypatch,
+                                                               name, commits):
+    lines = _run_early(world, monkeypatch, name, commits)
+    assert _under(lines, name) == UNREADABLE
+
+
+@pytest.mark.parametrize("name", EARLY)
+def test_an_early_comment_with_own_commits_is_the_same_as_before(world, monkeypatch, name):
+    lines = _run_early(world, monkeypatch, name, [_commit(PR_SHA, "ana <a@x>", ANA)])
+    assert "\U0001f465" not in "\n".join(lines)
+    at = _verdict_at(lines, name)
+    assert lines[at + 2].startswith(("This is expected", "- \U0001f195"))

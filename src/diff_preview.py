@@ -5156,6 +5156,19 @@ def _pr_commit_authors(repo, pr, pr_sha):
     return sorted(names)
 
 
+def _pr_authors_line(repo, pr, pr_sha):
+    """COPS-2766: the \U0001f465 line of the comment. An approval from someone
+    who wrote commits here is not independent. Informational: a failed read
+    says so and changes nothing else."""
+    try:
+        names = _pr_commit_authors(repo, pr, pr_sha)
+    except Exception as e:
+        logsink.log(f"    [comment] commit authors unreadable: {e}", "WARNING",
+                    pr=pr["id"], repo=repo, event="commit_authors_unreadable")
+        names = None
+    return commit_authors_line(names)
+
+
 _IDENTITY_SECRETS = ("dm-ui, mongodb-password, rabbitmq-password, redis-password, "
                      "mail-secret, library-secret, signschannel-secret, "
                      "contentintelligence-secret")
@@ -13127,17 +13140,21 @@ def format_comment(pr_sha, app_results, skipped_apps=None, base_sha="",
 
 def format_new_env_comment(pr_sha, new_env_lines, new_env_full_lines,
                            structural_envs, gates, n_envs, total_new,
-                           base_sha=""):
+                           base_sha="", authors_line=""):
     """COPS-2766: (body, state, desc) for a PR that only adds environments.
 
     The merge summary and the gates of a diff comment, with the same token
     and status rules. A structural problem stays [blocked] with its old
-    description; an open gate comes next. Pure, like format_comment."""
+    description; an open gate comes next. The authors line goes right under
+    the verdict, as in format_comment. Pure, like format_comment."""
     token = "blocked" if structural_envs else (gate_token(gates) or "clean")
     lines = [f"## \U0001f52d {STATUS_NAME}", "", _comment_header(pr_sha), ""]
     green = token == "clean"
     lines += _build_merge_summary({}, {}, None, None, None, new_env_lines,
                                   bool(structural_envs), gates=gates, green=green)
+    if authors_line:  # COPS-2766: right under the verdict
+        at = lines.index(MERGE_SUMMARY_HDR) + 3
+        lines[at:at] = ["", authors_line]
     lines += ["---", ""] + build_marks(new_env_lines, green)
     # v2.25.0: complete rendered output after the summary. The comment
     # inlines what fits (footer-preserving truncation in upsert_comment);
@@ -13594,7 +13611,8 @@ def process_pr(pr, path_map, base_sha="", repo=None):
                     + _ashn_copy_lines(gates, ashn_notes)
                     + _appset_miss_lines(gates, appset_notes) + new_env_lines,
                     new_env_full_lines, structural_envs,
-                    gates, len(new_env_candidates), total_new, base_sha)
+                    gates, len(new_env_candidates), total_new, base_sha,
+                    authors_line=_pr_authors_line(repo, pr, pr_sha))
                 # v2.25.0: this path never persisted a full-diff artifact, so
                 # new-env-only PRs had no full-output page at all. Save it
                 # BEFORE the final build status so the status icon deep-links
@@ -13614,11 +13632,13 @@ def process_pr(pr, path_map, base_sha="", repo=None):
                         pr=pr_id, repo=repo, event="no_apps_affected")
             st = post_build_status(pr_sha, "SUCCESSFUL",
                 "No ArgoCD apps affected by this PR", pr_id=pr_id, repo=repo)
+            authors_line = _pr_authors_line(repo, pr, pr_sha)
             no_apps_body = (
                 f"## \U0001f52d {STATUS_NAME}\n\n"
                 f"{_comment_header(pr_sha)}\n\n"
                 f"\u2705 **No ArgoCD apps are currently affected by the files "
                 f"changed in this commit.**\n\n"
+                + (f"{authors_line}\n\n" if authors_line else "") +
                 f"This is expected for documentation, tooling, or script changes that "
                 f"do not affect any ArgoCD-managed environment configuration.\n\n"
                 f"---\n**Status:** \u2705 No ArgoCD apps affected\n"
@@ -14142,14 +14162,7 @@ def process_pr(pr, path_map, base_sha="", repo=None):
             # every release before this one had.
             logsink.log(f"autosync check failed (non-fatal): {e}", "WARNING",
                         pr=pr_id, repo=repo, event="autosync_check_failed")
-        # COPS-2766: an approval from someone who wrote commits here is not
-        # independent. Informational: a failed read says so and changes nothing else.
-        try:
-            _authors = _pr_commit_authors(repo, pr, pr_sha)
-        except Exception as e:
-            logsink.log(f"    [comment] commit authors unreadable: {e}", "WARNING")
-            _authors = None
-        _comment_kwargs["authors_line"] = commit_authors_line(_authors)
+        _comment_kwargs["authors_line"] = _pr_authors_line(repo, pr, pr_sha)
         body = format_comment(pr_sha, app_results,
                               artifact_url=artifact_url, **_comment_kwargs)
         comment_kb = round(len(body.encode()) / 1024, 1)
