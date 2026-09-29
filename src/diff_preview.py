@@ -165,6 +165,11 @@ from comment_render import (  # comment rendering (same-dir module, stdlib only)
     _build_merge_summary,
     status_lead,
     join_status_lead,
+    GATES,
+    gate_trailer,
+    open_gates,
+    gate_token,
+    gate_status_description,
     _DECOM_ORPHAN_HDR,
     _DECOM_PURGE_HDR,
     _DECOM_SHARED_UC_HDR,
@@ -314,6 +319,7 @@ from identity import (  # environment identity and rename detection
     _appset_identity,
     _appset_param,
     _go_str,
+    _confirmations,
     _confirmed_renames,
     _is_rename_of,
     _split_renames_from_deletions,
@@ -4817,7 +4823,7 @@ def _identity_block_reason(hit, confirmed):
     """Why a live-env rename stays blocked, or None when it may merge."""
     if hit["decommission"]:
         return "decommission"  # no override: remove it first
-    if (hit["old_id"], hit["new_id"]) not in confirmed:
+    if (hit["old_id"].lower(), hit["new_id"].lower()) not in confirmed:
         return "unconfirmed"
     if not hit["paused_base"]:
         return "pause_first"
@@ -7212,8 +7218,15 @@ def _evaluate_env_decommissions(candidates: list, pr_sha: str, main_sha: str,
         # report, because the data destroyed belongs to an environment that is
         # NOT being torn down. Repo defaults to None like the sibling
         # _decommission_* calls on this same context.
-        lines += _shared_user_content_lines(
+        _uc_lines = _shared_user_content_lines(
             c["identity_file"], main_sha, purges_data)
+        lines += _uc_lines
+        # COPS-2766: merge gates, lifted by `Confirm-Teardown: <env>`. The env
+        # is the constellation on cl-*, so one line covers all of its blocks.
+        c["gates"] = ([{"kind": "public", "env": c["env_name"]}] if public_cloud
+                      else [] if cascade else [{"kind": "orphan", "env": c["env_name"]}])
+        if _DECOM_SHARED_UC_HDR in "\n".join(_uc_lines):
+            c["gates"].append({"kind": "shared_uc", "env": c["env_name"]})
         if public_cloud:
             lines += [
                 "\u26a0\ufe0f " + _DECOM_PUBLIC_CLOUD_HDR,
@@ -7390,6 +7403,19 @@ def _evaluate_env_decommissions(candidates: list, pr_sha: str, main_sha: str,
     if not with_full_output:
         return lines, envs_reported
     return lines, envs_reported, full_lines
+
+
+def _merge_gates(decommission_candidates) -> list:
+    """COPS-2766: the merge gates of this PR, one per kind and env, none lifted.
+
+    From the teardowns _evaluate_env_decommissions confirmed. Arming the flag
+    on cl-* deletes nothing, so that panel stays a warning; its folder
+    removal is the `public` gate.
+    """
+    gates = {}
+    for g in (g for c in decommission_candidates or () for g in c.get("gates", ())):
+        gates.setdefault((g["kind"], g["env"]), {"arg": g["env"], **g, "lifted": False})
+    return list(gates.values())
 
 
 def _apps_to_skip_for_decommission(candidates: list, confirmed_envs: list) -> set:
@@ -10363,13 +10389,52 @@ def _app_sort_key(app: str, r) -> tuple:
     return (0 if r.outcome != OUT_NO_DIFF else 1, app)
 
 
+def _comment_status_token(results, new_env_structural, skipped_apps,
+                          arming_broken, flag_typo, kcc_nil, gates) -> str:
+    """Machine-readable token embedded in the footer. Used by process_pr to
+    decide whether to re-run without parsing the human-readable status string.
+
+    - clean     : all apps diffed successfully (no retry, mark seen)
+    - permanent : unresolvable hard error (no retry, mark seen).
+      COPS-2696: oci_not_found is NOT here any more — it emits transient.
+      Apps over the cap are here too: the cut is the same on every retry.
+    - blocked   : COPS-2766, an open merge gate (no retry, mark seen)
+    - transient : diff unavailable on transient blip (retry next loop)
+    """
+    outcomes = {r.outcome for r in results.values()}
+    if (OUT_ERROR in outcomes or new_env_structural or arming_broken
+            or flag_typo or kcc_nil):
+        return "permanent"
+    if gate_token(gates) == "blocked":
+        return "blocked"
+    if OUT_INDETERMINATE in outcomes:
+        # Permanent if ANY app has a permanent reason that cannot resolve by
+        # itself (e.g. invalid_version mixed with transient ones). A mixed PR
+        # is still "permanent" for dedup purposes because the FAILED build
+        # status requires human action regardless.
+        # COPS-2696: oci_not_found alone is the exception — the status is
+        # FAILED either way, but the version may simply not have propagated
+        # to the registry yet, so the token stays "transient" and the poll
+        # loop keeps retrying under the COPS-2546 backoff instead of marking
+        # the head seen and forcing an empty commit to recover.
+        perm = {r.reason for r in results.values()
+                if r.outcome == OUT_INDETERMINATE} & PERMANENT_REASONS
+        return "permanent" if perm - SELF_RESOLVING_REASONS else "transient"
+    if gate_token(gates) == "transient":
+        return "transient"
+    # COPS-2766: apps over the cap make the build FAILED. With [clean]
+    # the status recovery (fix_stuck_inprogress) turned it green.
+    return "permanent" if skipped_apps else "clean"
+
+
 def format_comment(pr_sha, app_results, skipped_apps=None, base_sha="",
                     new_env_lines=None, new_env_structural=False, new_env_desc="",
                     decommission_lines=None, leftover_lines=None,
                     input_change_lines=None,
                     appspace_state_lines=None, appendix_lines=None,
                     vm_change_lines=None, artifact_url="",
-                    readable_budget=None, profile=None, paused_apps=None):
+                    readable_budget=None, profile=None, paused_apps=None,
+                    gates=None):
     """Format the full PR comment. Never uses <details>/<summary> — Bitbucket
     does not render them. Large changesets get a compact summary table at the
     top (all apps, one row each) and, for the diff sections below, apps
@@ -10669,13 +10734,47 @@ def format_comment(pr_sha, app_results, skipped_apps=None, base_sha="",
         ]
         return "\n".join(lines)
 
+    # COPS-2660 follow-up: the broken-arming shape diffs "successfully" (the
+    # VM CRs simply disappear), so every status branch below says clean or
+    # "N resource(s) will change". Live proof on acme-config-dev PR #7113:
+    # footer [clean], build SUCCESSFUL, one rubber-stamp approval away from
+    # orphaning the VM. Whatever else the status line says, it must carry
+    # the blocker, and the token must be permanent -- deterministic until a
+    # new commit, like every other permanent reason.
+    _arming_broken = bool(appspace_state_lines) and \
+        _DECOM_VM_STRIP_HDR in appspace_state_lines
+    # COPS-2707 follow-up: same reasoning, one step earlier in the sequence.
+    # A misspelled teardown flag renders nothing, so the diff is clean and
+    # every status branch below posts SUCCESSFUL — which is exactly how
+    # acme-config-prod #4376 merged. The comment blocking while the build
+    # passes is the shape COPS-2660 already fixed once for the VM strip; a
+    # green tick outranks a red paragraph for anyone skimming.
+    # Substring over the joined panel, not list membership: this header is
+    # emitted with an emoji prefix on its line (the VM-strip one is not), so
+    # the `in list` form the sibling check uses would silently never match.
+    _flag_typo_block = _DECOM_FLAG_TYPO_HDR in "\n".join(
+        appspace_state_lines or [])
+    # COPS-2677: KCC Compute* nil artifacts must not merge green. zeroPods+HPA
+    # is REVIEW-only (see comment_render) — do not stamp permanent/FAILED.
+    _kcc_nil_block = False
+    for _v in app_results.values():
+        _rr = _result(_v)
+        _arts = getattr(_rr, "template_artifacts", None) or []
+        if any(_is_kcc_blocking_artifact(h) for h in _arts):
+            _kcc_nil_block = True
+            break
+    _status_token = _comment_status_token(
+        results, new_env_structural, skipped_apps, _arming_broken,
+        _flag_typo_block, _kcc_nil_block, gates)
+
     # ── Merge summary ────────────────────────────────────────────────
     # The verdict, before any detail: an operator decides here whether
     # this PR is safe to merge, and only then reads down for the why.
     lines += _build_merge_summary(
         results, rollup_by_sig, vm_change_lines, decommission_lines,
         appspace_state_lines, new_env_lines, new_env_structural,
-        _paused_changing, _paused_envs, block_headline=block_headline or None)
+        _paused_changing, _paused_envs, block_headline=block_headline or None,
+        gates=gates)
     lines += ["---", ""]
 
     # COPS-2676: permanent render failures go FIRST after the verdict on the
@@ -11445,35 +11544,6 @@ def format_comment(pr_sha, app_results, skipped_apps=None, base_sha="",
     if downgrades:
         status += " | \U0001f53b CHART DOWNGRADE \u2014 verify intentional"
 
-    # COPS-2660 follow-up: the broken-arming shape diffs "successfully" (the
-    # VM CRs simply disappear), so every branch above happily says clean or
-    # "N resource(s) will change". Live proof on acme-config-dev PR #7113:
-    # footer [clean], build SUCCESSFUL, one rubber-stamp approval away from
-    # orphaning the VM. Whatever else the status line says, it must carry
-    # the blocker, and the token must be permanent -- deterministic until a
-    # new commit, like every other permanent reason.
-    _arming_broken = bool(appspace_state_lines) and \
-        _DECOM_VM_STRIP_HDR in appspace_state_lines
-    # COPS-2707 follow-up: same reasoning, one step earlier in the sequence.
-    # A misspelled teardown flag renders nothing, so the diff is clean and
-    # every branch above posts SUCCESSFUL — which is exactly how
-    # acme-config-prod #4376 merged. The comment blocking while the build
-    # passes is the shape COPS-2660 already fixed once for the VM strip; a
-    # green tick outranks a red paragraph for anyone skimming.
-    # Substring over the joined panel, not list membership: this header is
-    # emitted with an emoji prefix on its line (the VM-strip one is not), so
-    # the `in list` form the sibling check uses would silently never match.
-    _flag_typo_block = _DECOM_FLAG_TYPO_HDR in "\n".join(
-        appspace_state_lines or [])
-    # COPS-2677: KCC Compute* nil artifacts must not merge green. zeroPods+HPA
-    # is REVIEW-only (see comment_render) — do not stamp permanent/FAILED.
-    _kcc_nil_block = False
-    for _v in app_results.values():
-        _rr = _result(_v)
-        _arts = getattr(_rr, "template_artifacts", None) or []
-        if any(_is_kcc_blocking_artifact(h) for h in _arts):
-            _kcc_nil_block = True
-            break
     if _arming_broken:
         status += (" | \u26d4 DECOMMISSION ARMING BROKEN \u2014 the VM would "
                    "be orphaned, see comment")
@@ -11483,38 +11553,9 @@ def format_comment(pr_sha, app_results, skipped_apps=None, base_sha="",
     if _kcc_nil_block:
         status += (" | \u26d4 UNRESOLVED KCC VALUE \u2014 "
                    "`%!s(<nil>)` on Compute* resources, see comment")
-
-    # Machine-readable token embedded in the footer. Used by process_pr to decide
-    # whether to re-run without parsing the human-readable status string.
-    # Tokens: clean | permanent | transient
-    # - clean     : all apps diffed successfully (no retry, mark seen)
-    # - permanent : unresolvable hard error (no retry, mark seen).
-    #   COPS-2696: oci_not_found is NOT here any more — it emits transient.
-    #   Apps over the cap are here too: the cut is the same on every retry.
-    # - transient : diff unavailable on transient blip (retry next loop)
-    if (any_error or new_env_structural or _arming_broken
-            or _flag_typo_block or _kcc_nil_block):
-        _status_token = "permanent"
-    elif any_unknown:
-        # Distinguish permanent reasons from soft indeterminate (transient).
-        resolved = [_result(v) for v in app_results.values()]
-        indet    = [r for r in resolved if r.outcome == OUT_INDETERMINATE]
-        # Permanent if ANY app has a permanent reason that cannot resolve by
-        # itself (e.g. invalid_version mixed with transient ones). A mixed PR
-        # is still "permanent" for dedup purposes because the FAILED build
-        # status requires human action regardless.
-        # COPS-2696: oci_not_found alone is the exception — the status is
-        # FAILED either way, but the version may simply not have propagated
-        # to the registry yet, so the token stays "transient" and the poll
-        # loop keeps retrying under the COPS-2546 backoff instead of marking
-        # the head seen and forcing an empty commit to recover.
-        perm = {r.reason for r in indet} & PERMANENT_REASONS
-        _status_token = ("permanent" if perm - SELF_RESOLVING_REASONS
-                         else "transient")
-    else:
-        # COPS-2766: apps over the cap make the build FAILED. With [clean]
-        # the status recovery (fix_stuck_inprogress) turned it green.
-        _status_token = "permanent" if skipped_apps else "clean"
+    if open_gates(gates):
+        status += (f" | \u26d4 BLOCKED - {GATES[open_gates(gates)[0]['kind']][0]}, "
+                   "see comment")
 
     lines += ([
         # Above the separator, never between it and the Status line:
@@ -12445,6 +12486,14 @@ def process_pr(pr, path_map, base_sha="", repo=None):
                 raise  # COPS-2766: but a failed read retries the PR
             logsink.log(f"    [comment] vm-changes panel failed: {e}", "WARNING")
             vm_change_lines = []
+        # COPS-2766: merge gates. The commits are read only when a gate can be
+        # lifted, so a PR with none never pays for it. PrCommitsUnreadable goes
+        # to the catch-all below: a retry, never a lift.
+        gates = _merge_gates(decommission_candidates)
+        if any(gate_trailer(g) for g in gates):
+            confirmed = _confirmations(_pr_commit_messages(repo, pr_id, base_sha, pr_sha))
+            for g in gates:
+                g["lifted"] = gate_trailer(g).lower() in confirmed
         # Direct permalink into the full-diff view for this exact commit.
         # Only built when the view is reachable from outside the cluster
         # (base URL set), so the comment never links to something a
@@ -12464,7 +12513,7 @@ def process_pr(pr, path_map, base_sha="", repo=None):
             appspace_state_lines=appspace_state_lines or None,
             appendix_lines=((decom_full_lines or [])
                             + (new_env_full_lines or [])) or None,
-            vm_change_lines=vm_change_lines or None)
+            vm_change_lines=vm_change_lines or None, gates=gates or None)
         # COPS-2655: a change to a paused environment is never applied, so
         # both the comment and the full-diff page have to say so. Read at
         # pr_sha because the question is what is true AFTER the merge.
@@ -12618,9 +12667,10 @@ def process_pr(pr, path_map, base_sha="", repo=None):
             if any(_is_kcc_blocking_artifact(h) for h in _arts):
                 kcc_nil_block = True
                 break
+        gate_tok = gate_token(gates)
         if (any_hard_error or has_blocking_indet or structural_envs
                 or moves_missing_cohort or broken_arming
-                or flag_typo_block or kcc_nil_block):
+                or flag_typo_block or kcc_nil_block or gate_tok):
             state = "FAILED"
             # COPS-2552: a move whose destination has no cohort config.yaml
             # must never post green. Merging it removes the environment from
@@ -12645,6 +12695,8 @@ def process_pr(pr, path_map, base_sha="", repo=None):
                 desc = ("Unresolved KCC value - Compute* resources render "
                         "%!s(<nil>) / <no value>; set hostingID (or the "
                         "missing field) before merging (see PR comment)")
+            elif gate_tok:
+                desc = gate_status_description(gates)
             elif structural_envs:
                 # COPS-2709: "structural config problem" is a category, not a
                 # problem. When the render named one, lead with it.
@@ -12760,8 +12812,10 @@ def process_pr(pr, path_map, base_sha="", repo=None):
                                 or bool(structural_envs)
                                 or bool(moves_missing_cohort)
                                 or broken_arming
-                                or kcc_nil_block)
-        is_transient_failure = any_unknown and not is_permanent_failure
+                                or kcc_nil_block
+                                or gate_tok == "blocked")
+        is_transient_failure = ((any_unknown or gate_tok == "transient")
+                                and not is_permanent_failure)
         if not is_transient_failure:
             # Mark seen for both clean runs AND permanent failures so we don't
             # spam the PR with repeated "not found" comments every 60s.

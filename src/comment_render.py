@@ -356,6 +356,7 @@ _REVIEW_RANK = {
     "\U0001f5a5": 8,               # KCC resources unmanaged
     "\U0001f9ec": 9,               # unresolved chart value
     "\U0001f4da": 99,              # higher-layer values
+    "\u2611": 0,                   # merge gate confirmed in a commit
 }
 
 
@@ -392,11 +393,59 @@ def _fmt_env_list(apps, shown=8) -> str:
     return _fmt_service_list(envs, shown=shown)
 
 
+# COPS-2766: merge gates. A gate fails the build until a Confirm-* line in a
+# commit message of the PR lifts it. A kind with no trailer cannot be lifted.
+# kind: (summary text, trailer, token). A gate is {kind, env, arg, lifted}.
+GATES = {
+    "orphan": ("Teardown with no cascade, the workloads keep running",
+               "Confirm-Teardown", "blocked"),
+    "public": ("Public-cloud teardown, nothing is deleted by itself",
+               "Confirm-Teardown", "blocked"),
+    "shared_uc": ("The purge deletes user content a surviving environment uses",
+                  "Confirm-Teardown", "blocked"),
+    "hold": ("Decommission set less than 7 days ago", "Confirm-Decommission", "blocked"),
+    "ip": ("A static IP or DNS record is released", "Confirm-IP-Release", "blocked"),
+    "cl_rename": ("A live public-cloud environment is renamed or moved",
+                  "Confirm-Rename", "blocked"),
+    "paused": ("Cascade armed while auto-sync is paused, it never runs", None, "blocked"),
+    "shrink": ("Disk shrink, GCP cannot shrink a disk in place", None, "blocked"),
+    "not_live": ("The cascade finalizer is not live in ArgoCD yet", None, "transient"),
+}
+
+
+def gate_trailer(g) -> str:
+    """'<Trailer>: <arg>', the line that lifts gate g, or '' when none can."""
+    trailer = GATES[g["kind"]][1]
+    return f"{trailer}: {g.get('arg') or g['env']}" if trailer else ""
+
+
+def open_gates(gates) -> list:
+    """The gates no commit lifted, the blocking ones first."""
+    return sorted((g for g in gates or () if not g.get("lifted")),
+                  key=lambda g: GATES[g["kind"]][2] != "blocked")
+
+
+def gate_token(gates) -> str:
+    """'blocked', 'transient' or '': the footer token the open gates ask for."""
+    todo = open_gates(gates)
+    return GATES[todo[0]["kind"]][2] if todo else ""
+
+
+def gate_status_description(gates) -> str:
+    """The FAILED build status. It names the line to add, so a reviewer who
+    reads only the checks list can act."""
+    todo = open_gates(gates)
+    g, tr = todo[0], gate_trailer(todo[0])
+    return (f"Blocked - {GATES[g['kind']][0]}" + (f" in {g['env']}" if g["env"] else "")
+            + (f". To merge anyway, add '{tr}' to a commit message" if tr else "")
+            + (f" (+{len(todo) - 1} more)" if len(todo) > 1 else "") + " (see PR comment)")
+
+
 def _build_merge_summary(results, rollup_by_sig, vm_change_lines,
                          decommission_lines, appspace_state_lines,
                          new_env_lines, new_env_structural,
                          paused_changing=None, paused_envs=None,
-                         block_headline=None) -> list:
+                         block_headline=None, gates=None) -> list:
     """The verdict block that opens every comment.
 
     Reads the same deterministic facts the panels below use, so the
@@ -408,9 +457,24 @@ def _build_merge_summary(results, rollup_by_sig, vm_change_lines,
     render failure (e.g. "Missing Image Tag on => platform"). When set, the
     cannot-render bullet leads with it so operators see *why* without
     scrolling past deletions and bump noise.
+
+    gates (COPS-2766): the merge gates, first. An open one is why the build
+    is red and names the line that lifts it. A lifted one stays as a review
+    item, so the override is visible.
     """
     findings = []          # (severity, line)
     sev = _SEV_ROUTINE
+
+    for g in gates or ():
+        text, tr = GATES[g["kind"]][0], gate_trailer(g)
+        if g.get("lifted"):
+            findings.append((_SEV_REVIEW, f"\u2611\ufe0f **Confirmed in a commit:** "
+                                          f"`{tr}` ({text})"))
+        else:
+            findings.append((_SEV_BLOCK, f"\u26d4 **{text}**"
+                             + (f" in `{g['env']}`" if g["env"] else "")
+                             + (f" - to merge anyway, add `{tr}` to a commit message"
+                                if tr else "")))
 
     # COPS-2655. The pause finding below this one only fires when the PR
     # touches an identity file. This one fires whenever a CHANGED app sits

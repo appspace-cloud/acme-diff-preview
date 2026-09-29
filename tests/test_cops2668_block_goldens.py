@@ -142,13 +142,14 @@ def _decommission_body(monkeypatch, base_yaml):
     for a in APPS:
         monkeypatch.setitem(m._app_chart_revision_map, a, "2603.1.0")
 
-    lines, envs = m._evaluate_env_decommissions(
-        [{"env_name": ENV, "identity_file": IDENT, "apps": APPS,
-          "env_dir": ENV_DIR}], PR_SHA, BASE_SHA)
+    cand = {"env_name": ENV, "identity_file": IDENT, "apps": APPS,
+            "env_dir": ENV_DIR}
+    lines, envs = m._evaluate_env_decommissions([cand], PR_SHA, BASE_SHA)
     assert envs == [ENV], "the scenario must actually confirm the deletion"
     return m.format_comment(
         PR_SHA, {a: _result(outcome=m.OUT_DECOMMISSIONED) for a in APPS},
-        base_sha=BASE_SHA, decommission_lines=lines)
+        base_sha=BASE_SHA, decommission_lines=lines,
+        gates=m._merge_gates([cand]))
 
 
 def test_golden_env_decommission_cascade(monkeypatch):

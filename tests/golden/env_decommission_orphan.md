@@ -6,8 +6,9 @@
 
 ## ℹ️ Merge summary
 
-⛔ **DO NOT MERGE** without checking the item(s) below (1 item(s))
+⛔ **DO NOT MERGE** without checking the item(s) below (2 item(s))
 
+- ⛔ **Teardown with no cascade, the workloads keep running** in `pv-foo-c` - to merge anyway, add `Confirm-Teardown: pv-foo-c` to a commit message
 - 🗑️ **Environment decommission** — no cascade armed: the Applications are removed but their workloads keep running, orphaned and unmanaged
 
 ---
@@ -50,5 +51,5 @@ To delete them together with the Application, set `appspace.decommission: true` 
 ⚠️ The full-diff page could not be produced for this run, so every hunk is inlined below.
 
 ---
-**Status:** ✅ No manifest changes
-*2026-01-01 00:00 UTC — acme-diff-preview [clean] [base:00001111]*
+**Status:** ✅ No manifest changes | ⛔ BLOCKED - Teardown with no cascade, the workloads keep running, see comment
+*2026-01-01 00:00 UTC — acme-diff-preview [blocked] [base:00001111]*

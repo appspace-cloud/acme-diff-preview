@@ -271,15 +271,30 @@ def _appset_identity(customer_doc, cohort_doc):
             _go_str(sfx) if sfx else "a")
 
 
-_CONFIRM_RENAME_RE = re.compile(
-    r"^[\s*>]*`?confirm-rename:\s*`?([^\s`]+)`?\s*(?:->|\u2192)\s*`?([^\s`]+)`?\s*$",
+# COPS-2766: one parser for every Confirm-* line, so they all read the same way.
+_CONFIRM_RE = re.compile(
+    r"^[\s*>]*`?(confirm-(?:rename|teardown|decommission|ip-release)):\s*(.+?)\s*$",
     re.IGNORECASE)
+
+
+def _confirmations(messages) -> set:
+    """{'confirm-<kind>: <arg>'} in lower case, from the Confirm-* lines of the PR's
+    commit messages. Backticks and a final '.' are dropped, '\u2192' reads as '->'."""
+    out = set()
+    for msg in messages:
+        for line in (msg or "").splitlines():
+            m = _CONFIRM_RE.match(line)
+            if m:
+                arg = m[2].replace("`", "").replace("\u2192", "->").rstrip(".")
+                arg = re.sub(r"\s*->\s*", " -> ", " ".join(arg.split()))
+                out.add(f"{m[1].lower()}: {arg.lower()}")
+    return out
 
 
 def _confirmed_renames(messages):
     """{(old, new)} from `Confirm-Rename: <old> -> <new>` lines in commit messages."""
-    return {(m[1].rstrip("."), m[2].rstrip(".")) for msg in messages
-            for line in (msg or "").splitlines() for m in [_CONFIRM_RENAME_RE.match(line)] if m}
+    return {m.groups() for a in _confirmations(messages)
+            for m in [re.fullmatch(r"confirm-rename: (\S+) -> (\S+)", a)] if m}
 
 def _is_rename_of(old_header: str, new_header: str) -> bool:
     """True when two headers plausibly name the SAME resource renamed.
