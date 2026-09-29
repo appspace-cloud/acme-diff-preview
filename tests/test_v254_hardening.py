@@ -143,8 +143,9 @@ def test_status_structural_new_env_forces_red_even_with_clean_diff():
 def test_fix_stuck_inprogress_transient_token_resolves_to_failed(monkeypatch):
     monkeypatch.setattr(m, "http", lambda *a, **k: {"state": "INPROGRESS"})
     captured = {}
-    def fake_post(pr_sha, state, desc, pr_id=None):
+    def fake_post(pr_sha, state, desc, pr_id=None, repo=None):
         captured["state"] = state
+        return "ok"
     monkeypatch.setattr(m, "post_build_status", fake_post)
 
     body = m.format_comment("deadbeef01234567", {"a": _mk_result(m.OUT_INDETERMINATE, m.REASON_RENDER)})
@@ -155,8 +156,9 @@ def test_fix_stuck_inprogress_transient_token_resolves_to_failed(monkeypatch):
 def test_fix_stuck_inprogress_clean_token_still_successful(monkeypatch):
     monkeypatch.setattr(m, "http", lambda *a, **k: {"state": "INPROGRESS"})
     captured = {}
-    def fake_post(pr_sha, state, desc, pr_id=None):
+    def fake_post(pr_sha, state, desc, pr_id=None, repo=None):
         captured["state"] = state
+        return "ok"
     monkeypatch.setattr(m, "post_build_status", fake_post)
 
     body = m.format_comment("deadbeef01234567", {"a": _mk_result(m.OUT_DIFF, n=1)})
@@ -167,8 +169,9 @@ def test_fix_stuck_inprogress_clean_token_still_successful(monkeypatch):
 def test_fix_stuck_inprogress_permanent_token_still_failed(monkeypatch):
     monkeypatch.setattr(m, "http", lambda *a, **k: {"state": "INPROGRESS"})
     captured = {}
-    def fake_post(pr_sha, state, desc, pr_id=None):
+    def fake_post(pr_sha, state, desc, pr_id=None, repo=None):
         captured["state"] = state
+        return "ok"
     monkeypatch.setattr(m, "post_build_status", fake_post)
 
     body = m.format_comment("deadbeef01234567", {"a": _mk_result(m.OUT_INDETERMINATE, m.REASON_OCI_NOT_FOUND)})
@@ -180,8 +183,9 @@ def test_fix_stuck_inprogress_legacy_diff_incomplete_text_now_failed(monkeypatch
     # Legacy fallback path (comment without a token at all).
     monkeypatch.setattr(m, "http", lambda *a, **k: {"state": "INPROGRESS"})
     captured = {}
-    def fake_post(pr_sha, state, desc, pr_id=None):
+    def fake_post(pr_sha, state, desc, pr_id=None, repo=None):
         captured["state"] = state
+        return "ok"
     monkeypatch.setattr(m, "post_build_status", fake_post)
 
     legacy_comment = "Some comment...\nDiff incomplete, could not evaluate.\n"

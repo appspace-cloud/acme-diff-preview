@@ -200,13 +200,16 @@ def test_newenv_only_path_saves_artifact_before_final_status(monkeypatch):
                         lambda env_info, pr_sha: (RENDERED, None, 4, "2603.0.1-dev"))
     monkeypatch.setattr(m, "post_build_status",
                         lambda pr_sha, state, description, pr_id=None, repo=None:
-                        events.append(("status", state)))
+                        events.append(("status", state)) or "ok")
     monkeypatch.setattr(m, "_save_diff_ui_artifact",
                         lambda repo, pr_id, pr_sha, body, **kw:
                         events.append(("artifact", body)))
     monkeypatch.setattr(m, "upsert_comment",
-                        lambda pr_id, body, existing_id=None, repo=None:
-                        events.append(("comment", body)) or 1)
+                        lambda pr_id, body, existing_id=None, repo=None, **kw:
+                        events.append(("comment", body)) or "ok")
+    # Value reads stay off the network.
+    monkeypatch.setattr(m, "_bb_fetch_status",
+                        lambda path, sha, repo=None: (None, m.BB_NOT_FOUND))
     try:
         m.process_pr(_mk_pr(), {}, base_sha=_BASE_SHA)
     finally:

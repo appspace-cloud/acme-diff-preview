@@ -286,9 +286,9 @@ def _pr_world(monkeypatch):
     monkeypatch.setattr(m, "upsert_comment",
                         lambda pr_id, body, existing_id=None, repo=None,
                         artifact_url="", **kw:
-                        sinks["upserts"].append(body) or 1)
+                        sinks["upserts"].append(body) or "ok")
     monkeypatch.setattr(m, "post_build_status",
-                        lambda *a, **k: sinks["statuses"].append(a))
+                        lambda *a, **k: sinks["statuses"].append(a) or "ok")
     monkeypatch.setattr(m, "fix_stuck_inprogress", lambda *a, **k: None)
     monkeypatch.setattr(m, "_touch_progress", lambda: None)
     monkeypatch.setattr(m, "_bb_fetch_status",

@@ -313,6 +313,7 @@ def test_process_pr_revision_future_crash_defaults_to_no_bump(world, monkeypatch
     monkeypatch.setattr(m, "_pr_chart_revision_checked", boom)
     m.process_pr(_mk_pr(pr_id=701), PATH_MAP, base_sha=BASE_SHA)  # must not raise
     assert sinks.statuses, "the PR must still be processed to a terminal status"
+    assert m._extract_status_token(sinks.upserts[-1]) == "clean"
 
 
 def test_process_pr_legacy_incomplete_comment_forces_rerun(world, monkeypatch):
@@ -340,6 +341,7 @@ def test_process_pr_prewarm_skips_apps_without_chart_metadata(world, monkeypatch
     monkeypatch.delitem(m._app_chart_map, "pv-orch-a-ss", raising=False)
     m.process_pr(_mk_pr(pr_id=703), PATH_MAP, base_sha=BASE_SHA)  # must not raise
     assert sinks.statuses, "the run must complete despite the metadata gap"
+    assert m._extract_status_token(sinks.upserts[-1]) == "clean"
 
 
 def test_process_pr_prewarm_unexpected_error_is_swallowed(world, monkeypatch, tmp_path):
@@ -354,6 +356,7 @@ def test_process_pr_prewarm_unexpected_error_is_swallowed(world, monkeypatch, tm
     monkeypatch.setattr(m, "_ensure_chart", boom)
     m.process_pr(_mk_pr(pr_id=704), PATH_MAP, base_sha=BASE_SHA)  # must not raise
     assert sinks.statuses, "a pre-warm crash must never take down the PR run"
+    assert m._extract_status_token(sinks.upserts[-1]) == "clean"
 
 
 def test_process_pr_oci_not_found_alone_desc(world, monkeypatch):

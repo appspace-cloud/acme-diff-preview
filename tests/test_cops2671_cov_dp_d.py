@@ -182,10 +182,10 @@ def world(monkeypatch):
     monkeypatch.setattr(m, "upsert_comment",
                         lambda pr_id, body, existing_id=None, repo=None,
                         artifact_url="", **kw:
-                        sinks.upserts.append((body, artifact_url)) or 1)
+                        sinks.upserts.append((body, artifact_url)) or "ok")
     monkeypatch.setattr(m, "post_build_status",
                         lambda pr_sha, state, description, pr_id=None, repo=None:
-                        sinks.statuses.append((state, description)))
+                        sinks.statuses.append((state, description)) or "ok")
     monkeypatch.setattr(m, "fix_stuck_inprogress", lambda *a, **k: None)
     monkeypatch.setattr(m, "_touch_progress", lambda: None)
 

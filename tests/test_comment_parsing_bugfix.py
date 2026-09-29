@@ -205,7 +205,8 @@ def test_stuck_inprogress_recovery_marks_permanent_error_as_failed(monkeypatch):
         return {}
     monkeypatch.setattr(mod, "http", fake_http2)
     monkeypatch.setattr(mod, "post_build_status",
-                        lambda sha, state, desc, pr_id=None, repo=None: posted.update(state=state, desc=desc))
+                        lambda sha, state, desc, pr_id=None, repo=None:
+                        posted.update(state=state, desc=desc) or "ok")
 
     mod.fix_stuck_inprogress("a" * 40, 88, comment)
 

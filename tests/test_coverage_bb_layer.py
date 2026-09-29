@@ -127,7 +127,7 @@ def test_fix_stuck_inprogress_completes_a_clean_stuck_status(monkeypatch):
     posted = []
     monkeypatch.setattr(m, "post_build_status",
                         lambda pr_sha, state, description, pr_id=None, repo=None:
-                        posted.append(state))
+                        posted.append(state) or "ok")
     m.fix_stuck_inprogress("a" * 12, 10, f"body {m.COMMENT_MARKER} [clean]")
     assert posted and posted[-1] == "SUCCESSFUL"
 
@@ -137,7 +137,7 @@ def test_fix_stuck_inprogress_permanent_token_finalizes_failed(monkeypatch):
     posted = []
     monkeypatch.setattr(m, "post_build_status",
                         lambda pr_sha, state, description, pr_id=None, repo=None:
-                        posted.append(state))
+                        posted.append(state) or "ok")
     m.fix_stuck_inprogress("a" * 12, 10, f"body {m.COMMENT_MARKER} [permanent]")
     assert posted and posted[-1] == "FAILED"
 

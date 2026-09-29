@@ -35,6 +35,7 @@ AZ_MAP     = {f"{AZ_ENV_DIR}/customer.yaml": ["pv-stage-corporate-b-ms"],
               "azure/stage/private-cloud/na1-b/config.yaml":
                   ["pv-stage-corporate-b-ms"]}
 GCP_ENV    = "gcp/stage/private-cloud/na1/custom/pv-stage1-a"
+AZ_YAML    = "appspace:\n  customerName: stage-corporate\n  version: 2603.0.1-dev\n"
 
 NEW_SCOPES = ["gcp/", "azure/"]
 
@@ -53,16 +54,21 @@ def stage_world(monkeypatch):
     monkeypatch.setattr(m, "find_existing_comment",
                         lambda pr_id, repo=None: (None, "", ""))
     monkeypatch.setattr(m, "upsert_comment",
-                        lambda pr_id, body, existing_id=None, repo=None:
-                        sinks["upserts"].append((repo, body)))
+                        lambda pr_id, body, existing_id=None, repo=None, **kw:
+                        sinks["upserts"].append((repo, body)) or "ok")
     monkeypatch.setattr(m, "post_build_status",
                         lambda sha, st, d, pr_id=None, repo=None:
-                        sinks["statuses"].append((repo, st)))
+                        sinks["statuses"].append((repo, st)) or "ok")
     monkeypatch.setattr(m, "fix_stuck_inprogress", lambda *a, **k: None)
     monkeypatch.setattr(m, "_touch_progress", lambda: None)
     # Not about renames (COPR-32578 has its own tests): keep runs on the diff path.
     monkeypatch.setattr(m, "_detect_live_identity_changes", lambda *a, **k: [])
     monkeypatch.setattr(m, "_detect_frozen_versions", lambda *a, **k: [])
+    # Value reads stay off the network: the live env's customer.yaml exists.
+    monkeypatch.setattr(m, "_bb_fetch_status",
+                        lambda path, sha, repo=None: (AZ_YAML, m.BB_OK)
+                        if path.endswith(f"{AZ_ENV_DIR}/customer.yaml")
+                        else (None, m.BB_NOT_FOUND))
     m._seen.clear(); m._force_recompute.clear()
     yield sinks
     m._seen.clear(); m._force_recompute.clear()
@@ -82,6 +88,7 @@ def test_azure_only_pr_produces_comment_and_status(stage_world, monkeypatch):
         "azure PR must get a bot comment when azure/ is in scope"
     assert stage_world["statuses"], \
         "azure PR must get a build status when azure/ is in scope"
+    assert m._extract_status_token(stage_world["upserts"][-1][1]) == "clean"
 
 
 def test_mixed_gcp_azure_pr_keeps_both_files(stage_world, monkeypatch):
@@ -100,6 +107,8 @@ def test_mixed_gcp_azure_pr_keeps_both_files(stage_world, monkeypatch):
     m.process_pr(_mk_pr(202), AZ_MAP, base_sha="b" * 12, repo=STG)
     assert sorted(seen["files"]) == sorted(files), \
         "both gcp/ and azure/ files must survive the scope filter"
+    # Red on its own (the gcp env is new here and has no cohort config), never the catch-all.
+    assert m._extract_status_token(stage_world["upserts"][-1][1]) != "transient"
 
 
 def test_aws_only_pr_is_still_silent(stage_world, monkeypatch):

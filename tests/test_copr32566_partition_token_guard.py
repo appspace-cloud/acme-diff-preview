@@ -493,7 +493,7 @@ def clone_pr(world, monkeypatch):
         store["ids"].append(existing_id)
         store["id"], store["body"] = existing_id or 123, body
         sinks.upserts.append(body)
-        return store["id"]
+        return "ok"
 
     def find(pr_id, repo=None):
         b = store.get("body")

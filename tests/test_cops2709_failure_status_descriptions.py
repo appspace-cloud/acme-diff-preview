@@ -258,10 +258,10 @@ def _drive(monkeypatch, plan):
                         lambda pr_id, repo=None: (None, "", ""))
     monkeypatch.setattr(m, "upsert_comment",
                         lambda pr_id, body, existing_id=None, repo=None,
-                        **kw: 1)
+                        **kw: "ok")
     monkeypatch.setattr(m, "post_build_status",
                         lambda sha, state, description, pr_id=None,
-                        repo=None: statuses.append((state, description)))
+                        repo=None: statuses.append((state, description)) or "ok")
     monkeypatch.setattr(m, "fix_stuck_inprogress", lambda *a, **k: None)
     monkeypatch.setattr(m, "_touch_progress", lambda: None)
     monkeypatch.setattr(m, "argocd_diff",

@@ -141,7 +141,8 @@ def stuck_world(monkeypatch):
     captured = []
     monkeypatch.setattr(m, "http", lambda *a, **k: {"state": "INPROGRESS"})
     monkeypatch.setattr(m, "post_build_status",
-                        lambda sha, state, desc, pr_id=None, repo=None: captured.append((state, desc)))
+                        lambda sha, state, desc, pr_id=None, repo=None:
+                        captured.append((state, desc)) or "ok")
     return captured
 
 
@@ -728,7 +729,8 @@ def test_process_pr_sigterm_mid_diff_drains_without_marking_seen(world, monkeypa
         m.process_pr(_mk_pr(pr_id=609), PATH_MAP, base_sha=BASE_SHA)
     finally:
         m._shutdown = saved
-    assert 609 not in m._seen, \
+    assert sinks.diff_calls, "the drain must happen mid-diff"
+    assert (m.BB_REPO, 609) not in m._seen, \
         "a SIGTERM-drained PR must NOT be marked seen — the next pod re-diffs it"
 
 

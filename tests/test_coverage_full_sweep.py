@@ -383,10 +383,10 @@ def _orch(monkeypatch):
     monkeypatch.setattr(m, "upsert_comment",
                         lambda pr_id, body, existing_id=None, repo=None,
                         artifact_url="":
-                        sinks["upserts"].append(body) or 1)
+                        sinks["upserts"].append(body) or "ok")
     monkeypatch.setattr(m, "post_build_status",
                         lambda pr_sha, state, description, pr_id=None, repo=None:
-                        sinks["statuses"].append((state, description)))
+                        sinks["statuses"].append((state, description)) or "ok")
     monkeypatch.setattr(m, "_save_diff_ui_artifact",
                         lambda *a, **k: sinks["artifacts"].append(1))
     monkeypatch.setattr(m, "_detect_env_decommission_candidates", lambda *a, **k: [])
