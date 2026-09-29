@@ -21,7 +21,7 @@ import pytest
 import diff_preview as m
 import logsink
 
-from test_coverage_orchestration import world, _mk_pr, PATH_MAP, BASE_SHA, PR_SHA  # noqa: E402,F401
+from test_coverage_orchestration import world, _mk_pr, PATH_MAP, BASE_SHA, PR_SHA, IDENTITY  # noqa: E402,F401
 
 SK = ("acme-config-dev", 991)
 
@@ -138,12 +138,62 @@ def test_comment_skipped_when_not_leader(monkeypatch, failures):
     assert calls == [] and m._diff_stats["bb_write_failures"] == 0
 
 
-# ── process_pr: an early exit (the merge conflict block) ─────────────────
+# ── process_pr: the 8 early exits ────────────────────────────────────────
 
-def _conflict_world(world, monkeypatch, status="ok", comment="ok"):
+COHORT = "gcp/dev/private-cloud/ap1/custom/config.yaml"
+_ENV_ONLY = ["gcp/dev/private-cloud/ap1/custom/pv-new-a/customer.yaml"]
+
+
+def _force(monkeypatch, name, hits):
+    monkeypatch.setattr(m, name, lambda *a, **k: hits)
+
+
+def _identity(monkeypatch):
+    _force(monkeypatch, "_detect_live_identity_changes", [{
+        "path": IDENTITY, "moved_from": None, "old": ("orch", "a"),
+        "new": ("orch2", "a"), "old_ns": "pv-orch-a", "new_ns": "pv-orch2-a",
+        "old_id": "pv-orch-a", "new_id": "pv-orch2-a",
+        "apps": ["pv-orch-a-ms", "pv-orch-a-ss"], "decommission": False,
+        "paused_base": False, "paused_head": False, "taken": []}])
+    monkeypatch.setattr(m, "_pr_commit_messages", lambda *a, **k: [])
+
+
+def _new_env(monkeypatch):
+    monkeypatch.setattr(m, "get_pr_changed_files", lambda pr_id, repo=None: (_ENV_ONLY, {}))
+    _force(monkeypatch, "_detect_new_env_candidates", [{"name": "pv-new-a"}])
+    monkeypatch.setattr(m, "_evaluate_new_envs", lambda *a, **k: (
+        ["### \U0001f195 New Environment(s) Detected", ""], [], 5, []))
+
+
+# Each exit: how to force its detector, the token its comment must carry
+# and a phrase of its body, so the test proves it took that branch.
+EXITS = {
+    "conflict": (lambda mp: mp.setattr(m, "_merge_preview", lambda repo, base, sha:
+                                       (None, ["gcp/x/values.yaml"])),
+                 "", "CONFLICTS with `main`"),
+    "wiped": (lambda mp: _force(mp, "_detect_wiped_definitions", [IDENTITY]),
+              "blocked", "microservices.definitions"),
+    "token": (lambda mp: _force(mp, "_detect_partition_token_misses", [
+        (IDENTITY, "--aec1", [("customerName", "orch", "orch--aec1")])]),
+              "blocked", "orch--aec1"),
+    "cohort": (lambda mp: _force(mp, "_detect_orphaning_cohort_removals", [
+        {"cohort": COHORT, "envs": ["pv-orch-a"]}]),
+               "blocked", "removes a cohort"),
+    "identity": (_identity, "blocked", "Confirm-Rename: pv-orch-a -> pv-orch2-a"),
+    "frozen": (lambda mp: _force(mp, "_detect_frozen_versions", [
+        {"path": IDENTITY, "cohort": COHORT, "why": "missing"}]),
+               "blocked", "watch-only"),
+    "new_env": (_new_env, "clean", "New Environment(s) Detected"),
+    "no_apps": (lambda mp: mp.setattr(m, "get_pr_changed_files", lambda pr_id, repo=None:
+                                      (["docs/README.md"], {})),
+                "clean", "No ArgoCD apps are currently affected"),
+}
+
+
+def _exit_world(world, monkeypatch, name, status="ok", comment="ok"):
     sinks, _plan = world
-    monkeypatch.setattr(m, "_merge_preview",
-                        lambda repo, base, sha: (None, ["gcp/x/values.yaml"]))
+    force, token, phrase = EXITS[name]
+    force(monkeypatch)
     monkeypatch.setattr(m, "post_build_status",
                         lambda pr_sha, state, description, pr_id=None, repo=None:
                         sinks.statuses.append((state, description)) or status)
@@ -151,43 +201,49 @@ def _conflict_world(world, monkeypatch, status="ok", comment="ok"):
                         lambda pr_id, body, existing_id=None, repo=None, **kw:
                         sinks.upserts.append(body) or comment)
     m.process_pr(_mk_pr(), PATH_MAP, base_sha=BASE_SHA)
-    assert "[conflict]" in sinks.upserts[-1]
+    body = sinks.upserts[-1]
+    assert phrase in body and m._extract_status_token(body) == token, body
+    assert sinks.diff_calls == [], "an early exit renders nothing"
     return sinks
 
 
+@pytest.mark.parametrize("name", EXITS)
 @pytest.mark.parametrize("status,comment", [("transient", "ok"), ("ok", "transient")])
-def test_early_exit_with_a_transient_write_retries(world, monkeypatch, status, comment):
-    _conflict_world(world, monkeypatch, status=status, comment=comment)
+def test_early_exit_with_a_transient_write_retries(world, monkeypatch, name, status, comment):
+    _exit_world(world, monkeypatch, name, status=status, comment=comment)
     assert SK not in m._seen, "a write that did not land must not mark the PR seen"
     assert SK in m._retry_backoff, "and the retry must back off"
 
 
+@pytest.mark.parametrize("name", EXITS)
 @pytest.mark.parametrize("status,comment", [("ok", "ok"), ("permanent", "ok"),
                                             ("ok", "permanent")])
-def test_early_exit_with_landed_or_rejected_writes_is_seen(world, monkeypatch, status, comment):
+def test_early_exit_with_landed_or_rejected_writes_is_seen(world, monkeypatch, name,
+                                                           status, comment):
     m._retry_backoff[SK] = [0, 4, PR_SHA]     # an earlier transient pass
     monkeypatch.setitem(m._pr_supersede_aborts, SK, 1)
-    _conflict_world(world, monkeypatch, status=status, comment=comment)
+    _exit_world(world, monkeypatch, name, status=status, comment=comment)
     assert m._seen.get(SK) == (PR_SHA, BASE_SHA)
     assert SK not in m._retry_backoff, "a published result ends the backoff"
     assert SK not in m._pr_supersede_aborts, "and the supersede abort streak"
 
 
-def test_early_exit_not_leader_neither_seen_nor_backed_off(world, monkeypatch):
-    _conflict_world(world, monkeypatch, status="skipped", comment="skipped")
+@pytest.mark.parametrize("name", EXITS)
+def test_early_exit_not_leader_neither_seen_nor_backed_off(world, monkeypatch, name):
+    _exit_world(world, monkeypatch, name, status="skipped", comment="skipped")
     assert SK not in m._seen and SK not in m._retry_backoff
 
 
-def test_early_exit_status_carries_the_repo(world, monkeypatch):
+@pytest.mark.parametrize("name", EXITS)
+def test_early_exit_status_carries_the_repo(world, monkeypatch, name):
     sinks, _plan = world
     repos = []
-    monkeypatch.setattr(m, "_merge_preview",
-                        lambda repo, base, sha: (None, ["gcp/x/values.yaml"]))
+    EXITS[name][0](monkeypatch)
     monkeypatch.setattr(m, "post_build_status",
                         lambda pr_sha, state, description, pr_id=None, repo=None:
                         repos.append(repo) or "ok")
     m.process_pr(_mk_pr(), PATH_MAP, base_sha=BASE_SHA)
-    assert repos == ["acme-config-dev"]
+    assert repos and set(repos) == {"acme-config-dev"}
 
 
 # ── process_pr: the main diff path ───────────────────────────────────────
@@ -393,7 +449,6 @@ def test_a_block_whose_status_write_fails_turns_an_old_green_red(world, monkeypa
     """The early exits post no INPROGRESS. When their FAILED did not land,
     the commit kept the SUCCESSFUL of a render against an older main, and
     the recovery left it: a green gate under a [blocked] comment."""
-    from test_coverage_orchestration import IDENTITY
     monkeypatch.setattr(m, "_detect_wiped_definitions", lambda *a, **k: [IDENTITY])
     bb = _bitbucket(world, monkeypatch, "SUCCESSFUL", ["FAILED"])
     body = _render_then_recover(world, monkeypatch)
