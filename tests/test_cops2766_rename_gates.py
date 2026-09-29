@@ -105,8 +105,8 @@ def test_rebuild_hint_is_one_line_per_env():
              {"env_name": "not-confirmed"}]
     out = m._rebuild_hint_lines(cands)
     # The flag arms nothing on cl-*, so there the hint only names git mv.
-    assert out == ["\U0001f4a1 Looks like a rebuild or rename of `cl-prod-b`: use "
-                   "`git mv` with `Confirm-Rename`.", "",
+    assert out == [("\U0001f4a1 Looks like a rebuild or rename of `cl-prod-b`: use "
+                    "`git mv` with `Confirm-Rename`."), "",
                    HINT.replace("pv-orch-a", "pv-x-a"), ""]
     assert m._rebuild_hint_lines([]) == []
 

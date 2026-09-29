@@ -25,7 +25,7 @@ import diff_preview as m  # noqa: E402
 import vm_analysis as vma  # noqa: E402
 
 from test_coverage_orchestration import (  # noqa: E402,F401
-    world, _mk_pr, PATH_MAP, BASE_SHA, PR_SHA, IDENTITY, IDENTITY_YAML)
+    world, _mk_pr, PATH_MAP, BASE_SHA, IDENTITY, IDENTITY_YAML)
 
 SHRINK = vma._VM_SHRINK_REASON
 EVERY_TRAILER = ("Confirm-Teardown: pv-orch-a\nConfirm-Decommission: pv-orch-a\n"

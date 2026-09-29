@@ -224,9 +224,9 @@ def test_not_live_note_starts_with_its_header(monkeypatch):
 
 def test_unknown_finalizer_is_one_visible_warning(monkeypatch):
     assert _note(monkeypatch, None) == [
-        "⚠️ Could not verify the cascade finalizer on `pv-doomed-a` (ArgoCD lookup "
-        "failed). Check that `argocd app get pv-doomed-a-ms` lists "
-        "`resources-finalizer.argocd.argoproj.io` before merging.", ""]
+        ("⚠️ Could not verify the cascade finalizer on `pv-doomed-a` (ArgoCD lookup "
+         "failed). Check that `argocd app get pv-doomed-a-ms` lists "
+         "`resources-finalizer.argocd.argoproj.io` before merging."), ""]
     assert "`argocd app get pv-doomed-a`" in _note(monkeypatch, None, apps=[])[0]
     assert _note(monkeypatch, True) == []
 

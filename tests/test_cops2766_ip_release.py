@@ -28,7 +28,7 @@ import identity  # noqa: E402
 import vm_analysis as vma  # noqa: E402
 
 from test_coverage_orchestration import (  # noqa: E402,F401
-    world, _mk_pr, PATH_MAP, BASE_SHA, PR_SHA, IDENTITY_YAML)
+    world, _mk_pr, PATH_MAP, BASE_SHA, PR_SHA)
 
 CA = "/compute.cnrm.cloud.google.com/ComputeAddress pv-orch-a/pv-orch-a-ip"
 DNS = "/dns.cnrm.cloud.google.com/DNSRecordSet pv-orch-a/pv-orch-a-dns-record"
