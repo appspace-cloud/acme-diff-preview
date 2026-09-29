@@ -213,3 +213,36 @@ def test_other_failed_descriptions_do_not_change(world):
     m.process_pr(_mk_pr(), PATH_MAP, base_sha=BASE_SHA)
     assert sinks.statuses[-1] == ("FAILED",
                                   "Diff failed: helm exploded - check PR comment")
+
+
+# ── -revN on release tags (open decision row 20) ─────────────────────────
+
+@pytest.mark.parametrize("current,new,down", [
+    ("2603.1.38-rev2", "2603.1.38-rev1", True),
+    ("2603.1.38-rev1", "2603.1.38", True),
+    ("2602.1.14-rev1", "2602.1.14", True),         # the prod revert 5e59f9f9f
+    ("2603.1.38-rev10", "2603.1.38-rev9", True),   # a number, not text
+    ("2603.1.39", "2603.1.38-rev5", True),         # the version still leads
+    ("2603.1.38", "2603.1.38-rev1", False),
+    ("2603.1.38-rev1", "2603.1.39", False),
+    ("2603.1.38-rev1", "2603.1.38-rev1", False),
+    # feature and -dev tags keep the old compare: no rev there
+    ("2603.0.20-rev1-copr-32089-dev", "2603.0.20-rev1", False),
+    ("2602.4.3-rev2-ap-68093-dev", "2602.4.3-rev1-dev", False),
+    ("8.12.0-ac.1.4-rev6-dev", "8.12.0-ac.4.8-dev", False),
+])
+def test_a_rev_counts_only_on_release_tags(current, new, down):
+    assert cr._is_version_downgrade(current, new) is down
+
+
+def test_a_rev_revert_is_a_downgrade_not_a_bump():
+    b = _bullets({"pv-x-a-ms": _r(("2602.1.14-rev1", "2602.1.14"))})
+    assert b == ["⬇️ **Chart version downgrade** `2602.1.14-rev1` "
+                 "→ `2602.1.14` in pv-x-a"], b
+
+
+def test_a_new_rev_counts_up_for_the_note():
+    results = {"pv-dn-a-ms": _r(DOWN),
+               "pv-up-a-ms": _r(("2603.1.38", "2603.1.38-rev1")),
+               "pv-up-b-ms": _r(("2603.1.38-rev1", "2603.1.38-rev2"))}
+    assert cr._downgrade_mix_note(results).startswith("2 other environment(s)")

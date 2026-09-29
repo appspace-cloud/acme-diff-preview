@@ -46,12 +46,25 @@ def _parse_version_tuple(version: str):
     return tuple(int(x) for x in mnum.group(1).split("."))
 
 
+_RELEASE_TAG_RE = re.compile(r"\d+(?:\.\d+)*(?:-rev(\d+))?")
+
+
+def _rev_number(v):
+    """N of a release tag '2603.1.38-revN', 0 for the bare tag, None for
+    any other tag (-dev and feature tags have unrelated revs)."""
+    m = _RELEASE_TAG_RE.fullmatch((v or "").strip())
+    return int(m.group(1) or 0) if m else None
+
+
 def _is_version_downgrade(current: str, new: str) -> bool:
     """True when `new` is a strictly LOWER chart version than `current`.
 
     v2.5.8: downgrades are legal but dangerous (schema regressions, data
     migrations that do not run backwards), so the PR comment must shout.
-    Unparseable versions return False — never block on noise."""
+    Unparseable versions return False — never block on noise.
+
+    COPS-2766: a -revN is newer than the bare tag, and rev2 is newer than
+    rev1, only when both are release tags."""
     cur_t = _parse_version_tuple(current)
     new_t = _parse_version_tuple(new)
     if cur_t is None or new_t is None:
@@ -60,7 +73,10 @@ def _is_version_downgrade(current: str, new: str) -> bool:
     length = max(len(cur_t), len(new_t))
     cur_t += (0,) * (length - len(cur_t))
     new_t += (0,) * (length - len(new_t))
-    return new_t < cur_t
+    cur_r, new_r = _rev_number(current), _rev_number(new)
+    if cur_r is None or new_r is None:
+        cur_r = new_r = 0
+    return (new_t, new_r) < (cur_t, cur_r)
 
 
 def parse_diff_sections(diff_text):
