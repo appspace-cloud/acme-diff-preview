@@ -139,16 +139,19 @@ def _decommission_body(monkeypatch, base_yaml):
                             MANIFEST % {"a": app}))
     # Without this the note shells out to `argocd app get` per app, 30s each.
     monkeypatch.setattr(m, "_cascade_finalizer_live", lambda apps: None)
+    # COPS-2766: and the 7-day hold reads the git history of the mirror.
+    monkeypatch.setattr(m, "_teardown_hold_met", lambda *a, **k: True)
     for a in APPS:
         monkeypatch.setitem(m._app_chart_revision_map, a, "2603.1.0")
 
-    lines, envs = m._evaluate_env_decommissions(
-        [{"env_name": ENV, "identity_file": IDENT, "apps": APPS,
-          "env_dir": ENV_DIR}], PR_SHA, BASE_SHA)
+    cand = {"env_name": ENV, "identity_file": IDENT, "apps": APPS,
+            "env_dir": ENV_DIR}
+    lines, envs = m._evaluate_env_decommissions([cand], PR_SHA, BASE_SHA)
     assert envs == [ENV], "the scenario must actually confirm the deletion"
     return m.format_comment(
         PR_SHA, {a: _result(outcome=m.OUT_DECOMMISSIONED) for a in APPS},
-        base_sha=BASE_SHA, decommission_lines=lines)
+        base_sha=BASE_SHA, decommission_lines=lines,
+        gates=m._merge_gates([cand]))
 
 
 def test_golden_env_decommission_cascade(monkeypatch):

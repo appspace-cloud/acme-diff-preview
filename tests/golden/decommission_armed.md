@@ -6,7 +6,7 @@
 
 ## ℹ️ Merge summary
 
-⛔ **DO NOT MERGE** without checking the item(s) below (1 item(s))
+⚠️ **Review before merging** (1 item(s))
 
 - 🔒 **Decommission ARMED** — this environment becomes eligible for cascade deletion when its folder is removed
 

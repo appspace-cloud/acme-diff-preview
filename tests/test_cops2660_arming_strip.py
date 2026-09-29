@@ -205,7 +205,8 @@ def test_the_summary_blocks_and_names_the_orphaning():
 def test_plain_arming_summary_is_unchanged():
     fake_panel = ["## \U0001f512⚠️ DECOMMISSION ARMED for `pv-x` ⚠️\U0001f512"]
     out = _summary(fake_panel)
-    assert "DO NOT MERGE" in out, "arming already blocks, and must keep doing so"
+    # COPS-2766: a review, the build is green for an arming PR.
+    assert "Review before merging" in out and "DO NOT MERGE" not in out, out
     assert "orphan" not in out.lower(), \
         "the orphaning finding must only fire on the broken shape"
 

@@ -438,6 +438,10 @@ def _section_kind(header: str) -> str:
         return ""
 
 
+# COPS-2766: kinds whose CR name is the address itself. A new name is a new IP.
+_IP_KINDS = ("ComputeAddress", "DNSRecordSet")
+
+
 def _strip_trailing_comment(value: str) -> str:
     """Strip a trailing ` # comment` from an unquoted YAML scalar (v2.5.3).
 

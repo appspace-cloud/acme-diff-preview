@@ -293,17 +293,15 @@ def test_a_disappearing_snapshot_attachment_names_the_backup_schedule():
             or "snap" in joined), joined
 
 
-def test_a_deleted_instance_defaults_to_abandon_orphan_wording():
-    """COPS-2682: ComputeInstance leaving the render without an explicit
-    deletion-policy: delete is unmanage under the chart abandon default.
-    Contrast: only deletion-policy: delete (or unknown kinds) stay dangerous.
+def test_a_deleted_instance_with_no_policy_is_dangerous():
+    """COPS-2766: a ComputeInstance leaving the render with no policy line is
+    not the chart's abandon (every template writes it). KCC deletes.
     """
     f = _fact(CI_HDR, ATTACHMENT_GONE.replace(
         "ComputeDiskResourcePolicyAttachment", "ComputeInstance"))
-    assert f["deleted"] and f.get("orphaned")
-    assert not f["dangerous"]
-    joined = " ".join(f["notes"])
-    assert "ComputeInstance" in joined and "abandon" in joined.lower()
+    assert f["deleted"] and not f.get("orphaned")
+    joined = " ".join(f["dangerous"])
+    assert "ComputeInstance" in joined and "removed from the render entirely" in joined
 
 
 def test_a_deleted_instance_with_delete_policy_is_dangerous():

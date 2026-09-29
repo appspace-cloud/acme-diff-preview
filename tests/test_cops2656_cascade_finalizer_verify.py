@@ -158,7 +158,10 @@ def test_armed_but_absent_is_called_out(monkeypatch):
         "something is inconsistent")
 
 
-def test_an_unknown_result_does_not_warn(monkeypatch):
+def test_an_unknown_result_does_not_raise_the_alarm(monkeypatch):
     """Cannot tell is not the same as knowing it is wrong. Rendering a
-    scary block on a failed lookup would train reviewers to ignore it."""
-    assert _panel(monkeypatch, cascade=True, live=None) == []
+    scary block on a failed lookup would train reviewers to ignore it.
+    COPS-2766: but nobody checked, so one warning line says it."""
+    lines = _panel(monkeypatch, cascade=True, live=None)
+    assert len(lines) == 2 and lines[0].startswith("\u26a0\ufe0f Could not verify")
+    assert "NOT live" not in lines[0]

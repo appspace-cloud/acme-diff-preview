@@ -23,7 +23,7 @@ vm_analysis because the workload detectors happened to read it first.
 import re
 
 from comment_render import _section_name
-from manifest import _section_kind
+from manifest import _IP_KINDS, _section_kind
 
 
 _appspace_key_re      = re.compile(r"^\s*appspace:\s*(#.*)?$")
@@ -271,15 +271,30 @@ def _appset_identity(customer_doc, cohort_doc):
             _go_str(sfx) if sfx else "a")
 
 
-_CONFIRM_RENAME_RE = re.compile(
-    r"^[\s*>]*`?confirm-rename:\s*`?([^\s`]+)`?\s*(?:->|\u2192)\s*`?([^\s`]+)`?\s*$",
+# COPS-2766: one parser for every Confirm-* line, so they all read the same way.
+_CONFIRM_RE = re.compile(
+    r"^[\s*>]*`?(confirm-(?:rename|teardown|decommission|ip-release)):\s*(.+?)\s*$",
     re.IGNORECASE)
+
+
+def _confirmations(messages) -> set:
+    """{'confirm-<kind>: <arg>'} in lower case, from the Confirm-* lines of the PR's
+    commit messages. Backticks and a final '.' are dropped, '\u2192' reads as '->'."""
+    out = set()
+    for msg in messages:
+        for line in (msg or "").splitlines():
+            m = _CONFIRM_RE.match(line)
+            if m:
+                arg = m[2].replace("`", "").replace("\u2192", "->").rstrip(".")
+                arg = re.sub(r"\s*->\s*", " -> ", " ".join(arg.split()))
+                out.add(f"{m[1].lower()}: {arg.lower()}")
+    return out
 
 
 def _confirmed_renames(messages):
     """{(old, new)} from `Confirm-Rename: <old> -> <new>` lines in commit messages."""
-    return {(m[1].rstrip("."), m[2].rstrip(".")) for msg in messages
-            for line in (msg or "").splitlines() for m in [_CONFIRM_RENAME_RE.match(line)] if m}
+    return {m.groups() for a in _confirmations(messages)
+            for m in [re.fullmatch(r"confirm-rename: (\S+) -> (\S+)", a)] if m}
 
 def _is_rename_of(old_header: str, new_header: str) -> bool:
     """True when two headers plausibly name the SAME resource renamed.
@@ -296,8 +311,12 @@ def _is_rename_of(old_header: str, new_header: str) -> bool:
     Rule B - one token inserted or removed anywhere in the hyphen-token list.
       ...-mediatransform-access -> ...-mediatransform-gsa-access
       (mediatransform moved from workload identity to a dedicated GSA)
+
+    Never for an address or a DNS record (COPS-2766): a new name is a new IP,
+    so `-ip` -> `-ip-ext` releases the old one.
     """
-    if _section_kind(old_header) != _section_kind(new_header):
+    kind = _section_kind(old_header)
+    if kind in _IP_KINDS or kind != _section_kind(new_header):
         return False
     a, b = _section_name(old_header), _section_name(new_header)
     if not a or not b or a == b:

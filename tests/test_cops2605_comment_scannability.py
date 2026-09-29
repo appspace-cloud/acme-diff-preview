@@ -214,13 +214,12 @@ def test_vm_facts_deletion_policy_flip_is_dangerous():
     assert "deletion" in " ".join(facts[0]["dangerous"]).lower()
 
 
-def test_vm_facts_whole_instance_deletion_defaults_to_abandon_orphan():
-    # COPS-2682: chart default for ComputeInstance is abandon when
-    # allowDeletion is unset. A CR leaving the render without an explicit
-    # deletion-policy: delete annotation is unmanage, not GCP destroy.
+def test_vm_facts_whole_instance_deletion_with_no_policy_is_dangerous():
+    # COPS-2766: every template writes the policy, so a CR with no policy
+    # line is not the chart's abandon. KCC's own default is delete.
     facts = m._detect_vm_changes([(CI_HDR, VM_DELETED)])
-    assert facts and facts[0]["deleted"] and facts[0].get("orphaned")
-    assert not facts[0]["dangerous"]
+    assert facts and facts[0]["deleted"] and not facts[0].get("orphaned")
+    assert facts[0]["dangerous"]
 
 
 def test_vm_facts_whole_instance_deletion_with_delete_policy_is_dangerous():
@@ -618,7 +617,8 @@ def test_merge_summary_names_the_environments_jumping_version():
 
 def test_merge_summary_surfaces_a_quiet_decommission_arming():
     """PR #3892 shape: a config-only change that arms destruction and
-    rendered a 571-byte all-green comment."""
+    rendered a 571-byte all-green comment. COPS-2766: the build is green,
+    so the verdict is a review, not DO NOT MERGE (the icon rule)."""
     results = {"pv-adaptive-b-ms": _result(outcome=m.OUT_NO_DIFF)}
     body = m.format_comment(
         PR_SHA, results, base_sha=BASE_SHA,
@@ -626,7 +626,7 @@ def test_merge_summary_surfaces_a_quiet_decommission_arming():
                          "- \U0001f6a8 `pv-adaptive-b` \u00b7 **defaults**: "
                          "**added** `defaults.allowDeletion` = `True`", ""])
     head = _merge_summary_of(body)
-    assert "DO NOT MERGE" in head
+    assert "Review before merging" in head and "DO NOT MERGE" not in head
     assert "VM" in head
     assert "No manifest changes" not in head
 
@@ -793,14 +793,15 @@ def test_merge_summary_never_contradicts_an_armed_state_panel():
     "DECOMMISSION ARMED" while the summary said "Routine - nothing
     dangerous detected" and the footer said "No manifest changes". Arming
     destruction is config-only, so it never reaches the manifest diff --
-    the summary has to read the state panel."""
+    the summary has to read the state panel. COPS-2766: a review, as the
+    build is green for it."""
     results = {"pv-qa-13-a-ms": _result(outcome=m.OUT_NO_DIFF)}
     armed = m.format_comment(
         PR_SHA, results, base_sha=BASE_SHA,
         appspace_state_lines=["## \U0001f512\u26a0\ufe0f DECOMMISSION ARMED "
                               "for `pv-qa-13-a` \u26a0\ufe0f\U0001f512", ""])
     head = _merge_summary_of(armed)
-    assert "DO NOT MERGE" in head
+    assert "Review before merging" in head
     assert "Decommission ARMED" in head
     assert "nothing dangerous detected" not in head
 
@@ -809,7 +810,7 @@ def test_merge_summary_never_contradicts_an_armed_state_panel():
         appspace_state_lines=["## \U0001f6a8 PURGE ARMED for "
                               "already-decommissioned `pv-x` \U0001f6a8", ""])
     head_p = _merge_summary_of(purge)
-    assert "DO NOT MERGE" in head_p
+    assert "Review before merging" in head_p
     assert "purge" in head_p.lower()
 
 

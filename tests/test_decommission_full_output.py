@@ -188,6 +188,9 @@ def test_process_pr_threads_the_audit_appendix_through(monkeypatch):
                         lambda *a, **k: [_candidate()])
     monkeypatch.setattr(m, "_render_main_side_resources",
                         lambda app, main_sha: dict(RESOURCES))
+    # COPS-2766: the Phase 3 reads (ArgoCD, the git history), both passing.
+    monkeypatch.setattr(m, "_cascade_finalizer_live", lambda apps: True)
+    monkeypatch.setattr(m, "_teardown_hold_met", lambda *a, **k: True)
     table = {(_ID, _PR_SHA): (None, m.BB_NOT_FOUND),
              (_ID, _BASE): (ARMED, m.BB_OK)}
     monkeypatch.setattr(m, "_bb_fetch_cached",
@@ -218,6 +221,7 @@ def test_process_pr_threads_the_audit_appendix_through(monkeypatch):
     assert "Full rendered output" in comment, "the comment must point at it"
     assert "ENVIRONMENT DECOMMISSION" in comment, "the warning still shouts"
     assert len(body) > len(comment)
+    assert m._extract_status_token(comment) == "clean", "not the catch-all"
 
 
 def test_phase_gate_fails_closed_when_refetch_degrades(monkeypatch):

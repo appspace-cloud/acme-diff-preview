@@ -43,8 +43,8 @@ resource, and answers the only question that matters at merge time:
 |  | acme-diff-preview | Plain ArgoCD | Atlantis-style plan bots |
 |---|---|---|---|
 | **Answers before merge** | ✅ diff of the PR against `main` | ❌ shows drift *after* sync | ✅ but Terraform only |
-| **One verdict, not a wall** | ✅ ⛔ / ⚠️ / ✅ with named findings | ❌ | ❌ raw plan output |
-| **Knows what is dangerous** | ✅ **22 distinct findings**: deletions, decommissions, data purges, disk shrink, zeroed replicas, downgrades, orphaned VMs, renames… | ❌ | ❌ |
+| **One verdict, not a wall** | ✅ ⛔ / ⚠️ / ✅ with named findings, and ⛔ only when the build is red | ❌ | ❌ raw plan output |
+| **Knows what is dangerous** | ✅ **43 distinct findings**: deletions, decommissions, teardowns that leave things running, data purges, released IPs, disk shrink, zeroed replicas, downgrades, orphaned VMs, renames… | ❌ | ❌ |
 | **Scales to a fleet** | ✅ 863 apps in one PR; identical diffs folded once | ❌ | ❌ per-workspace |
 | **Never says "no changes" on failure** | ✅ a failed render is red, never green | ❌ | ⚠️ varies |
 | **Reads secrets safely** | ✅ redacted before it ever reaches a comment | n/a | n/a |

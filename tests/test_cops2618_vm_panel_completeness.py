@@ -162,14 +162,14 @@ def test_created_resource_still_reads_as_created(monkeypatch):
     assert not facts[0]["dangerous"]
 
 
-def test_deleted_resource_defaults_to_abandon_orphan(monkeypatch):
-    # COPS-2682: chart default is abandon when allowDeletion is unset.
-    # A CR leaving the render without deletion-policy: delete is unmanage.
+def test_deleted_resource_with_no_policy_is_dangerous(monkeypatch):
+    # COPS-2766: with no policy line KCC deletes. Only an explicit abandon
+    # is unmanage.
     facts = _facts(INST, "-    machineType: n2d-standard-4\n"
                          "-    zone: europe-west1-d\n")
     assert facts[0]["deleted"] is True
-    assert facts[0].get("orphaned")
-    assert not facts[0]["dangerous"]
+    assert not facts[0].get("orphaned")
+    assert facts[0]["dangerous"]
 
 
 def test_deleted_resource_with_delete_policy_still_dangerous(monkeypatch):

@@ -184,6 +184,11 @@ def test_process_pr_a_whole_cohort_decommission_is_not_blocked(rename_pr, monkey
     monkeypatch.setattr(dp, "get_pr_changed_files", lambda pr_id, repo=None: ([ENV_COHORT, ENV], {}))
     dp.process_pr(_pr(), path_map, base_sha=BASE_SHA)
     assert not sinks.statuses[-1][1].startswith("BLOCKED: removes cohort")
+    # COPS-2766: no cascade on main, so the teardown gate blocks it instead,
+    # and the commit messages were read to look for its trailer.
+    assert dp._extract_status_token(sinks.upserts[-1]) == "blocked"
+    assert "'Confirm-Teardown: pv-orch-a'" in sinks.statuses[-1][1]
+    assert store["read"] == 1
 
 
 # --- history, against the local config repos ------------------------------------------

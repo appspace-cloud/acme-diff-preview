@@ -44,19 +44,19 @@ and QA apps when CI publishes a new chart, so they pick it up past the OCI cache
 | ✅ no manifest changes | Rendered output is byte-identical. Safe. When the PR still edited YAML, the status and a Higher-layer panel explain why (values already set by an ancestor `config.yaml`, or the chart did not consume the keys) — COPS-2721 / acme-config-prod #4520. |
 | ⚠️ N resource(s) will change | Normal diff. Review it. |
 | ❔ diff unavailable | **Not** the same as "no changes". Something failed and the app was NOT evaluated. |
-| 🧭 Merge summary | **Always present, always first.** One verdict — ⛔ do not merge / ⚠️ review / ✅ routine — followed by one line per finding: decommissions, deletions, dangerous VM changes, downgrades, zeroed replicas, auto-sync toggles, new environments and the environments jumping version. It is built from the same deterministic facts as the panels below, so it can never disagree with the detail. ⛔ items come first, then ⚠️ items with a cause before its effect (a downgrade or a shutdown before the deletions it causes) and the higher-layer note last (COPS-2766). |
+| 🧭 Merge summary | **Always present, always first.** One verdict — ⛔ do not merge / ⚠️ review / ✅ routine — followed by one line per finding: merge gates, decommissions, deletions, dangerous VM changes, downgrades, zeroed replicas, auto-sync toggles, new environments and the environments jumping version. It is built from the same deterministic facts as the panels below, so it can never disagree with the detail. The most serious items come first, then ⚠️ items with a cause before its effect (a downgrade or a shutdown before the deletions it causes) and the higher-layer note last (COPS-2766). **The icons follow the build colour** (COPS-2766): ⛔ DO NOT MERGE, and a ⛔, 🚨 or ❌ on a line, only when the build is FAILED. On a green build the verdict is at most ⚠️ review, and the summary, the VM, decommission and state panels and the status lead show ⚠️ in their place. The findings and their order do not change. An open merge gate is a ⛔ line that names the `Confirm-*` line that lifts it, when one exists. A lifted gate stays as a ☑️ review line, so the override is visible ([Merge-blocking guards](#merge-blocking-guards)). |
 | 📚 Higher-layer values | `customer.yaml` (or another leaf) re-states keys an ancestor already sets identically (`gcp/config.yaml`, cohort `config.yaml`, …). Manifests stay quiet on purpose; the panel names the ancestor and the keys so "No manifest changes" is not misread as a missed diff (COPS-2721). |
-| 🗑️ RESOURCE(S) DELETED | Resources disappear from the rendered output entirely, with **no replacement in this PR**. Sensitive kinds are always listed in full and never truncated away. In the merge summary a deletion is a ⚠️ review item, not ⛔ (COPS-2766): the build never went red for a deletion, so the stop sign only taught people to merge past it. The summary line names the kinds with their counts: GCP (KCC) kinds first, then the most common, two of them (all three when there are three). When a data or public-address kind is deleted (bucket, BigQuery dataset or table, disk, snapshot, SQL, Redis, Secret Manager secret, IP address, DNS, volume, storage account), the line starts with `Data or IP deleted:` and names those kinds instead, all of them, so the few characters Bitbucket shows of the green status say it. |
+| 🗑️ RESOURCE(S) DELETED | Resources disappear from the rendered output entirely, with **no replacement in this PR**. Sensitive kinds are always listed in full and never truncated away. In the merge summary a deletion is a ⚠️ review item, not ⛔ (COPS-2766): the build never went red for a deletion, so the stop sign only taught people to merge past it. The summary line names the kinds with their counts: GCP (KCC) kinds first, then the most common, two of them (all three when there are three). When a data or public-address kind is deleted (bucket, BigQuery dataset or table, disk, snapshot, SQL, Redis, Secret Manager secret, IP address, DNS, volume, storage account), the line starts with `Data or IP deleted:` and names those kinds instead, all of them, so the few characters Bitbucket shows of the green status say it. One exception fails the build: a `ComputeAddress` or `DNSRecordSet` that leaves the render with no explicit `deletion-policy: abandon`. GCP releases that IP, so the build is FAILED until a commit message has `Confirm-IP-Release: <env>` (COPS-2766). |
 | 🎚️ acme-ping-scaler takes over replica control | The PR enables `acme-ping-scaler` in an environment, and the HPAs it deletes are the chart's own contract (`hpa.yaml` skips all HPA rendering while a ping-scaler is on, so the two never fight over replicas). The activation and the HPAs live in **different apps of the same environment** (the Deployment renders in `{env}-ss`, the HPAs leave `{env}-ms`), so the pairing is per environment. Said calmly as REVIEW with a docs link, instead of the deletion block: the HPAs come back on the next sync after `acmePingScaler.enabled` goes back to `false`. An HPA deleted any *other* way — or any other kind deleted alongside — still lands in the deletion block unchanged. |
 | 🖥️ VM infrastructure (KCC linux-services) | A change under `deployLinuxServicesK8s`. A **cohort** `config.yaml` gaining a role block is reported as a provision only when the render actually creates a ComputeInstance — a key written there provisions nothing on its own, but `svc.enabled: true` at that level would build a VM in every environment below, so the warning survives whenever the render agrees or cannot be read. An environment's own `customer.yaml` is unchanged. |
 | 🔄 resource(s) RENAMED | Deleted and recreated under a new name in the same PR, so nothing is lost. Typically a name carrying a content hash, or a resource moving to a new identity. These are deliberately kept **out** of the deletion count. |
-| 🗑️ ENVIRONMENT DECOMMISSION | A whole environment is being removed. Read the block: by default its workloads are **orphaned, not deleted**. When the deletion is properly phased (cascade armed beforehand per `acme-components` `documentation/delete.md`), the complete redacted manifests the cascade removes are kept on the **full-diff page** for audit; the comment links to them instead of inlining hundreds of lines of rendered YAML. |
+| 🗑️ ENVIRONMENT DECOMMISSION | A whole environment is being removed. Read the block: by default its workloads are **orphaned, not deleted**. When the deletion is properly phased (cascade armed beforehand per `acme-components` `documentation/decommission-environment.md`), the complete redacted manifests the cascade removes are kept on the **full-diff page** for audit; the comment links to them instead of inlining hundreds of lines of rendered YAML. A correctly armed cascade, with or without the data purge, is a ⚠️ review. Three teardowns fail the build until a commit message of the PR has `Confirm-Teardown: <env>` (COPS-2766): a private-cloud removal with no cascade armed, every public-cloud teardown (`<env>` is then the constellation) and a purge that deletes user content a surviving environment uses. A removal with the cascade armed has three more checks. When `zeroPods` or `decommission` has been on `main` for less than 7 days, it fails until `Confirm-Decommission: <env>`. When ArgoCD has not applied the cascade finalizer yet, the build is red and clears itself on a retry after ArgoCD syncs; when the lookup fails, a ⚠️ line asks you to check the finalizer and the build stays green. When the environment is paused on `main` (`appspace.autosync: false`), the build is FAILED and nothing lifts it: resume auto-sync first, let it sync, then remove the folder. When the same PR also adds an environment, a 💡 line says it looks like a rebuild or a rename: arm decommission on the old env, or use `git mv` with `Confirm-Rename`. [Details](internals.md#why-a-teardown-is-blocked). |
 | 🆕 New Environment(s) Detected | A brand-new environment is added. The provisioning summary (chart version, resource counts, applications) comes first; the complete redacted manifest is kept on the **full-diff page** behind the build-status link; the comment links to it rather than inlining it. |
 | ⏸️/▶️ Auto-sync PAUSED/RESUMED | `appspace.autosync` was toggled. Shown even when it is the ONLY change — no rendered manifest is touched, so the resource diff has nothing to say. |
-| 🔒 DECOMMISSION ARMED / 🔓 DISARMED | `appspace.decommission` (and `decommissionPurgeData`) was toggled on a LIVE environment. Different from the block above: nothing is deleted yet, this is the flag that decides what happens the day the folder actually goes. |
+| 🔒 DECOMMISSION ARMED / 🔓 DISARMED | `appspace.decommission` (and `decommissionPurgeData`) was toggled on a LIVE environment. Different from the block above: nothing is deleted yet, this is the flag that decides what happens the day the folder actually goes. In the merge summary, 🔒 Decommission ARMED and 🔒 Data purge ARMED are ⚠️ review items (COPS-2766). The build is green for an arming PR, so the comment says the same. |
 | 🔒 DECOMMISSION PHASE 1 | `allowDeletion` was armed on this environment's Linux VMs, and nothing else. The first PR of a teardown, which used to show only the VM danger bullets: this panel carries the same Phase 1/2/3 table as the later phases, so the reviewer can see which steps are done and which are still ahead. |
-| ⛔ STOP — teardown flag misspelled | A key that reads as `decommission`, `decommissionPurgeData`, `allowDeletion` or `confirmProdDeletion` but is not one the platform looks up at that depth — a dropped letter, wrong casing, or a VM arming flag under the wrong parent (e.g. `deployLinuxServicesK8s.allowDeletion` with no `defaults`/`svc`/… segment, or `confirmProdDeletion` under a role instead of `defaults`). Helm and the ApplicationSet match the key exactly, so the environment renders byte-identically and the PR would otherwise merge as a routine no-op with the operator believing a phase is done. **This one stops the comment**: the verdict, the key, the file and the rename, and nothing else. There is one correct response and the rest of a review is distance to it, so no diff, no VM panel and no phase table are rendered until the key is fixed. The build goes **FAILED** with the rename in the description, because a green tick outranks a red paragraph for anyone skimming the checks list. The full-diff page is exempt and still holds everything. Also shown on a folder-removal PR, where it explains why Phase 2 reads pending over a file that looks armed. Role-level `svc.allowDeletion` (and the other VM roles) is valid when spelled correctly — only paths the chart ignores are flagged as misplaced. |
-| 🖥️ VM infrastructure | **Always present**, in a fixed place, so "did this PR touch VMs?" is answerable without reading anything else: `🖥️🚨 VM INFRASTRUCTURE CHANGES` when something dangerous is found, `🖥️ (routine)` for harmless changes, and an explicit `no changes` line when the domain is untouched. Covers KCC linux-services (`ComputeInstance`, `ComputeDisk`, `ComputeAddress`, snapshot-policy attachments); instance-type and disk-type changes are always highlighted, since both mean destroy-and-recreate. |
+| ⛔ STOP — teardown flag misspelled | A key that reads as `decommission`, `decommissionPurgeData`, `allowDeletion` or `confirmProdDeletion` but is not one the platform looks up at that depth — a dropped letter, wrong casing, or a VM arming flag under the wrong parent (e.g. `deployLinuxServicesK8s.allowDeletion` with no `defaults`/`svc`/… segment, or `confirmProdDeletion` under a role instead of `defaults`). Helm and the ApplicationSet match the key exactly, so the environment renders byte-identically and the PR would otherwise merge as a routine no-op with the operator believing a phase is done. **This one stops the comment**: the verdict, the key, the file and the rename, and nothing else. There is one correct response and the rest of a review is distance to it, so no diff, no VM panel and no phase table are rendered until the key is fixed. The build goes **FAILED** with the rename in the description, because a green tick outranks a red paragraph for anyone skimming the checks list. The full-diff page is exempt and still holds everything. Also shown on a folder-removal PR, where it explains why Phase 2 reads pending over a file that looks armed. There it fails the build too, and nothing lifts it (COPS-2766), but the removal PR keeps its full comment. The key is read from `main` and the PR deletes the file, so the status says to fix the key on `main` in a separate PR, let it sync, then rebase the removal. Before, only the no-cascade gate stopped that PR, so `Confirm-Teardown` made it green with the typo still there. Role-level `svc.allowDeletion` (and the other VM roles) is valid when spelled correctly — only paths the chart ignores are flagged as misplaced. |
+| 🖥️ VM infrastructure | **Always present**, in a fixed place, so "did this PR touch VMs?" is answerable without reading anything else: `🖥️ VM INFRASTRUCTURE CHANGES` with one bullet per finding when something dangerous is found, `🖥️ (routine)` for harmless changes, and an explicit `no changes` line when the domain is untouched. Covers KCC linux-services (`ComputeInstance`, `ComputeDisk`, `ComputeAddress`, snapshot-policy attachments); instance-type and disk-type changes are always highlighted, since both mean destroy-and-recreate. A dangerous bullet is 🚨 on a FAILED build and ⚠️ on a green one (COPS-2766). A disk shrink fails the build and nothing lifts it: GCP cannot shrink a disk in place. The other dangers (machineType, zone, disk type) are a review with a green build. The deletion policy is read from the CR, never assumed: a VM, disk or address that leaves the render is unmanaged (GCP kept) only with `deletion-policy: abandon`. With `delete`, or with no policy line, KCC deletes it in GCP, so it is dangerous. |
 | ⬆️ Routine version bump | Several environments taking the same version-only change, folded into one line naming the transition and every environment it covers. Only ever applied to changes that are provably version-only. |
 | ✂️ N more changed app(s) omitted | The readability budget folded ordinary diff blocks away. Nothing risk-flagged is ever folded; the link goes to the full-diff page, which always holds everything. |
 | ⬆️ N of M changed resource(s) are the version transition | Inside ONE app, every resource whose only changed lines are version noise (image tags, chart labels, version env values, checksum annotations, deploy timestamps) folds behind that single line, which names the transition. Everything else in the same app stays inline, so a real change riding along with a bump cannot hide in it. Deletions, zeroed replicas and VM changes are never folded. |
@@ -82,7 +82,12 @@ constellation serves many customers from the same microservices, NEGs and
 load balancers, so no delete is safe to automate for one of them. The cascade
 gate was deliberately never ported there (COPS-2700), which means
 `appspace.decommission` is a silent no-op and teardown is operator-driven end
-to end. Every public-cloud panel says that reason, not just the mechanism, and
+to end. So the removal of a `cl-*` folder or block fails the build until a
+commit message has `Confirm-Teardown: <constellation>`, and a live
+`cl-*/config.yaml` that is renamed or moved needs
+`Confirm-Rename: <old dir> -> <new dir>` with the full folder paths
+(COPS-2766). Arming the flag there deletes nothing, so that panel stays a ⚠️
+warning. Every public-cloud panel says that reason, not just the mechanism, and
 names the constellation rather than the block inside it — `cl-prod-b`, not
 `constellation` or `app7` (COPS-2708). The manual checklist adapts to what is
 going: removing the `constellation` block takes the shared workloads with it,
@@ -94,7 +99,11 @@ namespace, and the checklist says so instead.
 `documentation/decommission-environment.md`): Phase 1 arms `allowDeletion`,
 Phase 2 arms the cascade with `appspace.decommission` (the data purge is a
 qualifier on it), Phase 3 removes the environment folder and is the only
-destructive one. Phases 1 and 2 may share a PR; Phase 3 must not. Every PR in
+destructive one. Phases 1 and 2 may share a PR; Phase 3 must not. Phase 3
+fails the build while the cascade cannot run as the table says: the ArgoCD
+finalizer is not live yet, the environment is paused, or `zeroPods` /
+`decommission` landed on `main` less than 7 days ago (COPS-2766, see the
+decommission row above). Every PR in
 the sequence renders the same three-row table with only the marks moving, so
 "where am I" is answerable from the comment alone. A row reads `✅ this PR`
 for work this diff performs, `✅ done` for work an earlier PR did,
@@ -148,7 +157,11 @@ the VM in GCP), a `machineType` change without parking the VM
 (`desiredStatus: TERMINATED`) first, a zone or disk-type change (both
 immutable — destroy and recreate), a disk **shrink**, and a VM or
 snapshot-policy attachment disappearing from the render. Disk growth, status
-transitions and brand-new resources are reported quietly as routine.
+transitions and brand-new resources are reported quietly as routine. A disk
+shrink is never valid, so it also fails the build, and no commit line lifts it
+(COPS-2766). The other dangers leave the build green, except a
+`ComputeAddress` that GCP releases (see
+[Merge-blocking guards](#merge-blocking-guards)).
 
 **Uptime schedules** (`uptimeSchedule`, COPS-2714) get advisory notes on top
 of those bullets, and they never block. The chart already refuses what it can
@@ -292,17 +305,30 @@ in-scope files is skipped silently rather than getting a "no apps affected" repl
 
 Beyond rendering diffs, the service also **blocks** a PR from merging (red
 `FAILED` build status + an explanatory comment) when it detects a change that
-is known to break an environment on merge. These are structural checks, run
-before any diff, that no rendered diff would make obvious to a reviewer.
+is known to break an environment on merge. Most are structural checks, run
+before any diff, that no rendered diff would make obvious to a reviewer. The
+merge gates of COPS-2766 (from **Unsafe teardown** down)
+run with the diff, so the comment still shows it. Their footer token is
+`[blocked]`, or `[transient]` for the finalizer and for a hold the git mirror
+cannot read yet. The **Override** column is
+the line a commit message of the PR needs to lift a guard. The comment and the
+red status give the exact line to add.
 
-| Guard | What it catches | Why it is dangerous |
-|---|---|---|
-| Structural new-env failure | a new environment missing a required value (e.g. `appspace.version`) | the environment cannot render at all on merge |
-| **Empty `microservices.definitions`** | a value file (typically `cicd-versions.yaml`) with `appspace.microservices.definitions` present but **null/empty** | silently deletes every microservice on merge ([details](internals.md#why-an-empty-microservicesdefinitions-is-blocked)) |
-| **Clone without its tier token** | an AEC or sandbox value file whose folder or names (`customerName`, `instanceName`, the mongo/rabbit VM names, ...) miss `--aec1` / `--sbx1` | the clone runs in the same cluster and cloud project as production, so it can reuse production's names and VMs ([details](internals.md#why-a-clone-without-its---aec1-token-is-blocked)) |
-| **Rename of a live environment** | a change of `customerName` or `suffix` of a live private-cloud env, also by a move or through its cohort `config.yaml`, or a move to another cloud, tier or spoke | ArgoCD creates a new namespace and leaves the old one running on the same GCP objects; a planned rename needs a pause on `main` and a `Confirm-Rename:` commit ([details](internals.md#why-renaming-a-live-environment-is-blocked)) |
-| **Removed cohort `config.yaml`** | a PR that deletes or moves a private-cloud `config.yaml` while live environments below it stay | the ApplicationSet makes no apps for those environments, so ArgoCD deletes their apps without pruning and the namespaces keep running unmanaged; keep the file, or move or tear down the environments in the same PR ([details](internals.md#why-removing-a-cohort-configyaml-is-blocked)) |
-| **No chart version** | a PR after which a live environment has no `appspace.version` in the files the ApplicationSet reads (also `version: ""`, a bare `version:`, or `appspace` that is not a map) | ArgoCD sets `targetRevision: watch-only`: the apps go Sync Unknown and stop syncing, while the diff looks normal ([details](internals.md#why-an-environment-without-a-chart-version-is-blocked)) |
+| Guard | What it catches | Why it is dangerous | Override |
+|---|---|---|---|
+| Structural new-env failure | a new environment missing a required value (e.g. `appspace.version`) | the environment cannot render at all on merge | none |
+| **Empty `microservices.definitions`** | a value file (typically `cicd-versions.yaml`) with `appspace.microservices.definitions` present but **null/empty** | silently deletes every microservice on merge ([details](internals.md#why-an-empty-microservicesdefinitions-is-blocked)) | none |
+| **Clone without its tier token** | an AEC or sandbox value file whose folder or names (`customerName`, `instanceName`, the mongo/rabbit VM names, ...) miss `--aec1` / `--sbx1` | the clone runs in the same cluster and cloud project as production, so it can reuse production's names and VMs ([details](internals.md#why-a-clone-without-its---aec1-token-is-blocked)) | none |
+| **Rename of a live environment** | a change of `customerName` or `suffix` of a live private-cloud env, also by a move or through its cohort `config.yaml`, or a move to another cloud, tier or spoke | ArgoCD creates a new namespace and leaves the old one running on the same GCP objects; a planned rename needs a pause on `main` and a confirmation commit ([details](internals.md#why-renaming-a-live-environment-is-blocked)) | `Confirm-Rename: <old namespace> -> <new namespace>`, after a pause on `main` |
+| **Removed cohort `config.yaml`** | a PR that deletes or moves a private-cloud `config.yaml` while live environments below it stay | the ApplicationSet makes no apps for those environments, so ArgoCD deletes their apps without pruning and the namespaces keep running unmanaged; keep the file, or move or tear down the environments in the same PR ([details](internals.md#why-removing-a-cohort-configyaml-is-blocked)) | none |
+| **No chart version** | a PR after which a live environment has no `appspace.version` in the files the ApplicationSet reads (also `version: ""`, a bare `version:`, or `appspace` that is not a map) | ArgoCD sets `targetRevision: watch-only`: the apps go Sync Unknown and stop syncing, while the diff looks normal ([details](internals.md#why-an-environment-without-a-chart-version-is-blocked)) | none |
+| **Unsafe teardown** | a private-cloud folder removal with no cascade armed on `main`, any public-cloud (`cl-*`) folder or block removal, or a purge that deletes the user content of a surviving environment | the workloads keep running with nobody to manage them (public cloud has no cascade at all), or a live environment loses its bucket and DNS record ([details](internals.md#why-a-teardown-is-blocked)) | `Confirm-Teardown: <env>`, the constellation for `cl-*` |
+| **Teardown hold** | a folder removal with the cascade armed, when `zeroPods` or `decommission` has been true on `main` for less than 7 days, or when that cannot be confirmed (a git mirror that cannot answer yet is `[transient]` and checked again) | nobody has seen the environment stopped before it is destroyed: acme-config-prod #4298 removed a folder 37 minutes after the PR that armed it | `Confirm-Decommission: <env>` |
+| **Cascade not live** | the cascade is armed in config, but ArgoCD has not applied `resources-finalizer.argocd.argoproj.io` to the Applications | the removal orphans everything, as with no cascade | none: red with `[transient]`, it clears itself after ArgoCD syncs |
+| **Cascade armed while paused** | the cascade is armed while `appspace.autosync: false` on `main` | a paused environment never syncs, so the finalizer never arrives | none: resume auto-sync on `main`, let it sync, then remove the folder |
+| **Released static IP or DNS record** | a `ComputeAddress` or `DNSRecordSet` that leaves the render of a live environment without `deletion-policy: abandon`; a new name is never a rename for these two kinds | GCP releases the address. An external IP cannot be got back, and whatever points at it breaks | `Confirm-IP-Release: <env>` |
+| **Disk shrink** | a disk size that goes down, in the values, in the render, or across the Terraform to KCC move | GCP cannot shrink a disk in place: it means recreation and data loss | none |
+| **Rename or move of a live `cl-*` environment** | a live `cl-*/config.yaml` that is renamed or moved | every Application of the constellation gets a new name | `Confirm-Rename: <old dir> -> <new dir>`, with the full folder paths |
 
 **The red status names the failure, not its category** (COPS-2709). Bitbucket
 shows the description and nothing else, so it is the whole message for anyone
@@ -324,6 +350,18 @@ the author to fix and push would send them to change a version that is
 probably correct. Apps failing the same way are grouped, so a fleet PR reads
 as one problem with an environment count rather than fifty lines.
 
+An open merge gate (COPS-2766) names the gate, the environment and the line
+that lifts it, or the fix when no line can, so a reviewer who reads only the
+checks list can act. A gate that is checked again by itself starts with
+`Waiting`. The comment's Status line ends with the same text, so a status
+rebuilt from the comment says the same:
+
+```
+Blocked - Teardown with no cascade, the workloads keep running in pv-uwm-a. To merge anyway, add 'Confirm-Teardown: pv-uwm-a' to a commit message (see PR comment)
+Blocked - Disk shrink in pv-uwm-a. GCP cannot shrink a disk in place, so keep the old size or grow it (see PR comment)
+Waiting - The cascade finalizer is not live in ArgoCD yet in pv-uwm-a. Re-checked automatically after ArgoCD syncs (see PR comment)
+```
+
 **The green status leads with the top finding** (COPS-2766). The Builds
 panel on the PR page shows the status description, and a green one used to
 say only `N resource(s) will change - review comment` (acme-config-prod #4684
@@ -335,12 +373,14 @@ finding as plain text, then ` | ` and the text it had before:
 
 ```
 ⚠️ 1 resource(s) deleted in 1 environment(s) (1 Secret): pv-uwm-a | 3 resource(s) will change - review comment
-🚨 VM infrastructure change flagged dangerous — see the VM section | 6 resource(s) will change - review comment
+⚠️ VM infrastructure change flagged dangerous — see the VM section | 6 resource(s) will change - review comment
 ```
 
-🚨 means the comment verdict is ⛔, and ⚠️ means review. A routine PR keeps
-the old text, and so does a PR whose only finding is the higher-layer note:
-keys that change no manifest are no reason for a warning sign. The status
+The mark is always ⚠️: the build is green, and the icons follow the build
+colour. A status rebuilt from a comment of 2.121.0 or older, with a ⛔
+verdict, also gets ⚠️. A routine PR keeps the old text, and so does a PR
+whose only finding is the higher-layer note: keys that change no manifest
+are no reason for a warning sign. The status
 never says DO NOT MERGE, because the build is green. The whole description
 fits in 255 UTF-8 bytes, so it fits whatever unit Bitbucket counts. Only the
 finding is cut (it ends in `...`), never the old text. The finding is read

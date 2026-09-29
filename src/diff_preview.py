@@ -163,8 +163,13 @@ from comment_render import (  # comment rendering (same-dir module, stdlib only)
     _VERDICTS,
     _fmt_env_list,
     _build_merge_summary,
+    build_marks,
     status_lead,
     join_status_lead,
+    gate_trailer,
+    gate_token,
+    gate_status_description,
+    gate_footer,
     _DECOM_ORPHAN_HDR,
     _DECOM_PURGE_HDR,
     _DECOM_SHARED_UC_HDR,
@@ -178,6 +183,8 @@ from comment_render import (  # comment rendering (same-dir module, stdlib only)
     _AUTOSYNC_RESUMED_HDR,
     _DECOM_VM_STRIP_HDR,
     _DECOM_FLAG_TYPO_HDR,
+    _DECOM_CASCADE_NOT_LIVE_HDR,
+    _DECOM_PAUSED_HDR,
     _SHUTDOWN_MIN_WORKLOADS,
     _is_env_shutdown,
 )
@@ -239,9 +246,11 @@ from vm_analysis import (  # VM/KCC infrastructure analysis (same-dir module)
     _VM_DISK_TYPE_RE,
     _vm_unquote,
     _detect_vm_changes,
+    _released_addresses,
     _vm_deletion_armed_flat,
     _vm_config_stripped,
     _VM_DISK_SIZE_KEYS,
+    _VM_SHRINK_REASON,
     _VM_ROLE_NAMES,
     _LEGACY_PREFIX,
     _KCC_PREFIX,
@@ -314,6 +323,7 @@ from identity import (  # environment identity and rename detection
     _appset_identity,
     _appset_param,
     _go_str,
+    _confirmations,
     _confirmed_renames,
     _is_rename_of,
     _split_renames_from_deletions,
@@ -2786,9 +2796,12 @@ DiffResult = namedtuple("DiffResult",
                          "version_change", "deleted_resources", "replicas_zeroed",
                          "fingerprint", "renamed_resources", "vm_changes",
                          "version_fold", "shutdown_stats",
-                         "template_artifacts", "pingscaler_created"],
+                         "template_artifacts", "pingscaler_created", "ip_released"],
                         defaults=[None, None, None, None, None, None, None,
-                                  None, None, None])
+                                  None, None, None, None])
+# ip_released (COPS-2766): the deleted ComputeAddress and DNSRecordSet headers
+# GCP releases (no explicit abandon), from the full pre-cap list. The `ip`
+# merge gate reads it. Only OUT_DIFF sets it, so a teardown never has it.
 # pingscaler_created (COPS-2714): True when this app's diff CREATES the
 # acme-ping-scaler Deployment. The chart skips all HPA rendering while a
 # ping-scaler is on, so the HPAs it displaces -- deleted in the SIBLING
@@ -4817,7 +4830,7 @@ def _identity_block_reason(hit, confirmed):
     """Why a live-env rename stays blocked, or None when it may merge."""
     if hit["decommission"]:
         return "decommission"  # no override: remove it first
-    if (hit["old_id"], hit["new_id"]) not in confirmed:
+    if (hit["old_id"].lower(), hit["new_id"].lower()) not in confirmed:
         return "unconfirmed"
     if not hit["paused_base"]:
         return "pause_first"
@@ -6641,20 +6654,24 @@ def _cascade_mismatch_note(env_name, apps, cascade: bool) -> list:
     """Markdown for the one state the panel could previously not describe:
     the config claims the cascade and the cluster does not have it.
 
-    Empty for every other state. Not-armed is the documented default and
-    the panel already warns about it in detail; adding a second voice there
-    would just make the loud one easier to skip.
+    Empty when the cascade is live or not armed. Not-armed is the documented
+    default and the panel already warns about it in detail; adding a second
+    voice there would just make the loud one easier to skip.
     """
     if not cascade:
         return []
     live = _cascade_finalizer_live(apps)
-    if live is not False:
-        # True: the promise is real. None: unknown, and a scary block on a
-        # failed lookup would train reviewers to ignore this panel.
+    if live:
         return []
+    if live is None:
+        # COPS-2766: unknown. A scary block on a failed lookup would train
+        # reviewers to ignore this panel, but they must know nobody checked.
+        app = (apps or [env_name])[0].split("/")[-1]
+        return [f"\u26a0\ufe0f Could not verify the cascade finalizer on `{env_name}` "
+                f"(ArgoCD lookup failed). Check that `argocd app get {app}` lists "
+                f"`{_ARGOCD_CASCADE_FINALIZER}` before merging.", ""]
     return [
-        "🚨 **The cascade is armed in config but NOT live in the "
-        "cluster.** `appspace.decommission: true` is set for "
+        "🚨 " + _DECOM_CASCADE_NOT_LIVE_HDR + " `appspace.decommission: true` is set for "
         f"`{env_name}`, so the phase table above reads as though deleting "
         "this folder will clean everything up. ArgoCD has not applied the "
         f"`{_ARGOCD_CASCADE_FINALIZER}` finalizer to its Application(s) "
@@ -6720,6 +6737,49 @@ def _paused_apps_for(apps, path_map, sha, repo=None) -> set:
         if _autosync_paused(flat or {}):
             paused.update(members)
     return paused
+
+
+DECOM_HOLD_DAYS = 7
+# COPS-2766: the gate for each answer of _teardown_hold_met but True.
+_HOLD_GATES = {False: "hold", None: "hold_retry", "unreadable": "hold_unread"}
+
+
+def _teardown_hold_met(identity_file, main_sha, now=None):
+    """COPS-2766: has zeroPods or decommission been true on main for
+    DECOM_HOLD_DAYS? True or False. None when the mirror cannot say now (not
+    ready, a git error), so a retry can. "unreadable" when no retry can: the
+    mirror is off by config, or an old version of the file does not parse.
+
+    First-parent history of the file, newest first, so a commit's time is
+    when it landed on main. A commit with both flags off ends the walk, and
+    so does the first commit older than the hold. A history that runs out
+    first is False: the env had the flag for less than the hold.
+    """
+    if not GIT_MIRROR_ENABLED:
+        return "unreadable"
+    repo = _repo_for_sha(main_sha)
+    if _mirror_disabled or not repo or not main_sha or not _mirror_has_sha(repo, main_sha):
+        return None
+    clean = posixpath.normpath(str(identity_file).replace("$config/", "").lstrip("/"))
+    r = _git_run(["--git-dir", _mirror_path(repo), "log", "--first-parent",
+                  "--format=%H %ct", main_sha, "--", clean], timeout=30)
+    if r is None or r.returncode != 0:
+        return None
+    cutoff = (now or time.time()) - DECOM_HOLD_DAYS * 86400
+    for sha, ct in (line.split() for line in r.stdout.splitlines()):
+        got = _git_read_file(repo, sha, clean)
+        if got is None:
+            return None
+        try:
+            flat = _flatten_yaml(_yaml_safe_load(got[0] or "") or {})
+        except yaml.YAMLError:
+            return "unreadable"
+        if not (_decommission_armed_flat(flat)
+                or str(flat.get("appspace.zeroPods", "")).lower() == "true"):
+            return False
+        if int(ct) <= cutoff:
+            return True
+    return False
 
 
 def _decommission_cascades(identity_file: str, main_sha: str) -> bool:
@@ -7172,7 +7232,18 @@ def _evaluate_env_decommissions(candidates: list, pr_sha: str, main_sha: str,
             # everything below this point is a promise that will not be kept,
             # so the correction goes immediately after the table and before the
             # inventory it would otherwise appear to describe.
-            lines += _cascade_mismatch_note(c["env_name"], c["apps"], cascade)
+            _note = _cascade_mismatch_note(c["env_name"], c["apps"], cascade)
+            lines += _note
+            # COPS-2766: the table says Phase 2 is done from the flag alone. A
+            # paused env never syncs, so the panel says so next to the table.
+            paused = cascade and _autosync_paused(
+                _flat_yaml_cached(c["identity_file"], main_sha))
+            if paused:
+                lines += [f"\U0001f6a8 **{_DECOM_PAUSED_HDR}.** `appspace.autosync: false` "
+                          f"is set for `{c['env_name']}` on `main`. A paused environment "
+                          "never syncs, so the cascade finalizer never arrives. Resume "
+                          "auto-sync in a separate PR, let it sync, then remove the "
+                          "folder.", ""]
             # COPS-2707: the table above just reported Phase 2 as pending on
             # an environment whose file looks armed to a reader. Saying only
             # "not armed" is what left acme-config-prod #4377 arguing with
@@ -7212,8 +7283,26 @@ def _evaluate_env_decommissions(candidates: list, pr_sha: str, main_sha: str,
         # report, because the data destroyed belongs to an environment that is
         # NOT being torn down. Repo defaults to None like the sibling
         # _decommission_* calls on this same context.
-        lines += _shared_user_content_lines(
+        _uc_lines = _shared_user_content_lines(
             c["identity_file"], main_sha, purges_data)
+        lines += _uc_lines
+        # COPS-2766: merge gates, lifted by `Confirm-Teardown: <env>`. The env
+        # is the constellation on cl-*, so one line covers all of its blocks.
+        c["gates"] = ([{"kind": "public", "env": c["env_name"]}] if public_cloud
+                      else [] if cascade else [{"kind": "orphan", "env": c["env_name"]}])
+        if _DECOM_SHARED_UC_HDR in "\n".join(_uc_lines):
+            c["gates"].append({"kind": "shared_uc", "env": c["env_name"]})
+        if cascade:
+            # COPS-2766: Phase 3 checks. The cascade is private cloud only, so
+            # _note is set. The finalizer not live yet clears itself on a retry.
+            if _DECOM_CASCADE_NOT_LIVE_HDR in "\n".join(_note):
+                c["gates"].append({"kind": "not_live", "env": c["env_name"]})
+            if paused:
+                c["gates"].append({"kind": "paused", "env": c["env_name"]})
+            # A mirror blip is a retry, never a reason to override the hold.
+            hold = _teardown_hold_met(c["identity_file"], main_sha)
+            if hold is not True:
+                c["gates"].append({"kind": _HOLD_GATES[hold], "env": c["env_name"]})
         if public_cloud:
             lines += [
                 "\u26a0\ufe0f " + _DECOM_PUBLIC_CLOUD_HDR,
@@ -7390,6 +7479,50 @@ def _evaluate_env_decommissions(candidates: list, pr_sha: str, main_sha: str,
     if not with_full_output:
         return lines, envs_reported
     return lines, envs_reported, full_lines
+
+
+def _merge_gates(decommission_candidates, renames=None, path_map=None,
+                 vm_change_lines=None, app_results=None) -> list:
+    """COPS-2766: the merge gates of this PR, one per kind and env, none lifted.
+
+    From the teardowns _evaluate_env_decommissions confirmed. Arming the flag
+    on cl-* deletes nothing, so that panel stays a warning; its folder
+    removal is the `public` gate. A live cl-*/config.yaml renamed or moved
+    renames every Application of the constellation: `cl_rename`, lifted by
+    `Confirm-Rename: <old dir> -> <new dir>`. A disk shrink in the VM panel
+    is `shrink`, one per env (the first name in backticks of its line), and
+    nothing lifts it. An app that releases a static IP or a DNS record is
+    `ip`, lifted by `Confirm-IP-Release: <env>`.
+    """
+    found = [g for c in decommission_candidates or () for g in c.get("gates", ())]
+    found += [{"kind": "cl_rename", "env": _CL_ENV_RE.match(old)[1],
+               "arg": f"{posixpath.dirname(old)} -> {posixpath.dirname(new)}"}
+              for old, new in (renames or {}).items()
+              if _CL_ENV_RE.match(old) and (path_map or {}).get(old)]
+    found += [{"kind": "shrink", "env": (re.findall(r"`([^`]+)`", line) or [""])[0]}
+              for line in vm_change_lines or () if _VM_SHRINK_REASON in line]
+    found += [{"kind": "ip", "env": _envs_from_apps([app])[0]}
+              for app, r in (app_results or {}).items() if getattr(r, "ip_released", None)]
+    gates = {}
+    for g in found:
+        gates.setdefault((g["kind"], g["env"]), {"arg": g["env"], **g, "lifted": False})
+    return list(gates.values())
+
+
+def _rebuild_hint_lines(candidates) -> list:
+    """COPS-2766: a live env removed while the PR adds another one looks like a
+    rebuild, or a rename done with no git mv. Its orphan or public gate blocks
+    the build already; this line says the ways out, one per env. The flag arms
+    nothing on cl-*, so there it only points at git mv."""
+    kinds = {}
+    for c in candidates:
+        for g in c.get("gates", ()):
+            if g["kind"] in ("orphan", "public"):
+                kinds.setdefault(c["env_name"], g["kind"])
+    return [line for env, kind in kinds.items() for line in (
+        f"\U0001f4a1 Looks like a rebuild or rename of `{env}`: "
+        + ("arm decommission on the old env, or " if kind == "orphan" else "")
+        + "use `git mv` with `Confirm-Rename`.", "")]
 
 
 def _apps_to_skip_for_decommission(candidates: list, confirmed_envs: list) -> set:
@@ -7980,11 +8113,12 @@ def argocd_diff(app, pr_sha, main_sha, chart_revision=None, changed_paths=None, 
         # full pre-cap list.
         pingscaler_res = _detect_pingscaler_created(
             _detect_created_resources(filtered_sections))
+        ip_released = _released_addresses(filtered_sections, deleted_res)
         return DiffResult(clean_diff, capped_sections,
                           n_res, True, None, OUT_DIFF, "changes", version_change,
                           deleted_res, zeroed_res, fingerprint, renamed_res,
                           vm_changes_res, version_fold, shutdown_stats,
-                          artifacts, pingscaler_res)
+                          artifacts, pingscaler_res, ip_released)
     # Exhausted retries
     return _indeterminate(last_reason, last_detail or "unknown error")
 
@@ -8370,6 +8504,12 @@ def upsert_comment(pr_id, body, existing_id=None, repo=None, artifact_url=""):
             return _write_failed(e2)
     return "ok"
 
+
+# COPS-2766: the FAILED status a merge gate wrote in the Status line
+# (comment_render.gate_footer), with the line to add or the fix.
+_GATE_FOOTER_RE = re.compile(r"\| \S+ ((?:Blocked|Waiting) - [^\n]*\(see PR comment\))")
+
+
 def fix_stuck_inprogress(pr_sha, pr_id, comment_raw, repo=None):
     """If build status is stuck INPROGRESS but comment is current, fix the status.
 
@@ -8396,6 +8536,7 @@ def fix_stuck_inprogress(pr_sha, pr_id, comment_raw, repo=None):
         # fixed for real in this version - see _extract_status_token), then
         # fall back to parsing the human-readable comment text.
         _token = _extract_status_token(comment_raw)
+        _gate_desc = (_GATE_FOOTER_RE.findall(comment_raw) or [""])[-1]
         if _token == "permanent":
             state, desc = "FAILED", "Diff failed - check PR comment"
         elif _token == "blocked":
@@ -8407,7 +8548,9 @@ def fix_stuck_inprogress(pr_sha, pr_id, comment_raw, repo=None):
             # comment and the status left a green gate under a blocking
             # comment. Recovering a status must never be the step that
             # unblocks a merge.
-            state, desc = "FAILED", "Blocked - merging would break the environment (see comment)"
+            # COPS-2766: a merge gate names its own way out.
+            state, desc = "FAILED", (_gate_desc or "Blocked - merging would break "
+                                     "the environment (see comment)")
         elif _token == "clean":
             if "resource(s) will change" in comment_raw:
                 m = re.search(r"(\d+) resource\(s\) will change", comment_raw)
@@ -8427,7 +8570,8 @@ def fix_stuck_inprogress(pr_sha, pr_id, comment_raw, repo=None):
             # from a killed pod. The retry itself is unaffected: this only
             # fixes the color of a stuck-INPROGRESS status being resolved,
             # it does not change whether the PR gets re-diffed next iteration.
-            state, desc = "FAILED", "Diff unavailable - review comment (will retry automatically if transient)"
+            state, desc = "FAILED", (_gate_desc or "Diff unavailable - review comment "
+                                     "(will retry automatically if transient)")
         elif "\u26d4" in comment_raw:
             # COPS-2668: legacy fallback for a blocked comment posted before
             # the [blocked] token was readable. The stop sign is only ever
@@ -9200,15 +9344,18 @@ def _clean_status_description(has_redundancy: bool,
     return values_redundancy.noop_status_hint(has_redundancy, has_input_changes)
 
 
-def _flag_typo_status_description(appspace_state_lines) -> str:
+def _flag_typo_status_description(lines, removal=False) -> str:
     """The Bitbucket build-status line for a misspelled teardown flag.
 
     Names the key and the rename, because the checks list is where a
     reviewer who never opens the comment makes their decision. Falls back to
     the generic sentence if the pairing cannot be read back, so a parse miss
     degrades to a vaguer FAILED rather than to no failure at all.
+
+    removal (COPS-2766): the typo is in a file this PR deletes, read from
+    main, so no push to this PR fixes it. The fix goes to main first.
     """
-    pairs = _teardown_flag_typo_pairs(appspace_state_lines)
+    pairs = _teardown_flag_typo_pairs(lines)
     if not pairs:
         return ("Teardown flag misspelled or misplaced - a decommission/"
                 "allowDeletion/confirmProdDeletion key in this PR is not "
@@ -9216,6 +9363,10 @@ def _flag_typo_status_description(appspace_state_lines) -> str:
                 "(see PR comment)")
     wrong, right = pairs[0]
     extra = f" (+{len(pairs) - 1} more)" if len(pairs) > 1 else ""
+    if removal:
+        return (f"Teardown flag misspelled on main: {wrong} arms nothing{extra} - "
+                f"fix it to {right} on main in a separate PR, let it sync, then "
+                f"rebase this removal")
     return (f"Teardown flag misspelled: {wrong} arms nothing{extra} - "
             f"rename it to {right} and push")
 
@@ -9979,8 +10130,7 @@ def _summarize_vm_changes(changed_files, pr_sha, base_sha, path_map,
                 try:
                     if float(new_s) < float(old_s):
                         danger = True
-                        reason = ("disk size DECREASES \u2014 GCP cannot "
-                                  "shrink a disk in place")
+                        reason = f"disk size DECREASES \u2014 {_VM_SHRINK_REASON}"
                 except (TypeError, ValueError):
                     # Sizes that are not plainly numeric (templated values,
                     # or values carrying a unit suffix) cannot be compared,
@@ -10363,13 +10513,52 @@ def _app_sort_key(app: str, r) -> tuple:
     return (0 if r.outcome != OUT_NO_DIFF else 1, app)
 
 
+def _comment_status_token(results, new_env_structural, skipped_apps,
+                          arming_broken, flag_typo, kcc_nil, gates) -> str:
+    """Machine-readable token embedded in the footer. Used by process_pr to
+    decide whether to re-run without parsing the human-readable status string.
+
+    - clean     : all apps diffed successfully (no retry, mark seen)
+    - permanent : unresolvable hard error (no retry, mark seen).
+      COPS-2696: oci_not_found is NOT here any more — it emits transient.
+      Apps over the cap are here too: the cut is the same on every retry.
+    - blocked   : COPS-2766, an open merge gate (no retry, mark seen)
+    - transient : diff unavailable on transient blip (retry next loop)
+    """
+    outcomes = {r.outcome for r in results.values()}
+    if (OUT_ERROR in outcomes or new_env_structural or arming_broken
+            or flag_typo or kcc_nil):
+        return "permanent"
+    if gate_token(gates) == "blocked":
+        return "blocked"
+    if OUT_INDETERMINATE in outcomes:
+        # Permanent if ANY app has a permanent reason that cannot resolve by
+        # itself (e.g. invalid_version mixed with transient ones). A mixed PR
+        # is still "permanent" for dedup purposes because the FAILED build
+        # status requires human action regardless.
+        # COPS-2696: oci_not_found alone is the exception — the status is
+        # FAILED either way, but the version may simply not have propagated
+        # to the registry yet, so the token stays "transient" and the poll
+        # loop keeps retrying under the COPS-2546 backoff instead of marking
+        # the head seen and forcing an empty commit to recover.
+        perm = {r.reason for r in results.values()
+                if r.outcome == OUT_INDETERMINATE} & PERMANENT_REASONS
+        return "permanent" if perm - SELF_RESOLVING_REASONS else "transient"
+    if gate_token(gates) == "transient":
+        return "transient"
+    # COPS-2766: apps over the cap make the build FAILED. With [clean]
+    # the status recovery (fix_stuck_inprogress) turned it green.
+    return "permanent" if skipped_apps else "clean"
+
+
 def format_comment(pr_sha, app_results, skipped_apps=None, base_sha="",
                     new_env_lines=None, new_env_structural=False, new_env_desc="",
                     decommission_lines=None, leftover_lines=None,
                     input_change_lines=None,
                     appspace_state_lines=None, appendix_lines=None,
                     vm_change_lines=None, artifact_url="",
-                    readable_budget=None, profile=None, paused_apps=None):
+                    readable_budget=None, profile=None, paused_apps=None,
+                    gates=None):
     """Format the full PR comment. Never uses <details>/<summary> — Bitbucket
     does not render them. Large changesets get a compact summary table at the
     top (all apps, one row each) and, for the diff sections below, apps
@@ -10669,13 +10858,51 @@ def format_comment(pr_sha, app_results, skipped_apps=None, base_sha="",
         ]
         return "\n".join(lines)
 
+    # COPS-2660 follow-up: the broken-arming shape diffs "successfully" (the
+    # VM CRs simply disappear), so every status branch below says clean or
+    # "N resource(s) will change". Live proof on acme-config-dev PR #7113:
+    # footer [clean], build SUCCESSFUL, one rubber-stamp approval away from
+    # orphaning the VM. Whatever else the status line says, it must carry
+    # the blocker, and the token must be permanent -- deterministic until a
+    # new commit, like every other permanent reason.
+    _arming_broken = bool(appspace_state_lines) and \
+        _DECOM_VM_STRIP_HDR in appspace_state_lines
+    # COPS-2707 follow-up: same reasoning, one step earlier in the sequence.
+    # A misspelled teardown flag renders nothing, so the diff is clean and
+    # every status branch below posts SUCCESSFUL — which is exactly how
+    # acme-config-prod #4376 merged. The comment blocking while the build
+    # passes is the shape COPS-2660 already fixed once for the VM strip; a
+    # green tick outranks a red paragraph for anyone skimming.
+    # Substring over the joined panel, not list membership: this header is
+    # emitted with an emoji prefix on its line (the VM-strip one is not), so
+    # the `in list` form the sibling check uses would silently never match.
+    # COPS-2766: and the folder-removal panel, which explains the same typo.
+    _flag_typo_block = _DECOM_FLAG_TYPO_HDR in "\n".join(
+        (appspace_state_lines or []) + (decommission_lines or []))
+    # COPS-2677: KCC Compute* nil artifacts must not merge green. zeroPods+HPA
+    # is REVIEW-only (see comment_render) — do not stamp permanent/FAILED.
+    _kcc_nil_block = False
+    for _v in app_results.values():
+        _rr = _result(_v)
+        _arts = getattr(_rr, "template_artifacts", None) or []
+        if any(_is_kcc_blocking_artifact(h) for h in _arts):
+            _kcc_nil_block = True
+            break
+    _status_token = _comment_status_token(
+        results, new_env_structural, skipped_apps, _arming_broken,
+        _flag_typo_block, _kcc_nil_block, gates)
+    # COPS-2766: the icons follow the build colour. The panels are built
+    # and read raw, only what this comment shows changes.
+    _green = _status_token == "clean"
+
     # ── Merge summary ────────────────────────────────────────────────
     # The verdict, before any detail: an operator decides here whether
     # this PR is safe to merge, and only then reads down for the why.
     lines += _build_merge_summary(
         results, rollup_by_sig, vm_change_lines, decommission_lines,
         appspace_state_lines, new_env_lines, new_env_structural,
-        _paused_changing, _paused_envs, block_headline=block_headline or None)
+        _paused_changing, _paused_envs, block_headline=block_headline or None,
+        gates=gates, green=_green)
     lines += ["---", ""]
 
     # COPS-2676: permanent render failures go FIRST after the verdict on the
@@ -10693,7 +10920,7 @@ def format_comment(pr_sha, app_results, skipped_apps=None, base_sha="",
     # for the whole environment while nothing else in the comment would
     # otherwise say so.
     if appspace_state_lines:
-        lines += appspace_state_lines
+        lines += build_marks(appspace_state_lines, _green)
 
     # ── Input root-cause panel (v2.6.2) ──────────────────────────────
     # WHAT the PR edits at the values level, before any symptom below —
@@ -10708,7 +10935,7 @@ def format_comment(pr_sha, app_results, skipped_apps=None, base_sha="",
     # Most critical/destructive possible finding — shown before even the
     # downgrade warning.
     if decommission_lines:
-        lines += decommission_lines
+        lines += build_marks(decommission_lines, _green)
 
     # COPR-32434: leftover Argo apps from a PRIOR decommission. Informational
     # (does not blame this PR), but visible so someone finishes the prune.
@@ -10722,7 +10949,7 @@ def format_comment(pr_sha, app_results, skipped_apps=None, base_sha="",
     # the reviewers reading these comments daily asked for it to be
     # impossible to miss.
     if vm_change_lines:
-        lines += vm_change_lines
+        lines += build_marks(vm_change_lines, _green)
 
     # ── Chart downgrade warning (v2.5.8) ─────────────────────────────
     # A chart version going DOWN is legal but dangerous (schema regressions,
@@ -11445,35 +11672,6 @@ def format_comment(pr_sha, app_results, skipped_apps=None, base_sha="",
     if downgrades:
         status += " | \U0001f53b CHART DOWNGRADE \u2014 verify intentional"
 
-    # COPS-2660 follow-up: the broken-arming shape diffs "successfully" (the
-    # VM CRs simply disappear), so every branch above happily says clean or
-    # "N resource(s) will change". Live proof on acme-config-dev PR #7113:
-    # footer [clean], build SUCCESSFUL, one rubber-stamp approval away from
-    # orphaning the VM. Whatever else the status line says, it must carry
-    # the blocker, and the token must be permanent -- deterministic until a
-    # new commit, like every other permanent reason.
-    _arming_broken = bool(appspace_state_lines) and \
-        _DECOM_VM_STRIP_HDR in appspace_state_lines
-    # COPS-2707 follow-up: same reasoning, one step earlier in the sequence.
-    # A misspelled teardown flag renders nothing, so the diff is clean and
-    # every branch above posts SUCCESSFUL — which is exactly how
-    # acme-config-prod #4376 merged. The comment blocking while the build
-    # passes is the shape COPS-2660 already fixed once for the VM strip; a
-    # green tick outranks a red paragraph for anyone skimming.
-    # Substring over the joined panel, not list membership: this header is
-    # emitted with an emoji prefix on its line (the VM-strip one is not), so
-    # the `in list` form the sibling check uses would silently never match.
-    _flag_typo_block = _DECOM_FLAG_TYPO_HDR in "\n".join(
-        appspace_state_lines or [])
-    # COPS-2677: KCC Compute* nil artifacts must not merge green. zeroPods+HPA
-    # is REVIEW-only (see comment_render) — do not stamp permanent/FAILED.
-    _kcc_nil_block = False
-    for _v in app_results.values():
-        _rr = _result(_v)
-        _arts = getattr(_rr, "template_artifacts", None) or []
-        if any(_is_kcc_blocking_artifact(h) for h in _arts):
-            _kcc_nil_block = True
-            break
     if _arming_broken:
         status += (" | \u26d4 DECOMMISSION ARMING BROKEN \u2014 the VM would "
                    "be orphaned, see comment")
@@ -11483,38 +11681,7 @@ def format_comment(pr_sha, app_results, skipped_apps=None, base_sha="",
     if _kcc_nil_block:
         status += (" | \u26d4 UNRESOLVED KCC VALUE \u2014 "
                    "`%!s(<nil>)` on Compute* resources, see comment")
-
-    # Machine-readable token embedded in the footer. Used by process_pr to decide
-    # whether to re-run without parsing the human-readable status string.
-    # Tokens: clean | permanent | transient
-    # - clean     : all apps diffed successfully (no retry, mark seen)
-    # - permanent : unresolvable hard error (no retry, mark seen).
-    #   COPS-2696: oci_not_found is NOT here any more — it emits transient.
-    #   Apps over the cap are here too: the cut is the same on every retry.
-    # - transient : diff unavailable on transient blip (retry next loop)
-    if (any_error or new_env_structural or _arming_broken
-            or _flag_typo_block or _kcc_nil_block):
-        _status_token = "permanent"
-    elif any_unknown:
-        # Distinguish permanent reasons from soft indeterminate (transient).
-        resolved = [_result(v) for v in app_results.values()]
-        indet    = [r for r in resolved if r.outcome == OUT_INDETERMINATE]
-        # Permanent if ANY app has a permanent reason that cannot resolve by
-        # itself (e.g. invalid_version mixed with transient ones). A mixed PR
-        # is still "permanent" for dedup purposes because the FAILED build
-        # status requires human action regardless.
-        # COPS-2696: oci_not_found alone is the exception — the status is
-        # FAILED either way, but the version may simply not have propagated
-        # to the registry yet, so the token stays "transient" and the poll
-        # loop keeps retrying under the COPS-2546 backoff instead of marking
-        # the head seen and forcing an empty commit to recover.
-        perm = {r.reason for r in indet} & PERMANENT_REASONS
-        _status_token = ("permanent" if perm - SELF_RESOLVING_REASONS
-                         else "transient")
-    else:
-        # COPS-2766: apps over the cap make the build FAILED. With [clean]
-        # the status recovery (fix_stuck_inprogress) turned it green.
-        _status_token = "permanent" if skipped_apps else "clean"
+    status += gate_footer(gates)
 
     lines += ([
         # Above the separator, never between it and the Status line:
@@ -11904,6 +12071,9 @@ def process_pr(pr, path_map, base_sha="", repo=None):
                 cm = upsert_comment(pr_id, body, existing_id, repo=repo)
                 _seen_after_writes(sk, pr_sha, base_sha, st, cm)
                 return
+        # COPS-2766: the Planned rename notice covers the old namespace of a
+        # confirmed rename, so removing its old path is no orphan teardown.
+        renamed_ok = {h["moved_from"] for h in identity_hits if not h["reason"]}
         # No chart version for a live env: ArgoCD sets watch-only and the apps freeze.
         frozen_hits = _detect_frozen_versions(changed, renames, path_map, render_sha, repo=repo)
         if frozen_hits:
@@ -11932,9 +12102,14 @@ def process_pr(pr, path_map, base_sha="", repo=None):
             decommission_lines, decommissioned_envs, decom_full_lines = \
                 _evaluate_env_decommissions(decommission_candidates, render_sha,
                                             base_sha, with_full_output=True)
+            for c in decommission_candidates:
+                if c["identity_file"] in renamed_ok:
+                    c["gates"] = [g for g in c.get("gates", ()) if g["kind"] != "orphan"]
             if decommissioned_envs:
                 logsink.log(f"PR #{pr_id}: environment decommission detected: "
                             f"{decommissioned_envs}", "WARNING", pr=pr_id)
+            if new_env_candidates:
+                decommission_lines += _rebuild_hint_lines(decommission_candidates)
 
         if not affected:
             # No existing ArgoCD app matched the changed files.
@@ -12445,6 +12620,15 @@ def process_pr(pr, path_map, base_sha="", repo=None):
                 raise  # COPS-2766: but a failed read retries the PR
             logsink.log(f"    [comment] vm-changes panel failed: {e}", "WARNING")
             vm_change_lines = []
+        # COPS-2766: merge gates. The commits are read only when a gate can be
+        # lifted, so a PR with none never pays for it. PrCommitsUnreadable goes
+        # to the catch-all below: a retry, never a lift.
+        gates = _merge_gates(decommission_candidates, renames, path_map,
+                             vm_change_lines, app_results)
+        if any(gate_trailer(g) for g in gates):
+            confirmed = _confirmations(_pr_commit_messages(repo, pr_id, base_sha, pr_sha))
+            for g in gates:
+                g["lifted"] = gate_trailer(g).lower() in confirmed
         # Direct permalink into the full-diff view for this exact commit.
         # Only built when the view is reachable from outside the cluster
         # (base URL set), so the comment never links to something a
@@ -12464,7 +12648,7 @@ def process_pr(pr, path_map, base_sha="", repo=None):
             appspace_state_lines=appspace_state_lines or None,
             appendix_lines=((decom_full_lines or [])
                             + (new_env_full_lines or [])) or None,
-            vm_change_lines=vm_change_lines or None)
+            vm_change_lines=vm_change_lines or None, gates=gates or None)
         # COPS-2655: a change to a paused environment is never applied, so
         # both the comment and the full-diff page have to say so. Read at
         # pr_sha because the question is what is true AFTER the merge.
@@ -12605,8 +12789,9 @@ def process_pr(pr, path_map, base_sha="", repo=None):
         # manifest diff, so without this the chain below lands on the
         # ordinary "N resource(s) will change" and posts SUCCESSFUL — which
         # is what acme-config-prod #4376 got, and it merged.
-        flag_typo_block = _DECOM_FLAG_TYPO_HDR in "\n".join(
-            appspace_state_lines or [])
+        # COPS-2766: the folder-removal panel explains the typo too.
+        typo_lines = (appspace_state_lines or []) + (decommission_lines or [])
+        flag_typo_block = _DECOM_FLAG_TYPO_HDR in "\n".join(typo_lines)
         # COPS-2677: KCC Compute* nil artifacts fail the build (OUT_DIFF that
         # must not merge green). zeroPods+HPA stays REVIEW-only — after
         # COPS-2548 hibernation works with leftover HPAs, so FAILED would
@@ -12618,9 +12803,10 @@ def process_pr(pr, path_map, base_sha="", repo=None):
             if any(_is_kcc_blocking_artifact(h) for h in _arts):
                 kcc_nil_block = True
                 break
+        gate_tok = gate_token(gates)
         if (any_hard_error or has_blocking_indet or structural_envs
                 or moves_missing_cohort or broken_arming
-                or flag_typo_block or kcc_nil_block):
+                or flag_typo_block or kcc_nil_block or gate_tok):
             state = "FAILED"
             # COPS-2552: a move whose destination has no cohort config.yaml
             # must never post green. Merging it removes the environment from
@@ -12640,7 +12826,9 @@ def process_pr(pr, path_map, base_sha="", repo=None):
                 # The description is the whole message for anyone reading the
                 # checks list rather than the comment, so it names the key and
                 # the fix rather than pointing at a panel.
-                desc = _flag_typo_status_description(appspace_state_lines)
+                desc = _flag_typo_status_description(
+                    typo_lines, removal=_DECOM_FLAG_TYPO_HDR not in "\n".join(
+                        appspace_state_lines or []))
             elif kcc_nil_block:
                 desc = ("Unresolved KCC value - Compute* resources render "
                         "%!s(<nil>) / <no value>; set hostingID (or the "
@@ -12680,6 +12868,10 @@ def process_pr(pr, path_map, base_sha="", repo=None):
                 desc = (f"Diff failed: {_errs[0].splitlines()[0][:180]} "
                         f"- check PR comment" if _errs else
                         "Diff failed - check PR comment")
+            elif not has_blocking_indet:
+                # COPS-2766: a merge gate comes last, so it never hides the
+                # text of an older guard.
+                desc = gate_status_description(gates)
             else:
                 # Permanent indeterminate reason other than oci_not_found.
                 # COPS-2709: this branch is reached by four different
@@ -12760,8 +12952,10 @@ def process_pr(pr, path_map, base_sha="", repo=None):
                                 or bool(structural_envs)
                                 or bool(moves_missing_cohort)
                                 or broken_arming
-                                or kcc_nil_block)
-        is_transient_failure = any_unknown and not is_permanent_failure
+                                or kcc_nil_block
+                                or gate_tok == "blocked")
+        is_transient_failure = ((any_unknown or gate_tok == "transient")
+                                and not is_permanent_failure)
         if not is_transient_failure:
             # Mark seen for both clean runs AND permanent failures so we don't
             # spam the PR with repeated "not found" comments every 60s.
