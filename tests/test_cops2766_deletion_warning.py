@@ -7,6 +7,8 @@ and the bullet says which kinds go, so the fact is still there to read:
 
   🗑️ **N resource(s) deleted** in E environment(s) (2 Kind, 1 Kind, +K kind(s)): envs
 
+GCP (KCC) kinds come first, then the count. Three kinds are all named.
+
 A data or public-address kind replaces the top-two list, is always named,
 and leads the bullet, so a bucket cannot hide among IAM bindings
 (acme-config-prod #4672), not even in the ~30 characters Bitbucket shows of
@@ -53,6 +55,25 @@ def test_the_top_two_kinds_lead_and_the_rest_are_counted():
     assert ("**8 resource(s) deleted** in 1 environment(s) "
             "(3 ComputeBackendService, 3 ComputeHealthCheck, +2 kind(s)): "
             "pv-nbc-a") in out, out
+
+
+def test_three_kinds_are_all_named_gcp_first():
+    """The #4565 shape. '+1 kind(s)' hid the BackendServices, the kind
+    behind the #4684 outage."""
+    out = _summary([f"/v1/Secret pv-nbc-a/s-{i}" for i in range(57)]
+                   + [f"/v1/ConfigMap pv-nbc-a/c-{i}" for i in range(57)]
+                   + [f"/compute.cnrm.cloud.google.com/v1beta1/"
+                      f"ComputeBackendService bs-{i}" for i in range(56)])
+    assert ("**170 resource(s) deleted** in 1 environment(s) "
+            "(56 ComputeBackendService, 57 ConfigMap, 57 Secret): "
+            "pv-nbc-a") in out, out
+
+
+def test_gcp_kinds_rank_before_a_larger_core_kind():
+    out = _summary(["/compute.cnrm.cloud.google.com/v1beta1/ComputeBackendService bs"]
+                   + [f"/v1/Service pv-nbc-a/s-{i}" for i in range(5)]
+                   + ["/v1/Secret pv-nbc-a/x", "/v1/ConfigMap pv-nbc-a/y"])
+    assert "(1 ComputeBackendService, 5 Service, +2 kind(s))" in out, out
 
 
 _NBC = ([f"/iam.cnrm.cloud.google.com/IAMPolicyMember pv-nbc-a/m-{i}"

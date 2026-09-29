@@ -338,17 +338,22 @@ _DATA_KINDS = frozenset({
 def _deletion_finding(headers, n_envs, envs) -> str:
     """The deletion bullet, kinds with counts. Data kinds come first in the
     text, so the ~30 characters Bitbucket shows of the status say it.
-    Otherwise the top two kinds by count."""
+    Otherwise GCP (KCC) kinds rank before the others, then by count: the
+    top two, or all three when there are three. A BackendService (#4684)
+    must not hide in "+1 kind(s)" behind Secrets and ConfigMaps."""
     n = Counter(_section_kind(h) for h in headers)
-    kinds = sorted(n, key=lambda k: (-n[k], k))
+    gcp = {_section_kind(h) for h in headers
+           if "cnrm.cloud.google.com/" in h.split(" ", 1)[0]}
+    kinds = sorted(n, key=lambda k: (k not in gcp, -n[k], k))
     count = f"{len(headers)} resource(s)"
     data = [f"{n[k]} {k}" for k in kinds if k in _DATA_KINDS]
     if data:
         return (f"\U0001f5d1\ufe0f **Data or IP deleted: {', '.join(data)}** "
                 f"({count} in {n_envs} environment(s)): {envs}")
-    more = f", +{len(kinds) - 2} kind(s)" if len(kinds) > 2 else ""
+    shown = kinds if len(kinds) <= 3 else kinds[:2]
+    more = f", +{len(kinds) - 2} kind(s)" if len(kinds) > 3 else ""
     return (f"\U0001f5d1\ufe0f **{count} deleted** in {n_envs} environment(s) "
-            f"({', '.join(f'{n[k]} {k}' for k in kinds[:2])}{more}): {envs}")
+            f"({', '.join(f'{n[k]} {k}' for k in shown)}{more}): {envs}")
 
 
 def _fmt_env_list(apps, shown=8) -> str:
