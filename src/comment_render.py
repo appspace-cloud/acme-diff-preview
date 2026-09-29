@@ -443,6 +443,8 @@ GATES = {
                  "Re-checked automatically after ArgoCD syncs"),
     "clone_wake": ("An AEC clone starts running with a copy of production data",
                    "Confirm-Clone-Sanitized", "blocked", ""),
+    "dup_identity": ("A new environment uses the name of another environment", None,
+                     "blocked", "Use git mv, or choose another customerName or suffix"),
 }
 
 

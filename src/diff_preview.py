@@ -4753,6 +4753,12 @@ def _is_pv_env_file(path):
     return _is_pv_file(path, "customer.yaml")
 
 
+def _live_apps_in_namespace(ns, exclude=()):
+    """Live apps `<ns>-*` in namespace `ns`, on any spoke: names are global on the hub."""
+    return sorted(a for a, n in (_app_namespace_map or {}).items()
+                  if n == ns and a not in exclude and a.split("/")[-1].startswith(ns + "-"))
+
+
 def _detect_live_identity_changes(changed, renames, path_map, sha, base_sha, repo=None):
     """Private-cloud envs on main whose ArgoCD apps and namespace this PR renames.
 
@@ -4820,11 +4826,85 @@ def _detect_live_identity_changes(changed, renames, path_map, sha, base_sha, rep
             "paused_base": eff(old_doc, old_cohort, "autosync") == "false",
             "paused_head": eff(new_doc, new_cohort, "autosync") == "false",
             # Names are global on the hub: another env may already own the new ones.
-            "taken": sorted(a for a, ns in (_app_namespace_map or {}).items()
-                            if ns == new_ns and a not in apps
-                            and a.split("/")[-1].startswith(new_ns + "-")),
+            "taken": _live_apps_in_namespace(new_ns, apps),
         })
     return hits
+
+
+def _app_identity_file(app):
+    """The customer.yaml an app renders from, from its value files, or ""."""
+    return next((vf.split("$config/", 1)[-1].lstrip("/")
+                 for vf in _app_value_files_map.get(app) or () if vf.endswith("customer.yaml")), "")
+
+
+def _detect_duplicate_identities(changed, renames, new_env_candidates, sha, repo=None):
+    """COPS-2766 (C03): (dup_identity gates, unchecked) for the new private-cloud envs.
+
+    A gate when a new env names its apps `pv-<customerName>-<suffix>-*` like a
+    live app on the hub (the `taken` rule), or like another new env in this
+    PR. Nothing lifts it. The apps of an env this PR deletes do not count: a
+    rebuild. `unchecked` is True when the app list is empty, so the live
+    names were not compared. A failed read raises, so the PR is retried.
+    """
+    renames = renames or {}
+    new_sides = set(renames.values())
+    files = sorted({f for c in new_env_candidates or () for f in c.get("all_yaml_files", ())
+                    if _is_pv_env_file(f) and f not in new_sides})
+    by_ns = {}
+    for f in files:
+        doc, state = _read_first_doc(f, sha, repo, True)
+        if state != "ok":
+            continue                       # the render reports it
+        cohort, cohort_state = _read_first_doc(_cohort_of(f), sha, repo, True)
+        ident = _appset_identity(doc, cohort)
+        if cohort_state != "absent" and ident[0] not in ("", "<no value>"):
+            by_ns.setdefault("pv-%s-%s" % ident, []).append(f)
+
+    def kept(app):
+        f = _app_identity_file(app)
+        return f not in changed or f in renames or _read_first_doc(f, sha, repo)[1] != "absent"
+    gates = []
+    for ns, paths in sorted(by_ns.items()):
+        apps = [a for a in _live_apps_in_namespace(ns) if kept(a)]
+        names = [a.split("/")[-1] for a in apps]
+        srcs = sorted({_app_identity_file(a) for a in apps} - {""})
+        for p in paths:
+            also = [q.split("/")[-2] for q in paths if q != p]
+            if not (apps or also):
+                continue
+            why = (f"live apps {', '.join(names)}" + (f" from {', '.join(srcs)}" if srcs else "")
+                   if apps else f"same name as {', '.join(also)} in this PR")
+            gates.append({"kind": "dup_identity", "env": p.split("/")[-2], "why": why,
+                          "path": p, "ns": ns, "apps": names, "files": srcs, "also": also})
+    return gates, bool(files) and not _app_namespace_map
+
+
+def _dup_identity_lines(gates, unchecked=False) -> list:
+    """COPS-2766: the panel of the dup_identity gates, and a note when the live
+    names were not checked. Plain lines, like _clone_wake_lines."""
+    dups = [g for g in gates or () if g["kind"] == "dup_identity"]
+    lines = ["## \u26d4 NEW ENVIRONMENT NAME ALREADY IN USE", ""] if dups else []
+    for g in dups:
+        head = f"- `{g['path']}` names its apps `{g['ns']}-*`"
+        if g["apps"]:
+            lines.append(f"{head}, but live apps already use these names: "
+                         + ", ".join(f"`{a}`" for a in g["apps"])
+                         + (" (from " + ", ".join(f"`{f}`" for f in g["files"]) + ")"
+                            if g["files"] else "") + ".")
+        else:
+            lines.append(f"{head}, like " + ", ".join(f"`{e}`" for e in g["also"])
+                         + " in this PR.")
+    if dups:
+        lines += ["", "Two environments cannot share one namespace. To move an environment, "
+                  "use `git mv`, so the old folder goes in the same PR. Otherwise choose "
+                  "another `customerName` or `suffix`.", ""]
+    if any(g["apps"] for g in dups):
+        lines += ["If the old environment is being removed, wait until its apps are gone "
+                  "in ArgoCD, then push again (an empty commit is enough).", ""]
+    if unchecked:
+        lines += ["\u2139\ufe0f Name check not run: the ArgoCD app list is not loaded, so "
+                  "the new environment names are not compared with the live apps.", ""]
+    return lines
 
 
 def _identity_block_reason(hit, confirmed):
@@ -12265,6 +12345,9 @@ def process_pr(pr, path_map, base_sha="", repo=None):
         # COPS-2766: an AEC clone that starts running is a gate on both paths below.
         clone_gates = _detect_clone_wakes(changed, renames, path_map, new_env_candidates,
                                           render_sha, base_sha, repo=repo)
+        # A new env with the app names of another env: nothing lifts it.
+        dup_gates, dup_unchecked = _detect_duplicate_identities(
+            changed, renames, new_env_candidates, render_sha, repo=repo)
 
         # v2.5.10 (explicit request): detect FULL environment decommissions
         # (identity file deleted, no successor anywhere — distinct from a
@@ -12298,10 +12381,11 @@ def process_pr(pr, path_map, base_sha="", repo=None):
                 new_env_lines, structural_envs, total_new, new_env_full_lines = \
                     _evaluate_new_envs(new_env_candidates, render_sha,
                                        with_full_output=True)
-                gates = _lift_gates(_merge_gates((), extra=clone_gates),
+                gates = _lift_gates(_merge_gates((), extra=clone_gates + dup_gates),
                                     repo, pr_id, base_sha, pr_sha)
                 body, state, desc = format_new_env_comment(
-                    pr_sha, _clone_wake_lines(gates) + new_env_lines,
+                    pr_sha, _clone_wake_lines(gates) + _dup_identity_lines(gates, dup_unchecked)
+                    + new_env_lines,
                     new_env_full_lines, structural_envs,
                     gates, len(new_env_candidates), total_new, base_sha)
                 # v2.25.0: this path never persisted a full-diff artifact, so
@@ -12777,9 +12861,10 @@ def process_pr(pr, path_map, base_sha="", repo=None):
         # COPS-2766: merge gates. PrCommitsUnreadable goes to the catch-all
         # below: a retry, never a lift.
         gates = _merge_gates(decommission_candidates, renames, path_map,
-                             vm_change_lines, app_results, clone_gates)
+                             vm_change_lines, app_results, clone_gates + dup_gates)
         _lift_gates(gates, repo, pr_id, base_sha, pr_sha)
-        appspace_state_lines = _clone_wake_lines(gates) + appspace_state_lines
+        appspace_state_lines = (_clone_wake_lines(gates) + _dup_identity_lines(gates, dup_unchecked)
+                                + appspace_state_lines)
         # Direct permalink into the full-diff view for this exact commit.
         # Only built when the view is reachable from outside the cluster
         # (base URL set), so the comment never links to something a
