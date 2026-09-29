@@ -894,6 +894,15 @@ _PROM_REGISTRY = (
      "counter", "Artifact downloads that failed. A 404 is a miss, not this."),
     ("artifact_gcs_pending", "artifact_gcs_pending", "gauge",
      "Artifact uploads queued for the reconcile pass."),
+    # COPS-2766. The poll gauge moves only on the leader, and the self-check
+    # gauge is absent until the first check runs.
+    ("bb_write_failures", "bb_write_failures_total", "counter",
+     "Bitbucket comment or status writes that failed. A not-leader skip "
+     "is not counted."),
+    ("poll_consecutive_failures", "poll_consecutive_failures", "gauge",
+     "Consecutive poll iterations where Bitbucket failed for every repo."),
+    ("oci_selfcheck_ok", "oci_selfcheck_ok", "gauge",
+     "1 when the last OCI self-check pulled a chart, 0 when it failed."),
 )
 
 
@@ -3625,6 +3634,7 @@ def _oci_selfcheck():
                 logsink.debug(f"OCI self-check fallback probe failed: {exc}")
 
     _diff_stats["oci_selfcheck"] = "ok" if ok else "failed"
+    _diff_stats["oci_selfcheck_ok"] = 1 if ok else 0
     _diff_stats["oci_selfcheck_at"] = datetime.now(timezone.utc).isoformat()
     if ok:
         logsink.log(f"OCI self-check OK ({chart}:{version})", "DEBUG")
@@ -12911,12 +12921,14 @@ def main_iteration():
     if poll_failures == len(REPOS):
         _last_poll_ok = False
         _consecutive_poll_fails += 1
+        _diff_stats["poll_consecutive_failures"] = _consecutive_poll_fails
         logsink.log(f"Bitbucket poll failed for ALL repos (poll_fails={_consecutive_poll_fails})",
                     "ERROR")
         return
     # Mark poll as healthy after at least one successful repo fetch.
     _last_poll_ok = True
     _consecutive_poll_fails = 0
+    _diff_stats["poll_consecutive_failures"] = 0
     _touch_progress()  # C2 checkpoint: Bitbucket poll succeeded
     logsink.log("Open PRs: " + ", ".join(f"{repo}={len(prs)}" for repo, prs, _ in per_repo))
 

@@ -96,8 +96,10 @@ _diff_stats:      dict          = {
     # v2.5.25 (post-403-incident L1/L2): OCI-path health, previously
     # invisible — a pod could be Ready with 100% of pulls failing.
     "oci_selfcheck": None,         # ok / failed / skipped — periodic helm show chart
+    "oci_selfcheck_ok": None,      # COPS-2766: 1 / 0 after a check, None before
     "oci_selfcheck_at": None,      # ISO timestamp of the last self-check
     "oci_consecutive_pull_failures": 0,  # systemic pull failures since last success
+    "poll_consecutive_failures": 0,  # COPS-2766: leader polls that failed for every repo
     "last_iteration_s": None,# seconds taken by most recent iteration
     "last_iteration_at": None,
     # COPS-2631 stage 0: per-stage cumulative wall time on the hot path.
