@@ -180,6 +180,7 @@ from comment_render import (  # comment rendering (same-dir module, stdlib only)
     _DECOM_PUBLIC_CLOUD_WHY,
     _BLAST_RADIUS_HDR,
     _VALUES_REDUNDANCY_HDR,
+    _INERT_EDIT_HDR,
     _IDENTITY_MIGRATION_HDR,
     _AUTOSYNC_PAUSED_HDR,
     _AUTOSYNC_RESUMED_HDR,
@@ -10118,6 +10119,14 @@ def _value_file_parent_chain(changed_path: str, apps, sha: str,
 
 def _values_redundancy_lines(changed_files, pr_sha, base_sha, path_map,
                              repo=None) -> list:
+    """COPS-2721: the higher-layer panel for _values_redundancy_findings."""
+    return values_redundancy.render_lines(
+        _values_redundancy_findings(changed_files, pr_sha, base_sha, path_map, repo=repo),
+        _VALUES_REDUNDANCY_HDR)
+
+
+def _values_redundancy_findings(changed_files, pr_sha, base_sha, path_map,
+                                repo=None) -> list:
     """COPS-2721: call out value-file edits already identical in a parent.
 
     Only identity / yaml value files that exist on BOTH sides are candidates
@@ -10163,18 +10172,90 @@ def _values_redundancy_lines(changed_files, pr_sha, base_sha, path_map,
         finding = values_redundancy.assess(clean, old_flat, new_flat, chain)
         if finding:
             findings.append(finding)
-    return values_redundancy.render_lines(findings, _VALUES_REDUNDANCY_HDR)
+    return findings
+
+
+# COPS-2766: keys the ApplicationSet, the pause panel or the teardown panels own.
+_INERT_EDIT_SKIP = ("appspace.decommission", "appspace.decommissionPurgeData",
+                    "appspace.customerName", "appspace.suffix")
+_INERT_REPLICAS_RE = re.compile(r"^appspace\.microservices\.(?:definitions\.)?([^.]+)\.replicas$")
+
+
+def _inert_edit_hint(key, paused) -> str:
+    """Why `key` can change nothing, or '' when the closing line says it."""
+    svc = _INERT_REPLICAS_RE.match(key)
+    if key == "appspace.autosync" and not paused:
+        return ("  - Only `autosync: false` pauses auto-sync. `true` is the default, so "
+                "this line changes nothing.")
+    if svc:
+        return (f"  - `replicas` does nothing while an HPA or the ping-scaler runs "
+                f"`{svc[1]}`. For a fixed count, use "
+                f"`microservices.acmePingScaler.customReplicas.{svc[1]}` with the "
+                "ping-scaler, or the service's `hpa.minReplicas` with an HPA.")
+    if key.startswith("appspace.helm"):
+        return f"  - `{key}` only acts in the legacy Helm pipeline, which ArgoCD replaced."
+    return ""
+
+
+def _inert_edit_lines(changed, sha, base_sha, path_map, app_results, redundant,
+                      repo=None) -> list:
+    """COPS-2766: the keys a live env's customer.yaml changes while every app of
+    that file renders the same (REVIEW). Helm ignores a key no chart reads, with
+    no error. Versions, appspace.infra.*, _INERT_EDIT_SKIP, a pause or resume
+    and the keys the higher-layer findings `redundant` list stay out. A failed
+    read raises, so the PR is retried."""
+    listed = {f["path"]: {r["key"] for r in f["redundant"]} for f in redundant}
+
+    def paused(path, doc, at):
+        # The ApplicationSet merges customer.yaml over the cohort config.yaml.
+        cohort = _read_first_doc(_cohort_of(path), at, repo, True)[0]
+        return _autosync_paused({"appspace.autosync": _appset_param(doc, cohort, "autosync")})
+
+    found = []
+    for f in sorted(set(changed)):
+        apps = path_map.get(f)
+        if posixpath.basename(f) != "customer.yaml" or not apps or any(
+                getattr(app_results.get(a), "outcome", None) != OUT_NO_DIFF for a in apps):
+            continue
+        (old, st_old), (new, st_new) = _read_first_doc(f, base_sha, repo), _read_first_doc(f, sha, repo)
+        if (st_old, st_new) != ("ok", "ok"):
+            continue
+        old_flat, new_flat = _flatten_yaml(old), _flatten_yaml(new)
+        keys = [k for k in sorted(values_redundancy.changed_keys(old_flat, new_flat))
+                if k in new_flat and k.rsplit(".", 1)[-1] != "version"
+                and not k.startswith("appspace.infra.") and k not in _INERT_EDIT_SKIP
+                and k not in listed.get(f, ())]
+        if "appspace.autosync" in keys and paused(f, old, base_sha) != paused(f, new, sha):
+            keys.remove("appspace.autosync")    # the auto-sync panel's
+        if keys:
+            env = ("/".join(f.split("/")[4:-1]) if "/public-cloud/" in f
+                   else posixpath.basename(posixpath.dirname(f)))
+            found.append((env, keys, _autosync_paused(new_flat)))
+    if not found:
+        return []
+    n = sum(len(keys) for _e, keys, _p in found)
+    lines = ["### \U0001f4a4 Edits with no effect", "",
+             f"{_INERT_EDIT_HDR} {n} key{'s' if n > 1 else ''} changed, but no rendered "
+             "manifest changed:", ""]
+    for env, keys, is_paused in found[:10]:
+        more = f" (+{len(keys) - 5} more)" if len(keys) > 5 else ""
+        lines.append(f"- `{env}`: " + ", ".join(f"`{k}`" for k in keys[:5]) + more)
+        lines += [h for h in (_inert_edit_hint(k, is_paused) for k in keys[:5]) if h]
+    if len(found) > 10:
+        lines.append(f"- ... and {len(found) - 10} more environment(s)")
+    return lines + ["", "*Check the key path and the service name. Helm ignores a key "
+                    "that no chart reads, with no error.*", ""]
 
 
 def _clean_status_description(has_redundancy: bool,
-                              has_input_changes: bool) -> str:
+                              has_input_changes: bool, has_inert: bool = False) -> str:
     """SUCCESSFUL build-status text when every evaluated app is unchanged.
 
     COPS-2721: keep SUCCESSFUL (nothing failed) but stop the status reading
     like a silent miss when the PR clearly edited YAML that a higher layer
     already set, or that the chart did not consume.
     """
-    return values_redundancy.noop_status_hint(has_redundancy, has_input_changes)
+    return values_redundancy.noop_status_hint(has_redundancy, has_input_changes, has_inert)
 
 
 def _flag_typo_status_description(lines, removal=False) -> str:
@@ -12507,7 +12588,8 @@ def format_comment(pr_sha, app_results, skipped_apps=None, base_sha="",
         _joined_state = "\n".join(appspace_state_lines or [])
         status = "\u2705 " + _clean_status_description(
             has_redundancy=_VALUES_REDUNDANCY_HDR in _joined_state,
-            has_input_changes=bool(input_change_lines))
+            has_input_changes=bool(input_change_lines),
+            has_inert=_INERT_EDIT_HDR in _joined_state)
 
     # v2.5.8: the downgrade must also be visible in the one-line status —
     # including the case where manifests are identical but the chart
@@ -13480,14 +13562,25 @@ def process_pr(pr, path_map, base_sha="", repo=None):
                 changed, render_sha, base_sha, path_map, repo=repo)
         except Exception as e:  # informational panel must never break the comment
             logsink.log(f"    [comment] blast-radius panel failed: {e}", "WARNING")
+        redundant = []
         try:
             # COPS-2721: same channel — REVIEW verdict when customer.yaml
             # re-states values a parent config.yaml already sets.
-            appspace_state_lines += _values_redundancy_lines(
+            redundant = _values_redundancy_findings(
                 changed, pr_sha, base_sha, path_map, repo=repo)
+            appspace_state_lines += values_redundancy.render_lines(
+                redundant, _VALUES_REDUNDANCY_HDR)
         except Exception as e:
             logsink.log(f"    [comment] values-redundancy panel failed: {e}",
                         "WARNING")
+        try:
+            # COPS-2766: same channel, a REVIEW line for keys that change nothing.
+            appspace_state_lines += _inert_edit_lines(
+                changed, render_sha, base_sha, path_map, app_results, redundant, repo=repo)
+        except Exception as e:
+            if _is_transient_exception(e):
+                raise  # a failed read retries the PR
+            logsink.log(f"    [comment] inert-edits panel failed: {e}", "WARNING")
         try:
             vm_change_lines = _summarize_vm_changes(
                 changed, render_sha, base_sha, path_map, app_results, repo=repo)
@@ -13794,7 +13887,8 @@ def process_pr(pr, path_map, base_sha="", repo=None):
                 _joined = "\n".join(appspace_state_lines or [])
                 _clean = _clean_status_description(
                     has_redundancy=_VALUES_REDUNDANCY_HDR in _joined,
-                    has_input_changes=bool(input_change_lines))
+                    has_input_changes=bool(input_change_lines),
+                    has_inert=_INERT_EDIT_HDR in _joined)
                 state, desc = "SUCCESSFUL", f"{_clean}{status_extra}"
         if state == "SUCCESSFUL":
             # COPS-2766: lead with the top finding of the comment just

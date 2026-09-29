@@ -135,7 +135,8 @@ def render_lines(findings, header: str) -> list:
     return lines
 
 
-def noop_status_hint(has_redundancy: bool, has_input_changes: bool) -> str:
+def noop_status_hint(has_redundancy: bool, has_input_changes: bool,
+                     has_inert: bool = False) -> str:
     """Bitbucket build-status / footer hint when renders are unchanged.
 
     Keeps SUCCESSFUL (nothing failed) but stops the status reading like a
@@ -144,6 +145,9 @@ def noop_status_hint(has_redundancy: bool, has_input_changes: bool) -> str:
     if has_redundancy:
         return ("No manifest changes — some config edits already match a "
                 "higher layer (see PR comment)")
+    if has_inert:
+        return ("No manifest changes - some config edits change nothing "
+                "rendered (see PR comment)")
     if has_input_changes:
         return ("No manifest changes — config YAML changed but render is "
                 "identical (see PR comment)")

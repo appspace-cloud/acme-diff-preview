@@ -241,6 +241,8 @@ _VALUES_REDUNDANCY_HDR = "**Higher-layer values.**"
 # no manifest are no reason for a warning sign on a green status.
 _HIGHER_LAYER_FINDING = ("\U0001f4da **Higher-layer values already cover "
                          "part of this PR**")
+# COPS-2766: written by the inert-edit panel in diff_preview, matched here.
+_INERT_EDIT_HDR = "**Edits with no effect.**"
 # Written by the identity-change guard in diff_preview for a confirmed rename of
 # a live environment, matched here for the REVIEW verdict line.
 _IDENTITY_MIGRATION_HDR = "**Planned rename.**"
@@ -366,6 +368,7 @@ _REVIEW_RANK = {
     "\U0001f5a5": 8,               # KCC resources unmanaged
     "\U0001f9ec": 9,               # unresolved chart value
     "\U0001f4da": 99,              # higher-layer values
+    "\U0001f4a4": 98,              # an edit changes nothing rendered
     "\u2611": 0,                   # merge gate confirmed in a commit
 }
 
@@ -995,6 +998,14 @@ def _build_merge_summary(results, rollup_by_sig, vm_change_lines,
                              _HIGHER_LAYER_FINDING + " \u2014 some keys match an "
                              "ancestor config.yaml, so they do not change "
                              "rendered manifests (see the higher-layer note)"))
+        # COPS-2766: keys a live env changed while all its apps render the same.
+        m = re.search(re.escape(_INERT_EDIT_HDR) + r" (\d+) keys? changed.*?\n- `([^`]+)`: "
+                      r"`([^`]+)`", txt, re.S)
+        if m:
+            more = int(m[1]) - 1
+            findings.append((_SEV_REVIEW,
+                             f"\U0001f4a4 **An edit changes nothing rendered**: `{m[3]}` "
+                             f"in `{m[2]}`" + (f" (+{more} more)" if more else "")))
     # COPS-2766: the checks of a new env are one REVIEW finding, led by the first.
     checks = [l for l in new_env_lines or () if l.startswith(_NEW_ENV_CHECK_PREFIX)]
     if checks:
