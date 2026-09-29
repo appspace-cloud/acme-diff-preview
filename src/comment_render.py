@@ -939,23 +939,24 @@ def status_lead(comment_md) -> str:
     return f"{mark} {text}" if mark and text else ""
 
 
-def _utf16_len(s) -> int:
-    return sum(2 if ord(c) > 0xFFFF else 1 for c in s)
+def _utf8_len(s) -> int:
+    return len(s.encode("utf-8", "surrogatepass"))
 
 
 def join_status_lead(lead, description, limit=255) -> str:
-    """'<lead> | <description>' in `limit` UTF-16 units, the unit Bitbucket
-    counts. Only the lead is cut, ending in '...'. The description is never
-    cut: when it leaves no room for a lead, it comes back unchanged."""
+    """'<lead> | <description>' in `limit` UTF-8 bytes. We do not know the
+    unit Bitbucket counts, and bytes are the largest one, so this fits any.
+    Only the lead is cut, ending in '...'. The description is never cut:
+    when it leaves no room for a lead, it comes back unchanged."""
     if not lead:
         return description
     tail = f" | {description}"
-    room = limit - _utf16_len(tail)
-    if _utf16_len(lead) <= room:
+    room = limit - _utf8_len(tail)
+    if _utf8_len(lead) <= room:
         return lead + tail
     cut, n = "", 3                       # 3 for the "..."
     for c in lead:
-        n += 2 if ord(c) > 0xFFFF else 1
+        n += _utf8_len(c)
         if n > room:
             break
         cut += c

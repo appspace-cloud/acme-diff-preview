@@ -9,7 +9,8 @@ the comment. A SUCCESSFUL description is now
 
   * 🚨 when the comment verdict is ⛔, ⚠️ when it is review, nothing when
     it is routine. The lead never says DO NOT MERGE: the build is green.
-  * 255 UTF-16 units at most. Only the lead is cut, never the old text.
+  * 255 UTF-8 bytes at most, which fits whatever unit Bitbucket counts.
+    Only the lead is cut, never the old text.
   * The lead is read from the posted comment by one pure function, so
     process_pr and fix_stuck_inprogress write the same text.
   * FAILED descriptions do not change.
@@ -55,8 +56,8 @@ def _comment(verdict, *bullets, after=""):
                      + ["", "---", "", after])
 
 
-def _u16(s):
-    return len(s.encode("utf-16-le")) // 2
+def _u8(s):
+    return len(s.encode("utf-8"))
 
 
 # Merge summaries as they were posted on acme-config-prod, with the green
@@ -143,7 +144,7 @@ def _check(comment, tail):
     lead = cr.status_lead(comment)
     out = cr.join_status_lead(lead, tail)
     assert "do not merge" not in lead.lower(), lead
-    assert _u16(out) <= 255, out
+    assert _u8(out) <= 255, out
     assert out.endswith(tail), "the old description must survive byte for byte"
     assert out == tail or out.startswith(("\U0001f6a8 ", "\u26a0\ufe0f ")), out
     return lead, out
@@ -181,7 +182,7 @@ def test_goldens_lead_as_the_verdict_says():
 def test_a_long_real_finding_is_cut_and_the_tail_kept():
     block, desc = next(s for s in REAL_SUMMARIES if "24 HorizontalPod" in s[0])
     _lead, out = _check(block, desc)
-    assert _u16(out) == 255
+    assert _u8(out) >= 253, "cut at the limit, less a multibyte character"
     assert out.endswith("... | " + desc), out
 
 
@@ -245,12 +246,18 @@ def test_a_short_lead_is_joined_whole():
                                               "change - review comment")
 
 
-def test_the_limit_counts_utf16_units():
-    """🚨 is one code point and two UTF-16 units."""
+def test_the_limit_counts_utf8_bytes():
+    """🚨 is one code point, two UTF-16 units and four UTF-8 bytes."""
     lead = "\U0001f6a8 " + "x" * 300
     out = cr.join_status_lead(lead, "tail")
-    assert _u16(out) == 255 and len(out) == 254
+    assert _u8(out) == 255 and len(out) == 252
     assert out.endswith("x... | tail")
+
+
+def test_a_multibyte_character_is_never_split():
+    lead = "\u26a0\ufe0f " + "\u2014" * 100          # 3 bytes each
+    out = cr.join_status_lead(lead, "tail")
+    assert 253 <= _u8(out) <= 255 and out.endswith("\u2014... | tail")
 
 
 def test_a_description_with_no_room_comes_back_unchanged():
@@ -288,7 +295,7 @@ def test_fuzz_join_keeps_the_tail_and_the_limit(lead, tail):
     out = cr.join_status_lead(lead, tail)
     assert out.endswith(tail)
     if out != tail:
-        assert _u16(out) <= 255
+        assert _u8(out) <= 255
         assert out.endswith(" | " + tail)
 
 

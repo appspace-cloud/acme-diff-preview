@@ -338,10 +338,11 @@ finding as plain text, then ` | ` and the text it had before:
 
 🚨 means the comment verdict is ⛔, and ⚠️ means review. A routine PR keeps
 the old text. The status never says DO NOT MERGE, because the build is green.
-The whole description fits in 255 UTF-16 units: only the finding is cut
-(it ends in `...`), never the old text. The finding is read back from our own
-merge summary in the posted comment, so the recovery of a stuck INPROGRESS
-status writes the same text. FAILED descriptions do not change.
+The whole description fits in 255 UTF-8 bytes, so it fits whatever unit
+Bitbucket counts. Only the finding is cut (it ends in `...`), never the old
+text. The finding is read back from our own merge summary in the posted
+comment, so the recovery of a stuck INPROGRESS status writes the same text.
+FAILED descriptions do not change.
 
 See [docs/internals.md](internals.md) for the reasoning behind each guard,
 how mass version bumps are handled, the secret-leak hardening, and the
