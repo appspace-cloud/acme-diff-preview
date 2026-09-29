@@ -14,15 +14,21 @@ that might be shrinking is a disk that gets flagged.
 """
 import re
 
-import yaml
+import yaml  # PyYAML (requirements.txt): the render facts parse a few docs
 
+import logsink  # structured logging seam (same-dir module)
 from comment_render import (
     _NEW_ENV_CHECK_PREFIX,
     _VM_PANEL_DANGER_HDR,
     _VM_PANEL_ROUTINE_HDR,
     _section_name,
 )
-from manifest import _IP_KINDS, _section_kind  # decoder lives with the format it decodes
+from manifest import (  # decoder lives with the format it decodes
+    _IP_KINDS,
+    _flatten_yaml,
+    _resource_header,
+    _section_kind,
+)
 
 
 # Hibernation / zeroPods counting (COPS-2683): charts scale Deployments and
@@ -449,6 +455,17 @@ _VM_TRACKED_FIELDS = {
     "ComputeDiskResourcePolicyAttachment": ("resourceID", "zone"),
 }
 _VM_DISK_TYPE_RE = re.compile(r"^(pd-|hyperdisk-)")
+# COPS-2766: the chart sets allow-stopping-for-update, so KCC itself stops,
+# resizes and starts the VM. A park with TERMINATED is not needed, and on some
+# KCC versions a parked VM gets a stop on every reconcile. The chart comment
+# that says to park first is out of date (COPS-2760 owns the chart side).
+_VM_RESIZE_REASON = ("machineType changes: KCC stops, resizes and starts the "
+                     "VM. Merge in a window. Do not park with TERMINATED.")
+_VM_PARK_NOTE = ("desiredStatus moves to TERMINATED: KCC stops the VM, and on "
+                 "some KCC versions it sends a stop on every reconcile "
+                 "(COPR-31983, COPS-2760)")
+_VM_START_NOTE = ("desiredStatus moves from TERMINATED to RUNNING: KCC starts "
+                  "the VM on sync")
 
 
 def _vm_unquote(v: str) -> str:
@@ -504,13 +521,11 @@ def _detect_vm_changes(sections: list) -> list:
       - deletion-policy moving to `delete`, or deletionProtection turning
         false, means the next cascade/prune can actually destroy the
         resource in GCP (both are driven by allowDeletion) — dangerous.
-      - a machineType change requires parking the VM first (desiredStatus:
-        TERMINATED, wait for KCC, then back to RUNNING). A machineType
-        change with no TERMINATED transition or TERMINATED state anywhere
-        in the section is exactly the mistake the template comment warns
-        about — dangerous.
+      - any machineType change: KCC stops, resizes and starts the VM, so
+        it needs a window. Parked or not, it is dangerous (COPS-2766). A
+        move to TERMINATED and a TERMINATED to RUNNING are notes.
       - zone and disk `type` are immutable in GCP: changing them means
-        destroy-and-recreate — dangerous.
+        destroy-and-recreate — dangerous. A ComputeDisk `location` too.
       - a disk size DECREASE is impossible in place (GCP only grows disks),
         so it implies recreation and data loss — dangerous. Growth is the
         routine case.
@@ -533,15 +548,12 @@ def _detect_vm_changes(sections: list) -> list:
         minus_vals, plus_vals = {}, {}
         untracked_keys = set()
         minus_n = plus_n = context_n = 0
-        context_terminated = False
         for line in body.splitlines():
             if line.startswith("+++") or line.startswith("---"):
                 continue
             sign = line[:1]
             if sign == " ":
                 context_n += 1
-                if "desiredStatus:" in line and "TERMINATED" in line:
-                    context_terminated = True
                 continue
             if sign not in ("+", "-"):
                 continue
@@ -632,11 +644,13 @@ def _detect_vm_changes(sections: list) -> list:
                 dangerous.append("deletionProtection turns OFF — GCP-side "
                                  "delete protection is removed")
             if "machineType" in byk:
-                ds_new = byk.get("desiredStatus", ("", ""))[1]
-                if ds_new != "TERMINATED" and not context_terminated:
-                    dangerous.append("machineType changes while the VM is "
-                                     "not parked TERMINATED — the runbook "
-                                     "requires stopping the VM first")
+                dangerous.append(_VM_RESIZE_REASON)
+            if "desiredStatus" in byk:
+                o, n = byk["desiredStatus"]
+                if o != "TERMINATED" and n == "TERMINATED":
+                    notes.append(_VM_PARK_NOTE)
+                elif o == "TERMINATED" and n == "RUNNING":
+                    notes.append(_VM_START_NOTE)
             if "deviceName" in byk:
                 o, n = byk["deviceName"]
                 if o and n:
@@ -659,6 +673,9 @@ def _detect_vm_changes(sections: list) -> list:
             if "zone" in byk:
                 dangerous.append("zone is immutable — changing it means "
                                  "destroy-and-recreate")
+            if kind == "ComputeDisk" and "location" in byk:
+                dangerous.append("disk location is immutable: KCC rejects "
+                                 "the change and the sync fails")
             if "type" in byk:
                 dangerous.append("disk type is immutable — changing it "
                                  "means destroy-and-recreate")
@@ -701,6 +718,132 @@ def _detect_vm_changes(sections: list) -> list:
                       "created": created, "deleted": deleted,
                       "orphaned": orphaned,
                       "dangerous": dangerous, "notes": notes})
+    return facts
+
+
+# COPS-2766: fields that render fine and that KCC rejects on sync. The hunk
+# cannot show where a line sits (3 context lines, mostly template comments),
+# so these few kinds are read from both parsed renders.
+_IMMUTABLE_RENDER_KINDS = ("ComputeInstance", "BigQueryDataset", "StorageBucket")
+_BOOT_DISK_REASON = (
+    "bootDisk is fixed when the VM is created: KCC rejects any change to it, "
+    "so the whole ComputeInstance fails to apply and the sync stays failed. "
+    "Keep the old value, or rebuild the VM on purpose")
+_DATA_LOCATION_REASON = (
+    "location is immutable: KCC rejects the change and the sync fails. The "
+    "data stays where it is, a move needs a new dataset or bucket and a copy")
+_DATA_PROJECT_REASON = ("the project changes: KCC rejects the change and the "
+                        "sync fails. The data stays in the old project")
+_DATA_PROJECT_NOTE = ("the project is now set explicitly: check it is the "
+                      "project where the data already is")
+
+
+def _yaml_map(text):
+    """One rendered doc as a dict, or None when it is not one."""
+    try:
+        doc = yaml.load(text, Loader=_YAML_LOADER)
+    except yaml.YAMLError:
+        return None
+    return doc if isinstance(doc, dict) else None
+
+
+def _sub_map(node, key) -> dict:
+    """node[key] when both are mappings, else {}: a null or a string never
+    crashes the read."""
+    v = node.get(key) if isinstance(node, dict) else None
+    return v if isinstance(v, dict) else {}
+
+
+def _fact_text(v) -> str:
+    """A parsed leaf as the panel prints it: None is '', a bool is YAML."""
+    if v is None:
+        return ""
+    return str(v).lower() if isinstance(v, bool) else str(v)
+
+
+def _data_project(doc) -> str:
+    """The project id. `external`, `name` and `projects/<id>` all name the
+    same project, so a format change in the chart is not a move."""
+    ref = _sub_map(_sub_map(doc, "spec"), "projectRef")
+    ann = _sub_map(_sub_map(doc, "metadata"), "annotations")
+    v = _fact_text(ref.get("external") or ref.get("name")
+                   or ann.get("cnrm.cloud.google.com/project-id")).strip()
+    return v[len("projects/"):] if v.startswith("projects/") else v
+
+
+def _render_immutable_facts(main_res, pr_res) -> list:
+    """VM-panel facts for changes KCC rejects on sync, from both renders.
+
+    Only keys on both sides with different text, of the kinds above. The
+    facts have the _detect_vm_changes shape, so _merge_vm_facts can fold
+    them into the hunk fact of the same resource. They are warnings: a
+    failure here is logged and gives [], a crashed diff is worse.
+    """
+    try:
+        facts = []
+        for key in sorted(pr_res):
+            type_key, ns, name = key
+            kind = type_key.rsplit("/", 1)[-1]
+            old_txt, new_txt = main_res.get(key), pr_res[key]
+            if (kind not in _IMMUTABLE_RENDER_KINDS or old_txt is None
+                    or old_txt == new_txt):
+                continue
+            old, new = _yaml_map(old_txt), _yaml_map(new_txt)
+            if old is None or new is None:
+                continue
+            o_spec, n_spec = _sub_map(old, "spec"), _sub_map(new, "spec")
+            fields, dangerous, notes = [], [], []
+            if kind == "ComputeInstance":
+                of = _flatten_yaml(o_spec.get("bootDisk"), "bootDisk")
+                nf = _flatten_yaml(n_spec.get("bootDisk"), "bootDisk")
+                fields = [(k, _fact_text(of.get(k)), _fact_text(nf.get(k)))
+                          for k in sorted(set(of) | set(nf))]
+                fields = [t for t in fields if t[1] != t[2]]
+                if fields:
+                    dangerous.append(_BOOT_DISK_REASON)
+            else:
+                ol = _fact_text(o_spec.get("location")).strip()
+                nl = _fact_text(n_spec.get("location")).strip()
+                if ol and nl and ol.lower() != nl.lower():
+                    fields.append(("location", ol, nl))
+                    dangerous.append(_DATA_LOCATION_REASON)
+                op, np_ = _data_project(old), _data_project(new)
+                if np_ and op != np_:
+                    fields.append(("project", op, np_))
+                    if op:
+                        dangerous.append(_DATA_PROJECT_REASON)
+                    else:
+                        notes.append(_DATA_PROJECT_NOTE)
+            if dangerous or notes:
+                facts.append({"header": _resource_header(type_key, ns, name),
+                              "kind": kind, "name": name, "fields": fields,
+                              "created": False, "deleted": False,
+                              "orphaned": False, "dangerous": dangerous,
+                              "notes": notes})
+        return facts
+    except Exception as e:
+        logsink.log(f"[vm] render facts skipped: {e}", "WARNING")
+        return []
+
+
+def _merge_vm_facts(facts: list, extra) -> list:
+    """Fold each extra fact into the fact with the same header, or append it.
+
+    One resource keeps one fact, so the panel names it once. Mutates and
+    returns `facts`."""
+    by_header = {f["header"]: f for f in facts}
+    for x in extra or []:
+        f = by_header.get(x["header"])
+        if f is None:
+            facts.append(x)
+            continue
+        # The hunk reads the boot disk `size` and `type` with no path. The
+        # render fact names the same change with its path: keep that one.
+        same = {(k.rsplit(".", 1)[1], o, n) for k, o, n in x["fields"]
+                if k.startswith("bootDisk.initializeParams.")}
+        f["fields"] = [t for t in f["fields"] if t not in same]
+        for k in ("fields", "dangerous", "notes"):
+            f[k] += [v for v in x[k] if v not in f[k]]
     return facts
 
 

@@ -365,6 +365,12 @@ def _is_kcc_blocking_artifact(header: str) -> bool:
     return any(k in header for k in _KCC_BLOCKING_ARTIFACT_KINDS)
 
 
+def _resource_header(type_key: str, ns: str, name: str) -> str:
+    """The section header of one resource key. A resource with no namespace
+    (a BigQueryDataset, a cluster-scoped kind) has no `ns/` part."""
+    return f"/{type_key} {ns}/{name}" if ns else f"/{type_key} {name}"
+
+
 def _diff_resources(main_res: dict, pr_res: dict) -> str:
     """Diff two pre-parsed resource dicts (from _parse_manifest_resources).
 
@@ -386,7 +392,7 @@ def _diff_resources(main_res: dict, pr_res: dict) -> str:
         delta = list(difflib.unified_diff(a_lines, b_lines, lineterm="\n"))
         if not delta:   # pragma: no cover - differing text always diffs non-empty
             continue
-        hdr = f"/{type_key} {ns}/{name}" if ns else f"/{type_key} {name}"
+        hdr = _resource_header(type_key, ns, name)
         parts.append(f"===== {hdr} ======\n" + "".join(delta))
     return "\n".join(parts)
 

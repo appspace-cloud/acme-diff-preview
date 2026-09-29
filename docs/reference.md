@@ -56,7 +56,7 @@ and QA apps when CI publishes a new chart, so they pick it up past the OCI cache
 | 🔒 DECOMMISSION ARMED / 🔓 DISARMED | `appspace.decommission` (and `decommissionPurgeData`) was toggled on a LIVE environment. Different from the block above: nothing is deleted yet, this is the flag that decides what happens the day the folder actually goes. In the merge summary, 🔒 Decommission ARMED and 🔒 Data purge ARMED are ⚠️ review items (COPS-2766). The build is green for an arming PR, so the comment says the same. |
 | 🔒 DECOMMISSION PHASE 1 | `allowDeletion` was armed on this environment's Linux VMs, and nothing else. The first PR of a teardown, which used to show only the VM danger bullets: this panel carries the same Phase 1/2/3 table as the later phases, so the reviewer can see which steps are done and which are still ahead. |
 | ⛔ STOP — teardown flag misspelled | A key that reads as `decommission`, `decommissionPurgeData`, `allowDeletion` or `confirmProdDeletion` but is not one the platform looks up at that depth — a dropped letter, wrong casing, or a VM arming flag under the wrong parent (e.g. `deployLinuxServicesK8s.allowDeletion` with no `defaults`/`svc`/… segment, or `confirmProdDeletion` under a role instead of `defaults`). Helm and the ApplicationSet match the key exactly, so the environment renders byte-identically and the PR would otherwise merge as a routine no-op with the operator believing a phase is done. **This one stops the comment**: the verdict, the key, the file and the rename, and nothing else. There is one correct response and the rest of a review is distance to it, so no diff, no VM panel and no phase table are rendered until the key is fixed. The build goes **FAILED** with the rename in the description, because a green tick outranks a red paragraph for anyone skimming the checks list. The full-diff page is exempt and still holds everything. Also shown on a folder-removal PR, where it explains why Phase 2 reads pending over a file that looks armed. There it fails the build too, and nothing lifts it (COPS-2766), but the removal PR keeps its full comment. The key is read from `main` and the PR deletes the file, so the status says to fix the key on `main` in a separate PR, let it sync, then rebase the removal. Before, only the no-cascade gate stopped that PR, so `Confirm-Teardown` made it green with the typo still there. Role-level `svc.allowDeletion` (and the other VM roles) is valid when spelled correctly — only paths the chart ignores are flagged as misplaced. |
-| 🖥️ VM infrastructure | **Always present**, in a fixed place, so "did this PR touch VMs?" is answerable without reading anything else: `🖥️ VM INFRASTRUCTURE CHANGES` with one bullet per finding when something dangerous is found, `🖥️ (routine)` for harmless changes, and an explicit `no changes` line when the domain is untouched. Covers KCC linux-services (`ComputeInstance`, `ComputeDisk`, `ComputeAddress`, snapshot-policy attachments); instance-type and disk-type changes are always highlighted, since both mean destroy-and-recreate. A dangerous bullet is 🚨 on a FAILED build and ⚠️ on a green one (COPS-2766). A disk shrink fails the build and nothing lifts it: GCP cannot shrink a disk in place. The other dangers (machineType, zone, disk type) are a review with a green build. The deletion policy is read from the CR, never assumed: a VM, disk or address that leaves the render is unmanaged (GCP kept) only with `deletion-policy: abandon`. With `delete`, or with no policy line, KCC deletes it in GCP, so it is dangerous. |
+| 🖥️ VM infrastructure | **Always present**, in a fixed place, so "did this PR touch VMs?" is answerable without reading anything else: `🖥️ VM INFRASTRUCTURE CHANGES` with one bullet per finding when something dangerous is found, `🖥️ (routine)` for harmless changes, and an explicit `no changes` line when the domain is untouched. Covers KCC linux-services (`ComputeInstance`, `ComputeDisk`, `ComputeAddress`, snapshot-policy attachments). Any `machineType` change is flagged, because KCC stops, resizes and starts the VM: merge it in a window, and do not park the VM with `TERMINATED`. Disk-type and zone changes mean destroy-and-recreate. A `bootDisk` change on an existing VM (a boot disk size, image or type change too), a disk `location` change and a BigQueryDataset or StorageBucket `location` or project change are flagged too: the render passes, but KCC rejects them and the sync fails. A dangerous bullet is 🚨 on a FAILED build and ⚠️ on a green one (COPS-2766). A disk shrink fails the build and nothing lifts it: GCP cannot shrink a disk in place. The other dangers are a review with a green build. The deletion policy is read from the CR, never assumed: a VM, disk or address that leaves the render is unmanaged (GCP kept) only with `deletion-policy: abandon`. With `delete`, or with no policy line, KCC deletes it in GCP, so it is dangerous. |
 | ⬆️ Routine version bump | Several environments taking the same version-only change, folded into one line naming the transition and every environment it covers. Only ever applied to changes that are provably version-only. |
 | ✂️ N more changed app(s) omitted | The readability budget folded ordinary diff blocks away. Nothing risk-flagged is ever folded; the link goes to the full-diff page, which always holds everything. |
 | ⬆️ N of M changed resource(s) are the version transition | Inside ONE app, every resource whose only changed lines are version noise (image tags, chart labels, version env values, checksum annotations, deploy timestamps) folds behind that single line, which names the transition. Everything else in the same app stays inline, so a real change riding along with a bump cannot hide in it. Deletions, zeroed replicas and VM changes are never folded. |
@@ -165,13 +165,31 @@ slowest thing on the platform to recover from when a change goes wrong, so
 they get a dedicated panel right after the decommission warning, ranked by
 severity. Flagged as dangerous: a deletion-policy moving to `delete` or
 `deletionProtection` turning off (the next cascade can then really destroy
-the VM in GCP), a `machineType` change without parking the VM
-(`desiredStatus: TERMINATED`) first, a zone or disk-type change (both
+the VM in GCP), any `machineType` change, a zone or disk-type change (both
 immutable — destroy and recreate), a disk **shrink**, and a VM or
-snapshot-policy attachment disappearing from the render. Disk growth, status
-transitions and brand-new resources are reported quietly as routine. A disk
-shrink is never valid, so it also fails the build, and no commit line lifts it
-(COPS-2766). The other dangers leave the build green, except a
+snapshot-policy attachment disappearing from the render. A `machineType`
+change is flagged even on a parked VM. The chart sets
+`allow-stopping-for-update`, so KCC stops the VM, resizes it and starts it
+again (a VM that is already parked stays stopped). Merge it in a window, and
+do not park the VM with `TERMINATED` for it: on some KCC versions a parked
+VM gets a stop on every reconcile (COPR-31983). The chart template comment
+that says to park the VM first is out of date. COPS-2760 covers the chart
+side of that stop loop.
+Also flagged: a `bootDisk` change on an existing VM, a disk `location`
+change, and a BigQueryDataset or StorageBucket `location` or project change.
+The chart renders `bootDiskSizeGb`, `bootImage` and the boot disk type into
+`bootDisk.initializeParams`, so a boot disk size, image or type change on an
+existing VM is a `bootDisk` change too. KCC rejects each of these, so the
+render passes but the sync fails. The bootDisk, dataset and bucket checks
+read both parsed renders, because the diff hunk cannot show where a line
+sits. A project written as `projects/<id>`, as `external` or as `name` is
+the same project. These stay warnings. A move to
+`TERMINATED` (KCC stops the VM, and some KCC versions send a stop on every
+reconcile) and a move from `TERMINATED` to `RUNNING` are routine notes.
+Disk growth on a data disk, other status transitions and brand-new
+resources are reported quietly as routine.
+A disk shrink is never valid, so it also fails the build, and no commit line
+lifts it (COPS-2766). The other dangers leave the build green, except a
 `ComputeAddress` that GCP releases (see
 [Merge-blocking guards](#merge-blocking-guards)).
 

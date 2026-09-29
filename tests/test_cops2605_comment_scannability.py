@@ -193,10 +193,12 @@ def test_vm_facts_machine_type_change_without_stop_is_dangerous():
         "machineType moving on a VM not parked TERMINATED must be dangerous"
 
 
-def test_vm_facts_machine_type_change_with_stop_is_not_dangerous():
+def test_vm_facts_machine_type_change_with_stop_is_dangerous():
+    # COPS-2766: KCC resizes a running VM itself, and a park can loop on stop.
     facts = m._detect_vm_changes([(CI_HDR, MACHINE_TYPE_STOPPED)])
     assert len(facts) == 1
-    assert not facts[0]["dangerous"]
+    assert facts[0]["dangerous"] == [m._VM_RESIZE_REASON]
+    assert m._VM_PARK_NOTE in facts[0]["notes"]
     assert ("desiredStatus", "RUNNING", "TERMINATED") in facts[0]["fields"]
 
 

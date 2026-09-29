@@ -281,6 +281,12 @@ from vm_analysis import (  # VM/KCC infrastructure analysis (same-dir module)
     _VM_REPEAT_MIN,
     _collapse_repeated_vm_lines,
     _vm_panel_lines,
+    _VM_RESIZE_REASON,
+    _VM_PARK_NOTE,
+    _VM_START_NOTE,
+    _IMMUTABLE_RENDER_KINDS,
+    _render_immutable_facts,
+    _merge_vm_facts,
 )
 from decommission import (
     _PH_DONE,  # environment teardown and creation analysis
@@ -415,7 +421,9 @@ except ImportError:  # pragma: no cover - production image always has the wheel
 
 # COPS-2631 stage 2: CSafeLoader for values-file YAML. Rendered manifests
 # never touch PyYAML; every former yaml.safe_load site parses customer.yaml /
-# config.yaml. Prefer the C loader when libyaml is present, fall back so a
+# config.yaml. One bounded exception (COPS-2766): vm_analysis parses only the
+# changed ComputeInstance, BigQueryDataset and StorageBucket docs of a
+# render. Prefer the C loader when libyaml is present, fall back so a
 # libyaml-less environment still boots. Call sites keep catching YAMLError.
 # COPS-2766: vm_analysis also parses changed workloads, for the CPU request.
 _YAML_SAFE_LOADER = getattr(yaml, "CSafeLoader", yaml.SafeLoader)
@@ -2848,7 +2856,9 @@ DiffResult = namedtuple("DiffResult",
 # vm_changes: structured facts about KCC linux-services (VM) resources this
 # diff touches, extracted by _detect_vm_changes on the FULL pre-cap section
 # list (same design as deleted_resources: safety facts never depend on
-# display caps). None on non-OUT_DIFF outcomes and legacy/coerced results.
+# display caps), plus the _render_immutable_facts of _run_one_diff (COPS-2766:
+# bootDisk, BigQueryDataset and StorageBucket changes KCC rejects on sync).
+# None on non-OUT_DIFF outcomes and legacy/coerced results.
 # fingerprint (COPS-2579): stable hash of this app's FULL (pre-cap) section
 # list, set only on the OUT_DIFF success path. Two apps whose changes are
 # byte-for-byte identical (a shared ancestor-file edit rolled out the same
@@ -6501,7 +6511,8 @@ def _fingerprint_sections(sections: list) -> str:
     return hashlib.sha256(blob.encode("utf-8", errors="replace")).hexdigest()
 
 
-def _package_sections(filtered_sections: list, version_change=None):
+def _package_sections(filtered_sections: list, version_change=None,
+                      render_facts=None):
     """Build (clean_diff, stored_sections, deleted, zeroed, fingerprint,
     renamed, vm_changes, version_fold)
     from the FULL filtered section list. Detection runs here — before the
@@ -6525,7 +6536,9 @@ def _package_sections(filtered_sections: list, version_change=None):
     # cap. The headers join the risk reservation below so the actual VM
     # section is visible in the comment, not just named by the panel —
     # detecting a risk is only half the job (the PR-3845 lesson).
-    vm_changes = _detect_vm_changes(filtered_sections)
+    # COPS-2766: the render facts join here, so they are exempt too.
+    vm_changes = _merge_vm_facts(_detect_vm_changes(filtered_sections),
+                                 render_facts)
     # COPS-2632: same rule for unresolved chart values. The blocking finding
     # names the resource, so the resource has to be reachable in the comment.
     artifacts = _detect_template_artifacts(filtered_sections)
@@ -9081,9 +9094,16 @@ def _run_one_diff(app, pr_sha, main_sha, chart_revision=None, changed_paths=None
     # Deployments / HPAs never appear there. Without the full-render
     # workload totals, scaling two services to 0 looked like a whole-env
     # shutdown (acme-config-prod #4321).
+    # COPS-2766: element 6 is the capacity facts, element 7 what KCC rejects
+    # on sync (bootDisk, a dataset or bucket location or project), both read
+    # from both renders.
+    # Index: 0 diff, 1 reason, 2 detail, 3 version_change, 4 hpas_remaining,
+    # 5 replica_stats, 6 capacity, 7 render facts. A new element goes at the
+    # end, with its own index.
     return (diff_text, None, None, version_change,
             _count_hpas_remaining(pr_resources),
-            _count_workload_replicas(pr_resources), capacity)
+            _count_workload_replicas(pr_resources), capacity,
+            _render_immutable_facts(main_resources, pr_resources))
 
 
 def _indeterminate(reason, detail):
@@ -9139,13 +9159,14 @@ def argocd_diff(app, pr_sha, main_sha, chart_revision=None, changed_paths=None, 
             chart_revision=chart_revision, changed_paths=changed_paths, renames=renames)
         # v2.5.8: success returns a 4-tuple with the version change; COPS-2677
         # extends to 5 with hpas_remaining; COPS-2680 adds replica_stats
-        # (total, zeroed) from the PR-side render. Failure paths keep
-        # returning 3-tuples.
+        # (total, zeroed) from the PR-side render; COPS-2766 adds the render
+        # facts. Failure paths keep returning 3-tuples.
         diff_text, reason, detail = step[0], step[1], step[2]
         version_change = step[3] if len(step) > 3 else None
         hpas_remaining = step[4] if len(step) > 4 else 0
         replica_stats = step[5] if len(step) > 5 else None
         capacity = step[6] if len(step) > 6 else None  # COPS-2766
+        render_facts = step[7] if len(step) > 7 else None
 
         if reason is not None:
             last_detail, last_reason = detail or reason, reason
@@ -9191,7 +9212,8 @@ def argocd_diff(app, pr_sha, main_sha, chart_revision=None, changed_paths=None, 
         # (v2.5.26: the PR-6773 lesson, see _package_sections).
         clean_diff, capped_sections, deleted_res, zeroed_res, fingerprint, \
             renamed_res, vm_changes_res, version_fold = _package_sections(
-                filtered_sections, version_change=version_change)
+                filtered_sections, version_change=version_change,
+                render_facts=render_facts)
         # Counted on the full pre-cap list, like every other safety fact.
         # hpas_remaining + replica_stats come from the PR-side render in
         # _run_one_diff (COPS-2677 / COPS-2680).
@@ -11437,13 +11459,15 @@ def _summarize_vm_changes(changed_files, pr_sha, base_sha, path_map,
                 "`%s` `%s` \u2192 `%s`" % (k, o or "(absent)", n or "(removed)")
                 for k, o, n in fact["fields"])
             if fact["dangerous"]:
+                # COPS-2766: the notes ride along, so a resize with a park
+                # still names the stop loop.
                 dangerous_lines.append(
                     "- \U0001f6a8 %s: %s \u2014 %s" % (
                         where,
                         field_txt or ("resource DELETED from the render"
                                       if fact["deleted"] else
                                       "resource-level change"),
-                        "; ".join(fact["dangerous"])))
+                        "; ".join(fact["dangerous"] + fact["notes"])))
             elif fact.get("orphaned") or (
                     fact["deleted"] and fact.get("notes")):
                 # COPS-2682: abandon unmanage and snapshot-attachment notes.
@@ -11460,8 +11484,9 @@ def _summarize_vm_changes(changed_files, pr_sha, base_sha, path_map,
                     _prov_kinds.setdefault(env, set()).add(fact["kind"])
                     continue
                 routine_lines.append(
-                    (env, "- %s: %s" % (where,
-                                        field_txt or "; ".join(fact["notes"]))))
+                    (env, "- %s: %s" % (where, " \u2014 ".join(
+                        t for t in (field_txt, "; ".join(fact["notes"]))
+                        if t))))
 
     # COPS-2635: one statement per provision signature. 🚨 because a new
     # machine in GCP deserves the operator's eyes, but said once, in the
