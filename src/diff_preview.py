@@ -228,6 +228,8 @@ from version_fold import (  # version-transition fold (same-dir module, stdlib o
     _classify_fold_pair,
     _classify_version_fold,
     _detect_image_downgrades,
+    _image_defaults,
+    _pins_left_behind,
 )
 import uptime_schedule  # VM uptime-schedule advisory notes (same-dir module, stdlib only)
 from grouping import (  # same-change grouping and rollup (same-dir module)
@@ -2827,9 +2829,9 @@ DiffResult = namedtuple("DiffResult",
                          "fingerprint", "renamed_resources", "vm_changes",
                          "version_fold", "shutdown_stats",
                          "template_artifacts", "pingscaler_created", "ip_released",
-                         "neg_removed", "capacity", "image_downgrades"],
+                         "neg_removed", "capacity", "image_downgrades", "pins_behind"],
                         defaults=[None, None, None, None, None, None, None,
-                                  None, None, None, None, None, None, None])
+                                  None, None, None, None, None, None, None, None])
 # ip_released (COPS-2766): the deleted ComputeAddress and DNSRecordSet headers
 # GCP releases (no explicit abandon), from the full pre-cap list. The `ip`
 # merge gate reads it. Only OUT_DIFF sets it, so a teardown never has it.
@@ -2840,6 +2842,10 @@ DiffResult = namedtuple("DiffResult",
 # annotation (manifest._detect_neg_removed), on the full pre-cap list. The
 # summary pairs them with a deleted ComputeBackendService of the same env
 # (acme-config-prod #3888). None on non-OUT_DIFF outcomes.
+# pins_behind (COPS-2766): on a chart upgrade, [(service, pinned tag, new
+# chart default), ...] for every value-file pin the bump leaves behind
+# (_pins_behind), or 'skipped' when the check could not read its inputs.
+# None when the chart does not go up or has no versions.yaml.
 # image_downgrades (COPS-2766): ((header, repo, old tag, new tag), ...) for
 # every image tag that goes down (_detect_image_downgrades), counted on the
 # full pre-cap list (#4679). None when there is none, and when the chart
@@ -8781,6 +8787,44 @@ def _legacy_backends_lines(changes) -> list:
             "BackendService is UpToDate.", ""]
 
 
+def _chart_image_defaults(chart_dir):
+    """COPS-2766: the chart's default image tag per service, or None when it
+    has no versions.yaml (only the micro-services chart has one). The chart
+    merges its values.yaml over versions.yaml, so values.yaml wins. Raises
+    on a read or parse error."""
+    path = os.path.join(chart_dir, "versions.yaml")
+    if not os.path.isfile(path):
+        return None
+    with open(path, encoding="utf-8") as f:
+        defaults = _image_defaults(_yaml_safe_load(f.read()))
+    values = os.path.join(chart_dir, "values.yaml")
+    if os.path.isfile(values):
+        with open(values, encoding="utf-8") as f:
+            defaults.update(_image_defaults(_yaml_safe_load(f.read())))
+    return defaults
+
+
+def _pins_behind(main_chart, pr_chart, pr_vals):
+    """COPS-2766: the value-file image pins a chart bump leaves behind. None
+    when the PR chart has no versions.yaml. A main chart with none gives [],
+    because no pin was compared before. 'skipped' when anything fails: it is
+    a warning, and it must never turn a green bump red."""
+    try:
+        new = _chart_image_defaults(pr_chart)
+        if new is None:
+            return None
+        old = _chart_image_defaults(main_chart) or {}
+        pins = {}
+        for content in pr_vals.values():       # helm -f order, last wins
+            pins.update(_image_defaults(_yaml_safe_load(content)))
+        return _pins_left_behind(pins, old, new)
+    except Exception as e:
+        # The type only: a YAML error echoes the line, and a value file can
+        # hold a secret (COPS-2668).
+        logsink.log(f"pin check skipped (non-fatal): {type(e).__name__}", "WARNING")
+        return "skipped"
+
+
 
 
 def _run_one_diff(app, pr_sha, main_sha, chart_revision=None, changed_paths=None, renames=None):
@@ -9096,6 +9140,10 @@ def _run_one_diff(app, pr_sha, main_sha, chart_revision=None, changed_paths=None
     except Exception as e:
         logsink.log(f"[{app}] capacity check failed (non-fatal): {e}", "WARNING")
         capacity = None
+    # COPS-2766: only on a chart upgrade, the pins it leaves behind.
+    pins = (_pins_behind(main_chart, pr_chart, pr_vals)
+            if version_change and _is_version_downgrade(pr_rev, main_rev)
+            else None)
     # COPS-2677 / COPS-2680: HPA count and workload replica totals travel
     # with the diff — argocd_diff only sees the unified text, and unchanged
     # Deployments / HPAs never appear there. Without the full-render
@@ -9103,14 +9151,14 @@ def _run_one_diff(app, pr_sha, main_sha, chart_revision=None, changed_paths=None
     # shutdown (acme-config-prod #4321).
     # COPS-2766: element 6 is the capacity facts, element 7 what KCC rejects
     # on sync (bootDisk, a dataset or bucket location or project), both read
-    # from both renders.
+    # from both renders, element 8 the pins a chart upgrade leaves behind.
     # Index: 0 diff, 1 reason, 2 detail, 3 version_change, 4 hpas_remaining,
-    # 5 replica_stats, 6 capacity, 7 render facts. A new element goes at the
-    # end, with its own index.
+    # 5 replica_stats, 6 capacity, 7 render facts, 8 pins_behind. A new
+    # element goes at the end, with its own index.
     return (diff_text, None, None, version_change,
             _count_hpas_remaining(pr_resources),
             _count_workload_replicas(pr_resources), capacity,
-            _render_immutable_facts(main_resources, pr_resources))
+            _render_immutable_facts(main_resources, pr_resources), pins)
 
 
 def _indeterminate(reason, detail):
@@ -9166,14 +9214,16 @@ def argocd_diff(app, pr_sha, main_sha, chart_revision=None, changed_paths=None, 
             chart_revision=chart_revision, changed_paths=changed_paths, renames=renames)
         # v2.5.8: success returns a 4-tuple with the version change; COPS-2677
         # extends to 5 with hpas_remaining; COPS-2680 adds replica_stats
-        # (total, zeroed) from the PR-side render; COPS-2766 adds the render
-        # facts. Failure paths keep returning 3-tuples.
+        # (total, zeroed) from the PR-side render; COPS-2766 adds the capacity
+        # facts, the render facts and pins_behind. Failure paths keep returning
+        # 3-tuples.
         diff_text, reason, detail = step[0], step[1], step[2]
         version_change = step[3] if len(step) > 3 else None
         hpas_remaining = step[4] if len(step) > 4 else 0
         replica_stats = step[5] if len(step) > 5 else None
         capacity = step[6] if len(step) > 6 else None  # COPS-2766
         render_facts = step[7] if len(step) > 7 else None
+        pins_behind = step[8] if len(step) > 8 else None
 
         if reason is not None:
             last_detail, last_reason = detail or reason, reason
@@ -9205,13 +9255,13 @@ def argocd_diff(app, pr_sha, main_sha, chart_revision=None, changed_paths=None, 
         # diff_text == "" means manifests are identical
         if not diff_text:
             return DiffResult("", [], 0, False, None, OUT_NO_DIFF, "clean",
-                              version_change)
+                              version_change, pins_behind=pins_behind)
 
         # Filter noise sections (checksums, version annotations that always drift)
         filtered_sections = _filter_diff_sections(parse_diff_sections(diff_text))
         if not filtered_sections:
             return DiffResult("", [], 0, False, None, OUT_NO_DIFF, "noise_only",
-                              version_change)
+                              version_change, pins_behind=pins_behind)
 
         n_res = len(filtered_sections)
         # Truncate to display budget NOW so we never hold the full YAML in
@@ -9242,7 +9292,7 @@ def argocd_diff(app, pr_sha, main_sha, chart_revision=None, changed_paths=None, 
                           vm_changes_res, version_fold, shutdown_stats,
                           artifacts, pingscaler_res, ip_released=ip_released,
                           neg_removed=neg_res, capacity=capacity,
-                          image_downgrades=image_downgrades)
+                          image_downgrades=image_downgrades, pins_behind=pins_behind)
     # Exhausted retries
     return _indeterminate(last_reason, last_detail or "unknown error")
 

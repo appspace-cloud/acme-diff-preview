@@ -447,3 +447,356 @@ def test_the_green_status_names_the_image_downgrade(world):
         "⚠️ Image downgrade in pv-orch-a: device 1.117.4 → 1.116.10. Check "
         "that an old pin or an old branch is not moving it back. | 2 resource(s) "
         "will change" + IMG_SUFFIX + " - review comment")
+
+
+# ── a pin left behind by a chart bump (COPR-32582) ──────────────────────
+# COPR-32582 pinned signschannel to a 1.90.15 hotfix on 15 AEC clones, over
+# the chart's 1.90.14. A bump to a chart that ships 1.91.8 keeps them on
+# 1.90.15, and nothing said so: the pin now holds the service back.
+
+import logsink  # noqa: E402
+import render_cache  # noqa: E402
+import yaml  # noqa: E402
+
+SC_PIN = "1.90.15-rc.20260923031"
+
+
+def _defs(tags):
+    return {"appspace": {"microservices": {"definitions": {
+        s: {"image": {"tag": t}} for s, t in tags.items()}}}}
+
+
+def test_image_defaults_reads_the_tag_of_each_service():
+    doc = _defs({"device": "1.117.4", "web": 2})
+    d = doc["appspace"]["microservices"]["definitions"]
+    d.update({"timer": {"replicas": 1}, "raw": {"image": "r/app:1.0"},
+              "unset": {"image": {"tag": None}}, "odd": "x"})
+    assert vf._image_defaults(doc) == {"device": "1.117.4", "web": "2"}
+
+
+@pytest.mark.parametrize("doc", [
+    None, [], "x", {"appspace": None}, {"appspace": {"microservices": []}},
+    {"appspace": {"microservices": {"definitions": "x"}}},
+    {"appspace": {"microservices": {"defaultReplicaCount": 2}}},
+])
+def test_image_defaults_on_a_partial_tree_is_empty(doc):
+    assert vf._image_defaults(doc) == {}
+
+
+@pytest.mark.parametrize("pins,old,new,left", [
+    # COPR-32582: newer than the old chart, older than the new one.
+    ({"signschannel": SC_PIN}, {"signschannel": "1.90.14"},
+     {"signschannel": "1.91.8"}, [("signschannel", SC_PIN, "1.91.8")]),
+    # The same tag as the old default: it held nothing back before.
+    ({"device": "1.117.4"}, {"device": "1.117.4"}, {"device": "1.118.0"},
+     [("device", "1.117.4", "1.118.0")]),
+    # Already older before the bump: not new, not ours to name.
+    ({"device": "1.110.0"}, {"device": "1.117.4"}, {"device": "1.118.0"}, []),
+    # COPS-2346 pwa shape: the pin is newer than the new chart too.
+    ({"pwa-static-assets": "2.100.0-rc.20260902013"},
+     {"pwa-static-assets": "2.75.0"}, {"pwa-static-assets": "2.80.0"}, []),
+    # The bump does not move this service.
+    ({"device": "1.110.0"}, {"device": "1.110.0"}, {"device": "1.110.0"}, []),
+    ({"new-svc": "1.0.0"}, {}, {"new-svc": "2.0.0"}, []),
+    ({"gone": "1.0.0"}, {"gone": "0.9.0"}, {}, []),
+    ({"platform": "1.85.1"}, {"device": "1.0.0"}, {"device": "2.0.0"}, []),
+    # Not a dotted version.
+    ({"migrate": "abc123"}, {"migrate": "1.0.0"}, {"migrate": "2.0.0"}, []),
+    ({"migrate": "latest"}, {"migrate": "1.0.0"}, {"migrate": "2.0.0"}, []),
+])
+def test_a_pin_is_left_behind_only_when_it_is_newly_older(pins, old, new, left):
+    assert vf._pins_left_behind(pins, old, new) == left
+
+
+def test_pins_left_behind_are_sorted_by_service():
+    old = {"web": "1.0.0", "api": "1.0.0"}
+    new = {"web": "2.0.0", "api": "2.0.0"}
+    assert vf._pins_left_behind({"web": "1.0.0", "api": "1.0.1"}, old, new) == [
+        ("api", "1.0.1", "2.0.0"), ("web", "1.0.0", "2.0.0")]
+
+
+def _chart(root, name, versions=None, values=None):
+    """A chart dir. versions / values: a tag dict, raw text, or None."""
+    d = root / name
+    d.mkdir(parents=True)
+    (d / "Chart.yaml").write_text(f"apiVersion: v2\nname: {name}\n")
+    for fname, content in (("versions.yaml", versions), ("values.yaml", values)):
+        if content is not None:
+            (d / fname).write_text(content if isinstance(content, str)
+                                   else yaml.safe_dump(_defs(content)))
+    return str(d)
+
+
+def test_chart_image_defaults_is_none_without_a_versions_yaml(tmp_path):
+    """-ss and -glb charts have no versions.yaml: they are not checked."""
+    assert m._chart_image_defaults(_chart(tmp_path, "ss", values={"a": "1.0"})) is None
+
+
+def test_chart_image_defaults_reads_versions_yaml(tmp_path):
+    d = _chart(tmp_path, "ms", versions={"device": "1.117.4"})
+    assert m._chart_image_defaults(d) == {"device": "1.117.4"}
+
+
+def test_the_chart_values_yaml_wins_over_versions_yaml(tmp_path):
+    """The chart merges `$versions | merge $envs | merge .Values`, so a
+    tag in its values.yaml wins. pwa-static-assets is only there."""
+    d = _chart(tmp_path, "ms", versions={"device": "1.117.4", "web": "1.0.0"},
+               values={"web": "1.2.0", "pwa-static-assets": "2.75.0"})
+    assert m._chart_image_defaults(d) == {
+        "device": "1.117.4", "web": "1.2.0", "pwa-static-assets": "2.75.0"}
+
+
+@pytest.mark.parametrize("versions,values", [
+    ("appspace: [unclosed\n", None),
+    ("appspace: {}\n", "appspace: [unclosed\n"),
+])
+def test_chart_image_defaults_raises_on_broken_yaml(tmp_path, versions, values):
+    d = _chart(tmp_path, "ms", versions=versions, values=values)
+    with pytest.raises(yaml.YAMLError):
+        m._chart_image_defaults(d)
+
+
+def _pin_vals(*tag_dicts):
+    return {f"$config/f{i}.yaml": yaml.safe_dump(_defs(t))
+            for i, t in enumerate(tag_dicts)}
+
+
+@pytest.fixture()
+def warnings(monkeypatch):
+    logged = []
+    monkeypatch.setattr(logsink, "log", lambda msg, sev="INFO", **k:
+                        logged.append((sev, msg)))
+    return logged
+
+
+def test_pins_behind_names_the_pin_the_bump_leaves(tmp_path):
+    main = _chart(tmp_path, "main", versions={"signschannel": "1.90.14"})
+    pr = _chart(tmp_path, "pr", versions={"signschannel": "1.91.8"})
+    vals = _pin_vals({}, {"signschannel": SC_PIN})
+    vals["$config/empty.yaml"] = ""
+    assert m._pins_behind(main, pr, vals) == [("signschannel", SC_PIN, "1.91.8")]
+
+
+def test_pins_behind_merges_the_value_files_last_wins(tmp_path):
+    main = _chart(tmp_path, "main", versions={"signschannel": "1.90.14"})
+    pr = _chart(tmp_path, "pr", versions={"signschannel": "1.91.8"})
+    assert m._pins_behind(main, pr, _pin_vals({"signschannel": SC_PIN},
+                                              {"signschannel": "1.91.9"})) == []
+    assert m._pins_behind(main, pr, _pin_vals({"signschannel": "1.91.9"},
+                                              {"signschannel": SC_PIN})) != []
+
+
+def test_pins_behind_is_none_without_a_pr_versions_yaml(tmp_path):
+    main = _chart(tmp_path, "main", versions={"signschannel": "1.90.14"})
+    pr = _chart(tmp_path, "pr")
+    assert m._pins_behind(main, pr, _pin_vals({"signschannel": SC_PIN})) is None
+
+
+def test_a_main_chart_without_versions_yaml_leaves_nothing_behind(tmp_path):
+    """Nothing was older before, because there was no default to compare."""
+    main = _chart(tmp_path, "main")
+    pr = _chart(tmp_path, "pr", versions={"signschannel": "1.91.8"})
+    assert m._pins_behind(main, pr, _pin_vals({"signschannel": SC_PIN})) == []
+
+
+def test_pins_behind_is_skipped_on_a_broken_versions_yaml(tmp_path, warnings):
+    main = _chart(tmp_path, "main", versions={"signschannel": "1.90.14"})
+    pr = _chart(tmp_path, "pr", versions="appspace: [unclosed\n")
+    assert m._pins_behind(main, pr, _pin_vals({"signschannel": SC_PIN})) == "skipped"
+    assert [s for s, msg in warnings if "pin check skipped" in msg] == ["WARNING"]
+
+
+def test_pins_behind_is_skipped_on_a_broken_value_file(tmp_path, warnings):
+    """The log names the error type only: a YAML error echoes the line,
+    and a value file can hold a secret (COPS-2668)."""
+    main = _chart(tmp_path, "main", versions={"signschannel": "1.90.14"})
+    pr = _chart(tmp_path, "pr", versions={"signschannel": "1.91.8"})
+    vals = {"$config/secrets.yaml": "password: hunter2\n  bad: [\n"}
+    assert m._pins_behind(main, pr, vals) == "skipped"
+    assert warnings and "hunter2" not in warnings[0][1]
+
+
+def test_pins_behind_never_raises(tmp_path, monkeypatch, warnings):
+    """Critic: any error here, not only a read or parse error, must not turn
+    a green bump red through the OUT_ERROR path of process_pr."""
+    main = _chart(tmp_path, "main", versions={"signschannel": "1.90.14"})
+    pr = _chart(tmp_path, "pr", versions={"signschannel": "1.91.8"})
+
+    def boom(doc):
+        raise TypeError("unexpected shape")
+
+    monkeypatch.setattr(m, "_image_defaults", boom)
+    assert m._pins_behind(main, pr, _pin_vals({"signschannel": SC_PIN})) == "skipped"
+    assert warnings[0][0] == "WARNING" and "TypeError" in warnings[0][1]
+
+
+# _run_one_diff wired to fakes, with a real chart dir per version.
+
+PIN_APP, PIN_NS = "pv-pin-a-ms", "pv-pin-a"
+
+
+def _manifest(tag):
+    return ("apiVersion: apps/v1\nkind: Deployment\nmetadata:\n"
+            f"  name: web\n  namespace: {PIN_NS}\nspec:\n  template:\n"
+            f"    spec:\n      containers:\n      - image: r/web:{tag}\n")
+
+
+@pytest.fixture()
+def pin_world(tmp_path, monkeypatch):
+    monkeypatch.setattr(render_cache, "MAIN_RENDER_CACHE_DIR", str(tmp_path / "renders"))
+    monkeypatch.setattr(render_cache, "MAIN_RENDER_GCS_BUCKET", "")
+    with m._main_render_lock:
+        m._main_render_cache.clear()
+    charts = {
+        "2603.2.19": _chart(tmp_path, "c1", versions={"signschannel": "1.90.14",
+                                                      "web": "1.0.0"}),
+        "2603.3.10": _chart(tmp_path, "c2", versions={"signschannel": "1.91.8",
+                                                      "web": "2.0.0"}),
+        "2603.1.0": _chart(tmp_path, "c0", versions={"signschannel": "1.80.0",
+                                                     "web": "0.9.0"}),
+    }
+    monkeypatch.setitem(m._app_chart_map, PIN_APP, "appspace-micro-services")
+    monkeypatch.setitem(m._app_chart_revision_map, PIN_APP, "2603.2.19")
+    monkeypatch.setitem(m._app_chart_registry_map, PIN_APP, "registry.example.com")
+    monkeypatch.setitem(m._app_value_files_map, PIN_APP,
+                        ["$config/gcp/prod/x/config.yaml",
+                         f"$config/gcp/prod/x/{PIN_NS}/customer.yaml"])
+    monkeypatch.setitem(m._app_namespace_map, PIN_APP, PIN_NS)
+    monkeypatch.setattr(m, "_ensure_chart", lambda reg, chart, ver: charts[ver])
+    monkeypatch.setattr(m, "_fetch_value_files", lambda files, sha: {
+        f: yaml.safe_dump(_defs({"signschannel": SC_PIN} if "customer" in f else {}))
+        for f in files})
+    monkeypatch.setattr(m, "_helm_template", lambda chart, rel, ns, vals: (
+        _manifest("1.0.0" if chart == charts["2603.2.19"] else "2.0.0"), None))
+    yield charts
+    with m._main_render_lock:
+        m._main_render_cache.clear()
+
+
+def test_run_one_diff_returns_the_pins_a_bump_leaves(pin_world):
+    out = m._run_one_diff(PIN_APP, "pinpr0000001", "pinmain00001",
+                          chart_revision="2603.3.10")
+    assert out[1] is None and out[3] == ("2603.2.19", "2603.3.10")
+    assert out[8] == [("signschannel", SC_PIN, "1.91.8")]
+
+
+@pytest.mark.parametrize("rev", [None, "2603.1.0"])
+def test_run_one_diff_checks_no_pin_unless_the_chart_goes_up(pin_world, rev):
+    out = m._run_one_diff(PIN_APP, "pinpr0000001", "pinmain00001",
+                          chart_revision=rev)
+    assert out[1] is None and len(out) == 9 and out[8] is None
+
+
+def test_a_raising_pin_check_keeps_the_diff(pin_world, monkeypatch, warnings):
+    """Critic blocker: the whole diff path, with a pin check that raises."""
+    def boom(doc):
+        raise TypeError("unexpected shape")
+
+    monkeypatch.setattr(m, "_image_defaults", boom)
+    r = m.argocd_diff(PIN_APP, "pinpr0000001", "pinmain00001",
+                      chart_revision="2603.3.10")
+    assert r.outcome == m.OUT_DIFF and r.pins_behind == "skipped"
+    b = _bullets({PIN_APP: r})
+    assert "ℹ️ Pin check skipped in pv-pin-a: the chart versions.yaml or a " \
+           "value file could not be read." in b
+
+
+def _stub_step(monkeypatch, diff_text, pins):
+    monkeypatch.setattr(m, "_run_one_diff", lambda *a, **k: (
+        diff_text, None, "", ("2603.2.19", "2603.3.10"), 0, None, None, None, pins))
+
+
+PINS = [("signschannel", SC_PIN, "1.91.8")]
+
+
+def test_argocd_diff_carries_the_pins_on_a_diff(monkeypatch):
+    _stub_step(monkeypatch, _diff_text(_ups()), PINS)
+    r = m.argocd_diff("pv-x-a-ms", "aaaa1111", "bbbb2222")
+    assert r.outcome == m.OUT_DIFF and r.pins_behind == PINS
+
+
+@pytest.mark.parametrize("diff_text,reason", [
+    ("", "clean"),
+    ("===== apps/Deployment webx =====\n"
+     "-   checksum/config: aaa\n+   checksum/config: bbb\n", "noise_only"),
+])
+def test_argocd_diff_carries_the_pins_with_no_manifest_change(
+        monkeypatch, diff_text, reason):
+    """A pin that holds the only service the bump moves leaves no diff."""
+    _stub_step(monkeypatch, diff_text, PINS)
+    r = m.argocd_diff("pv-x-a-ms", "aaaa1111", "bbbb2222")
+    assert r.outcome == m.OUT_NO_DIFF and r.reason == reason
+    assert r.pins_behind == PINS
+
+
+def test_an_old_six_tuple_step_has_no_pins(monkeypatch):
+    assert _via_argocd_diff(monkeypatch, _ups()).pins_behind is None
+
+
+def _pinned(pins, vc=("2603.2.19", "2603.3.10")):
+    return m.DiffResult("d", [("apps/Deployment x", "+a")], 1, True, "",
+                        m.OUT_DIFF, "", vc, pins_behind=pins)
+
+
+PIN_LINE = ("📌 **Image pin left behind** in pv-a, pv-b: `signschannel` pinned "
+            f"`{SC_PIN}`, the new chart ships `1.91.8`. The pin now holds the "
+            "service back: bump it or remove it.")
+
+
+def test_the_summary_names_the_pin_left_behind():
+    results = {"pv-a-ms": _pinned(PINS), "pv-b-ms": _pinned(PINS),
+               "pv-c-ms": _pinned([]), "pv-d-ms": _pinned(None)}
+    lines = cr._build_merge_summary(results, {}, None, None, None, None, False)
+    assert any("Review before merging" in l for l in lines)
+    assert PIN_LINE in _bullets(results)
+
+
+def test_the_pin_line_shows_three_pairs_and_counts_the_rest():
+    pins = [(f"svc-{i}", "1.0.0", "2.0.0") for i in range(5)]
+    line = next(b for b in _bullets({"pv-a-ms": _pinned(pins)})
+                if b.startswith("📌"))
+    assert line == (
+        "📌 **Image pin left behind** in pv-a: `svc-0` pinned `1.0.0`, the new "
+        "chart ships `2.0.0`; `svc-1` pinned `1.0.0`, the new chart ships "
+        "`2.0.0`; `svc-2` pinned `1.0.0`, the new chart ships `2.0.0` "
+        "(+2 more). The pin now holds the service back: bump it or remove it.")
+
+
+def test_a_skipped_pin_check_is_routine():
+    results = {"pv-a-ms": _pinned("skipped"), "pv-b-ms": _pinned(None)}
+    lines = cr._build_merge_summary(results, {}, None, None, None, None, False)
+    assert any(l.startswith("✅ **Routine**") for l in lines), lines
+    assert ("ℹ️ Pin check skipped in pv-a: the chart versions.yaml or a value "
+            "file could not be read.") in _bullets(results)
+    assert not any(b.startswith("📌") for b in _bullets(results))
+
+
+def test_process_pr_with_a_pin_left_behind_is_a_green_review(world):
+    sinks, plan = world
+    plan["pv-orch-a-ms"] = m.DiffResult(
+        "--- main\n+++ pr", [("/apps/Deployment pv-orch-a/web",
+                              "-image: r/web:1.0.0\n+image: r/web:2.0.0")],
+        1, True, "", m.OUT_DIFF, "", version_change=("2603.0.1-dev", "2603.0.2-dev"),
+        pins_behind=PINS)
+    m.process_pr(_mk_pr(), PATH_MAP, base_sha=BASE_SHA)
+    body = sinks.upserts[-1]
+    assert m._extract_status_token(body) == "clean", "not the transient path"
+    assert "Review before merging" in body.split("\n---\n", 1)[0]
+    state, desc = sinks.statuses[-1]
+    assert state == "SUCCESSFUL", desc
+    assert desc.startswith("⚠️ Image pin left behind in pv-orch-a: signschannel "
+                           f"pinned {SC_PIN}"), desc
+    assert desc.endswith(" - review comment"), desc
+
+
+def test_process_pr_with_a_skipped_pin_check_stays_routine(world):
+    sinks, plan = world
+    plan["pv-orch-a-ms"] = m.DiffResult(
+        "", [], 0, False, None, m.OUT_NO_DIFF, "clean",
+        ("2603.0.1-dev", "2603.0.2-dev"), pins_behind="skipped")
+    m.process_pr(_mk_pr(), PATH_MAP, base_sha=BASE_SHA)
+    body = sinks.upserts[-1]
+    assert m._extract_status_token(body) == "clean", "not the transient path"
+    summary = body.split("\n---\n", 1)[0]
+    assert "✅ **Routine**" in summary and "Pin check skipped in pv-orch-a" in summary
+    assert sinks.statuses[-1][0] == "SUCCESSFUL"

@@ -287,7 +287,7 @@ def _dep_ns(replicas, image="v1"):
 def test_run_one_diff_returns_the_capacity_facts(helm_world):
     helm_world.update(main=_dep_ns(10), pr=_dep_ns(6))
     out = m._run_one_diff(APP, PR_SHA, MAIN_SHA)
-    assert out[1] is None and len(out) == 8, out
+    assert out[1] is None and len(out) == 9, out
     assert out[6] == {"cuts": [("signschannel", "floor 10 → 6")], "released": []}
     helm_world.update(main=_dep_ns(10, "v1"), pr=_dep_ns(10, "v2"))
     out = m._run_one_diff(APP, PR_SHA, "othermain001")

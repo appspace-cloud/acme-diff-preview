@@ -873,6 +873,28 @@ def _build_merge_summary(results, rollup_by_sig, vm_change_lines,
                                      for s, o, n in _pairs[:3])
                          + f"{_more}. Check that an old pin or an old branch "
                          f"is not moving it back."))
+    # COPS-2766: a chart bump ships a newer default, and a pin that was not
+    # older before now holds the service back (COPR-32582).
+    pin_apps = sorted(a for a, r in results.items()
+                      if isinstance(getattr(r, "pins_behind", None), list)
+                      and r.pins_behind)
+    if pin_apps:
+        _pins = sorted({tuple(p) for a in pin_apps for p in results[a].pins_behind})
+        _more = f" (+{len(_pins) - 3} more)" if len(_pins) > 3 else ""
+        findings.append((_SEV_REVIEW,
+                         f"\U0001f4cc **Image pin left behind** in "
+                         f"{_fmt_env_list(pin_apps)}: "
+                         + "; ".join(f"`{s}` pinned `{p}`, the new chart "
+                                     f"ships `{n}`" for s, p, n in _pins[:3])
+                         + f"{_more}. The pin now holds the service back: "
+                         f"bump it or remove it."))
+    pin_skipped = sorted(a for a, r in results.items()
+                         if getattr(r, "pins_behind", None) == "skipped")
+    if pin_skipped:
+        findings.append((_SEV_ROUTINE,
+                         f"\u2139\ufe0f Pin check skipped in "
+                         f"{_fmt_env_list(pin_skipped)}: the chart versions.yaml "
+                         f"or a value file could not be read."))
     # COPS-2632 / COPS-2677: a rendered `%!s(<nil>)` or `<no value>` is a
     # value the chart read and this environment does not set. Live proof:
     # pv-stage1-a shipped `hosting-id: hst-%!s(<nil>)` and KCC rejected every

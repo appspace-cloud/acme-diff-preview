@@ -255,3 +255,29 @@ def _detect_image_downgrades(sections, version_change=None):
             if new and _image_tag_downgrade(old, new):
                 found.append((hdr, repo.rsplit("/", 1)[-1], old, new))
     return tuple(found)
+
+
+def _image_defaults(doc) -> dict:
+    """{service: tag} from appspace.microservices.definitions.<svc>.image.tag.
+    The chart versions.yaml and a config value file use the same path. A
+    level that is not a dict, and a tag that is not set, are skipped."""
+    defs = doc
+    for key in ("appspace", "microservices", "definitions"):
+        defs = defs.get(key) if isinstance(defs, dict) else None
+    out = {}
+    for svc, d in (defs.items() if isinstance(defs, dict) else ()):
+        img = d.get("image") if isinstance(d, dict) else None
+        tag = img.get("tag") if isinstance(img, dict) else None
+        if tag is not None:
+            out[svc] = str(tag)
+    return out
+
+
+def _pins_left_behind(pins, old_defaults, new_defaults) -> list:
+    """COPS-2766: [(svc, pin, new default), ...], sorted, for every pin that
+    is older than the new chart default and was not older than the old one.
+    The bump now holds the service back (COPR-32582)."""
+    return sorted((svc, pin, new_defaults[svc]) for svc, pin in pins.items()
+                  if svc in old_defaults and svc in new_defaults
+                  and _image_tag_downgrade(new_defaults[svc], pin)
+                  and not _image_tag_downgrade(old_defaults[svc], pin))
