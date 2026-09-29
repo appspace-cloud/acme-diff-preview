@@ -779,13 +779,15 @@ def _build_merge_summary(results, rollup_by_sig, vm_change_lines,
     both = [n for n in neg if any(b == n or (n.startswith("cl-") and b.startswith(n + "-"))
                                   for b in bs)]
     if both:
+        # The action first: the green status lead is cut at 255 bytes.
         findings.append((_SEV_REVIEW,
                          "\U0001f517 **NEG and BackendService removed together** in "
-                         + _fmt_service_list([f"`{n}`" for n in both])
-                         + ": GKE deletes a NEG only when no BackendService uses "
-                         "it. After the sync, check `kubectl get svcneg -n "
-                         "<namespace>`. If one is stuck, delete the BackendService, "
-                         "never the finalizer (acme-config-prod #3888)."))
+                         + _fmt_service_list([f"`{n}`" for n in both], 3)
+                         + ": after the sync, check `kubectl get svcneg -n "
+                         "<namespace>`, and if one is stuck, delete the "
+                         "BackendService, never the finalizer. GKE deletes a NEG "
+                         "only when no BackendService uses it (acme-config-prod "
+                         "#3888)."))
     renamed_apps = sorted(a for a, r in results.items()
                           if getattr(r, "renamed_resources", None))
     if renamed_apps:

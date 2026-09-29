@@ -102,9 +102,9 @@ def _bullets(results, state=None):
 
 
 NEG_FINDING = ("\U0001f517 **NEG and BackendService removed together** in `pv-x`: "
-               "GKE deletes a NEG only when no BackendService uses it. After the "
-               "sync, check `kubectl get svcneg -n <namespace>`. If one is stuck, "
-               "delete the BackendService, never the finalizer (acme-config-prod #3888).")
+               "after the sync, check `kubectl get svcneg -n <namespace>`, and if one "
+               "is stuck, delete the BackendService, never the finalizer. GKE deletes "
+               "a NEG only when no BackendService uses it (acme-config-prod #3888).")
 
 
 def test_a_neg_and_a_backend_service_in_one_env_lead_the_deletions():
@@ -149,6 +149,24 @@ def test_several_envs_are_named():
                             "pv-b-ms": _r(neg=[SVC]), "pv-b-glb": _r(deleted=[BS])})
     assert b[0].startswith("\U0001f517 **NEG and BackendService removed together** "
                            "in `pv-a`, `pv-b`:"), b
+
+
+def test_the_green_status_keeps_the_action_at_the_3888_size():
+    """The action comes first and only 3 names are shown, so the status
+    lead cut at 255 bytes still says what to do. #3888 had 22 envs."""
+    tail = "44 resource(s) will change - review comment"
+    for n, action in ((1, "delete the BackendService, never the finalizer."),
+                      (22, "check kubectl get svcneg -n <namespace>, and if one is "
+                           "stuck, delete")):
+        results = {}
+        for i in range(n):
+            results[f"pv-cust{i:02}--aec1-a-ms"] = _r(neg=[SVC])
+            results[f"pv-cust{i:02}--aec1-a-glb"] = _r(deleted=[BS])
+        desc = cr.join_status_lead(cr.status_lead("\n".join(cr._build_merge_summary(
+            results, {}, None, None, None, None, False))), tail)
+        assert len(desc.encode()) <= 255 and desc.endswith(" | " + tail), desc
+        assert action in desc, desc
+    assert "`pv-cust02--aec1-a` (+19 more): after the sync" in _bullets(results)[1][0]
 
 
 def test_a_result_without_the_field_does_not_crash():
