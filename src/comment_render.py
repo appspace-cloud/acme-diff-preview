@@ -390,7 +390,9 @@ _REVIEW_RANK = {
     "\U0001f500": 4,               # planned rename
     "\U0001f5d1": 5,               # resources deleted, env decommission
     "\U0001f9ca": 6,               # replicas scaled to zero
+    "\U0001f4c9": 6,               # capacity cut
     "\U0001f39a": 7,               # ping-scaler activated
+    "\U0001f501": 7,               # fixed replicas released
     "\U0001f5a5": 8,               # KCC resources unmanaged
     "\U0001f9ec": 9,               # unresolved chart value
     "\U0001f4da": 99,              # higher-layer values
@@ -946,6 +948,27 @@ def _build_merge_summary(results, rollup_by_sig, vm_change_lines,
         findings.append((_SEV_REVIEW,
                          "\U0001f9ca **Replicas scaled to zero** in "
                          f"{_fmt_env_list(clean_partial_apps)}"))
+
+    # COPS-2766 (COPR-32597): capacity facts from the full renders. Warnings
+    # only, because a planned right-sizing looks the same.
+    cap = {a: r.capacity for a, r in sorted(results.items())
+           if getattr(r, "capacity", None)}
+    for part, text, tail in (
+            ("cuts", "\U0001f4c9 **Capacity cut**",
+             "Keep 2 replicas or more, keep the floor of the connection "
+             "services, and a CPU request of 30m or more (COPR-32597)."),
+            ("released", "\U0001f501 **Fixed replicas released**",
+             "On sync the field goes away, and Kubernetes runs 1 replica until "
+             "the HPA or acme-ping-scaler scales it back. Merge in a quiet "
+             "window (acme-config-prod #4523).")):
+        apps = [a for a in cap if cap[a].get(part)]
+        items = [f"{_envs_from_apps([a])[0]} `{w}` "
+                 + (f"({what})" if part == "released" else what)
+                 for a in apps for w, what in cap[a][part]]
+        if items:
+            findings.append((_SEV_REVIEW,
+                             f"{text} in {_fmt_env_list(apps, shown=3)}: "
+                             f"{_fmt_service_list(items, 4)}. {tail}"))
 
     if appspace_state_lines:
         txt = "\n".join(appspace_state_lines)

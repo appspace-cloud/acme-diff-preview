@@ -250,6 +250,8 @@ from vm_analysis import (  # VM/KCC infrastructure analysis (same-dir module)
     _detect_workload_shutdown,
     _count_hpas_remaining,
     _count_workload_replicas,
+    _detect_capacity_floor_risk,
+    _detect_replicas_released,
     _VM_KINDS,
     _VM_DELETION_POLICY_KEY,
     _VM_TRACKED_FIELDS,
@@ -414,6 +416,7 @@ except ImportError:  # pragma: no cover - production image always has the wheel
 # never touch PyYAML; every former yaml.safe_load site parses customer.yaml /
 # config.yaml. Prefer the C loader when libyaml is present, fall back so a
 # libyaml-less environment still boots. Call sites keep catching YAMLError.
+# COPS-2766: vm_analysis also parses changed workloads, for the CPU request.
 _YAML_SAFE_LOADER = getattr(yaml, "CSafeLoader", yaml.SafeLoader)
 
 
@@ -2812,12 +2815,15 @@ DiffResult = namedtuple("DiffResult",
                          "fingerprint", "renamed_resources", "vm_changes",
                          "version_fold", "shutdown_stats",
                          "template_artifacts", "pingscaler_created", "ip_released",
-                         "neg_removed"],
+                         "neg_removed", "capacity"],
                         defaults=[None, None, None, None, None, None, None,
-                                  None, None, None, None, None])
+                                  None, None, None, None, None, None])
 # ip_released (COPS-2766): the deleted ComputeAddress and DNSRecordSet headers
 # GCP releases (no explicit abandon), from the full pre-cap list. The `ip`
 # merge gate reads it. Only OUT_DIFF sets it, so a teardown never has it.
+# capacity (COPS-2766): {"cuts": [(workload, what)], "released": [(workload,
+# n)]} from vm_analysis on the full main and PR renders, or None. Warnings
+# only (COPR-32597, acme-config-prod #4523).
 # neg_removed (COPS-2766): headers of the Services that lose their NEG
 # annotation (manifest._detect_neg_removed), on the full pre-cap list. The
 # summary pairs them with a deleted ComputeBackendService of the same env
@@ -9055,6 +9061,15 @@ def _run_one_diff(app, pr_sha, main_sha, chart_revision=None, changed_paths=None
     _t_diff0 = time.perf_counter()
     diff_text = _diff_resources(main_resources, pr_resources)
     _record_stage("diff", time.perf_counter() - _t_diff0)
+    # COPS-2766: capacity facts need both full renders, like the counts
+    # below. A bug here must not turn a working diff into an error.
+    try:
+        cuts = _detect_capacity_floor_risk(main_resources, pr_resources)
+        released = _detect_replicas_released(main_resources, pr_resources)
+        capacity = {"cuts": cuts, "released": released} if cuts or released else None
+    except Exception as e:
+        logsink.log(f"[{app}] capacity check failed (non-fatal): {e}", "WARNING")
+        capacity = None
     # COPS-2677 / COPS-2680: HPA count and workload replica totals travel
     # with the diff — argocd_diff only sees the unified text, and unchanged
     # Deployments / HPAs never appear there. Without the full-render
@@ -9062,7 +9077,7 @@ def _run_one_diff(app, pr_sha, main_sha, chart_revision=None, changed_paths=None
     # shutdown (acme-config-prod #4321).
     return (diff_text, None, None, version_change,
             _count_hpas_remaining(pr_resources),
-            _count_workload_replicas(pr_resources))
+            _count_workload_replicas(pr_resources), capacity)
 
 
 def _indeterminate(reason, detail):
@@ -9124,6 +9139,7 @@ def argocd_diff(app, pr_sha, main_sha, chart_revision=None, changed_paths=None, 
         version_change = step[3] if len(step) > 3 else None
         hpas_remaining = step[4] if len(step) > 4 else 0
         replica_stats = step[5] if len(step) > 5 else None
+        capacity = step[6] if len(step) > 6 else None  # COPS-2766
 
         if reason is not None:
             last_detail, last_reason = detail or reason, reason
@@ -9188,7 +9204,7 @@ def argocd_diff(app, pr_sha, main_sha, chart_revision=None, changed_paths=None, 
                           deleted_res, zeroed_res, fingerprint, renamed_res,
                           vm_changes_res, version_fold, shutdown_stats,
                           artifacts, pingscaler_res, ip_released=ip_released,
-                          neg_removed=neg_res)
+                          neg_removed=neg_res, capacity=capacity)
     # Exhausted retries
     return _indeterminate(last_reason, last_detail or "unknown error")
 
@@ -12261,8 +12277,10 @@ def format_comment(pr_sha, app_results, skipped_apps=None, base_sha="",
             "This PR enables `acme-ping-scaler` here. From now on it owns "
             "the replica counts: it pings its target host every minute, "
             "scales every Deployment in the namespace to **0** while the "
-            "host is down, and restores the configured replicas when the "
-            "host answers.",
+            "host is down. When the host answers, it sets the default "
+            "replica count (2 on AEC) or the value in "
+            "`acmePingScaler.customReplicas`. It never reads "
+            "`definitions.<service>.replicas`.",
             "",
             f"The {n_ps} HorizontalPodAutoscaler(s) this PR deletes go "
             "**by design**: the chart never renders HPA while a "

@@ -14,6 +14,8 @@ that might be shrinking is a disk that gets flagged.
 """
 import re
 
+import yaml
+
 from comment_render import (
     _NEW_ENV_CHECK_PREFIX,
     _VM_PANEL_DANGER_HDR,
@@ -75,6 +77,37 @@ def _detect_replicas_zeroed(sections: list) -> list:
         if ends_zero and not ends_pos:
             zeroed.append(header)
     return zeroed
+
+
+def _res_kind_name(key):
+    """(Kind, name) of a _parse_manifest_resources key, name None if absent."""
+    if not isinstance(key, tuple):
+        return str(key).rsplit("/", 1)[-1], None
+    return key[0].rsplit("/", 1)[-1], (key[2] if len(key) > 2 else None)
+
+
+_REPLICAS_FIELD_RE = re.compile(r"^\s{0,4}replicas:")
+
+
+def _detect_replicas_released(main_resources, pr_resources) -> list:
+    """[(workload, n)]: fixed replicas whose field goes away (COPS-2766).
+
+    An HPA or acme-ping-scaler takes over, so the chart stops rendering
+    `replicas`. On sync the field goes away and Kubernetes runs 1 replica
+    until the new owner scales it back (acme-config-prod #4523, 10 to 1).
+    Only a workload on both sides, with n > 0 before.
+    """
+    out = []
+    pr_resources = pr_resources or {}
+    for key, body in (main_resources or {}).items():
+        kind, name = _res_kind_name(key)
+        head = pr_resources.get(key)
+        if kind not in _WORKLOAD_KINDS or not name or head is None:
+            continue
+        n = _manifest_replicas(body)
+        if n and not any(_REPLICAS_FIELD_RE.match(l) for l in head.splitlines()):
+            out.append((name, n))
+    return sorted(out)
 
 
 def _count_hpas_remaining(pr_resources) -> int:
@@ -240,6 +273,144 @@ def _detect_workload_shutdown(sections: list, pr_resources=None,
     return {"zeroed": zeroed, "workloads": total,
             "hpas_remaining": int(hpas_remaining or 0),
             "hpas_targeting_zeroed": int(targeting or 0)}
+
+
+# ── Capacity floors (COPS-2766, COPR-32597) ──────────────────────────
+# Warnings only: a planned right-sizing looks the same as a mistake.
+# The connection services hold long-lived device connections, so any
+# smaller floor there is flagged, not only a cut of 4.
+_CONN_SERVICES = frozenset({"devicegateway", "signschannel",
+                            "signschannelgateway", "pushnotification"})
+_HPA_BOUND_RE = re.compile(r"^(\s*)(minReplicas|maxReplicas):\s*(.*?)\s*(?:#.*)?$")
+_YAML_LOADER = getattr(yaml, "CSafeLoader", yaml.SafeLoader)
+
+
+def _yaml_doc(text):
+    return yaml.load(text, Loader=_YAML_LOADER)
+
+
+def _hpa_bounds(body):
+    """(minReplicas, maxReplicas) of an HPA body. min defaults to 1 like
+    Kubernetes. A value that is not a number gives None."""
+    lo, hi = 1, None
+    for line in body.splitlines():
+        mt = _HPA_BOUND_RE.match(line)
+        if not mt or len(mt.group(1)) > 4:
+            continue
+        v = mt.group(3).strip("\"'")
+        v = int(v) if v.isdigit() else None
+        if mt.group(2) == "minReplicas":
+            lo = v
+        else:
+            hi = v
+    return lo, hi
+
+
+def _replica_floors(resources) -> dict:
+    """{workload: (floor, max)}. A Deployment or StatefulSet gives
+    (spec.replicas, None). An HPA overrides its scaleTargetRef (else its own
+    name) with (minReplicas, maxReplicas). No replicas field and no HPA
+    (acme-ping-scaler), or HPA bounds that are not numbers: no entry."""
+    floors, hpas = {}, {}
+    for key, body in (resources or {}).items():
+        kind, name = _res_kind_name(key)
+        if not name:
+            continue
+        if kind in _WORKLOAD_KINDS:
+            n = _manifest_replicas(body)
+            if n is not None:
+                floors[name] = (n, None)
+        elif kind == "HorizontalPodAutoscaler":
+            hpas[_hpa_scale_target_name(body) or name] = _hpa_bounds(body)
+    for target, (lo, hi) in hpas.items():
+        if lo is None or hi is None:
+            floors.pop(target, None)
+        else:
+            floors[target] = (lo, hi)
+    return floors
+
+
+def _cpu_millicores(v):
+    """'20m' -> 20, '0.02' -> 20, '1' or 1 -> 1000; anything else None."""
+    if v is None or isinstance(v, bool):
+        return None
+    try:
+        s = str(v).strip()
+        if s.endswith("m"):
+            return int(s[:-1])
+        return round(float(s) * 1000)
+    except (ValueError, OverflowError):
+        return None
+
+
+def _main_container_cpu(body, name):
+    """CPU request of the main container in millicores, or None. The main
+    container is the one named like the workload (the chart names it
+    `<service>-container`), else the first. initContainers never count."""
+    try:
+        containers = _yaml_doc(body)["spec"]["template"]["spec"]["containers"]
+        main = next((c for c in containers
+                     if c.get("name") in (name, f"{name}-container")), containers[0])
+        return _cpu_millicores(main["resources"]["requests"]["cpu"])
+    except Exception:
+        return None
+
+
+def _detect_capacity_floor_risk(main_resources, pr_resources) -> list:
+    """[(workload, what)] for the workloads whose render changes and whose
+    capacity drops (COPR-32597):
+
+    - an HPA floor under 2 with room to scale (max > 1), unless the base
+      already had one;
+    - a smaller floor on a connection service (#4523: 10 replicas to an HPA
+      with min 6 on signschannel);
+    - a cut of 4 or more on any workload (#4608, 12 to 8). A cut to 0 stays
+      the zeroed-replicas finding;
+    - a main container CPU request under 30m that is new in this PR.
+
+    The floor compares fixed replicas with an HPA min. A workload with no
+    floor on a side (acme-ping-scaler) is not compared.
+    """
+    main_resources, pr_resources = main_resources or {}, pr_resources or {}
+    changed, bodies = set(), set()
+    for key in set(main_resources) | set(pr_resources):
+        old, new = main_resources.get(key), pr_resources.get(key)
+        kind, name = _res_kind_name(key)
+        if old == new or not name:
+            continue
+        if kind in _WORKLOAD_KINDS:
+            changed.add(name)
+            bodies.add(key)
+        elif kind == "HorizontalPodAutoscaler":
+            changed.update(_hpa_scale_target_name(b) or name for b in (old, new) if b)
+    if not changed:
+        return []
+    before, after = _replica_floors(main_resources), _replica_floors(pr_resources)
+    cpu = {}
+    for key in bodies:
+        if key not in pr_resources:
+            continue
+        new_cpu = _main_container_cpu(pr_resources[key], key[2])
+        if new_cpu is None or new_cpu >= 30:
+            continue
+        if key in main_resources and \
+                _main_container_cpu(main_resources[key], key[2]) == new_cpu:
+            continue
+        cpu[key[2]] = new_cpu
+    out = []
+    for w in sorted(changed):
+        o, n = before.get(w), after.get(w)
+        parts = []
+        if n and n[1] is not None and n[0] < 2 and n[1] > 1 \
+                and not (o and o[1] is not None and o[0] < 2):
+            parts.append(f"HPA minReplicas {n[0]} (max {n[1]})")
+        if o and n and 0 < n[0] < o[0] and (w in _CONN_SERVICES or o[0] - n[0] >= 4):
+            parts.append(f"floor {o[0]} \u2192 {n[0]}")
+        if w in cpu:
+            parts.append(f"CPU request {cpu[w]}m")
+        if parts:
+            out.append((w, " and ".join(parts)))
+    return out
 
 
 # ── VM-domain (KCC linux-services) risk detection ────────────────────
