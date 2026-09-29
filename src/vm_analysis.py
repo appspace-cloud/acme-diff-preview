@@ -283,6 +283,11 @@ def _vm_unquote(v: str) -> str:
     return v
 
 
+# COPS-2766: every shrink producer writes this, and the `shrink` merge gate
+# looks for it. A shrink is never valid, so no trailer lifts that gate.
+_VM_SHRINK_REASON = "GCP cannot shrink a disk in place"
+
+
 # Kinds whose chart template defaults deletion-policy to abandon unless
 # allowDeletion is armed. Attachments never set the annotation.
 _VM_ABANDON_DEFAULT_KINDS = ("ComputeInstance", "ComputeDisk", "ComputeAddress")
@@ -481,9 +486,9 @@ def _detect_vm_changes(sections: list) -> list:
                 o, n = byk["size"]
                 try:
                     if int(float(n)) < int(float(o)):
-                        dangerous.append("disk size DECREASES — GCP cannot "
-                                         "shrink a disk in place; this "
-                                         "implies recreation and data loss")
+                        dangerous.append(
+                            f"disk size DECREASES — {_VM_SHRINK_REASON}; "
+                            "this implies recreation and data loss")
                 except ValueError:
                     # A size that is not plainly numeric (a templated value,
                     # or one carrying a unit suffix) cannot be compared, so
@@ -719,7 +724,7 @@ def _kcc_move_disk_shrink(old_flat: dict, new_flat: dict, roles: list) -> str:
                 if float(str(new_v)) < float(str(old_v)):
                     return (f"`{leaf}` DECREASES across the Terraform \u2192 KCC "
                             f"move for role `{role}` (`{old_v}` \u2192 `{new_v}`) "
-                            f"\u2014 GCP cannot shrink a disk in place")
+                            f"\u2014 {_VM_SHRINK_REASON}")
             except (TypeError, ValueError):
                 continue
     return ""

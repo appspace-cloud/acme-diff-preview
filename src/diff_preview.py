@@ -247,6 +247,7 @@ from vm_analysis import (  # VM/KCC infrastructure analysis (same-dir module)
     _vm_deletion_armed_flat,
     _vm_config_stripped,
     _VM_DISK_SIZE_KEYS,
+    _VM_SHRINK_REASON,
     _VM_ROLE_NAMES,
     _LEGACY_PREFIX,
     _KCC_PREFIX,
@@ -7405,20 +7406,24 @@ def _evaluate_env_decommissions(candidates: list, pr_sha: str, main_sha: str,
     return lines, envs_reported, full_lines
 
 
-def _merge_gates(decommission_candidates, renames=None, path_map=None) -> list:
+def _merge_gates(decommission_candidates, renames=None, path_map=None,
+                 vm_change_lines=None) -> list:
     """COPS-2766: the merge gates of this PR, one per kind and env, none lifted.
 
     From the teardowns _evaluate_env_decommissions confirmed. Arming the flag
     on cl-* deletes nothing, so that panel stays a warning; its folder
     removal is the `public` gate. A live cl-*/config.yaml renamed or moved
     renames every Application of the constellation: `cl_rename`, lifted by
-    `Confirm-Rename: <old dir> -> <new dir>`.
+    `Confirm-Rename: <old dir> -> <new dir>`. A disk shrink in the VM panel
+    is `shrink`, one for the PR, and nothing lifts it.
     """
     found = [g for c in decommission_candidates or () for g in c.get("gates", ())]
     found += [{"kind": "cl_rename", "env": _CL_ENV_RE.match(old)[1],
                "arg": f"{posixpath.dirname(old)} -> {posixpath.dirname(new)}"}
               for old, new in (renames or {}).items()
               if _CL_ENV_RE.match(old) and (path_map or {}).get(old)]
+    if any(_VM_SHRINK_REASON in line for line in vm_change_lines or ()):
+        found.append({"kind": "shrink", "env": ""})
     gates = {}
     for g in found:
         gates.setdefault((g["kind"], g["env"]), {"arg": g["env"], **g, "lifted": False})
@@ -9249,7 +9254,7 @@ def _clean_status_description(has_redundancy: bool,
     return values_redundancy.noop_status_hint(has_redundancy, has_input_changes)
 
 
-def _flag_typo_status_description(appspace_state_lines) -> str:
+def _flag_typo_status_description(lines) -> str:
     """The Bitbucket build-status line for a misspelled teardown flag.
 
     Names the key and the rename, because the checks list is where a
@@ -9257,7 +9262,7 @@ def _flag_typo_status_description(appspace_state_lines) -> str:
     the generic sentence if the pairing cannot be read back, so a parse miss
     degrades to a vaguer FAILED rather than to no failure at all.
     """
-    pairs = _teardown_flag_typo_pairs(appspace_state_lines)
+    pairs = _teardown_flag_typo_pairs(lines)
     if not pairs:
         return ("Teardown flag misspelled or misplaced - a decommission/"
                 "allowDeletion/confirmProdDeletion key in this PR is not "
@@ -10028,8 +10033,7 @@ def _summarize_vm_changes(changed_files, pr_sha, base_sha, path_map,
                 try:
                     if float(new_s) < float(old_s):
                         danger = True
-                        reason = ("disk size DECREASES \u2014 GCP cannot "
-                                  "shrink a disk in place")
+                        reason = f"disk size DECREASES \u2014 {_VM_SHRINK_REASON}"
                 except (TypeError, ValueError):
                     # Sizes that are not plainly numeric (templated values,
                     # or values carrying a unit suffix) cannot be compared,
@@ -10775,8 +10779,9 @@ def format_comment(pr_sha, app_results, skipped_apps=None, base_sha="",
     # Substring over the joined panel, not list membership: this header is
     # emitted with an emoji prefix on its line (the VM-strip one is not), so
     # the `in list` form the sibling check uses would silently never match.
+    # COPS-2766: and the folder-removal panel, which explains the same typo.
     _flag_typo_block = _DECOM_FLAG_TYPO_HDR in "\n".join(
-        appspace_state_lines or [])
+        (appspace_state_lines or []) + (decommission_lines or []))
     # COPS-2677: KCC Compute* nil artifacts must not merge green. zeroPods+HPA
     # is REVIEW-only (see comment_render) — do not stamp permanent/FAILED.
     _kcc_nil_block = False
@@ -12514,7 +12519,8 @@ def process_pr(pr, path_map, base_sha="", repo=None):
         # COPS-2766: merge gates. The commits are read only when a gate can be
         # lifted, so a PR with none never pays for it. PrCommitsUnreadable goes
         # to the catch-all below: a retry, never a lift.
-        gates = _merge_gates(decommission_candidates, renames, path_map)
+        gates = _merge_gates(decommission_candidates, renames, path_map,
+                             vm_change_lines)
         if any(gate_trailer(g) for g in gates):
             confirmed = _confirmations(_pr_commit_messages(repo, pr_id, base_sha, pr_sha))
             for g in gates:
@@ -12679,8 +12685,9 @@ def process_pr(pr, path_map, base_sha="", repo=None):
         # manifest diff, so without this the chain below lands on the
         # ordinary "N resource(s) will change" and posts SUCCESSFUL — which
         # is what acme-config-prod #4376 got, and it merged.
-        flag_typo_block = _DECOM_FLAG_TYPO_HDR in "\n".join(
-            appspace_state_lines or [])
+        # COPS-2766: the folder-removal panel explains the typo too.
+        typo_lines = (appspace_state_lines or []) + (decommission_lines or [])
+        flag_typo_block = _DECOM_FLAG_TYPO_HDR in "\n".join(typo_lines)
         # COPS-2677: KCC Compute* nil artifacts fail the build (OUT_DIFF that
         # must not merge green). zeroPods+HPA stays REVIEW-only — after
         # COPS-2548 hibernation works with leftover HPAs, so FAILED would
@@ -12715,7 +12722,7 @@ def process_pr(pr, path_map, base_sha="", repo=None):
                 # The description is the whole message for anyone reading the
                 # checks list rather than the comment, so it names the key and
                 # the fix rather than pointing at a panel.
-                desc = _flag_typo_status_description(appspace_state_lines)
+                desc = _flag_typo_status_description(typo_lines)
             elif kcc_nil_block:
                 desc = ("Unresolved KCC value - Compute* resources render "
                         "%!s(<nil>) / <no value>; set hostingID (or the "
