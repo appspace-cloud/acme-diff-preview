@@ -7,6 +7,7 @@ bump that #3314 merged about one hour before, while 15 other files went up.
 A new -dev chart next to release charts (#4382) is a mutable tag in a
 release PR. All of them stay warnings: the build stays green.
 """
+import json
 import os
 import sys
 
@@ -17,6 +18,7 @@ sys.path.insert(0, os.path.dirname(__file__))
 
 import comment_render as cr  # noqa: E402
 import diff_preview as m  # noqa: E402
+import logsink  # noqa: E402
 
 from test_coverage_orchestration import (  # noqa: E402,F401
     world, _mk_pr, PATH_MAP, BASE_SHA)
@@ -800,3 +802,91 @@ def test_process_pr_with_a_skipped_pin_check_stays_routine(world):
     summary = body.split("\n---\n", 1)[0]
     assert "✅ **Routine**" in summary and "Pin check skipped in pv-orch-a" in summary
     assert sinks.statuses[-1][0] == "SUCCESSFUL"
+
+
+# ── the JFrog webhook never hard-refreshes appspace-prod ─────────────────
+
+JF_CHART, JF_TAG = "appspace-micro-services", "2603.3.7-dev"
+
+
+def _jf_app(name, project):
+    return {
+        "metadata": {"name": name, "namespace": "argocd"},
+        "spec": {"project": project,
+                 "destination": {"namespace": name[:-3]},
+                 "sources": [{"repoURL": "oci://helm-oci-dev.repo.appspace.com/charts",
+                              "chart": JF_CHART, "targetRevision": JF_TAG}]},
+    }
+
+
+@pytest.fixture()
+def jfrog(tmp_path, monkeypatch):
+    """Run the webhook against a fake argocd that lists `apps` and writes
+    every call to a file. Returns the `app get` calls and the logs."""
+    for name in ("_path_map_count", "_path_map_app_count", "_app_chart_map",
+                 "_app_chart_revision_map", "_app_chart_registry_map",
+                 "_app_value_files_map", "_app_namespace_map", "_app_repo_map",
+                 "_repo_path_maps", "_app_project_map"):
+        monkeypatch.setattr(m, name, getattr(m, name))
+    monkeypatch.setattr(m, "_path_map_cache", {})
+    monkeypatch.setattr(m, "_path_map_ts", 0.0)
+    calls, logs = tmp_path / "calls", []
+    calls.write_text("")
+    monkeypatch.setattr(logsink, "log",
+                        lambda msg, sev="INFO", **k: logs.append((sev, str(msg))))
+
+    def run(apps):
+        payload = json.dumps(apps).replace("'", "'\\''")
+        fake = tmp_path / "argocd"
+        fake.write_text(f"""#!/bin/bash
+echo "$*" >> '{calls}'
+case "$*" in
+  *"app list"*) printf '%s' '{payload}';;
+esac
+exit 0
+""")
+        fake.chmod(0o755)
+        monkeypatch.setattr(m, "ARGOCD_BIN", str(fake))
+        m._jfrog_hard_refresh(JF_CHART, JF_TAG)
+        gets = [c.split()[2] for c in calls.read_text().splitlines()
+                if c.startswith("app get")]
+        return gets, logs
+    return run
+
+
+def test_the_jfrog_webhook_never_hard_refreshes_a_prod_app(jfrog):
+    gets, logs = jfrog([_jf_app("pv-qa88-a-ms", "appspace-qa"),
+                        _jf_app("pv-fake-a-ms", "appspace-prod")])
+    assert gets == ["pv-qa88-a-ms"]
+    assert m._app_project_map == {"pv-qa88-a-ms": "appspace-qa",
+                                  "pv-fake-a-ms": "appspace-prod"}
+    msgs = [msg for _, msg in logs]
+    assert "  hard-refresh OK: pv-qa88-a-ms" in msgs
+    assert "JFrog webhook: 1 apps to hard-refresh: pv-qa88-a-ms" in msgs
+    assert msgs[-1].endswith(" 1 refreshed, 0 failed"), msgs
+    warned = [msg for sev, msg in logs if sev == "WARNING"]
+    assert warned == [
+        "JFrog webhook: skipped 1 appspace-prod app(s) on "
+        "appspace-micro-services:2603.3.7-dev, prod is never hard-refreshed: "
+        "pv-fake-a-ms"]
+    assert not any("pv-fake-a-ms" in msg for msg in msgs if msg not in warned)
+
+
+def test_a_webhook_that_only_matches_prod_refreshes_nothing(jfrog):
+    gets, logs = jfrog([_jf_app(f"pv-p{i}-a-ms", "appspace-prod")
+                        for i in range(6)])
+    assert gets == []
+    assert logs[-1] == ("WARNING",
+        "JFrog webhook: skipped 6 appspace-prod app(s) on "
+        "appspace-micro-services:2603.3.7-dev, prod is never hard-refreshed: "
+        "pv-p0-a-ms, pv-p1-a-ms, pv-p2-a-ms, pv-p3-a-ms, pv-p4-a-ms...")
+    assert not any("no apps found" in msg or "hard-refresh:" in msg
+                   for _, msg in logs)
+
+
+def test_an_app_with_no_project_is_still_refreshed(jfrog):
+    app = _jf_app("pv-dev-a-ms", "appspace-dev")
+    del app["spec"]["project"]
+    gets, logs = jfrog([app])
+    assert gets == ["pv-dev-a-ms"] and m._app_project_map == {}
+    assert not any(sev == "WARNING" for sev, _ in logs)

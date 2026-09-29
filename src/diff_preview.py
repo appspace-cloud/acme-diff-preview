@@ -514,6 +514,8 @@ ARGOCD_USER          = os.environ.get("ARGOCD_USER", "diff-preview")
 ARGOCD_PASS          = os.environ["ARGOCD_PASS"]
 # Comma-separated list of ArgoCD projects the webhook hard-refresh targets.
 ARGOCD_PROJECTS      = os.environ.get("ARGOCD_PROJECTS", "appspace-dev,appspace-qa").split(",")
+# COPS-2766: the JFrog webhook never hard-refreshes an app in this project.
+JFROG_SKIP_PROJECT   = "appspace-prod"
 # HMAC-SHA256 key for verifying incoming JFrog webhook requests.
 # HMAC-SHA256 secret for verifying incoming Bitbucket PR webhook requests.
 # Bitbucket signs the payload with X-Hub-Signature: sha256=<hex>.
@@ -1380,6 +1382,8 @@ _app_chart_registry_map: dict = {}
 _app_value_files_map: dict = {}
 # app full_name -> destination namespace.
 _app_namespace_map: dict = {}
+# app full_name -> ArgoCD project (spec.project), e.g. "appspace-prod".
+_app_project_map: dict = {}
 # Total app-reference count across all path entries. Used to detect when a new
 # app appears under an *existing* path key (which would not change len(path_map)
 # and would be missed by the old key-count invalidation check).
@@ -1902,7 +1906,8 @@ def _jfrog_refresh_guarded(chart_name: str, chart_version: str) -> None:
 
 
 def _jfrog_hard_refresh(chart_name: str, chart_version: str) -> None:
-    """Hard-refresh all ArgoCD apps tracking chart_name:chart_version.
+    """Hard-refresh all ArgoCD apps tracking chart_name:chart_version,
+    except the appspace-prod ones.
 
     Called in a daemon thread after responding 202 to the JFrog webhook.
     Bypasses the repo-server OCI cache so ArgoCD picks up the new image
@@ -1951,6 +1956,18 @@ def _jfrog_hard_refresh(chart_name: str, chart_version: str) -> None:
                 if c == chart_name
                 and _app_chart_revision_map.get(a) == chart_version]
     source = f"path map, {len(_app_chart_map)} apps"
+
+    # COPS-2766: a -dev tag pushed again must not reach a prod app in one
+    # minute. Prod waits for its own refresh.
+    prod = [a for a in matching if _app_project_map.get(a) == JFROG_SKIP_PROJECT]
+    if prod:
+        matching = [a for a in matching
+                    if _app_project_map.get(a) != JFROG_SKIP_PROJECT]
+        logsink.log(f"JFrog webhook: skipped {len(prod)} {JFROG_SKIP_PROJECT} app(s) on "
+                    f"{chart_name}:{chart_version}, prod is never hard-refreshed: "
+                    f"{', '.join(prod[:5])}{'...' if len(prod) > 5 else ''}", "WARNING")
+        if not matching:
+            return
 
     if not matching:
         logsink.log(f"JFrog webhook: no apps found for {chart_name}:{chart_version}"
@@ -2492,7 +2509,8 @@ def _discover_path_app_map_locked():
     """The rebuild itself. Only ever entered holding _path_map_lock."""
     global _path_map_cache, _path_map_ts, _path_map_count, _path_map_app_count, \
            _app_chart_map, _app_chart_revision_map, _app_chart_registry_map, \
-           _app_value_files_map, _app_namespace_map, _app_repo_map, _repo_path_maps
+           _app_value_files_map, _app_namespace_map, _app_repo_map, _repo_path_maps, \
+           _app_project_map
     r = subprocess.run(
         [ARGOCD_BIN, "app", "list", "-o", "json"] + _auth_flags(),
         capture_output=True, text=True, timeout=90,
@@ -2520,6 +2538,7 @@ def _discover_path_app_map_locked():
     chart_reg_map = {}
     value_files_map = {}
     namespace_map = {}
+    project_map = {}
     app_repo_map = {}
     repo_maps = {slug: {} for slug in REPOS}
     unknown_repos_seen = set()
@@ -2539,6 +2558,9 @@ def _discover_path_app_map_locked():
         dest = app.get("spec", {}).get("destination", {})
         if dest.get("namespace"):
             namespace_map[full_name] = dest["namespace"]
+        project = app.get("spec", {}).get("project")
+        if project:
+            project_map[full_name] = project
         # COPS-2507 multi-repo: record which git config repo this app renders
         # from (sources[0], the `ref: config` git source). A PR in repo R may
         # only ever match apps whose git source is R — makes cross-repo
@@ -2571,6 +2593,7 @@ def _discover_path_app_map_locked():
     _app_chart_registry_map  = chart_reg_map
     _app_value_files_map     = value_files_map
     _app_namespace_map       = namespace_map
+    _app_project_map         = project_map
     _app_repo_map            = app_repo_map
     _repo_path_maps          = repo_maps
     _path_map_ts        = time.monotonic()

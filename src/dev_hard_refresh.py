@@ -16,11 +16,10 @@ safety net behind the webhook at all. Prod is deliberately excluded: it pins
 immutable `-rev1` tags, so a refresh can never find anything new, and walking
 its 761 apps daily would hammer the hub for nothing.
 
-Deliberately NOT reusing ARGOCD_PROJECTS (the webhook path's list): that one
-includes appspace-prod on purpose, because the webhook only refreshes the
-apps actually tracking the chart that was just published - a targeted set.
-This CronJob refreshes EVERY app in the listed projects, so it needs its own,
-narrower list.
+Deliberately NOT reusing ARGOCD_PROJECTS (the webhook path's list). The
+webhook refreshes only the apps that track the chart:version it was told
+about, and never appspace-prod (COPS-2766): a targeted set. This CronJob
+refreshes EVERY app in the listed projects, so it needs its own list.
 """
 import concurrent.futures
 import json

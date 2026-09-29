@@ -32,8 +32,9 @@ Two things to know up front:
   `selfHeal: true`, so live state tracks `main` closely (measured 2026-07-31:
   1020 of 1021 apps Synced).
 
-It also runs a second, unrelated job: a **JFrog webhook** that hard-refreshes dev
-and QA apps when CI publishes a new chart, so they pick it up past the OCI cache.
+It also runs a second, unrelated job: a **JFrog webhook** that hard-refreshes the
+dev, QA and stage apps (never prod) that track the chart CI just published, so
+they pick it up past the OCI cache.
 
 ---
 
@@ -637,7 +638,7 @@ All endpoints are served on port **8080** inside the pod.
 |---|---|---|
 | `POST` | `/diff-preview/webhook` | Bitbucket PR webhook (wakes the diff loop) |
 | `GET` | `/diff-preview/stats` | Diff outcome counters, main-render cache hits split by tier (memory/disk/gcs) and misses, last iteration timing (JSON) |
-| `POST` | `/jfrog-webhook` | JFrog OCI push webhook (triggers hard-refresh) |
+| `POST` | `/jfrog-webhook` | JFrog OCI push webhook (triggers hard-refresh, never for appspace-prod) |
 | `GET` | `/jfrog-webhook/stats` | Webhook counters (JSON) |
 | `GET` | `/healthz` | Liveness probe |
 | `GET` | `/readyz` | Readiness probe |
