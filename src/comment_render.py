@@ -237,6 +237,10 @@ _BLAST_RADIUS_HDR = "**Blast radius.**"
 # blast radius: a quiet render caused by copying parent values into
 # customer.yaml must not read as "the tool missed the change".
 _VALUES_REDUNDANCY_HDR = "**Higher-layer values.**"
+# COPS-2766: its merge-summary line. status_lead skips it: keys that change
+# no manifest are no reason for a warning sign on a green status.
+_HIGHER_LAYER_FINDING = ("\U0001f4da **Higher-layer values already cover "
+                         "part of this PR**")
 # Written by the identity-change guard in diff_preview for a confirmed rename of
 # a live environment, matched here for the REVIEW verdict line.
 _IDENTITY_MIGRATION_HDR = "**Planned rename.**"
@@ -827,8 +831,7 @@ def _build_merge_summary(results, rollup_by_sig, vm_change_lines,
         # the edit (acme-config-prod #4520).
         if _VALUES_REDUNDANCY_HDR in txt:
             findings.append((_SEV_REVIEW,
-                             "\U0001f4da **Higher-layer values already cover "
-                             "part of this PR** \u2014 some keys match an "
+                             _HIGHER_LAYER_FINDING + " \u2014 some keys match an "
                              "ancestor config.yaml, so they do not change "
                              "rendered manifests (see the higher-layer note)"))
     if new_env_lines:
@@ -957,6 +960,8 @@ def status_lead(comment_md) -> str:
     rest = [l for l in lines[lines.index(MERGE_SUMMARY_HDR) + 1:] if l.strip()]
     mark = _STATUS_MARKS.get(rest[0][:1]) if rest else None
     bullet = next((l[2:] for l in rest[1:] if l.startswith("- ")), "")
+    if bullet.startswith(_HIGHER_LAYER_FINDING):
+        return ""       # it sorts last, so nothing else needs a review
     text = re.sub(r"\[([^\]]*)\]\([^)]*\)", r"\1", bullet)
     text = text.replace("**", "").replace("`", "").strip()
     emoji, _, after = text.partition(" ")

@@ -179,6 +179,27 @@ def test_goldens_lead_as_the_verdict_says():
         "VM section")
 
 
+def test_the_higher_layer_note_alone_gives_no_lead():
+    """#4599 (and the HPA-floor PRs #4613 to #4615, #4623, #4655): the
+    lead repeated the tail and put a warning sign on keys that change
+    nothing. The note still counts in the comment verdict."""
+    block, desc = next(s for s in REAL_SUMMARIES if "Higher-layer" in s[0])
+    assert cr.status_lead(block + "\n---\n") == ""
+    lines = cr._build_merge_summary({}, {}, None, None,
+                                    [cr._VALUES_REDUNDANCY_HDR], None, False)
+    assert REVIEW in lines
+    assert cr.status_lead("\n".join(lines) + "\n---\n") == ""
+
+
+def test_the_higher_layer_note_does_not_hide_a_real_finding():
+    results = {"pv-y-a-ms": m.DiffResult("d", [], 1, True, "", m.OUT_DIFF, "",
+                                         None, ["/v1/Secret pv-y-a/s"])}
+    lines = cr._build_merge_summary(results, {}, None, None,
+                                    [cr._VALUES_REDUNDANCY_HDR], None, False)
+    assert cr.status_lead("\n".join(lines) + "\n---\n").startswith(
+        "\u26a0\ufe0f 1 resource(s) deleted")
+
+
 def test_a_long_real_finding_is_cut_and_the_tail_kept():
     block, desc = next(s for s in REAL_SUMMARIES if "24 HorizontalPod" in s[0])
     _lead, out = _check(block, desc)
