@@ -183,6 +183,7 @@ from comment_render import (  # comment rendering (same-dir module, stdlib only)
     _BLAST_RADIUS_HDR,
     _NOCORE_FLIP_HDR,
     _NOCORE_UNKNOWN,
+    _TENANT_WIDE_HDR,
     _VALUES_REDUNDANCY_HDR,
     _INERT_EDIT_HDR,
     _IDENTITY_MIGRATION_HDR,
@@ -10238,7 +10239,7 @@ def _blast_radius_lines(changed_files, pr_sha, base_sha, path_map,
     decommission panels) or transiently unreadable - either way the diff and
     those panels tell the story, so this one stays quiet rather than guessing.
     """
-    findings = []
+    findings, singles = [], []
     for f in changed_files or []:
         clean = posixpath.normpath(f.lstrip("/"))
         if posixpath.basename(clean) != "config.yaml":
@@ -10248,11 +10249,11 @@ def _blast_radius_lines(changed_files, pr_sha, base_sha, path_map,
         if st_new != BB_OK or st_old != BB_OK:
             continue
         try:
-            keys = blast_radius.changed_keys(
-                _flatten_yaml(_yaml_safe_load(old_txt) or {}),
-                _flatten_yaml(_yaml_safe_load(new_txt) or {}))
+            old_flat = _flatten_yaml(_yaml_safe_load(old_txt) or {})
+            new_flat = _flatten_yaml(_yaml_safe_load(new_txt) or {})
         except yaml.YAMLError:
             continue  # unparseable - the input-changes panel already flags it
+        keys = blast_radius.changed_keys(old_flat, new_flat)
         affected = get_affected_apps([clean], path_map)
         env_files = set()
         for app in affected:
@@ -10266,8 +10267,40 @@ def _blast_radius_lines(changed_files, pr_sha, base_sha, path_map,
                                       DIFF_BLAST_ENVS, DIFF_BLAST_SPOKES)
         if finding:
             findings.append(finding)
+        else:
+            singles.append((clean, old_flat, new_flat, env_files))
+    # COPS-2766: the same change over sibling files (#4565), same thresholds.
+    findings += blast_radius.sibling_findings(
+        singles, DIFF_BLAST_ENVS, DIFF_BLAST_SPOKES, hide=_SENSITIVE_KEY_RE.search)
     return blast_radius.render_lines(findings, _BLAST_RADIUS_HDR,
                                      DIFF_BLAST_ENVS, DIFF_BLAST_SPOKES)
+
+
+_TENANT_APP_RE = re.compile(r"cl-.+-(ms|ss)")
+
+
+def _tenant_wide(app_results) -> list:
+    """COPS-2766: the prod public-cloud constellations whose shared ms or ss
+    app changes in this PR. Those apps serve every customer of the
+    constellation, while the blast radius counts them as one environment.
+    Info only: an app with no value files in discovery is not flagged."""
+    return sorted({
+        _envs_from_apps([a])[0] for a, r in (app_results or {}).items()
+        if _result(r).outcome == OUT_DIFF
+        and _TENANT_APP_RE.fullmatch(a.split("/")[-1])
+        and any("/prod/public-cloud/" in vf
+                for vf in (_app_value_files_map or {}).get(a) or [])})
+
+
+def _tenant_wide_lines(cls) -> list:
+    """The routine note for _tenant_wide, in the appspace_state channel."""
+    if not cls:
+        return []
+    names = ", ".join(f"`{c}`" for c in cls)
+    return ["\U0001f310 " + _TENANT_WIDE_HDR + f" This PR changes the shared ms "
+            f"or ss app of {names}. It serves every customer of its "
+            "constellation, so the change reaches every tenant there, not one "
+            "environment.", ""]
 
 
 def _value_file_parent_chain(changed_path: str, apps, sha: str,
@@ -13751,11 +13784,15 @@ def process_pr(pr, path_map, base_sha="", repo=None):
             logsink.log(f"    [comment] appspace-state panel failed: {e}", "WARNING")
             appspace_state_lines = []
         appspace_state_lines += _identity_migration_lines(identity_hits)
+        tenant_cls = []
         try:
             # COPS-2693 Plan B: shares the appspace_state_lines channel so the
             # verdict scan in comment_render sees it without new plumbing.
             appspace_state_lines += _blast_radius_lines(
                 changed, render_sha, base_sha, path_map, repo=repo)
+            # COPS-2766: info only, the green status tail carries it too.
+            tenant_cls = _tenant_wide(app_results)
+            appspace_state_lines += _tenant_wide_lines(tenant_cls)
         except Exception as e:  # informational panel must never break the comment
             logsink.log(f"    [comment] blast-radius panel failed: {e}", "WARNING")
         redundant = []
@@ -13939,7 +13976,9 @@ def process_pr(pr, path_map, base_sha="", repo=None):
         leftover_extra = (
             f" | \U0001f9f9 {len(leftover_apps)} leftover app(s) from prior decommission"
             if leftover_apps else "")
-        status_extra = decom_extra + leftover_extra
+        tenant_extra = (f" | \U0001f310 every tenant of {', '.join(tenant_cls)}"
+                        if tenant_cls else "")
+        status_extra = decom_extra + leftover_extra + tenant_extra
 
         # v2.5.4 (Finding 1): traffic-light rule agreed with Marcos — green ONLY
         # when the diff was actually computed (with or without changes); ANY

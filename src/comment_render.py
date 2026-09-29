@@ -238,6 +238,8 @@ _NOCORE_FLIP_HDR = "**noCore changes.**"
 _NOCORE_COUNTS_RE = re.compile(
     r"noCore changes in (\d+) environment\(s\): on in (\d+), off in (\d+)")
 _NOCORE_UNKNOWN = "noCore check unavailable"
+# COPS-2766: a prod cl-*-ms/-ss app serves every tenant of its constellation.
+_TENANT_WIDE_HDR = "**Reaches every public-cloud tenant.**"
 # COPS-2721: written by values_redundancy.render_lines via diff_preview,
 # matched here for the REVIEW verdict line. Same one-constant wiring as
 # blast radius: a quiet render caused by copying parent values into
@@ -1010,6 +1012,14 @@ def _build_merge_summary(results, rollup_by_sig, vm_change_lines,
             findings.append((_SEV_REVIEW,
                              f"\U0001f50c **{_NOCORE_UNKNOWN}** for part of this "
                              f"PR (see the noCore note)"))
+        # COPS-2766: routine, the reach is a fact and not a risk. The names
+        # come from our own line only.
+        _tw = [l for l in txt.splitlines()
+               if l.startswith("\U0001f310 " + _TENANT_WIDE_HDR)]
+        if _tw:
+            findings.append((_SEV_ROUTINE,
+                             "\U0001f310 **Reaches every public-cloud tenant** of "
+                             + ", ".join(f"`{c}`" for c in re.findall(r"`([^`]+)`", _tw[0]))))
         if _IDENTITY_MIGRATION_HDR in txt:
             findings.append((_SEV_REVIEW,
                              "\U0001f500 **Planned rename of a live environment** "

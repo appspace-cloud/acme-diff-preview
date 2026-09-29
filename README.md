@@ -44,7 +44,7 @@ resource, and answers the only question that matters at merge time:
 |---|---|---|---|
 | **Answers before merge** | ✅ diff of the PR against `main` | ❌ shows drift *after* sync | ✅ but Terraform only |
 | **One verdict, not a wall** | ✅ ⛔ / ⚠️ / ✅ with named findings, and ⛔ only when the build is red | ❌ | ❌ raw plan output |
-| **Knows what is dangerous** | ✅ **51 distinct findings**: deletions, decommissions, teardowns that leave things running, data purges, released IPs, disk shrink, zeroed replicas, downgrades, orphaned VMs, renames, clones that wake on production data, names and ashn already in use, pd- disks on n4 or c4, folders no ApplicationSet reads, YAML slips, the legacy Helm writer, edits that change nothing, noCore changes… | ❌ | ❌ |
+| **Knows what is dangerous** | ✅ **51 distinct findings**: deletions, decommissions, teardowns that leave things running, data purges, released IPs, disk shrink, zeroed replicas, downgrades, orphaned VMs, renames, clones that wake on production data, names and ashn already in use, pd- disks on n4 or c4, folders no ApplicationSet reads, YAML slips, the legacy Helm writer, edits that change nothing, noCore changes, wide-reach changes, public-cloud tenant reach… | ❌ | ❌ |
 | **Scales to a fleet** | ✅ 863 apps in one PR; identical diffs folded once | ❌ | ❌ per-workspace |
 | **Never says "no changes" on failure** | ✅ a failed render is red, never green | ❌ | ⚠️ varies |
 | **Reads secrets safely** | ✅ redacted before it ever reaches a comment | n/a | n/a |
