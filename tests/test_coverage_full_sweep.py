@@ -378,7 +378,7 @@ def _orch(monkeypatch):
     m._app_chart_revision_map.update({"pv-orch-x-ms": "2603.0.1-dev"})
     monkeypatch.setattr(m, "get_pr_changed_files", lambda pr_id, repo=None: ([_PM_ID], {}))
     monkeypatch.setattr(m, "find_existing_comment", lambda pr_id, repo=None: (None, "", ""))
-    monkeypatch.setattr(m, "fix_stuck_inprogress", lambda *a, **k: None)
+    monkeypatch.setattr(m, "fix_stuck_inprogress", lambda *a, **k: "ok")
     monkeypatch.setattr(m, "_touch_progress", lambda: None)
     monkeypatch.setattr(m, "upsert_comment",
                         lambda pr_id, body, existing_id=None, repo=None,

@@ -74,7 +74,7 @@ def world(monkeypatch):
     monkeypatch.setattr(m, "post_build_status",
                         lambda pr_sha, state, description, pr_id=None, repo=None:
                         sinks.statuses.append((state, description)) or "ok")
-    monkeypatch.setattr(m, "fix_stuck_inprogress", lambda *a, **k: None)
+    monkeypatch.setattr(m, "fix_stuck_inprogress", lambda *a, **k: "ok")
     monkeypatch.setattr(m, "_touch_progress", lambda: None)
     # Value reads never reach the network. The env's customer.yaml exists, so
     # its apps are live (not a leftover decommission); other files are absent.

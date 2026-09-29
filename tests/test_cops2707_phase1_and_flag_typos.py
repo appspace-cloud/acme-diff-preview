@@ -604,7 +604,7 @@ def test_process_pr_fails_the_build_on_a_misspelled_flag(monkeypatch):
     monkeypatch.setattr(m, "post_build_status",
                         lambda pr_sha, state, description, pr_id=None,
                         repo=None: statuses.append((state, description)) or "ok")
-    monkeypatch.setattr(m, "fix_stuck_inprogress", lambda *a, **k: None)
+    monkeypatch.setattr(m, "fix_stuck_inprogress", lambda *a, **k: "ok")
     monkeypatch.setattr(m, "_touch_progress", lambda: None)
     monkeypatch.setattr(m, "argocd_diff",
                         lambda app, pr_sha, main_sha, chart_revision=None,

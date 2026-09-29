@@ -89,7 +89,7 @@ def world(monkeypatch):
     monkeypatch.setattr(m, "post_build_status",
                         lambda pr_sha, state, description, pr_id=None, repo=None:
                         sinks.statuses.append((state, description)) or "ok")
-    monkeypatch.setattr(m, "fix_stuck_inprogress", lambda *a, **k: None)
+    monkeypatch.setattr(m, "fix_stuck_inprogress", lambda *a, **k: "ok")
     monkeypatch.setattr(m, "_touch_progress", lambda: None)
     monkeypatch.setattr(m, "_bb_fetch_status",
                         lambda path, sha, repo=None: (None, m.BB_NOT_FOUND))

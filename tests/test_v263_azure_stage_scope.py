@@ -59,7 +59,7 @@ def stage_world(monkeypatch):
     monkeypatch.setattr(m, "post_build_status",
                         lambda sha, st, d, pr_id=None, repo=None:
                         sinks["statuses"].append((repo, st)) or "ok")
-    monkeypatch.setattr(m, "fix_stuck_inprogress", lambda *a, **k: None)
+    monkeypatch.setattr(m, "fix_stuck_inprogress", lambda *a, **k: "ok")
     monkeypatch.setattr(m, "_touch_progress", lambda: None)
     # Not about renames (COPR-32578 has its own tests): keep runs on the diff path.
     monkeypatch.setattr(m, "_detect_live_identity_changes", lambda *a, **k: [])

@@ -4046,6 +4046,23 @@ def _backoff_clear(sk):
         _retry_backoff.pop(sk, None)
 
 
+def _seen_after_writes(sk, pr_sha, base_sha, *results) -> bool:
+    """COPS-2766: mark a PR seen only when its comment and status writes
+    landed. "permanent" counts as landed: a retry would fail the same way.
+    "transient" backs off and retries. "skipped" (not the leader) does
+    neither, because the new leader owns the PR."""
+    if "transient" in results:
+        _backoff_register_transient(sk, pr_sha)
+        logsink.log(f"PR #{sk[1]}: a comment or status write failed, will retry",
+                    "WARNING", pr=sk[1], event="write_failed_retry")
+        return False
+    if all(r in ("ok", "permanent") for r in results):
+        with _seen_lock:
+            _seen[sk] = (pr_sha, base_sha)
+        return True
+    return False
+
+
 def _warn_if_name_invariant_broken(flat: dict):
     """The cap encodes an invariant that lives in the config repos, not in a
     schema: prefix is always 2 chars and suffix always 1. If that ever
@@ -7918,8 +7935,19 @@ def argocd_diff(app, pr_sha, main_sha, chart_revision=None, changed_paths=None, 
 
 
 # ── Bitbucket helpers ─────────────────────────────────────────────────
+def _write_failed(e) -> str:
+    """COPS-2766: count a failed comment or status write and classify it."""
+    with _diff_stats_lock:
+        _diff_stats["bb_write_failures"] += 1
+    return "transient" if _is_transient_exception(e) else "permanent"
+
+
 def post_build_status(pr_sha, state, description, pr_id=None, repo=None):
     """Post build status. Swallows errors - never crashes the script.
+
+    COPS-2766: returns "ok", "transient" (retry later), "permanent" (a retry
+    fails the same way) or "skipped" (not the leader), so the caller only
+    marks the PR seen when the merge gate is really there.
 
     The status URL used to always point at the ArgoCD server (bughunt: this
     build status is the acme-diff-preview service itself running as an
@@ -7940,7 +7968,7 @@ def post_build_status(pr_sha, state, description, pr_id=None, repo=None):
     if not _still_leader():
         logsink.debug(f"not leader, skipping build status {state} for "
                       f"{pr_sha[:8]}", pr=pr_id)
-        return
+        return "skipped"
     repo = repo or _repo_for_sha(pr_sha)
     # v2.6.1: Bitbucket REQUIRES a url on build statuses (empirically verified:
     # both a missing and an empty url are rejected). A bare PR link is
@@ -7972,7 +8000,11 @@ def post_build_status(pr_sha, state, description, pr_id=None, repo=None):
             "description": description[:255],
         })
     except Exception as e:
-        logsink.log(f"[build status] failed to set {state}: {e}", "WARNING")
+        res = _write_failed(e)
+        logsink.log(f"[build status] failed to set {state}: {e}",
+                    "WARNING" if res == "transient" else "ERROR")
+        return res
+    return "ok"
 
 def _bb_api_base(repo=None):
     """Per-repo Bitbucket API base URL (COPS-2507 multi-repo)."""
@@ -8225,14 +8257,15 @@ def upsert_comment(pr_id, body, existing_id=None, repo=None, artifact_url=""):
     """Post or update PR comment. Truncates if over limit; posts fallback on error.
 
     artifact_url is threaded into the truncation note so an oversized
-    comment links straight to the full-diff view (see _truncate_comment)."""
+    comment links straight to the full-diff view (see _truncate_comment).
+    Returns the same results as post_build_status (COPS-2766)."""
     if not _still_leader():
         # COPS-2654: the standby took the lease while this iteration was
         # running. It is now computing the same PRs, so writing here would
         # fight it for the same comment.
         logsink.log(f"Lease lost mid-iteration; skipping comment write on PR "
                     f"#{pr_id}", "WARNING", pr=pr_id, event="write_skipped_not_leader")
-        return
+        return "skipped"
     orig_bytes = len(body.encode("utf-8"))
     if orig_bytes > MAX_COMMENT_BYTES:
         body = _truncate_comment(body, artifact_url=artifact_url)
@@ -8257,15 +8290,16 @@ def upsert_comment(pr_id, body, existing_id=None, repo=None, artifact_url=""):
         # Only a 404 on PUT means the comment was deleted and a fresh POST is
         # correct. Any other failure (429/5xx/network) means the old comment
         # still exists: POSTing would create a duplicate (bughunt F2). Give up
-        # this round — the comment still carries the previous sha, so the
-        # next iteration's cross-pod check recomputes and retries the update.
+        # this round. On a transient result process_pr leaves the PR unseen,
+        # and the comment still carries the previous sha, so a later pass
+        # recomputes and retries the update.
         # (Error-message fallbacks caused a re-run loop in the past; see git log.)
         was_deleted = (existing_id and isinstance(e, urllib.error.HTTPError)
                        and e.code == 404)
         if not was_deleted:
             logsink.log(f"[comment] upsert failed ({e}); NOT posting a fallback "
                         f"(comment likely still exists — would duplicate)", "ERROR")
-            return
+            return _write_failed(e)
         logsink.log(f"[comment] comment {existing_id} was deleted; re-creating", "WARNING")
         with _comment_id_cache_lock:
             _comment_id_cache.pop(ck, None)
@@ -8277,20 +8311,31 @@ def upsert_comment(pr_id, body, existing_id=None, repo=None, artifact_url=""):
             logsink.log("[comment] fallback POST succeeded", "INFO")
         except Exception as e2:
             logsink.log(f"[comment] fallback POST also failed: {e2}", "ERROR")
+            return _write_failed(e2)
+    return "ok"
 
 def fix_stuck_inprogress(pr_sha, pr_id, comment_raw, repo=None):
     """If build status is stuck INPROGRESS but comment is current, fix the status.
 
     This handles the case where a previous CronJob pod was killed after posting
     the comment but before posting the final SUCCESSFUL/FAILED status.
+
+    COPS-2766: a 404 means no status at all (the INPROGRESS and the final
+    post both failed), so that commit gets one from the comment too. Returns
+    the write result, or "ok" when the status is already final.
     """
     try:
-        st = http("GET",
-            f"{_bb_api_base(repo)}"
-            f"/commit/{pr_sha}/statuses/build/{BUILD_KEY}",
-            auth=(BB_USER, BB_TOKEN))
-        if st.get("state") != "INPROGRESS":
-            return
+        try:
+            st = http("GET",
+                f"{_bb_api_base(repo)}"
+                f"/commit/{pr_sha}/statuses/build/{BUILD_KEY}",
+                auth=(BB_USER, BB_TOKEN))
+        except urllib.error.HTTPError as e:
+            if e.code != 404:
+                raise
+            st = None
+        if st is not None and st.get("state") != "INPROGRESS":
+            return "ok"
         # Derive correct state from the machine-readable token first (1.9.1+,
         # fixed for real in this version - see _extract_status_token), then
         # fall back to parsing the human-readable comment text.
@@ -8346,11 +8391,15 @@ def fix_stuck_inprogress(pr_sha, pr_id, comment_raw, repo=None):
             state, desc = "FAILED", "Diff unavailable - review comment"
         else:
             state, desc = "SUCCESSFUL", "No manifest changes"
-        post_build_status(pr_sha, state, desc, pr_id=pr_id)
-        logsink.log(f"Fixed stuck INPROGRESS for PR #{pr_id} -> {state}",
-                    pr=pr_id, event="stuck_inprogress_fixed")
+        res = post_build_status(pr_sha, state, desc, pr_id=pr_id, repo=repo)
+        if res == "ok":
+            logsink.log(f"Fixed {'stuck INPROGRESS' if st else 'missing'} status "
+                        f"for PR #{pr_id} -> {state}",
+                        pr=pr_id, event="stuck_inprogress_fixed")
+        return res
     except Exception as e:
         logsink.log(f"[fix_stuck_inprogress] PR #{pr_id}: {e}", "WARNING")
+        return "transient" if _is_transient_exception(e) else "permanent"
 
 # ── Vertex AI (Gemini) summary ─────────────────────────────────────────
 # AI-powered diff summary using Vertex AI Gemini.
@@ -11573,12 +11622,11 @@ def process_pr(pr, path_map, base_sha="", repo=None):
                         event="rerun_not_clean")
             # existing_id is kept — the comment will be updated in place, not duplicated.
         else:
-            with _seen_lock:
-                _seen[sk] = (pr_sha, base_sha)
             logsink.log(f"Skipping: comment up to date for SHA {pr_sha[:8]}",
                         "DEBUG", pr=pr_id, repo=repo, event="skip_up_to_date")
             # Fix potential stuck INPROGRESS from a previously killed pod
-            fix_stuck_inprogress(pr_sha, pr_id, comment_raw, repo=repo)
+            fixed = fix_stuck_inprogress(pr_sha, pr_id, comment_raw, repo=repo)
+            _seen_after_writes(sk, pr_sha, base_sha, fixed)
             return
 
     try:
@@ -11632,7 +11680,7 @@ def process_pr(pr, path_map, base_sha="", repo=None):
             _files_md = "\n".join(f"- `{c}`" for c in _merge_conflicts)
             desc = (f"CONFLICT with main in {len(_merge_conflicts)} file(s) "
                     f"— resolve before the diff can be computed")
-            post_build_status(pr_sha, "FAILED", desc, pr_id=pr_id)
+            st = post_build_status(pr_sha, "FAILED", desc, pr_id=pr_id, repo=repo)
             body = (
                 f"## \U0001f52d {STATUS_NAME}\n\n"
                 f"{_comment_header(pr_sha)}\n\n"
@@ -11649,9 +11697,8 @@ def process_pr(pr, path_map, base_sha="", repo=None):
                 f"*{_ts()} \u2014 {COMMENT_MARKER} [conflict]"
                 + (f" [base:{base_sha[:8]}]" if base_sha else "") + "*"
             )
-            upsert_comment(pr_id, body, existing_id, repo=repo)
-            with _seen_lock:
-                _seen[sk] = (pr_sha, base_sha)
+            cm = upsert_comment(pr_id, body, existing_id, repo=repo)
+            _seen_after_writes(sk, pr_sha, base_sha, st, cm)
             return
         if render_sha:
             _register_sha_repo(render_sha, repo)
@@ -11687,7 +11734,7 @@ def process_pr(pr, path_map, base_sha="", repo=None):
             _files_md = "\n".join(f"- `{w}`" for w in wiped)
             desc = (f"BLOCKED: {len(wiped)} file(s) empty out "
                     f"microservices.definitions (wipes image overrides)")
-            post_build_status(pr_sha, "FAILED", desc, pr_id=pr_id)
+            st = post_build_status(pr_sha, "FAILED", desc, pr_id=pr_id, repo=repo)
             body = (
                 f"## \U0001f52d {STATUS_NAME}\n\n"
                 f"{_comment_header(pr_sha)}\n\n"
@@ -11713,9 +11760,8 @@ def process_pr(pr, path_map, base_sha="", repo=None):
                 f"*{_ts()} \u2014 {COMMENT_MARKER} [blocked]"
                 + (f" [base:{base_sha[:8]}]" if base_sha else "") + "*"
             )
-            upsert_comment(pr_id, body, existing_id, repo=repo)
-            with _seen_lock:
-                _seen[sk] = (pr_sha, base_sha)
+            cm = upsert_comment(pr_id, body, existing_id, repo=repo)
+            _seen_after_writes(sk, pr_sha, base_sha, st, cm)
             return
 
         # COPR-32566: same hard block for a clone whose names miss its token.
@@ -11723,10 +11769,9 @@ def process_pr(pr, path_map, base_sha="", repo=None):
         token_hits = _detect_partition_token_misses(changed, render_sha, repo=repo, base_sha=base_sha)
         if token_hits:
             desc, body = _partition_token_block(token_hits, pr_sha, base_sha)
-            post_build_status(pr_sha, "FAILED", desc, pr_id=pr_id)
-            upsert_comment(pr_id, body, existing_id, repo=repo)
-            with _seen_lock:
-                _seen[sk] = (pr_sha, base_sha)
+            st = post_build_status(pr_sha, "FAILED", desc, pr_id=pr_id, repo=repo)
+            cm = upsert_comment(pr_id, body, existing_id, repo=repo)
+            _seen_after_writes(sk, pr_sha, base_sha, st, cm)
             return
 
         # v2.5.4 (Finding 4): always check for new-env candidates, not just
@@ -11748,10 +11793,9 @@ def process_pr(pr, path_map, base_sha="", repo=None):
                                                         repo=repo)
         if cohort_hits:
             desc, body = _cohort_removal_block(cohort_hits, pr_sha, base_sha)
-            post_build_status(pr_sha, "FAILED", desc, pr_id=pr_id)
-            upsert_comment(pr_id, body, existing_id, repo=repo)
-            with _seen_lock:
-                _seen[sk] = (pr_sha, base_sha)
+            st = post_build_status(pr_sha, "FAILED", desc, pr_id=pr_id, repo=repo)
+            cm = upsert_comment(pr_id, body, existing_id, repo=repo)
+            _seen_after_writes(sk, pr_sha, base_sha, st, cm)
             return
 
         # Renaming a live env orphans its namespace (COPR-32565): block it unless
@@ -11767,19 +11811,17 @@ def process_pr(pr, path_map, base_sha="", repo=None):
             todo = [h for h in identity_hits if h["reason"]]
             if todo:
                 desc, body = _identity_change_block(todo, pr_sha, base_sha)
-                post_build_status(pr_sha, "FAILED", desc, pr_id=pr_id)
-                upsert_comment(pr_id, body, existing_id, repo=repo)
-                with _seen_lock:
-                    _seen[sk] = (pr_sha, base_sha)
+                st = post_build_status(pr_sha, "FAILED", desc, pr_id=pr_id, repo=repo)
+                cm = upsert_comment(pr_id, body, existing_id, repo=repo)
+                _seen_after_writes(sk, pr_sha, base_sha, st, cm)
                 return
         # No chart version for a live env: ArgoCD sets watch-only and the apps freeze.
         frozen_hits = _detect_frozen_versions(changed, renames, path_map, render_sha, repo=repo)
         if frozen_hits:
             desc, body = _frozen_version_block(frozen_hits, pr_sha, base_sha)
-            post_build_status(pr_sha, "FAILED", desc, pr_id=pr_id)
-            upsert_comment(pr_id, body, existing_id, repo=repo)
-            with _seen_lock:
-                _seen[sk] = (pr_sha, base_sha)
+            st = post_build_status(pr_sha, "FAILED", desc, pr_id=pr_id, repo=repo)
+            cm = upsert_comment(pr_id, body, existing_id, repo=repo)
+            _seen_after_writes(sk, pr_sha, base_sha, st, cm)
             return
         new_env_candidates = _detect_new_env_candidates(changed, path_map, renames, pr_sha=render_sha, repo=repo)
         if new_env_candidates:
@@ -11808,7 +11850,8 @@ def process_pr(pr, path_map, base_sha="", repo=None):
         if not affected:
             # No existing ArgoCD app matched the changed files.
             if new_env_candidates:
-                post_build_status(pr_sha, "INPROGRESS", "Rendering new environment(s)...", pr_id=pr_id)
+                post_build_status(pr_sha, "INPROGRESS", "Rendering new environment(s)...",
+                                  pr_id=pr_id, repo=repo)
                 new_env_lines, structural_envs, total_new, new_env_full_lines = \
                     _evaluate_new_envs(new_env_candidates, render_sha,
                                        with_full_output=True)
@@ -11852,17 +11895,16 @@ def process_pr(pr, path_map, base_sha="", repo=None):
                 # to the complete page (same standard as the diff path).
                 _save_diff_ui_artifact(repo, pr_id, pr_sha, body,
                                        base_sha=base_sha)
-                post_build_status(pr_sha, state, desc, pr_id=pr_id)
-                upsert_comment(pr_id, body, existing_id, repo=repo)
-                with _seen_lock:
-                    _seen[sk] = (pr_sha, base_sha)
+                st = post_build_status(pr_sha, state, desc, pr_id=pr_id, repo=repo)
+                cm = upsert_comment(pr_id, body, existing_id, repo=repo)
+                _seen_after_writes(sk, pr_sha, base_sha, st, cm)
                 return
 
             # No apps affected and no new env pattern found.
             logsink.log("No ArgoCD apps affected - posting SUCCESSFUL",
                         pr=pr_id, repo=repo, event="no_apps_affected")
-            post_build_status(pr_sha, "SUCCESSFUL",
-                "No ArgoCD apps affected by this PR", pr_id=pr_id)
+            st = post_build_status(pr_sha, "SUCCESSFUL",
+                "No ArgoCD apps affected by this PR", pr_id=pr_id, repo=repo)
             no_apps_body = (
                 f"## \U0001f52d {STATUS_NAME}\n\n"
                 f"{_comment_header(pr_sha)}\n\n"
@@ -11873,13 +11915,12 @@ def process_pr(pr, path_map, base_sha="", repo=None):
                 f"---\n**Status:** \u2705 No ArgoCD apps affected\n"
                 f"*{_ts()} \u2014 {COMMENT_MARKER} [clean]" + (f" [base:{base_sha[:8]}]" if base_sha else "") + "*"
             )
-            upsert_comment(pr_id, no_apps_body, existing_id, repo=repo)
-            with _seen_lock:
-                _seen[sk] = (pr_sha, base_sha)
+            cm = upsert_comment(pr_id, no_apps_body, existing_id, repo=repo)
+            _seen_after_writes(sk, pr_sha, base_sha, st, cm)
             return
 
         logsink.log(f"Apps: {affected}", "DEBUG", pr=pr_id, repo=repo)
-        post_build_status(pr_sha, "INPROGRESS", "Running ArgoCD diff...", pr_id=pr_id)
+        post_build_status(pr_sha, "INPROGRESS", "Running ArgoCD diff...", pr_id=pr_id, repo=repo)
 
         # v2.5.11 (live PR #6677): apps whose environment was CONFIRMED
         # decommissioned above must never enter the normal diff pipeline —
@@ -12387,8 +12428,8 @@ def process_pr(pr, path_map, base_sha="", repo=None):
             comment_kb = round(len(body.encode()) / 1024, 1)
         _record_comment_stats(body, render_profile.COMMENT_PROFILE,
                               fallback_inline=fallback_inline)
-        upsert_comment(pr_id, body, existing_id, repo=repo,
-                       artifact_url=artifact_url)
+        cm = upsert_comment(pr_id, body, existing_id, repo=repo,
+                            artifact_url=artifact_url)
         action = "updated" if existing_id else "posted"
         logsink.log(f"Comment {action} on PR #{pr_id} ({comment_kb}KB)",
                     pr=pr_id, event="comment_posted", comment_kb=comment_kb)
@@ -12485,33 +12526,30 @@ def process_pr(pr, path_map, base_sha="", repo=None):
         if (any_hard_error or has_blocking_indet or structural_envs
                 or moves_missing_cohort or broken_arming
                 or flag_typo_block or kcc_nil_block):
+            state = "FAILED"
             # COPS-2552: a move whose destination has no cohort config.yaml
             # must never post green. Merging it removes the environment from
             # ArgoCD instead of moving it, and the apps themselves diff clean,
             # so nothing else in this chain would catch it.
             if moves_missing_cohort:
                 envs = ", ".join(b["env"] for b in moves_missing_cohort)
-                _mmc_desc = (f"{len(moves_missing_cohort)} moved environment(s) "
-                             f"have no cohort config.yaml at the destination "
-                             f"({envs}) - merging would remove them from ArgoCD")
-                post_build_status(pr_sha, "FAILED", _mmc_desc, pr_id=pr_id)
+                desc = (f"{len(moves_missing_cohort)} moved environment(s) "
+                        f"have no cohort config.yaml at the destination "
+                        f"({envs}) - merging would remove them from ArgoCD")
             elif broken_arming:
-                _ba_desc = ("Decommission arming broken - this PR strips the "
-                            "Linux VM config while arming deletion; the cloud "
-                            "VM would be orphaned, not deleted. Keep the VM "
-                            "block (see PR comment)")
-                post_build_status(pr_sha, "FAILED", _ba_desc, pr_id=pr_id)
+                desc = ("Decommission arming broken - this PR strips the "
+                        "Linux VM config while arming deletion; the cloud "
+                        "VM would be orphaned, not deleted. Keep the VM "
+                        "block (see PR comment)")
             elif flag_typo_block:
                 # The description is the whole message for anyone reading the
                 # checks list rather than the comment, so it names the key and
                 # the fix rather than pointing at a panel.
-                _ft_desc = _flag_typo_status_description(appspace_state_lines)
-                post_build_status(pr_sha, "FAILED", _ft_desc, pr_id=pr_id)
+                desc = _flag_typo_status_description(appspace_state_lines)
             elif kcc_nil_block:
-                _kcc_desc = ("Unresolved KCC value - Compute* resources render "
-                             "%!s(<nil>) / <no value>; set hostingID (or the "
-                             "missing field) before merging (see PR comment)")
-                post_build_status(pr_sha, "FAILED", _kcc_desc, pr_id=pr_id)
+                desc = ("Unresolved KCC value - Compute* resources render "
+                        "%!s(<nil>) / <no value>; set hostingID (or the "
+                        "missing field) before merging (see PR comment)")
             elif structural_envs:
                 # COPS-2709: "structural config problem" is a category, not a
                 # problem. When the render named one, lead with it.
@@ -12529,16 +12567,14 @@ def process_pr(pr, path_map, base_sha="", repo=None):
                     desc = f"{base_desc} | {permanent_indet_count} existing app(s): invalid config"
                 else:
                     desc = base_desc
-                post_build_status(pr_sha, "FAILED", desc, pr_id=pr_id)
             elif oci_not_found_count:
                 # COPS-2709: name the chart and version. "chart version not
                 # found" without saying which one leaves the reader to guess
                 # between the bump they just made and every pin they did not.
-                _oci_desc = (
+                desc = (
                     _permanent_failure_status_description(app_results)
                     or f"{oci_not_found_count} app(s): chart version not "
                        f"found in OCI registry")
-                post_build_status(pr_sha, "FAILED", _oci_desc, pr_id=pr_id)
             elif any_hard_error:
                 # COPS-2709: "Diff failed" named nothing at all. The error is
                 # right there on the result.
@@ -12546,28 +12582,26 @@ def process_pr(pr, path_map, base_sha="", repo=None):
                          for v in app_results.values()
                          if _result(v).outcome == OUT_ERROR]
                 _errs = [e for e in _errs if e]
-                _hd_desc = (f"Diff failed: {_errs[0].splitlines()[0][:180]} "
-                            f"- check PR comment" if _errs else
-                            "Diff failed - check PR comment")
-                post_build_status(pr_sha, "FAILED", _hd_desc, pr_id=pr_id)
+                desc = (f"Diff failed: {_errs[0].splitlines()[0][:180]} "
+                        f"- check PR comment" if _errs else
+                        "Diff failed - check PR comment")
             else:
                 # Permanent indeterminate reason other than oci_not_found.
                 # COPS-2709: this branch is reached by four different
                 # failures, and until now described all of them as "invalid
                 # config".
-                _pf_desc = (
+                desc = (
                     _permanent_failure_status_description(app_results)
                     or f"{permanent_indet_count} app(s): invalid config — "
                        f"fix and push again (check PR comment for details)")
-                post_build_status(pr_sha, "FAILED", _pf_desc, pr_id=pr_id)
         elif skipped_apps:
             # Apps beyond MAX_APPS_PER_RUN were never evaluated — never post SUCCESSFUL
             # with a coverage gap, as reviewers assume full coverage.
             n_skipped = len(skipped_apps)
             extra = f" | {sections_total} resource(s) changed" if sections_total else ""
-            post_build_status(pr_sha, "FAILED",
+            state, desc = "FAILED", (
                 f"{n_skipped} app(s) not evaluated (cap={MAX_APPS_PER_RUN} — raise "
-                f"MAX_APPS_PER_RUN to cover){extra} — review comment", pr_id=pr_id)
+                f"MAX_APPS_PER_RUN to cover){extra} — review comment")
         elif any_unknown:
             # v2.5.4 (Finding 1): ANY indeterminate app blocks now, whether or
             # not other apps in the same PR produced a real diff. Before this
@@ -12578,19 +12612,18 @@ def process_pr(pr, path_map, base_sha="", repo=None):
             # reason still retries automatically next iteration (unchanged
             # below); only the color is different now.
             extra = f" | {sections_total} resource(s) confirmed changed" if sections_total else ""
-            post_build_status(pr_sha, "FAILED",
+            state, desc = "FAILED", (
                 f"Diff unavailable for {n_unknown} app(s){extra}{status_extra} - review comment "
-                f"(will retry automatically if transient)", pr_id=pr_id)
+                f"(will retry automatically if transient)")
         elif sections_total > 0:
             extra = f" | +{len(new_env_candidates)} new environment(s) will be created" if new_env_candidates else ""
-            post_build_status(pr_sha, "SUCCESSFUL",
-                f"{sections_total} resource(s) will change{extra}{status_extra} - review comment",
-                pr_id=pr_id)
+            state, desc = "SUCCESSFUL", (
+                f"{sections_total} resource(s) will change{extra}{status_extra} - review comment")
         else:
             if new_env_candidates:
-                post_build_status(pr_sha, "SUCCESSFUL",
+                state, desc = "SUCCESSFUL", (
                     f"No manifest changes to existing apps | +{len(new_env_candidates)} "
-                    f"new environment(s) will be created{status_extra}", pr_id=pr_id)
+                    f"new environment(s) will be created{status_extra}")
             else:
                 # COPS-2721: SUCCESSFUL stays (nothing failed), but the
                 # description names why the render is quiet when YAML moved.
@@ -12598,8 +12631,8 @@ def process_pr(pr, path_map, base_sha="", repo=None):
                 _clean = _clean_status_description(
                     has_redundancy=_VALUES_REDUNDANCY_HDR in _joined,
                     has_input_changes=bool(input_change_lines))
-                post_build_status(pr_sha, "SUCCESSFUL",
-                                  f"{_clean}{status_extra}", pr_id=pr_id)
+                state, desc = "SUCCESSFUL", f"{_clean}{status_extra}"
+        st = post_build_status(pr_sha, state, desc, pr_id=pr_id, repo=repo)
 
         # Mark as seen logic:
         # - Clean run (no error, no indeterminate): mark seen -> skip next iteration
@@ -12633,12 +12666,12 @@ def process_pr(pr, path_map, base_sha="", repo=None):
         if not is_transient_failure:
             # Mark seen for both clean runs AND permanent failures so we don't
             # spam the PR with repeated "not found" comments every 60s.
-            with _seen_lock:
-                _seen[sk] = (pr_sha, base_sha)
-            _backoff_clear(sk)
-            # COPS-2575: this PR published a real result, so the livelock
-            # guard's consecutive-abort streak is over.
-            _note_supersede_complete(sk)
+            # COPS-2766: only once the comment and the status really landed.
+            if _seen_after_writes(sk, pr_sha, base_sha, cm, st):
+                _backoff_clear(sk)
+                # COPS-2575: this PR published a real result, so the livelock
+                # guard's consecutive-abort streak is over.
+                _note_supersede_complete(sk)
         else:
             # COPS-2546: still unseen (so it retries), but with escalating
             # spacing instead of every iteration.
@@ -12667,7 +12700,7 @@ def process_pr(pr, path_map, base_sha="", repo=None):
         try:
             _sdesc = (f"Diff unavailable (infrastructure) - will retry: {str(e)[:150]}"
                       if _transient else f"Diff error: {str(e)[:200]}")
-            post_build_status(pr_sha, "FAILED", _sdesc, pr_id=pr_id)
+            post_build_status(pr_sha, "FAILED", _sdesc, pr_id=pr_id, repo=repo)
         except Exception:
             pass
         _human = (

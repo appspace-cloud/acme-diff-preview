@@ -169,7 +169,7 @@ def test_cross_pod_dedup_actually_works_after_pod_restart(monkeypatch):
 
     monkeypatch.setattr(mod, "find_existing_comment",
                         lambda pid, repo=None: (55, mod._extract_comment_sha(posted_comment), posted_comment))
-    monkeypatch.setattr(mod, "fix_stuck_inprogress", lambda *a, **k: None)
+    monkeypatch.setattr(mod, "fix_stuck_inprogress", lambda *a, **k: "ok")
 
     diff_ran = []
     monkeypatch.setattr(mod, "get_pr_changed_files", lambda pid, repo=None: diff_ran.append(1) or [])

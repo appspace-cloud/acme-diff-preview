@@ -186,7 +186,7 @@ def world(monkeypatch):
     monkeypatch.setattr(m, "post_build_status",
                         lambda pr_sha, state, description, pr_id=None, repo=None:
                         sinks.statuses.append((state, description)) or "ok")
-    monkeypatch.setattr(m, "fix_stuck_inprogress", lambda *a, **k: None)
+    monkeypatch.setattr(m, "fix_stuck_inprogress", lambda *a, **k: "ok")
     monkeypatch.setattr(m, "_touch_progress", lambda: None)
 
     # Live apps still have their identity file on main (and usually the PR).

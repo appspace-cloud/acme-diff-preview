@@ -85,6 +85,7 @@ _diff_stats:      dict          = {
     "section_cap_trims": 0,
     "diff_retries": 0,             # per-diff transient retries performed
     "futures_cancelled": 0,        # subtask futures cancelled on abnormal exit
+    "bb_write_failures": 0,        # COPS-2766: comment/status writes that failed
     # v2.5.20 (E1): HTTP connection-pool observability. reuses vs fresh
     # tells whether keep-alive is actually paying off in production;
     # fallbacks counts requests the pool could not serve (redirects,

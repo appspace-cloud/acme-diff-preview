@@ -188,7 +188,7 @@ def test_newenv_only_path_saves_artifact_before_final_status(monkeypatch):
     monkeypatch.setattr(m, "get_pr_changed_files",
                         lambda pr_id, repo=None: (["x/customer.yaml"], {}))
     monkeypatch.setattr(m, "find_existing_comment", lambda pr_id, repo=None: (None, "", ""))
-    monkeypatch.setattr(m, "fix_stuck_inprogress", lambda *a, **k: None)
+    monkeypatch.setattr(m, "fix_stuck_inprogress", lambda *a, **k: "ok")
     monkeypatch.setattr(m, "_touch_progress", lambda: None)
     monkeypatch.setattr(m, "_detect_env_decommission_candidates",
                         lambda *a, **k: [])
