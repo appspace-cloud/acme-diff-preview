@@ -328,10 +328,13 @@ def test_no_change_no_panel():
     assert m._nocore_flip_lines([]) == []
 
 
+CRASH_LINE = ("⚠️ noCore check unavailable for this PR. Check `appspace.infra.noCore` "
+              "of the changed environments by hand before you merge.")
+
+
 def test_a_crash_says_so():
-    out = _text(None)
-    assert "noCore check unavailable for this PR (see the service log)" in out
-    assert "###" not in out
+    """The PR author cannot read the service log: the line says what to do."""
+    assert m._nocore_flip_lines(None) == [CRASH_LINE, ""]
 
 
 def test_the_on_text_carries_the_core_vm_rule():
@@ -420,7 +423,8 @@ def test_an_unknown_env_is_named():
     out = m._nocore_flip_lines([_change(new=None), _change(env="pv-y-a")])
     assert out[0].endswith("in 1 environment(s): on in 1, off in 0")
     assert ("⚠️ noCore check unavailable for `pv-x-a`: one of its value "
-            "files is not valid YAML.") in out
+            "files is not valid YAML. Check `appspace.infra.noCore` of this "
+            "environment by hand before you merge.") in out
     only = _text([_change(old=None)])
     assert "###" not in only and "check unavailable for `pv-x-a`" in only
 
@@ -429,7 +433,8 @@ def test_names_are_capped_at_ten():
     out = _text([_change(env=f"pv-e{i:02}-a") for i in range(13)])
     assert "`pv-e09-a` (+3 more)." in out and "pv-e10-a" not in out
     unknown = _text([_change(env=f"pv-e{i:02}-a", new=None) for i in range(12)])
-    assert "`pv-e09-a` (+2 more): one of their value files" in unknown
+    assert ("`pv-e09-a` (+2 more): one of their value files is not valid YAML. Check "
+            "`appspace.infra.noCore` of these environments by hand") in unknown
 
 
 def test_no_em_or_en_dash_in_any_line():
@@ -476,11 +481,17 @@ def test_the_gate_is_do_not_merge():
 
 
 def test_an_unknown_is_a_review_not_a_routine():
-    for state in (m._nocore_flip_lines(None), m._nocore_flip_lines([_change(new=None)])):
+    """The summary names what was not checked, like the panel: the whole PR
+    after a crash, the envs when a value file is bad YAML."""
+    for state, who in ((m._nocore_flip_lines(None), "this PR"),
+                       (m._nocore_flip_lines([_change(new=None)]), "`pv-x-a`"),
+                       (m._nocore_flip_lines([_change(env=f"pv-e{i:02}-a", new=None)
+                                              for i in range(12)]),
+                        "`pv-e00-a`, `pv-e01-a`, `pv-e02-a` (+9 more)")):
         verdict, b = _bullets(state)
         assert verdict.startswith("⚠️ **Review before merging** (1 item(s))")
-        assert b == ["\U0001f50c **noCore check unavailable** for part of this PR "
-                     "(see the noCore note)"]
+        assert b == [f"\U0001f50c **noCore check unavailable** for {who}: check "
+                     "`appspace.infra.noCore` by hand before you merge"]
 
 
 def test_the_gate_table_has_the_kind():
@@ -570,8 +581,9 @@ def test_a_bug_in_the_check_is_a_review_line(move, monkeypatch):
     monkeypatch.setattr(m, "_key_changes", lambda *a, **k: 1 / 0)
     body, (state, desc), _reads = move()
     assert state == "SUCCESSFUL" and m._extract_status_token(body) == "clean", desc
-    assert "noCore check unavailable for this PR (see the service log)" in body
-    assert desc.startswith("⚠️ noCore check unavailable"), desc
+    assert CRASH_LINE in body
+    assert desc.startswith("⚠️ noCore check unavailable for this PR: check "
+                           "appspace.infra.noCore by hand"), desc
 
 
 def test_a_pr_without_config_changes_reads_nothing_for_it(world, monkeypatch):

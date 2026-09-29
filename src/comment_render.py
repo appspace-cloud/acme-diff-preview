@@ -189,6 +189,15 @@ def _fmt_service_list(services: list, shown: int = 8) -> str:
     return f"{head}{more}"
 
 
+def _panel_names(*segments, shown=3) -> str:
+    """COPS-2766: '`a`, `b`, `c` (+N more)' from the name lists of our own
+    panel lines, like '`pv-a` (moved from `x`), `pv-b` (+8 more)'."""
+    names = [n for seg in segments for n in re.findall(r"(?:^|, )(`[^`]+`)", seg)]
+    rest = len(names) - shown + sum(
+        int(x) for seg in segments for x in re.findall(r"\(\+(\d+) more\)$", seg))
+    return ", ".join(names[:shown]) + (f" (+{rest} more)" if rest > 0 else "")
+
+
 def _routine_bump_label(sig) -> str:
     """One human line naming the transition a rollup group shares."""
     old_rev, new_rev, items = sig
@@ -238,6 +247,7 @@ _NOCORE_FLIP_HDR = "**noCore changes.**"
 _NOCORE_COUNTS_RE = re.compile(
     r"noCore changes in (\d+) environment\(s\): on in (\d+), off in (\d+)")
 _NOCORE_UNKNOWN = "noCore check unavailable"
+_NOCORE_UNKNOWN_RE = re.compile(re.escape(_NOCORE_UNKNOWN) + r" for (.+?): one of ")
 # COPS-2766: legacyBackends false to true, the same wiring.
 _LEGACY_BACKENDS_HDR = "**Legacy backends come back.**"
 _LEGACY_BACKENDS_RE = re.compile(
@@ -1032,9 +1042,12 @@ def _build_merge_summary(results, rollup_by_sig, vm_change_lines,
                              f"environment(s)**: on in {nc.group(2)}, off in "
                              f"{nc.group(3)} (read the noCore note, COPS-2758)"))
         if _NOCORE_UNKNOWN in txt:
+            # Named envs when a value file is bad YAML, the PR when it crashed.
+            unk = _NOCORE_UNKNOWN_RE.search(txt)
             findings.append((_SEV_REVIEW,
-                             f"\U0001f50c **{_NOCORE_UNKNOWN}** for part of this "
-                             f"PR (see the noCore note)"))
+                             f"\U0001f50c **{_NOCORE_UNKNOWN}** for "
+                             f"{_panel_names(unk.group(1)) if unk else 'this PR'}: "
+                             f"check `appspace.infra.noCore` by hand before you merge"))
         lb = _LEGACY_BACKENDS_RE.search(txt)
         if lb:
             findings.append((_SEV_REVIEW,

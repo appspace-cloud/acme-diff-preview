@@ -8692,7 +8692,8 @@ def _nocore_flip_lines(changes) -> list:
     the check crashed. Shares the appspace_state_lines channel, and the merge
     summary reads the counts of its header."""
     if changes is None:
-        return [f"\u26a0\ufe0f {_NOCORE_UNKNOWN} for this PR (see the service log).", ""]
+        return [f"\u26a0\ufe0f {_NOCORE_UNKNOWN} for this PR. Check `{_NOCORE_KEY}` of "
+                "the changed environments by hand before you merge.", ""]
     known = [c for c in changes if c["old"] is not None and c["new"] is not None]
     unknown = [c for c in changes if c["old"] is None or c["new"] is None]
     lines = []
@@ -8721,9 +8722,11 @@ def _nocore_flip_lines(changes) -> list:
                   f"noCore, or `false` if Core must come back. The build fails until "
                   f"the file sets it.", ""]
     if unknown:
-        whose = "its" if len(unknown) == 1 else "their"
+        whose, them = (("its", "this environment") if len(unknown) == 1
+                       else ("their", "these environments"))
         lines += [f"\u26a0\ufe0f {_NOCORE_UNKNOWN} for {_nocore_names(unknown)}: one of "
-                  f"{whose} value files is not valid YAML.", ""]
+                  f"{whose} value files is not valid YAML. Check `{_NOCORE_KEY}` of "
+                  f"{them} by hand before you merge.", ""]
     return lines
 
 
