@@ -166,11 +166,10 @@ from comment_render import (  # comment rendering (same-dir module, stdlib only)
     build_marks,
     status_lead,
     join_status_lead,
-    gate_text,
     gate_trailer,
-    open_gates,
     gate_token,
     gate_status_description,
+    gate_footer,
     _DECOM_ORPHAN_HDR,
     _DECOM_PURGE_HDR,
     _DECOM_SHARED_UC_HDR,
@@ -185,6 +184,7 @@ from comment_render import (  # comment rendering (same-dir module, stdlib only)
     _DECOM_VM_STRIP_HDR,
     _DECOM_FLAG_TYPO_HDR,
     _DECOM_CASCADE_NOT_LIVE_HDR,
+    _DECOM_PAUSED_HDR,
     _SHUTDOWN_MIN_WORKLOADS,
     _is_env_shutdown,
 )
@@ -6740,20 +6740,25 @@ def _paused_apps_for(apps, path_map, sha, repo=None) -> set:
 
 
 DECOM_HOLD_DAYS = 7
+# COPS-2766: the gate for each answer of _teardown_hold_met but True.
+_HOLD_GATES = {False: "hold", None: "hold_retry", "unreadable": "hold_unread"}
 
 
 def _teardown_hold_met(identity_file, main_sha, now=None):
     """COPS-2766: has zeroPods or decommission been true on main for
-    DECOM_HOLD_DAYS? True, False, or None when the mirror cannot say.
+    DECOM_HOLD_DAYS? True or False. None when the mirror cannot say now (not
+    ready, a git error), so a retry can. "unreadable" when no retry can: the
+    mirror is off by config, or an old version of the file does not parse.
 
     First-parent history of the file, newest first, so a commit's time is
     when it landed on main. A commit with both flags off ends the walk, and
     so does the first commit older than the hold. A history that runs out
     first is False: the env had the flag for less than the hold.
     """
+    if not GIT_MIRROR_ENABLED:
+        return "unreadable"
     repo = _repo_for_sha(main_sha)
-    if (not GIT_MIRROR_ENABLED or _mirror_disabled or not repo or not main_sha
-            or not _mirror_has_sha(repo, main_sha)):
+    if _mirror_disabled or not repo or not main_sha or not _mirror_has_sha(repo, main_sha):
         return None
     clean = posixpath.normpath(str(identity_file).replace("$config/", "").lstrip("/"))
     r = _git_run(["--git-dir", _mirror_path(repo), "log", "--first-parent",
@@ -6768,7 +6773,7 @@ def _teardown_hold_met(identity_file, main_sha, now=None):
         try:
             flat = _flatten_yaml(_yaml_safe_load(got[0] or "") or {})
         except yaml.YAMLError:
-            return None
+            return "unreadable"
         if not (_decommission_armed_flat(flat)
                 or str(flat.get("appspace.zeroPods", "")).lower() == "true"):
             return False
@@ -7229,6 +7234,16 @@ def _evaluate_env_decommissions(candidates: list, pr_sha: str, main_sha: str,
             # inventory it would otherwise appear to describe.
             _note = _cascade_mismatch_note(c["env_name"], c["apps"], cascade)
             lines += _note
+            # COPS-2766: the table says Phase 2 is done from the flag alone. A
+            # paused env never syncs, so the panel says so next to the table.
+            paused = cascade and _autosync_paused(
+                _flat_yaml_cached(c["identity_file"], main_sha))
+            if paused:
+                lines += [f"\U0001f6a8 **{_DECOM_PAUSED_HDR}.** `appspace.autosync: false` "
+                          f"is set for `{c['env_name']}` on `main`. A paused environment "
+                          "never syncs, so the cascade finalizer never arrives. Resume "
+                          "auto-sync in a separate PR, let it sync, then remove the "
+                          "folder.", ""]
             # COPS-2707: the table above just reported Phase 2 as pending on
             # an environment whose file looks armed to a reader. Saying only
             # "not armed" is what left acme-config-prod #4377 arguing with
@@ -7282,12 +7297,12 @@ def _evaluate_env_decommissions(candidates: list, pr_sha: str, main_sha: str,
             # _note is set. The finalizer not live yet clears itself on a retry.
             if _DECOM_CASCADE_NOT_LIVE_HDR in "\n".join(_note):
                 c["gates"].append({"kind": "not_live", "env": c["env_name"]})
-            if _autosync_paused(_flat_yaml_cached(c["identity_file"], main_sha)):
+            if paused:
                 c["gates"].append({"kind": "paused", "env": c["env_name"]})
+            # A mirror blip is a retry, never a reason to override the hold.
             hold = _teardown_hold_met(c["identity_file"], main_sha)
             if hold is not True:
-                c["gates"].append({"kind": "hold", "env": c["env_name"], **(
-                    {} if hold is False else {"why": "history unreadable"})})
+                c["gates"].append({"kind": _HOLD_GATES[hold], "env": c["env_name"]})
         if public_cloud:
             lines += [
                 "\u26a0\ufe0f " + _DECOM_PUBLIC_CLOUD_HDR,
@@ -7475,16 +7490,17 @@ def _merge_gates(decommission_candidates, renames=None, path_map=None,
     removal is the `public` gate. A live cl-*/config.yaml renamed or moved
     renames every Application of the constellation: `cl_rename`, lifted by
     `Confirm-Rename: <old dir> -> <new dir>`. A disk shrink in the VM panel
-    is `shrink`, one for the PR, and nothing lifts it. An app that releases a
-    static IP or a DNS record is `ip`, lifted by `Confirm-IP-Release: <env>`.
+    is `shrink`, one per env (the first name in backticks of its line), and
+    nothing lifts it. An app that releases a static IP or a DNS record is
+    `ip`, lifted by `Confirm-IP-Release: <env>`.
     """
     found = [g for c in decommission_candidates or () for g in c.get("gates", ())]
     found += [{"kind": "cl_rename", "env": _CL_ENV_RE.match(old)[1],
                "arg": f"{posixpath.dirname(old)} -> {posixpath.dirname(new)}"}
               for old, new in (renames or {}).items()
               if _CL_ENV_RE.match(old) and (path_map or {}).get(old)]
-    if any(_VM_SHRINK_REASON in line for line in vm_change_lines or ()):
-        found.append({"kind": "shrink", "env": ""})
+    found += [{"kind": "shrink", "env": (re.findall(r"`([^`]+)`", line) or [""])[0]}
+              for line in vm_change_lines or () if _VM_SHRINK_REASON in line]
     found += [{"kind": "ip", "env": _envs_from_apps([app])[0]}
               for app, r in (app_results or {}).items() if getattr(r, "ip_released", None)]
     gates = {}
@@ -8488,6 +8504,12 @@ def upsert_comment(pr_id, body, existing_id=None, repo=None, artifact_url=""):
             return _write_failed(e2)
     return "ok"
 
+
+# COPS-2766: the FAILED status a merge gate wrote in the Status line
+# (comment_render.gate_footer), with the line to add or the fix.
+_GATE_FOOTER_RE = re.compile(r"\| \S+ ((?:Blocked|Waiting) - [^\n]*\(see PR comment\))")
+
+
 def fix_stuck_inprogress(pr_sha, pr_id, comment_raw, repo=None):
     """If build status is stuck INPROGRESS but comment is current, fix the status.
 
@@ -8514,6 +8536,7 @@ def fix_stuck_inprogress(pr_sha, pr_id, comment_raw, repo=None):
         # fixed for real in this version - see _extract_status_token), then
         # fall back to parsing the human-readable comment text.
         _token = _extract_status_token(comment_raw)
+        _gate_desc = (_GATE_FOOTER_RE.findall(comment_raw) or [""])[-1]
         if _token == "permanent":
             state, desc = "FAILED", "Diff failed - check PR comment"
         elif _token == "blocked":
@@ -8525,7 +8548,9 @@ def fix_stuck_inprogress(pr_sha, pr_id, comment_raw, repo=None):
             # comment and the status left a green gate under a blocking
             # comment. Recovering a status must never be the step that
             # unblocks a merge.
-            state, desc = "FAILED", "Blocked - merging would break the environment (see comment)"
+            # COPS-2766: a merge gate names its own way out.
+            state, desc = "FAILED", (_gate_desc or "Blocked - merging would break "
+                                     "the environment (see comment)")
         elif _token == "clean":
             if "resource(s) will change" in comment_raw:
                 m = re.search(r"(\d+) resource\(s\) will change", comment_raw)
@@ -8545,7 +8570,8 @@ def fix_stuck_inprogress(pr_sha, pr_id, comment_raw, repo=None):
             # from a killed pod. The retry itself is unaffected: this only
             # fixes the color of a stuck-INPROGRESS status being resolved,
             # it does not change whether the PR gets re-diffed next iteration.
-            state, desc = "FAILED", "Diff unavailable - review comment (will retry automatically if transient)"
+            state, desc = "FAILED", (_gate_desc or "Diff unavailable - review comment "
+                                     "(will retry automatically if transient)")
         elif "\u26d4" in comment_raw:
             # COPS-2668: legacy fallback for a blocked comment posted before
             # the [blocked] token was readable. The stop sign is only ever
@@ -11648,9 +11674,7 @@ def format_comment(pr_sha, app_results, skipped_apps=None, base_sha="",
     if _kcc_nil_block:
         status += (" | \u26d4 UNRESOLVED KCC VALUE \u2014 "
                    "`%!s(<nil>)` on Compute* resources, see comment")
-    if open_gates(gates):
-        status += (f" | \u26d4 BLOCKED - {gate_text(open_gates(gates)[0])}, "
-                   "see comment")
+    status += gate_footer(gates)
 
     lines += ([
         # Above the separator, never between it and the Status line:

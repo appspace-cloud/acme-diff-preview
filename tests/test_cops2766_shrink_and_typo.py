@@ -131,13 +131,15 @@ def values_pr(world, monkeypatch):
     return run, plan
 
 
-SHRINK_DESC = f"Blocked - {cr.GATES['shrink'][0]} (see PR comment)"
+SHRINK_DESC = ("Blocked - Disk shrink in pv-orch-a. GCP cannot shrink a disk in "
+               "place, so keep the old size or grow it (see PR comment)")
 
 
 def _assert_blocked_shrink(body, state, desc):
     assert m._extract_status_token(body) == "blocked"
     assert state == "FAILED" and desc == SHRINK_DESC
-    assert f"- \u26d4 **{cr.GATES['shrink'][0]}**" in body
+    assert ("- \u26d4 **Disk shrink** in `pv-orch-a`. GCP cannot shrink a disk in "
+            "place, so keep the old size or grow it") in body
     assert "Confirmed in a commit" not in body
 
 
@@ -228,8 +230,15 @@ def test_7372_with_only_machine_type_stays_green(values_pr):
 
 # ── _merge_gates ─────────────────────────────────────────────────────────
 
-def test_merge_gates_adds_one_shrink_gate():
-    lines = [cr._VM_PANEL_DANGER_HDR, f"- a \u2014 {SHRINK}", f"- b \u2014 {SHRINK}"]
+def test_merge_gates_adds_one_shrink_gate_per_env():
+    """The env is the first name in backticks of the panel line: the env,
+    or the ancestor file."""
+    lines = [cr._VM_PANEL_DANGER_HDR,
+             f"- \U0001f6a8 `pv-a` \u00b7 **linux VM (KCC) \u00b7 mongo**: x \u2014 {SHRINK}",
+             f"- \U0001f6a8 `pv-a` \u00b7 `ComputeDisk d`: `size` \u2014 {SHRINK}",
+             f"- \U0001f6a8 ancestor `gcp/x/config.yaml` (inherited): y \u2014 {SHRINK}",
+             f"- b \u2014 {SHRINK}"]
     assert m._merge_gates(None, None, None, lines) == [
-        {"kind": "shrink", "env": "", "arg": "", "lifted": False}]
+        {"kind": "shrink", "env": e, "arg": e, "lifted": False}
+        for e in ("pv-a", "gcp/x/config.yaml", "")]
     assert m._merge_gates(None, None, None, [cr._VM_PANEL_DANGER_HDR, "- grow"]) == []

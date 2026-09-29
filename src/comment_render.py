@@ -289,7 +289,7 @@ _DECOM_FLAG_TYPO_HDR = (
 _DECOM_CASCADE_NOT_LIVE_HDR = ("**The cascade is armed in config but NOT live "
                                "in the cluster.**")
 # COPS-2766: a paused env never syncs, so its finalizer never arrives.
-_DECOM_PAUSED_HDR = "Cascade armed while auto-sync is paused, it never runs"
+_DECOM_PAUSED_HDR = "Auto-sync is paused on main, so the cascade never runs"
 
 
 def _pingscaler_reclass(results) -> dict:
@@ -414,30 +414,39 @@ def build_marks(lines, green):
 
 
 # COPS-2766: merge gates. A gate fails the build until a Confirm-* line in a
-# commit message of the PR lifts it. A kind with no trailer cannot be lifted.
-# kind: (summary text, trailer, token). A gate is {kind, env, arg, lifted},
-# and `why` when its text needs a reason.
+# commit message of the PR lifts it. A kind with no trailer cannot be lifted:
+# its fix says what to do. A transient kind is checked again by itself.
+# kind: (summary text, trailer, token, fix). A gate is {kind, env, arg, lifted}.
 GATES = {
     "orphan": ("Teardown with no cascade, the workloads keep running",
-               "Confirm-Teardown", "blocked"),
+               "Confirm-Teardown", "blocked", ""),
     "public": ("Public-cloud teardown, nothing is deleted by itself",
-               "Confirm-Teardown", "blocked"),
+               "Confirm-Teardown", "blocked", ""),
     "shared_uc": ("The purge deletes user content a surviving environment uses",
-                  "Confirm-Teardown", "blocked"),
+                  "Confirm-Teardown", "blocked", ""),
     "hold": ("Decommission or zeroPods set less than 7 days ago",
-             "Confirm-Decommission", "blocked"),
-    "ip": ("A static IP or DNS record is released", "Confirm-IP-Release", "blocked"),
+             "Confirm-Decommission", "blocked", ""),
+    # Fail closed: a history no retry can read is never "hold met".
+    "hold_unread": ("Could not confirm zeroPods or decommission has been on main "
+                    "for 7 days (history unreadable)", "Confirm-Decommission",
+                    "blocked", ""),
+    "hold_retry": ("The git history for the 7-day hold is not readable yet", None,
+                   "transient", "Re-checked automatically"),
+    "ip": ("A static IP or DNS record is released", "Confirm-IP-Release", "blocked", ""),
     "cl_rename": ("A live public-cloud environment is renamed or moved",
-                  "Confirm-Rename", "blocked"),
-    "paused": (_DECOM_PAUSED_HDR, None, "blocked"),
-    "shrink": ("Disk shrink, GCP cannot shrink a disk in place", None, "blocked"),
-    "not_live": ("The cascade finalizer is not live in ArgoCD yet", None, "transient"),
+                  "Confirm-Rename", "blocked", ""),
+    "paused": (_DECOM_PAUSED_HDR, None, "blocked",
+               "Resume auto-sync on main, let it sync, then remove the folder"),
+    "shrink": ("Disk shrink", None, "blocked",
+               "GCP cannot shrink a disk in place, so keep the old size or grow it"),
+    "not_live": ("The cascade finalizer is not live in ArgoCD yet", None, "transient",
+                 "Re-checked automatically after ArgoCD syncs"),
 }
 
 
 def gate_text(g) -> str:
-    """The summary text of gate g, with its reason when it has one."""
-    return GATES[g["kind"]][0] + (f" ({g['why']})" if g.get("why") else "")
+    """The summary text of gate g."""
+    return GATES[g["kind"]][0]
 
 
 def gate_trailer(g) -> str:
@@ -458,14 +467,33 @@ def gate_token(gates) -> str:
     return GATES[todo[0]["kind"]][2] if todo else ""
 
 
+def _gate_mark(g) -> str:
+    """\u23f3 for a gate that is checked again by itself, else \u26d4."""
+    return "\u23f3" if GATES[g["kind"]][2] == "transient" else "\u26d4"
+
+
+def _gate_way_out(g, trailer_fmt) -> str:
+    """The trailer that lifts g in trailer_fmt, or else the fix of its kind."""
+    tr = gate_trailer(g)
+    return trailer_fmt.format(tr) if tr else ". " + GATES[g["kind"]][3]
+
+
 def gate_status_description(gates) -> str:
-    """The FAILED build status. It names the line to add, so a reviewer who
-    reads only the checks list can act."""
+    """The FAILED build status. It names the line to add or the fix, so a
+    reviewer who reads only the checks list can act. A transient gate waits."""
     todo = open_gates(gates)
-    g, tr = todo[0], gate_trailer(todo[0])
-    return (f"Blocked - {gate_text(g)}" + (f" in {g['env']}" if g["env"] else "")
-            + (f". To merge anyway, add '{tr}' to a commit message" if tr else "")
+    g = todo[0]
+    return (("Waiting - " if GATES[g["kind"]][2] == "transient" else "Blocked - ")
+            + gate_text(g) + (f" in {g['env']}" if g["env"] else "")
+            + _gate_way_out(g, ". To merge anyway, add '{}' to a commit message")
             + (f" (+{len(todo) - 1} more)" if len(todo) > 1 else "") + " (see PR comment)")
+
+
+def gate_footer(gates) -> str:
+    """The gate part of the comment's Status line: the FAILED status with its
+    mark, so fix_stuck_inprogress can post it again. '' with no open gate."""
+    todo = open_gates(gates)
+    return f" | {_gate_mark(todo[0])} {gate_status_description(todo)}" if todo else ""
 
 
 def _build_merge_summary(results, rollup_by_sig, vm_change_lines,
@@ -496,15 +524,15 @@ def _build_merge_summary(results, rollup_by_sig, vm_change_lines,
     sev = _SEV_ROUTINE
 
     for g in gates or ():
-        text, tr = gate_text(g), gate_trailer(g)
+        text = gate_text(g)
         if g.get("lifted"):
             findings.append((_SEV_REVIEW, f"\u2611\ufe0f **Confirmed in a commit:** "
-                                          f"`{tr}` ({text})"))
+                                          f"`{gate_trailer(g)}` ({text})"))
         else:
-            findings.append((_SEV_BLOCK, f"\u26d4 **{text}**"
+            findings.append((_SEV_BLOCK, f"{_gate_mark(g)} **{text}**"
                              + (f" in `{g['env']}`" if g["env"] else "")
-                             + (f" - to merge anyway, add `{tr}` to a commit message"
-                                if tr else "")))
+                             + _gate_way_out(g, " - to merge anyway, add `{}` to a "
+                                                "commit message")))
 
     # COPS-2655. The pause finding below this one only fires when the PR
     # touches an identity file. This one fires whenever a CHANGED app sits

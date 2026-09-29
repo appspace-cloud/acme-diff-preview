@@ -51,5 +51,5 @@ To delete them together with the Application, set `appspace.decommission: true` 
 ⚠️ The full-diff page could not be produced for this run, so every hunk is inlined below.
 
 ---
-**Status:** ✅ No manifest changes | ⛔ BLOCKED - Teardown with no cascade, the workloads keep running, see comment
+**Status:** ✅ No manifest changes | ⛔ Blocked - Teardown with no cascade, the workloads keep running in pv-foo-c. To merge anyway, add 'Confirm-Teardown: pv-foo-c' to a commit message (see PR comment)
 *2026-01-01 00:00 UTC — acme-diff-preview [blocked] [base:00001111]*

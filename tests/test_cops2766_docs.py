@@ -20,7 +20,7 @@ import identity  # noqa: E402
 
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 DOCS = ("README.md", "docs/reference.md", "docs/internals.md", "tests/golden/README.md")
-TRAILERS = {t for _text, t, _tok in cr.GATES.values() if t}
+TRAILERS = {g[1] for g in cr.GATES.values() if g[1]}
 
 
 def _read(rel):

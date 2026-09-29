@@ -79,10 +79,11 @@ def _gate(kind, env="pv-x-a", lifted=False, **kw):
     return {"kind": kind, "env": env, "arg": env, "lifted": lifted, **kw}
 
 
-def test_every_gate_kind_has_text_and_a_known_token():
-    for kind, (text, trailer, token) in cr.GATES.items():
+def test_every_gate_kind_has_text_a_known_token_and_a_way_out():
+    for kind, (text, trailer, token, fix) in cr.GATES.items():
         assert text and token in ("blocked", "transient"), kind
         assert trailer is None or trailer.startswith("Confirm-"), kind
+        assert bool(trailer) != bool(fix), "a trailer, or else the fix: " + kind
 
 
 def test_gate_trailer_names_the_env_or_the_arg():
@@ -121,9 +122,9 @@ def test_merge_summary_blocks_an_open_gate_and_shows_a_lifted_one():
             f"anyway, add `Confirm-Teardown: pv-x-a` to a commit message") in out
     assert (f"- ☑️ **Confirmed in a commit:** `Confirm-Teardown: cl-y` "
             f"({cr.GATES['public'][0]})") in out
-    shrink = "\n".join(cr._build_merge_summary(
-        {}, {}, None, None, None, None, False, gates=[_gate("shrink", env="")]))
-    assert f"**{cr.GATES['shrink'][0]}**\n" in shrink + "\n"
+    shrink = cr._build_merge_summary(
+        {}, {}, None, None, None, None, False, gates=[_gate("shrink", env="")])
+    assert f"- ⛔ **Disk shrink**. {cr.GATES['shrink'][3]}" in shrink
 
 
 def test_a_lifted_gate_alone_is_a_review():
@@ -254,7 +255,7 @@ def _decom(gates):
 def test_format_comment_open_gate_is_blocked_with_a_footer_suffix():
     body = _decom([_gate("orphan")])
     assert m._extract_status_token(body) == "blocked"
-    assert (f"| ⛔ BLOCKED - {cr.GATES['orphan'][0]}, see comment") in body
+    assert body.count(f"| ⛔ {cr.gate_status_description([_gate('orphan')])}\n") == 1
     assert "`Confirm-Teardown: pv-x-a` to a commit message" in body
 
 
@@ -344,16 +345,28 @@ def test_a_transient_gate_is_red_and_retries(world, monkeypatch):
     assert SK not in m._seen and SK in m._retry_backoff
 
 
-def test_fix_stuck_inprogress_keeps_a_blocked_teardown_red(teardown, monkeypatch):
-    commits, _calls = teardown
-    body, _status = commits([])
+def _fix_stuck(monkeypatch, body):
     posted = []
     monkeypatch.setattr(m, "http", lambda *a, **k: {"state": "INPROGRESS"})
     monkeypatch.setattr(m, "post_build_status",
                         lambda sha, state, d, pr_id=None, repo=None:
-                        posted.append(state) or "ok")
+                        posted.append((state, d)) or "ok")
     assert REAL_FIX_STUCK(PR_SHA, 991, body) == "ok"
-    assert posted == ["FAILED"]
+    return posted
+
+
+def test_fix_stuck_inprogress_keeps_a_blocked_teardown_red(teardown, monkeypatch):
+    """With the gate's own status, so it still names the line to add."""
+    commits, _calls = teardown
+    body, status = commits([])
+    assert _fix_stuck(monkeypatch, body) == [status]
+    assert f"add '{TRAILER}' to a commit message" in status[1]
+
+
+def test_fix_stuck_inprogress_says_a_transient_gate_waits(monkeypatch):
+    gates = [_gate("not_live")]
+    assert _fix_stuck(monkeypatch, _decom(gates)) == [
+        ("FAILED", cr.gate_status_description(gates))]
 
 
 # ── (e) no gate, no commit read ──────────────────────────────────────────
@@ -387,7 +400,7 @@ def test_an_older_guard_keeps_its_status_text(world, monkeypatch, result, desc):
     assert state == "FAILED" and not got.startswith("Blocked"), got
     assert got == (desc or m._permanent_failure_status_description(
         {"pv-orch-a-ms": result}))
-    assert "| ⛔ BLOCKED" in sinks.upserts[-1], "the comment still shows the gate"
+    assert "| ⛔ Blocked - " in sinks.upserts[-1], "the comment still shows the gate"
 
 
 # ── a blocked gate next to a transient app ───────────────────────────────

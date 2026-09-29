@@ -183,7 +183,7 @@ FAILED, the comment still shows the diff, and the merge summary starts with one
 | Shared user content | the purge is armed, and a surviving environment uses the same user content bucket and DNS record | `Confirm-Teardown: <env>` |
 | 7-day hold | the cascade is armed, and `zeroPods` or `decommission` has been true on `main` for less than 7 days | `Confirm-Decommission: <env>` |
 | Cascade not live | the cascade is armed in config, but ArgoCD has not put `resources-finalizer.argocd.argoproj.io` on the Applications | nothing, it clears itself |
-| Paused | the cascade is armed while `appspace.autosync: false` on `main`, so the finalizer never arrives | nothing: resume auto-sync first |
+| Paused | the cascade is armed while `appspace.autosync: false` on `main`, so the finalizer never arrives. The panel says it next to the phase table. | nothing: resume auto-sync first, let it sync, then remove the folder |
 | Flag typo | a teardown flag that is misspelled or in the wrong place, so Phase 2 reads pending | nothing: fix the key |
 
 The same mechanism has three gates outside a teardown:
@@ -226,12 +226,15 @@ It fails closed:
   retried. It is never a lift.
 - The hold reads the first-parent history of the removed `customer.yaml` on the
   git mirror, newest first, so the time of a commit is when it landed on
-  `main`. A history that cannot be read (mirror off, a missing commit) is never
-  "hold met": the gate says "history unreadable" and still needs
-  `Confirm-Decommission`.
-- The finalizer is read from ArgoCD. Not live is a red status with the token
-  `[transient]`: the poll loop retries it with the usual backoff (COPS-2546),
-  and it clears itself after ArgoCD syncs. When the lookup fails, the panel
+  `main`. A history that cannot be read is never "hold met". When the mirror
+  cannot answer yet (a commit not fetched, a git error), the status says
+  `Waiting` with `[transient]` and the check runs again, so a blip never asks
+  for the override. When no retry can help (the mirror off by config, an old
+  version that does not parse), the gate says it could not confirm the hold
+  and still needs `Confirm-Decommission`.
+- The finalizer is read from ArgoCD. Not live is a red `Waiting` status with
+  the token `[transient]`: the poll loop retries it with the usual backoff
+  (COPS-2546), and it clears itself after ArgoCD syncs. When the lookup fails, the panel
   shows one ⚠️ line that asks you to check `argocd app get`, and the build stays
   green: a red build on every failed lookup would teach people to skip the
   panel.

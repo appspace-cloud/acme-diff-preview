@@ -13,7 +13,10 @@ three cases where the cascade does not do what the panel says:
 - zeroPods or decommission has been true on main for less than 7 days. The
   gate `hold` is lifted by `Confirm-Decommission: <env>`. The history comes
   from the git mirror, first parent, and an unreadable history is never
-  "hold met".
+  "hold met". A mirror that cannot answer now is `hold_retry`, [transient],
+  so a blip never asks for the override. A history no retry can read (the
+  mirror off by config, an old version that does not parse) is
+  `hold_unread`, [blocked] until `Confirm-Decommission`.
 """
 import os
 import shutil
@@ -153,7 +156,7 @@ def test_the_time_is_when_it_landed_on_main(history):
     assert hold() is False
 
 
-def test_the_mirror_off_or_an_unknown_sha_is_none(history, monkeypatch):
+def test_an_unknown_sha_is_none_and_the_mirror_off_is_unreadable(history, monkeypatch):
     commit, hold, _ = history
     commit(11, ARMED)                  # a sha no other test registers
     assert hold(register=False) is None, "no repo for this sha"
@@ -164,7 +167,10 @@ def test_the_mirror_off_or_an_unknown_sha_is_none(history, monkeypatch):
     sha = m._git_run(["--git-dir", os.path.join(m.GIT_MIRROR_DIR, "acme-config-dev.git"),
                       "rev-parse", "HEAD"]).stdout.strip()
     monkeypatch.setattr(m, "GIT_MIRROR_ENABLED", False)
-    assert m._teardown_hold_met(IDENT, sha, now=NOW) is None, "the mirror is off"
+    assert m._teardown_hold_met(IDENT, sha, now=NOW) == "unreadable", "the mirror is off"
+    monkeypatch.setattr(m, "GIT_MIRROR_ENABLED", True)
+    monkeypatch.setattr(m, "_mirror_disabled", True)
+    assert m._teardown_hold_met(IDENT, sha, now=NOW) is None, "disabled after a failure"
 
 
 def test_a_git_error_is_none(history, monkeypatch):
@@ -183,11 +189,11 @@ def test_a_git_error_is_none(history, monkeypatch):
         assert hold() is None, rc
 
 
-def test_a_read_miss_or_a_broken_file_is_none(history, monkeypatch):
+def test_a_broken_file_is_unreadable_and_a_read_miss_is_none(history, monkeypatch):
     commit, hold, _ = history
     commit(10, ARMED)
     commit(2, "appspace: [\n")
-    assert hold() is None, "unparseable at a commit"
+    assert hold() == "unreadable", "unparseable at a commit, for ever"
     commit(1, ARMED)
     monkeypatch.setattr(m, "_git_read_file", lambda *a: None)
     assert hold() is None, "a read miss"
@@ -267,18 +273,21 @@ def test_finalizer_unknown_is_a_line_not_a_gate(monkeypatch):
     assert "⚠️ Could not verify the cascade finalizer on `pv-foo-c`" in text
 
 
-def test_paused_at_base_is_a_paused_gate(monkeypatch):
-    gates, _, _ = _evaluate(monkeypatch, ARMED + "  autosync: false\n")
+def test_paused_at_base_is_a_paused_gate_with_a_panel_line(monkeypatch):
+    gates, text, _ = _evaluate(monkeypatch, ARMED + "  autosync: false\n")
     assert gates == [{"kind": "paused", "env": "pv-foo-c"}]
+    assert (f"🚨 **{cr._DECOM_PAUSED_HDR}.** `appspace.autosync: false` is set for "
+            "`pv-foo-c` on `main`") in text
+    assert "Resume auto-sync in a separate PR, let it sync, then remove the folder." in text
+    _gates, text, _ = _evaluate(monkeypatch, ARMED)
+    assert cr._DECOM_PAUSED_HDR not in text
 
 
-@pytest.mark.parametrize("hold,gate", [
-    (False, {"kind": "hold", "env": "pv-foo-c"}),
-    (None, {"kind": "hold", "env": "pv-foo-c", "why": "history unreadable"}),
-])
-def test_hold_not_met_is_a_hold_gate(monkeypatch, hold, gate):
+@pytest.mark.parametrize("hold,kind", [
+    (False, "hold"), (None, "hold_retry"), ("unreadable", "hold_unread")])
+def test_hold_not_met_is_a_hold_gate(monkeypatch, hold, kind):
     gates, _, _ = _evaluate(monkeypatch, ARMED, hold=hold)
-    assert gates == [gate]
+    assert gates == [{"kind": kind, "env": "pv-foo-c"}]
 
 
 def test_no_cascade_or_public_cloud_never_reads_the_history(monkeypatch):
@@ -290,17 +299,31 @@ def test_no_cascade_or_public_cloud_never_reads_the_history(monkeypatch):
 
 # ── the gate text ────────────────────────────────────────────────────────
 
-def test_gate_text_adds_the_reason():
-    g = {"kind": "hold", "env": "pv-x-a", "why": "history unreadable", "lifted": False}
-    assert cr.gate_text(g) == cr.GATES["hold"][0] + " (history unreadable)"
-    assert cr.gate_text({"kind": "hold", "env": "pv-x-a"}) == cr.GATES["hold"][0]
+def _gate(kind):
+    return {"kind": kind, "env": "pv-x-a", "arg": "pv-x-a", "lifted": False}
+
+
+@pytest.mark.parametrize("kind,desc", [
+    ("hold_unread", "Blocked - Could not confirm zeroPods or decommission has been on "
+     "main for 7 days (history unreadable) in pv-x-a. To merge anyway, add "
+     "'Confirm-Decommission: pv-x-a' to a commit message (see PR comment)"),
+    ("hold_retry", "Waiting - The git history for the 7-day hold is not readable yet "
+     "in pv-x-a. Re-checked automatically (see PR comment)"),
+    ("not_live", "Waiting - The cascade finalizer is not live in ArgoCD yet in pv-x-a. "
+     "Re-checked automatically after ArgoCD syncs (see PR comment)"),
+    ("paused", "Blocked - Auto-sync is paused on main, so the cascade never runs in "
+     "pv-x-a. Resume auto-sync on main, let it sync, then remove the folder "
+     "(see PR comment)"),
+])
+def test_the_status_says_the_way_out(kind, desc):
     assert cr.GATES["paused"][0] == cr._DECOM_PAUSED_HDR
-    desc = cr.gate_status_description([g])
-    assert desc.startswith(f"Blocked - {cr.gate_text(g)} in pv-x-a.")
-    assert "add 'Confirm-Decommission: pv-x-a'" in desc
+    assert cr.gate_status_description([_gate(kind)]) == desc
+    mark = "⏳" if desc.startswith("Waiting") else "⛔"
+    assert cr.gate_footer([_gate(kind)]) == f" | {mark} {desc}"
     summary = "\n".join(cr._build_merge_summary({}, {}, None, None, None, None,
-                                                False, gates=[g]))
-    assert f"**{cr.gate_text(g)}** in `pv-x-a`" in summary
+                                                False, gates=[_gate(kind)]))
+    assert f"- {mark} **{cr.gate_text(_gate(kind))}** in `pv-x-a`" in summary
+    assert cr.gate_footer([]) == ""
 
 
 # ── (d) process_pr ───────────────────────────────────────────────────────
@@ -360,8 +383,10 @@ def test_paused_at_base_is_blocked_and_no_trailer_lifts_it(phase3):
     body, (state, desc) = phase3(extra="  autosync: false\n", messages=[
         "Confirm-Decommission: pv-orch-a\nConfirm-Teardown: pv-orch-a"])
     assert m._extract_status_token(body) == "blocked" and state == "FAILED"
-    assert desc.startswith(f"Blocked - {cr._DECOM_PAUSED_HDR} in pv-orch-a")
-    assert f"⛔ **{cr._DECOM_PAUSED_HDR}** in `pv-orch-a`" in body
+    assert desc == (f"Blocked - {cr._DECOM_PAUSED_HDR} in pv-orch-a. Resume auto-sync "
+                    "on main, let it sync, then remove the folder (see PR comment)")
+    assert f"⛔ **{cr._DECOM_PAUSED_HDR}** in `pv-orch-a`. Resume auto-sync" in body
+    assert f"🚨 **{cr._DECOM_PAUSED_HDR}.**" in body, "the panel says it too"
     assert m._seen.get(SK) == (PR_SHA, BASE_SHA)
 
 
@@ -377,6 +402,19 @@ def test_hold_not_met_is_blocked_until_confirm_decommission(phase3):
 
 
 def test_unreadable_history_blocks_visibly(phase3):
-    body, (state, desc) = phase3(hold=None)
+    body, (state, desc) = phase3(hold="unreadable")
     assert m._extract_status_token(body) == "blocked" and state == "FAILED"
-    assert "(history unreadable)" in desc and "(history unreadable)" in body
+    assert desc.startswith("Blocked - " + cr.GATES["hold_unread"][0])
+    assert "(history unreadable)" in body
+    assert m._seen.get(SK) == (PR_SHA, BASE_SHA)
+
+
+def test_a_mirror_blip_waits_and_never_asks_for_the_override(phase3):
+    body, (state, desc) = phase3(hold=None)
+    assert m._extract_status_token(body) == "transient" and state == "FAILED"
+    assert desc.startswith("Waiting - " + cr.GATES["hold_retry"][0])
+    assert "Confirm-Decommission" not in body + desc
+    assert SK not in m._seen and SK in m._retry_backoff
+    assert m._backoff_should_skip(SK, PR_SHA), "the next loop waits"
+    body, (state, _desc) = phase3(hold=True)
+    assert m._extract_status_token(body) == "clean" and state == "SUCCESSFUL"
