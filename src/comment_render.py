@@ -417,7 +417,8 @@ def build_marks(lines, green):
 # COPS-2766: merge gates. A gate fails the build until a Confirm-* line in a
 # commit message of the PR lifts it. A kind with no trailer cannot be lifted:
 # its fix says what to do. A transient kind is checked again by itself.
-# kind: (summary text, trailer, token, fix). A gate is {kind, env, arg, lifted}.
+# kind: (summary text, trailer, token, fix). A gate is {kind, env, arg, lifted},
+# and `why` when its text needs a reason.
 GATES = {
     "orphan": ("Teardown with no cascade, the workloads keep running",
                "Confirm-Teardown", "blocked", ""),
@@ -440,12 +441,14 @@ GATES = {
                "GCP cannot shrink a disk in place, so keep the old size or grow it"),
     "not_live": ("The cascade finalizer is not live in ArgoCD yet", None, "transient",
                  "Re-checked automatically after ArgoCD syncs"),
+    "clone_wake": ("An AEC clone starts running with a copy of production data",
+                   "Confirm-Clone-Sanitized", "blocked", ""),
 }
 
 
 def gate_text(g) -> str:
-    """The summary text of gate g."""
-    return GATES[g["kind"]][0]
+    """The summary text of gate g, with its reason when it has one."""
+    return GATES[g["kind"]][0] + (f" ({g['why']})" if g.get("why") else "")
 
 
 def gate_trailer(g) -> str:

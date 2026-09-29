@@ -168,6 +168,7 @@ from comment_render import (  # comment rendering (same-dir module, stdlib only)
     join_status_lead,
     gate_trailer,
     gate_token,
+    open_gates,
     gate_status_description,
     gate_footer,
     _DECOM_ORPHAN_HDR,
@@ -6820,7 +6821,7 @@ def _decommission_purges_data(identity_file: str, main_sha: str) -> bool:
 
 
 def _merged_kcc_flat_for_env(identity_file: str, sha: str,
-                             repo: str = None):
+                             repo: str = None, strict: bool = False):
     """Flattened appspace values for an env: ancestor config.yaml chain +
     identity file, last-wins (same order live Helm uses).
 
@@ -6835,6 +6836,9 @@ def _merged_kcc_flat_for_env(identity_file: str, sha: str,
     YAML that returned BB_OK). A missing file (BB_NOT_FOUND) is normal for
     intermediate path segments and is skipped. Returns None when the merge
     is not proven; callers must treat that as "not fully phased".
+
+    COPS-2766: `strict` raises ValueFileUnreadable on BB_ERROR, so the PR is
+    retried. None then means only YAML that cannot be parsed.
     """
     env_dir = identity_file.rsplit("/", 1)[0]
     ancestors = []
@@ -6847,6 +6851,10 @@ def _merged_kcc_flat_for_env(identity_file: str, sha: str,
     for path in ancestors + [identity_file]:
         content, status = _bb_fetch_cached(path, sha, repo=repo)
         if status == BB_ERROR:
+            if strict:
+                raise ValueFileUnreadable(
+                    f"value file unreadable at sha {sha[:8]} "
+                    f"(Bitbucket transport, not absence): {path}")
             return None
         if status != BB_OK or not content:
             continue
@@ -6856,6 +6864,121 @@ def _merged_kcc_flat_for_env(identity_file: str, sha: str,
             return None
         merged.update(flat)
     return merged
+
+
+# COPS-2766 (AE-15507): an AEC clone runs on a copy of production data, so it
+# is created asleep and wakes only after its data is cleaned.
+_CLONE_DIR_RE = re.compile(r"--aec\d+(?=-|$)")
+_CLONE_NEW_WHY, _CLONE_BAD_WHY = "new clone", "values cannot be parsed"
+
+
+def _is_clone_env_file(path):
+    return _is_pv_env_file(path) and bool(_CLONE_DIR_RE.search(path.split("/")[-2]))
+
+
+def _own_zero_pods(path, sha, repo=None):
+    """(appspace.zeroPods as the file itself writes it, in lower case, or None
+    when it does not set it; the read state). A failed read raises."""
+    doc, state = _read_first_doc(path, sha, repo)
+    own = doc.get("appspace") if isinstance(doc, dict) else None
+    own = own if isinstance(own, dict) else {}
+    return (str(own["zeroPods"]).lower() if "zeroPods" in own else None), state
+
+
+def _zero_pods_on(flat):
+    return str(flat.get("appspace.zeroPods", "")).lower() == "true"
+
+
+def _detect_clone_wakes(changed, renames, path_map, new_env_candidates, sha, base_sha,
+                        repo=None) -> list:
+    """COPS-2766: the clone_wake gates, one per clone that starts running.
+
+    A new clone that is not asleep at `sha`. A live clone whose value chain
+    has zeroPods true at base and not at `sha`: its own customer.yaml changed
+    (a move reads the old path at base), or a config.yaml above it changed
+    its own zeroPods. Only clone files, and a config.yaml with a live clone
+    below, are read; the chain only in those cases. A failed read raises, so
+    the PR is retried; values that cannot be parsed are a gate.
+    """
+    renames = renames or {}
+    inv = {n: o for o, n in renames.items()}
+    pairs = {f: None for c in new_env_candidates or () for f in c.get("all_yaml_files", ())
+             if _is_clone_env_file(f)}     # head path -> base path, None when new
+    gone = set()
+    for f in changed if base_sha else ():
+        old = inv.get(f, f)
+        if not _is_clone_env_file(f) or f in renames or f in pairs or old not in path_map:
+            continue
+        now = _own_zero_pods(f, sha, repo)
+        if now[1] == "absent":
+            gone.add(f)                    # a teardown, not a wake
+        elif old != f or now[1] != "ok" or now != _own_zero_pods(old, base_sha, repo):
+            pairs[f] = old
+    for cfg in changed if base_sha else ():
+        if posixpath.basename(cfg) != "config.yaml":
+            continue
+        below = posixpath.dirname(cfg) + "/"
+        kids = [p for p in path_map if p.startswith(below) and _is_clone_env_file(p)
+                and p not in pairs and p not in renames and p not in gone]
+        if kids and _own_zero_pods(cfg, sha, repo) != _own_zero_pods(inv.get(cfg, cfg),
+                                                                     base_sha, repo):
+            pairs.update({p: p for p in kids})
+    gates = []
+    for head, base in sorted(pairs.items()):
+        now = _merged_kcc_flat_for_env(head, sha, repo, strict=True)
+        was = _merged_kcc_flat_for_env(base, base_sha, repo, strict=True) if base else {}
+        if now is not None and _zero_pods_on(now):
+            continue                       # asleep at the head
+        v = (now or {}).get("appspace.zeroPods")
+        to = None if v is None else str(v).lower()
+        if now is None or was is None:
+            why = _CLONE_BAD_WHY
+        elif not base:
+            why = _CLONE_NEW_WHY
+        elif _zero_pods_on(was):
+            why = f"zeroPods true to {to or 'unset'}"
+        else:
+            continue                       # awake on main already
+        gates.append({"kind": "clone_wake", "env": head.split("/")[-2], "why": why, "to": to})
+    return gates
+
+
+def _clone_wake_lines(gates) -> list:
+    """COPS-2766: the panel of the clone_wake gates. Plain lines: the caller's
+    icon rule turns its \U0001f6a8 into \u26a0\ufe0f on a green build."""
+    wakes = [g for g in gates or () if g["kind"] == "clone_wake"]
+    if not wakes:
+        return []
+    lines = ["## \U0001f6a8 AEC CLONE STARTS RUNNING", ""]
+    for g in wakes:
+        if g["why"] == _CLONE_NEW_WHY:
+            lines.append(f"- `{g['env']}` is a new clone and it starts running on merge. "
+                         "Add `zeroPods: true` under `appspace:` to create it asleep, "
+                         "restore and clean the data, and wake it in a later PR.")
+        elif g["why"] == _CLONE_BAD_WHY:
+            lines.append(f"- `{g['env']}` can start running with this PR: its values "
+                         "cannot be parsed, so `zeroPods` is unknown.")
+        else:
+            to = f"`{g['to']}`" if g["to"] else "unset"
+            lines.append(f"- `{g['env']}` starts running with this PR (`zeroPods` goes "
+                         f"from `true` to {to}).")
+    lines += ["", "A clone starts with a copy of the production data, so it can call the "
+              "customer live integrations: SSO, webhooks, mail and connected apps "
+              "(AE-15507). `zeroPods` does not stop the Core VM.", "",
+              "Before you merge, check on the clone Mongo that these are empty, and write "
+              "the counts in the PR:", "",
+              "- `passport.passports`", "- `mail.smtpConfigurations`",
+              "- `integrationwebhook.webhookSubscriptions`",
+              "- `authorization.authorizationregistrations`",
+              "- the `applicationintegration` database",
+              "- `cacsJwts` in `feedconnector`, `contentconversion`, `userinbox` and `mention`",
+              "", "Runbook: https://appspace.atlassian.net/wiki/spaces/cops/pages/66093626 "
+              "step 2."]
+    todo = [gate_trailer(g) for g in open_gates(wakes)]
+    if todo:
+        lines += ["", "Then confirm with an empty commit:", "", "```",
+                  *[f'git commit --allow-empty -m "{t}"' for t in todo], "git push", "```"]
+    return lines + [""]
 
 
 def _fleet_identity_files(repo: str = None) -> list:
@@ -12139,6 +12262,9 @@ def process_pr(pr, path_map, base_sha="", repo=None):
         if new_env_candidates:
             logsink.log(f"PR #{pr_id}: {len(new_env_candidates)} new env candidate(s): "
                         f"{[e['name'] for e in new_env_candidates]}", pr=pr_id)
+        # COPS-2766: an AEC clone that starts running is a gate on both paths below.
+        clone_gates = _detect_clone_wakes(changed, renames, path_map, new_env_candidates,
+                                          render_sha, base_sha, repo=repo)
 
         # v2.5.10 (explicit request): detect FULL environment decommissions
         # (identity file deleted, no successor anywhere — distinct from a
@@ -12172,10 +12298,11 @@ def process_pr(pr, path_map, base_sha="", repo=None):
                 new_env_lines, structural_envs, total_new, new_env_full_lines = \
                     _evaluate_new_envs(new_env_candidates, render_sha,
                                        with_full_output=True)
-                gates = _lift_gates(_merge_gates((), extra=()),
+                gates = _lift_gates(_merge_gates((), extra=clone_gates),
                                     repo, pr_id, base_sha, pr_sha)
                 body, state, desc = format_new_env_comment(
-                    pr_sha, new_env_lines, new_env_full_lines, structural_envs,
+                    pr_sha, _clone_wake_lines(gates) + new_env_lines,
+                    new_env_full_lines, structural_envs,
                     gates, len(new_env_candidates), total_new, base_sha)
                 # v2.25.0: this path never persisted a full-diff artifact, so
                 # new-env-only PRs had no full-output page at all. Save it
@@ -12650,8 +12777,9 @@ def process_pr(pr, path_map, base_sha="", repo=None):
         # COPS-2766: merge gates. PrCommitsUnreadable goes to the catch-all
         # below: a retry, never a lift.
         gates = _merge_gates(decommission_candidates, renames, path_map,
-                             vm_change_lines, app_results)
+                             vm_change_lines, app_results, clone_gates)
         _lift_gates(gates, repo, pr_id, base_sha, pr_sha)
+        appspace_state_lines = _clone_wake_lines(gates) + appspace_state_lines
         # Direct permalink into the full-diff view for this exact commit.
         # Only built when the view is reachable from outside the cluster
         # (base URL set), so the comment never links to something a
