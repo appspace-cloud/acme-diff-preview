@@ -855,7 +855,12 @@ an unambiguous carrier (an image tag, a chart label, `targetRevision`, or the
 app-level chart `version_change`). That is why a `MAX_WORKERS: 4 -> 16`
 change can never fold. Fewer than `_VERSION_FOLD_MIN` foldable sections
 means no fold at all, because one fold line costs more attention than the
-two hunks it would hide.
+two hunks it would hide. An image tag that goes down (`_image_tag_downgrade`)
+never classifies, so its section stays inline and the merge summary names it
+(COPS-2766, #4679). The rule is off when the app's chart moves and does not
+go up (`_images_may_go_down`): a chart downgrade takes every image down with
+it and has its own finding, and another tag of the same version is not a
+downgrade. Then the images fold as before.
 
 Like every other safety fact, this is computed in `_package_sections` on the
 FULL pre-cap list, so what folds never depends on a display cap. Sections

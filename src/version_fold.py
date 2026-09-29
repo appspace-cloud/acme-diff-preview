@@ -1,8 +1,9 @@
 """Version-transition fold: which sections are provably a version bump.
 
 Sliced out of diff_preview.py unchanged (COPS-2658 phase 3). A leaf by
-construction: it reads nothing but `re` and its own names, so there is no
-module it could import the service back through.
+construction: it reads nothing but `re`, the version compare of
+comment_render and its own names, so there is no module it could import the
+service back through.
 
 The classifier answers one question -- is this section provably nothing but
 a version bump? -- and the safe failure direction is always "no". Anything
@@ -10,6 +11,8 @@ unpaired, unknown or ambiguous keeps its section inline, because a false
 positive here folds a real change behind a one-line summary.
 """
 import re
+
+from comment_render import _is_version_downgrade
 
 
 # ── Version-transition fold ───────────────────────────────────────────
@@ -98,12 +101,34 @@ def _split_image(v: str):
     return repo, tag
 
 
-def _classify_fold_pair(key, old, new, candidates):
+# COPS-2766: an image tag that goes down is not version noise (#4679 took
+# device 1.117.4 -> 1.116.10 on pv-gsk--aec1-c, and the fold called it a
+# bump). Only dotted tags count, so a sha, 'latest' or 'v1.2' never does.
+_DOTTED_TAG_RE = re.compile(r"^\d+\.\d+")
+
+
+def _image_tag_downgrade(old, new) -> bool:
+    """True when both tags are dotted versions and `new` is lower."""
+    return bool(_DOTTED_TAG_RE.match(old) and _DOTTED_TAG_RE.match(new)
+                and _is_version_downgrade(old, new))
+
+
+def _images_may_go_down(version_change) -> bool:
+    """True when the app's chart moves and does not go up: a chart
+    downgrade (every image goes down with it, and it has its own finding)
+    or another tag of the same version. Then the images fold as before."""
+    return bool(version_change and version_change[0] and version_change[1]
+                and not _is_version_downgrade(str(version_change[1]),
+                                              str(version_change[0])))
+
+
+def _classify_fold_pair(key, old, new, candidates, images_may_go_down=False):
     """One paired change -> (noise_class, version_pair) or (None, None).
 
     candidates is the set of (old, new) version transitions observed on
     unambiguous carriers; a bare env "value:" pair is only accepted when
     it repeats one of those, so an unrelated config value can never fold.
+    An image tag that goes down never classifies, unless images_may_go_down.
     """
     if _FOLD_CHECKSUM_RE.match(key):
         if (_FOLD_HEX_RE.match(old) and _FOLD_HEX_RE.match(new)
@@ -114,7 +139,8 @@ def _classify_fold_pair(key, old, new, candidates):
     if kl == "image" or kl.endswith("image"):
         ro, to = _split_image(old)
         rn, tn = _split_image(new)
-        if ro and ro == rn and to != tn:
+        if (ro and ro == rn and to != tn
+                and (images_may_go_down or not _image_tag_downgrade(to, tn))):
             candidates.add((to, tn))
             return "image tags", (to, tn)
         return None, None
@@ -160,13 +186,14 @@ def _classify_version_fold(sections, version_change=None,
     if (version_change and version_change[0] and version_change[1]
             and version_change[0] != version_change[1]):
         candidates.add((str(version_change[0]), str(version_change[1])))
+    may_go_down = _images_may_go_down(version_change)
     paired = []
     for hdr, body in sections:
         pairs = None if hdr in exempt else _fold_pairs(body)
         paired.append((hdr, pairs))
         if pairs:
             for key, old, new in pairs:
-                _classify_fold_pair(key, old, new, candidates)
+                _classify_fold_pair(key, old, new, candidates, may_go_down)
     foldable_headers, classes = [], set()
     chart_votes, other_votes = {}, {}
     for hdr, pairs in paired:
@@ -174,7 +201,8 @@ def _classify_version_fold(sections, version_change=None,
             continue
         ok, sec_classes, sec_votes = True, set(), []
         for key, old, new in pairs:
-            cls, pair = _classify_fold_pair(key, old, new, candidates)
+            cls, pair = _classify_fold_pair(key, old, new, candidates,
+                                            may_go_down)
             if cls is None:
                 ok = False
                 break
@@ -200,3 +228,30 @@ def _classify_version_fold(sections, version_change=None,
             "label": label,
             "headers": tuple(foldable_headers),
             "classes": tuple(c for c in _FOLD_CLASS_ORDER if c in classes)}
+
+
+def _detect_image_downgrades(sections, version_change=None):
+    """((header, repo basename, old tag, new tag), ...) for every image that
+    goes down, on the last tag of each repo per side of a section. () when
+    the chart moves and does not go up: _images_may_go_down."""
+    if _images_may_go_down(version_change):
+        return ()
+    found = []
+    for hdr, body in sections or ():
+        sides = {"-": {}, "+": {}}
+        for raw in body.splitlines():
+            if raw.startswith(("---", "+++")) or raw[:1] not in sides:
+                continue
+            t = raw[1:].strip()
+            t = t[2:] if t.startswith("- ") else t
+            key, _, val = t.partition(":")
+            if not key.strip().lower().endswith("image"):
+                continue
+            repo, tag = _split_image(val.strip().strip('"').strip("'"))
+            if repo:
+                sides[raw[:1]][repo] = tag
+        for repo, old in sides["-"].items():
+            new = sides["+"].get(repo)
+            if new and _image_tag_downgrade(old, new):
+                found.append((hdr, repo.rsplit("/", 1)[-1], old, new))
+    return tuple(found)

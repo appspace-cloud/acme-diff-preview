@@ -227,6 +227,7 @@ from version_fold import (  # version-transition fold (same-dir module, stdlib o
     _split_image,
     _classify_fold_pair,
     _classify_version_fold,
+    _detect_image_downgrades,
 )
 import uptime_schedule  # VM uptime-schedule advisory notes (same-dir module, stdlib only)
 from grouping import (  # same-change grouping and rollup (same-dir module)
@@ -2826,9 +2827,9 @@ DiffResult = namedtuple("DiffResult",
                          "fingerprint", "renamed_resources", "vm_changes",
                          "version_fold", "shutdown_stats",
                          "template_artifacts", "pingscaler_created", "ip_released",
-                         "neg_removed", "capacity"],
+                         "neg_removed", "capacity", "image_downgrades"],
                         defaults=[None, None, None, None, None, None, None,
-                                  None, None, None, None, None, None])
+                                  None, None, None, None, None, None, None])
 # ip_released (COPS-2766): the deleted ComputeAddress and DNSRecordSet headers
 # GCP releases (no explicit abandon), from the full pre-cap list. The `ip`
 # merge gate reads it. Only OUT_DIFF sets it, so a teardown never has it.
@@ -2839,6 +2840,10 @@ DiffResult = namedtuple("DiffResult",
 # annotation (manifest._detect_neg_removed), on the full pre-cap list. The
 # summary pairs them with a deleted ComputeBackendService of the same env
 # (acme-config-prod #3888). None on non-OUT_DIFF outcomes.
+# image_downgrades (COPS-2766): ((header, repo, old tag, new tag), ...) for
+# every image tag that goes down (_detect_image_downgrades), counted on the
+# full pre-cap list (#4679). None when there is none, and when the chart
+# moves and does not go up (_images_may_go_down).
 # pingscaler_created (COPS-2714): True when this app's diff CREATES the
 # acme-ping-scaler Deployment. The chart skips all HPA rendering while a
 # ping-scaler is on, so the HPAs it displaces -- deleted in the SIBLING
@@ -9229,12 +9234,15 @@ def argocd_diff(app, pr_sha, main_sha, chart_revision=None, changed_paths=None, 
             _detect_created_resources(filtered_sections))
         ip_released = _released_addresses(filtered_sections, deleted_res)
         neg_res = _detect_neg_removed(filtered_sections)  # COPS-2766, pre-cap too
+        image_downgrades = _detect_image_downgrades(
+            filtered_sections, version_change) or None
         return DiffResult(clean_diff, capped_sections,
                           n_res, True, None, OUT_DIFF, "changes", version_change,
                           deleted_res, zeroed_res, fingerprint, renamed_res,
                           vm_changes_res, version_fold, shutdown_stats,
                           artifacts, pingscaler_res, ip_released=ip_released,
-                          neg_removed=neg_res, capacity=capacity)
+                          neg_removed=neg_res, capacity=capacity,
+                          image_downgrades=image_downgrades)
     # Exhausted retries
     return _indeterminate(last_reason, last_detail or "unknown error")
 
@@ -10148,6 +10156,8 @@ def _routine_bump_signature(r):
         return None
     if r.version_change and _is_version_downgrade(*r.version_change):
         return None
+    if getattr(r, "image_downgrades", None):
+        return None                # COPS-2766: #4679 said "jumping"
     minus, plus = {}, {}
     for _hdr, body in r.sections:
         for line in body.splitlines():
@@ -14118,7 +14128,12 @@ def process_pr(pr, path_map, base_sha="", repo=None):
             and _is_version_downgrade(*_result(v).version_change))
         downgrade_extra = (f" | CHART DOWNGRADE in {len(_dg_envs)} environment(s)"
                            if _dg_envs else "")
-        status_extra = decom_extra + leftover_extra + downgrade_extra
+        _img_envs = _envs_from_apps(
+            a for a, v in app_results.items()
+            if getattr(_result(v), "image_downgrades", None))
+        image_extra = (f" | IMAGE DOWNGRADE in {len(_img_envs)} environment(s)"
+                       if _img_envs else "")
+        status_extra = decom_extra + leftover_extra + downgrade_extra + image_extra
         # COPS-2766: the tenant reach goes only on a green status, so no
         # FAILED text changes.
         green_extra = status_extra + (

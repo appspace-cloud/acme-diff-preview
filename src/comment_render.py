@@ -858,6 +858,21 @@ def _build_merge_summary(results, rollup_by_sig, vm_change_lines,
                          f"\U0001f9ea **-dev chart next to release charts** {_vers} "
                          f"in {_fmt_env_list(dev_new)}. A -dev tag can be pushed "
                          f"again at any time: check that it belongs in this PR."))
+    # COPS-2766: an image tag that goes down while the chart stays or goes up
+    # (#4679 took device 1.117.4 -> 1.116.10 on pv-gsk--aec1-c: "Routine").
+    img_apps = sorted(a for a, r in results.items()
+                      if getattr(r, "image_downgrades", None))
+    if img_apps:
+        _pairs = sorted({(_section_name(h), o, n) for a in img_apps
+                         for h, _repo, o, n in results[a].image_downgrades})
+        _more = f" (+{len(_pairs) - 3} more)" if len(_pairs) > 3 else ""
+        findings.append((_SEV_REVIEW,
+                         f"\u2b07\ufe0f **Image downgrade** in "
+                         f"{_fmt_env_list(img_apps)}: "
+                         + ", ".join(f"`{s}` `{o}` \u2192 `{n}`"
+                                     for s, o, n in _pairs[:3])
+                         + f"{_more}. Check that an old pin or an old branch "
+                         f"is not moving it back."))
     # COPS-2632 / COPS-2677: a rendered `%!s(<nil>)` or `<no value>` is a
     # value the chart read and this environment does not set. Live proof:
     # pv-stage1-a shipped `hosting-id: hst-%!s(<nil>)` and KCC rejected every

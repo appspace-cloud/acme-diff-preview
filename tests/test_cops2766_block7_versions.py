@@ -246,3 +246,204 @@ def test_a_new_rev_counts_up_for_the_note():
                "pv-up-a-ms": _r(("2603.1.38", "2603.1.38-rev1")),
                "pv-up-b-ms": _r(("2603.1.38-rev1", "2603.1.38-rev2"))}
     assert cr._downgrade_mix_note(results).startswith("2 other environment(s)")
+
+
+# ── an image that goes down is never folded as a bump (#4679) ───────────
+# #4679 pinned device, device-background and devicegateway to
+# 1.116.10-rc.20260923001 (and signschannel to 1.90.15-rc) on 15 AEC clones.
+# On pv-gsk--aec1-c they ran 1.117.4, so 5 Deployments went down, and the
+# chart did not move. The fold called it version noise and the rollup said
+# "jumping", Routine.
+
+import version_fold as vf  # noqa: E402
+
+GSK_DOWN = (("device", "appspace-device", "1.117.4", "1.116.10-rc.20260923001"),
+            ("device-background", "appspace-device", "1.117.4",
+             "1.116.10-rc.20260923001"),
+            ("devicegateway", "appspace-devicegateway", "1.117.4",
+             "1.116.10-rc.20260923001"),
+            ("signschannel", "appspace-signschannel", "1.91.2",
+             "1.90.15-rc.20260923031"),
+            ("signschannelgateway", "appspace-signschannelgateway", "1.91.2",
+             "1.90.15-rc.20260923031"))
+
+
+def _img(env, name, repo, old, new, dash=""):
+    return (f"/apps/Deployment {env}/{name}",
+            "--- \n+++ \n@@ -12,7 +12,7 @@\n"
+            "       containers:\n"
+            f"-      {dash}image: gcr.example/acme/{repo}:{old}\n"
+            f"+      {dash}image: gcr.example/acme/{repo}:{new}\n")
+
+
+def _ups(env="pv-x-a", n=3, old="2603.2.19", new="2603.3.10"):
+    return [_img(env, f"svc-{i}", f"appspace-svc-{i}", old, new) for i in range(n)]
+
+
+def _diff_text(sections):
+    return "\n".join(f"===== {h} ======\n{b}" for h, b in sections)
+
+
+def _via_argocd_diff(monkeypatch, sections, version_change=None):
+    """The REAL argocd_diff on a scripted render."""
+    monkeypatch.setattr(m, "_run_one_diff", lambda *a, **k: (
+        _diff_text(sections), None, "", version_change, 0, None))
+    return m.argocd_diff("pv-x-a-ms", "aaaa1111", "bbbb2222")
+
+
+@pytest.mark.parametrize("old,new,down", [
+    ("1.117.4", "1.116.10-rc.20260923001", True),
+    ("1.116.10-rc.20260923001", "1.117.4", False),
+    ("1.2.3-rev2", "1.2.3-rev1", True),
+    ("1.2.3", "1.2.3", False),
+    ("9f8e7d", "1a2b3c", False),          # a git sha is not a version
+    ("latest", "1.0.0", False),
+    ("1.0.0", "latest", False),
+    ("v1.2", "v1.1", False),              # dotted tags only
+    ("20260923", "20260922", False),
+])
+def test_only_a_dotted_tag_can_go_down(old, new, down):
+    assert vf._image_tag_downgrade(old, new) is down
+
+
+def test_a_downgraded_section_stays_out_of_the_fold():
+    down = _img("pv-x-a", "device", "appspace-device", "1.117.4", "1.116.10")
+    fold = vf._classify_version_fold(_ups() + [down])
+    assert fold["n_foldable"] == 3 and fold["n_total"] == 4
+    assert down[0] not in fold["headers"]
+    assert fold["label"] == "2603.2.19 → 2603.3.10"
+
+
+def test_three_downgraded_sections_do_not_fold():
+    assert vf._classify_version_fold(_ups(old="2603.3.10", new="2603.2.19")) is None
+
+
+def test_a_chart_that_goes_up_does_not_hide_an_image_that_goes_down():
+    down = _img("pv-x-a", "device", "appspace-device", "1.117.4", "1.116.10")
+    fold = vf._classify_version_fold(
+        _ups() + [down], version_change=("2603.2.19", "2603.3.10"))
+    assert fold["n_foldable"] == 3 and down[0] not in fold["headers"]
+
+
+@pytest.mark.parametrize("vc", [
+    ("2603.3.10-rev3", "2603.2.19-rev3"),       # a chart downgrade (#4501)
+    ("2603.1.33-rev1-dev", "2603.1.33"),        # same version, other tag
+    ("2603.1.33", "2603.1.33-rev1-dev"),
+    ("main", "HEAD"),                           # no version to compare
+])
+def test_a_chart_that_does_not_go_up_folds_its_images_as_today(vc):
+    """Every image goes down with the chart: the chart finding names it,
+    and the fold must keep working on these PRs (critic blocker)."""
+    secs = _ups(old="2603.3.10", new="2603.2.19")
+    fold = vf._classify_version_fold(secs, version_change=vc)
+    assert fold is not None and fold["n_foldable"] == 3
+    assert vf._detect_image_downgrades(secs, vc) == ()
+
+
+def test_the_detector_names_only_the_image_that_goes_down():
+    body = ("--- \n+++ \n@@ -12,9 +12,9 @@\n"
+            "       containers:\n"
+            "-      - image: gcr.example/acme/appspace-device:1.117.4\n"
+            "+      - image: gcr.example/acme/appspace-device:1.116.10\n"
+            "-      - image: gcr.example/acme/logshipper:2.0.1\n"
+            "+      - image: gcr.example/acme/logshipper:2.1.0\n"
+            "-        initImage: gcr.example/acme/migrate:abc123\n"
+            "+        initImage: gcr.example/acme/migrate:def456\n")
+    hdr = "/apps/Deployment pv-x-a/device"
+    assert vf._detect_image_downgrades([(hdr, body)]) == (
+        (hdr, "appspace-device", "1.117.4", "1.116.10"),)
+
+
+def test_the_detector_keeps_the_last_tag_of_a_repo_on_each_side():
+    body = ("-  image: r/app:1.0.0\n-  image: r/app:3.0.0\n"
+            "+  image: r/app:2.0.0\n+  image: r/app:2.5.0\n")
+    assert vf._detect_image_downgrades([("h", body)]) == (("h", "app", "3.0.0", "2.5.0"),)
+
+
+@pytest.mark.parametrize("body", [
+    "-  replicas: 2\n+  replicas: 3\n",                   # no image line
+    "+  image: r/app:1.0.0\n",                            # created only
+    "-  image: r/app:2.0.0\n+  image: r/other:1.0.0\n",   # another repo
+    "-  image: r:5000/app\n+  image: r:5000/app\n",       # no tag
+    "--- \n+++ \n-  image: r/app:2.0.0\n+  image: r/app:2.0.1\n",
+])
+def test_the_detector_finds_nothing_without_a_lower_tag(body):
+    assert vf._detect_image_downgrades([("h", body)]) == ()
+
+
+def test_argocd_diff_carries_the_image_downgrades(monkeypatch):
+    down = _img("pv-x-a", "device", "appspace-device", "1.117.4", "1.116.10")
+    r = _via_argocd_diff(monkeypatch, _ups() + [down])
+    assert r.outcome == m.OUT_DIFF
+    assert r.image_downgrades == ((down[0], "appspace-device", "1.117.4", "1.116.10"),)
+    assert r.version_fold["n_foldable"] == 3
+    assert m._is_risky_result(r) and m._routine_bump_signature(r) is None
+
+
+def test_argocd_diff_has_no_image_downgrades_on_a_plain_bump(monkeypatch):
+    r = _via_argocd_diff(monkeypatch, _ups())
+    assert r.image_downgrades is None
+    assert not m._is_risky_result(r) and m._routine_bump_signature(r) is not None
+
+
+def test_a_chart_downgrade_pr_folds_and_has_no_image_line(monkeypatch):
+    """#4501 shape: 2603.3.10 -> 2603.2.19, every image goes down."""
+    vc = ("2603.3.10", "2603.2.19")
+    r = _via_argocd_diff(monkeypatch, _ups(old="2603.3.10", new="2603.2.19"), vc)
+    assert r.image_downgrades is None and r.version_fold["n_foldable"] == 3
+    b = _bullets({"pv-x-a-ms": r})
+    assert b[0].startswith("⬇️ **Chart version downgrade**"), b
+    assert not any("Image downgrade" in x for x in b), b
+
+
+def _pr4679(monkeypatch):
+    """pv-gsk--aec1-c and two more clones take the same pins, the same way."""
+    results = {}
+    for env in ("pv-gsk--aec1-c", "pv-hsbc--aec1-a", "pv-ford--aec1-b"):
+        secs = [_img(env, *d) for d in GSK_DOWN]
+        results[f"{env}-ms"] = _via_argocd_diff(monkeypatch, secs)
+    return results
+
+
+def test_pr4679_is_a_review_item_not_a_routine_jump(monkeypatch):
+    body = m.format_comment("c" * 12, _pr4679(monkeypatch))
+    summary = body.split("\n---\n", 1)[0]
+    assert "Review before merging" in summary
+    first = next(l for l in summary.splitlines() if l.startswith("- "))
+    assert first == (
+        "- ⬇️ **Image downgrade** in pv-ford--aec1-b, pv-gsk--aec1-c, "
+        "pv-hsbc--aec1-a: `device` `1.117.4` → `1.116.10-rc.20260923001`, "
+        "`device-background` `1.117.4` → `1.116.10-rc.20260923001`, "
+        "`devicegateway` `1.117.4` → `1.116.10-rc.20260923001` (+2 more). "
+        "Check that an old pin or an old branch is not moving it back."), first
+    assert "jumping" not in body
+
+
+def test_the_image_line_has_no_more_suffix_up_to_three():
+    r = m.DiffResult("d", [("apps/Deployment x", "+a")], 1, True, "", m.OUT_DIFF,
+                     "", image_downgrades=(("/apps/Deployment pv-x-a/web", "web",
+                                            "2.0.0", "1.9.9"),))
+    assert _bullets({"pv-x-a-ms": r})[0] == (
+        "⬇️ **Image downgrade** in pv-x-a: `web` `2.0.0` → `1.9.9`. Check "
+        "that an old pin or an old branch is not moving it back.")
+
+
+IMG_SUFFIX = " | IMAGE DOWNGRADE in 1 environment(s)"
+
+
+def test_the_green_status_names_the_image_downgrade(world):
+    sinks, plan = world
+    plan["pv-orch-a-ms"] = m.DiffResult(
+        "--- main\n+++ pr", [("/apps/Deployment pv-orch-a/device",
+                              "-image: r/d:1.117.4\n+image: r/d:1.116.10")],
+        1, True, "", m.OUT_DIFF, "",
+        image_downgrades=(("/apps/Deployment pv-orch-a/device", "d",
+                           "1.117.4", "1.116.10"),))
+    plan["pv-orch-a-ss"] = plan["pv-orch-a-ms"]
+    m.process_pr(_mk_pr(), PATH_MAP, base_sha=BASE_SHA)
+    assert m._extract_status_token(sinks.upserts[-1]) == "clean", "not the transient path"
+    assert sinks.statuses[-1] == (
+        "SUCCESSFUL",
+        "⚠️ Image downgrade in pv-orch-a: device 1.117.4 → 1.116.10. Check "
+        "that an old pin or an old branch is not moving it back. | 2 resource(s) "
+        "will change" + IMG_SUFFIX + " - review comment")

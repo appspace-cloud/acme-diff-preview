@@ -188,7 +188,8 @@ def _is_risky_result(r) -> bool:
                 or getattr(r, "template_artifacts", None)
                 or getattr(r, "vm_changes", None)
                 or (r.version_change
-                    and _is_version_downgrade(*r.version_change)))
+                    and _is_version_downgrade(*r.version_change))
+                or getattr(r, "image_downgrades", None))
 
 
 def _shape_signature(r) -> tuple:
