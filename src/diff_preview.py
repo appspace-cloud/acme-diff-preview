@@ -198,6 +198,8 @@ from comment_render import (  # comment rendering (same-dir module, stdlib only)
     _SHUTDOWN_MIN_WORKLOADS,
     _is_env_shutdown,
     _NEW_ENV_CHECK_PREFIX,
+    MERGE_SUMMARY_HDR,
+    commit_authors_line,
 )
 from redact import (  # display-time redaction (same-dir module, stdlib only)
     _unquote,
@@ -5087,6 +5089,27 @@ def _identity_block_reason(hit, confirmed):
     return None if hit["paused_head"] else "keep_paused"
 
 
+def _pr_commits(repo, pr_id):
+    """The commits of the PR from the API, every page."""
+    commits, page, base = [], f"pullrequests/{pr_id}/commits?pagelen=100", _bb_api_base(repo)
+    for _ in range(_BB_MAX_PAGES):
+        try:
+            data = bb("GET", page, repo=repo)
+        except urllib.error.HTTPError as e:
+            if not _is_transient_exception(e):
+                raise  # a 4xx is not a blip: fail, do not retry forever
+            raise PrCommitsUnreadable(f"commits of PR #{pr_id} unreadable: {e}") from e
+        except (OSError, ValueError) as e:
+            raise PrCommitsUnreadable(f"commits of PR #{pr_id} unreadable: {e}") from e
+        commits += data.get("values", [])
+        page = (data.get("next") or "").replace(f"{base}/", "")
+        if not page:
+            break
+    else:
+        raise PrCommitsUnreadable(f"commits of PR #{pr_id}: too many pages")
+    return commits
+
+
 def _pr_commit_messages(repo, pr_id, base_sha, pr_sha):
     """Commit messages of the PR (base_sha..pr_sha): the mirror first, else the API."""
     path = _mirror_path(repo) if repo else ""
@@ -5097,26 +5120,40 @@ def _pr_commit_messages(repo, pr_id, base_sha, pr_sha):
                       f"{base_sha}..{pr_sha}"], timeout=30)
         if r is not None and r.returncode == 0:
             return r.stdout.split("\x00")
-    commits, page, base = [], f"pullrequests/{pr_id}/commits?pagelen=100", _bb_api_base(repo)
-    for _ in range(_BB_MAX_PAGES):
-        try:
-            data = bb("GET", page, repo=repo)
-        except urllib.error.HTTPError as e:
-            if not _is_transient_exception(e):
-                raise  # a 4xx is not a blip: fail, do not retry forever
-            raise PrCommitsUnreadable(f"commit messages of PR #{pr_id} unreadable: {e}") from e
-        except (OSError, ValueError) as e:
-            raise PrCommitsUnreadable(f"commit messages of PR #{pr_id} unreadable: {e}") from e
-        commits += data.get("values", [])
-        page = (data.get("next") or "").replace(f"{base}/", "")
-        if not page:
-            break
-    else:
-        raise PrCommitsUnreadable(f"commit messages of PR #{pr_id}: too many pages")
+    commits = _pr_commits(repo, pr_id)
     # Right after a push the list can still miss the new head: retry, never "unconfirmed".
     if not any((c.get("hash") or "").startswith(pr_sha) for c in commits):
         raise PrCommitsUnreadable(f"commit list of PR #{pr_id} does not have {pr_sha[:8]} yet")
     return [c.get("message") or "" for c in commits]
+
+
+def _pr_commit_authors(repo, pr):
+    """COPS-2766: the other people who wrote commits in the PR, by name.
+
+    API only: the mirror has git names and emails, not the Bitbucket account.
+    It does not wait for a new head the list does not have yet: the older
+    commits are still right, and the next render reads the head."""
+    me = pr.get("author") or {}
+    bot = me.get("type") == "app_user"  # a repository access token
+    if not bot and not me.get("account_id"):
+        raise PrCommitsUnreadable(f"PR #{pr['id']} has no author")
+    mine = {(me.get(k) or "").casefold() for k in ("display_name", "nickname")}
+    names = set()
+    for c in _pr_commits(repo, pr["id"]):
+        if len(c.get("parents") or ()) > 1:
+            continue  # a merge of main brings no change of its own
+        a = c.get("author") or {}
+        u = a.get("user") or {}
+        name = u.get("display_name") or (a.get("raw") or "").split(" <")[0]
+        if bot:  # its commits carry another git name: only a person counts
+            same = u.get("type") != "user" or not u.get("account_id")
+        elif u.get("account_id"):
+            same = u["account_id"] == me["account_id"]
+        else:  # a git email with no account: the name is all there is
+            same = name.casefold() in mine
+        if not same:
+            names.add(name)
+    return sorted(names)
 
 
 _IDENTITY_SECRETS = ("dm-ui, mongodb-password, rabbitmq-password, redis-password, "
@@ -11925,7 +11962,7 @@ def format_comment(pr_sha, app_results, skipped_apps=None, base_sha="",
                     appspace_state_lines=None, appendix_lines=None,
                     vm_change_lines=None, artifact_url="",
                     readable_budget=None, profile=None, paused_apps=None,
-                    gates=None):
+                    gates=None, authors_line=""):
     """Format the full PR comment. Never uses <details>/<summary> — Bitbucket
     does not render them. Large changesets get a compact summary table at the
     top (all apps, one row each) and, for the diff sections below, apps
@@ -12271,6 +12308,9 @@ def format_comment(pr_sha, app_results, skipped_apps=None, base_sha="",
         _paused_changing, _paused_envs, block_headline=block_headline or None,
         gates=gates, green=_green)
     lines += ["---", ""]
+    if authors_line:  # COPS-2766: right under the verdict
+        at = lines.index(MERGE_SUMMARY_HDR) + 3
+        lines[at:at] = ["", authors_line]
 
     # COPS-2676: permanent render failures go FIRST after the verdict on the
     # COMMENT. The full-diff page keeps one block per app (COPS-2629
@@ -14102,6 +14142,14 @@ def process_pr(pr, path_map, base_sha="", repo=None):
             # every release before this one had.
             logsink.log(f"autosync check failed (non-fatal): {e}", "WARNING",
                         pr=pr_id, repo=repo, event="autosync_check_failed")
+        # COPS-2766: an approval from someone who wrote commits here is not
+        # independent. Informational: a failed read says so and changes nothing else.
+        try:
+            _authors = _pr_commit_authors(repo, pr)
+        except Exception as e:
+            logsink.log(f"    [comment] commit authors unreadable: {e}", "WARNING")
+            _authors = None
+        _comment_kwargs["authors_line"] = commit_authors_line(_authors)
         body = format_comment(pr_sha, app_results,
                               artifact_url=artifact_url, **_comment_kwargs)
         comment_kb = round(len(body.encode()) / 1024, 1)

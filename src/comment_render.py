@@ -1381,6 +1381,25 @@ def join_status_lead(lead, description, limit=255) -> str:
     return f"{cut.rstrip()}...{tail}" if cut.strip() else description
 
 
+def commit_authors_line(names) -> str:
+    """COPS-2766: the line under the verdict that names the other people who
+    wrote commits in the PR. None means the commits could not be read.
+
+    Not a '- ' bullet, so status_lead never reads it. Git author names are
+    PR-controlled markdown: each one is one line with no backticks, cut to
+    40 characters, inside backticks."""
+    if names is None:
+        return ("\U0001f465 Could not read who wrote the commits of this PR. "
+                "Check the commit authors before you approve.")
+    if not names:
+        return ""
+    shown = ", ".join("`%s`" % " ".join(n.replace("`", "").split())[:40]
+                      for n in names[:5])
+    more = f" and {len(names) - 5} more" if len(names) > 5 else ""
+    return (f"\U0001f465 **Other people wrote commits in this PR:** {shown}{more}. "
+            "Their approval is not independent, so ask another person to approve.")
+
+
 _SHUTDOWN_MIN_WORKLOADS = 2
 
 
