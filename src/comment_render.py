@@ -490,15 +490,22 @@ def _gate_way_out(g, trailer_fmt) -> str:
     return trailer_fmt.format(tr) if tr else ". " + GATES[g["kind"]][3]
 
 
-def gate_status_description(gates) -> str:
+def gate_status_description(gates, limit=255) -> str:
     """The FAILED build status. It names the line to add or the fix, so a
-    reviewer who reads only the checks list can act. A transient gate waits."""
+    reviewer who reads only the checks list can act. A transient gate waits.
+    Over `limit` UTF-8 bytes, only the reason is cut: the panel has it in full."""
     todo = open_gates(gates)
     g = todo[0]
-    return (("Waiting - " if GATES[g["kind"]][2] == "transient" else "Blocked - ")
-            + gate_text(g) + (f" in {g['env']}" if g["env"] else "")
+    head = "Waiting - " if GATES[g["kind"]][2] == "transient" else "Blocked - "
+    tail = ((f" in {g['env']}" if g["env"] else "")
             + _gate_way_out(g, ". To merge anyway, add '{}' to a commit message")
             + (f" (+{len(todo) - 1} more)" if len(todo) > 1 else "") + " (see PR comment)")
+    why, over = g.get("why") or "", _utf8_len(f"{head}{gate_text(g)}{tail}") - limit
+    if over > 0:                         # 3 for the "..."
+        why = why.encode("utf-8", "surrogatepass")[:max(_utf8_len(why) - over - 3, 0)]
+        why = why.decode("utf-8", "ignore").rstrip()
+        why = why and why + "..."
+    return f"{head}{gate_text(dict(g, why=why))}{tail}"
 
 
 def gate_footer(gates) -> str:

@@ -778,6 +778,13 @@ def _kcc_instance_names(flat: dict, role: str) -> set:
             for i in flat.get(f"{_KCC_PREFIX}{role}.instances") or ()}
 
 
+def _kcc_disk_type(flat: dict, role: str, disk: str) -> str:
+    """The 'data' or 'boot' disk type: the role, defaults.gcp, then pd-ssd."""
+    return _norm_machine_type(flat.get(f"{_KCC_PREFIX}{role}.{disk}DiskType")
+                              or flat.get(f"{_KCC_PREFIX}defaults.gcp.{disk}DiskType")
+                              or _KCC_CHART_DISK_TYPE)
+
+
 def _vm_disk_family_errors(flat) -> list:
     """[(role, machineType, 'data' or 'boot', disk type)]: each rendered role on
     an n4 or c4 family with a pd- disk. The boot disk counts only when KCC
@@ -789,9 +796,7 @@ def _vm_disk_family_errors(flat) -> list:
             continue
         new_boot = _kcc_true(_kcc_role_value(flat, role, "createNewBootDisk"))
         for disk in ("data", "boot") if new_boot else ("data",):
-            t = _norm_machine_type(flat.get(f"{_KCC_PREFIX}{role}.{disk}DiskType")
-                                   or flat.get(f"{_KCC_PREFIX}defaults.gcp.{disk}DiskType")
-                                   or _KCC_CHART_DISK_TYPE)
+            t = _kcc_disk_type(flat, role, disk)
             if t.startswith("pd-"):
                 out.append((role, mt, disk, t))
     return out
@@ -808,9 +813,10 @@ def _vm_disk_family_changes(old_flat, new_flat) -> list:
     """[(role, text)]: the n4 or c4 disk errors a change adds to a live env.
 
     A VM that runs at base keeps its disks: GCP cannot change a disk type in
-    place. So moving it into the family is the error, whatever the disk
-    values say. A new VM (a new role or a new name) is checked on its values.
-    An error that is already on main does not count."""
+    place. So moving it into the family is the error, unless its data disk
+    and a boot disk KCC created are Hyperdisk at base. A new VM (a new role
+    or a new name) is checked on its values. An error that is already on
+    main does not count."""
     if old_flat is None or new_flat is None:
         return []
     ran = _kcc_rendered_roles(old_flat)
@@ -820,7 +826,10 @@ def _vm_disk_family_changes(old_flat, new_flat) -> list:
     for role in _kcc_rendered_roles(new_flat):
         old_mt, new_mt = _kcc_machine_type(old_flat, role), _kcc_machine_type(new_flat, role)
         if (role in ran and _kcc_instance_names(old_flat, role) & _kcc_instance_names(new_flat, role)
-                and _VM_DISK_FAMILY_RE.match(new_mt) and not _VM_DISK_FAMILY_RE.match(old_mt)):
+                and _VM_DISK_FAMILY_RE.match(new_mt) and not _VM_DISK_FAMILY_RE.match(old_mt)
+                and not (_kcc_true(_kcc_role_value(old_flat, role, "createNewBootDisk"))
+                         and all(_kcc_disk_type(old_flat, role, d).startswith("hyperdisk-")
+                                 for d in ("data", "boot")))):
             out.append((role, f"`machineType` `{old_mt}` \u2192 `{new_mt}`: "
                               f"{_VM_DISK_FAMILY_REASON}. The running VM keeps its disks, "
                               "because a disk type cannot change in place. Keep the current "

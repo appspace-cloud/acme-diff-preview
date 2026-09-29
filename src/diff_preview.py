@@ -7995,6 +7995,11 @@ def _evaluate_env_decommissions(candidates: list, pr_sha: str, main_sha: str,
     return lines, envs_reported, full_lines
 
 
+# The VM panel line of a vm_disk error, built in _summarize_vm_changes.
+_VM_DISK_LINE_RE = re.compile(r"`([^`]+)` \u00b7 \*\*linux VM \(KCC\) \u00b7 (\w+)\*\*: "
+                              r"`(?:machineType` `([^`]+)` \u2192 `)?([^`]+)`")
+
+
 def _merge_gates(decommission_candidates, renames=None, path_map=None,
                  vm_change_lines=None, app_results=None, extra=()) -> list:
     """COPS-2766: the merge gates of this PR, one per kind and env, none lifted.
@@ -8007,9 +8012,9 @@ def _merge_gates(decommission_candidates, renames=None, path_map=None,
     is `shrink`, one per env (the first name in backticks of its line), and
     nothing lifts it. An app that releases a static IP or a DNS record is
     `ip`, lifted by `Confirm-IP-Release: <env>`.
-    `extra` holds gates the caller built itself.
-    An n4 or c4 machine with a pd- disk in the VM panel is `vm_disk`, like
-    `shrink`.
+    `extra` holds gates the caller built itself. An n4 or c4 machine with a
+    pd- disk in the VM panel is `vm_disk`, one per env with the role and the
+    machine type as its reason, and nothing lifts it either.
     """
     found = [g for c in decommission_candidates or () for g in c.get("gates", ())]
     found += [{"kind": "cl_rename", "env": _CL_ENV_RE.match(old)[1],
@@ -8018,8 +8023,10 @@ def _merge_gates(decommission_candidates, renames=None, path_map=None,
               if _CL_ENV_RE.match(old) and (path_map or {}).get(old)]
     found += [{"kind": "shrink", "env": (re.findall(r"`([^`]+)`", line) or [""])[0]}
               for line in vm_change_lines or () if _VM_SHRINK_REASON in line]
-    if any(_VM_DISK_FAMILY_REASON in line for line in vm_change_lines or ()):
-        found.append({"kind": "vm_disk", "env": ""})
+    for hit in (_VM_DISK_LINE_RE.search(line) for line in vm_change_lines or ()
+                if _VM_DISK_FAMILY_REASON in line):
+        why = hit and f"{hit[2]} " + " to ".join(filter(None, hit.groups()[2:]))
+        found.append({"kind": "vm_disk", "env": hit[1] if hit else "", "why": why or ""})
     found += [{"kind": "ip", "env": _envs_from_apps([app])[0]}
               for app, r in (app_results or {}).items() if getattr(r, "ip_released", None)]
     found += extra

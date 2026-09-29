@@ -215,6 +215,26 @@ def test_a_new_vm_name_is_a_new_vm():
         ("mongo", _new_text("c4-standard-4", ("data", "pd-ssd")))]
 
 
+@pytest.mark.parametrize("base,err", [
+    ({"createNewBootDisk": True}, False),     # data and boot disks KCC made are Hyperdisk
+    ({}, True),                               # the adopted boot disk can be pd-
+    ({"createNewBootDisk": True, "bootDiskType": "pd-balanced"}, True),
+])
+def test_a_running_vm_on_hyperdisk_can_move_into_the_family(base, err):
+    old = _flat({"svc": dict(HD, machineType="c3-highmem-4", **base)})
+    new = _flat({"svc": dict(HD, machineType="n4-highmem-2", **base)})
+    want = [("svc", _move_text("c3-highmem-4", "n4-highmem-2"))] if err else []
+    assert va._vm_disk_family_changes(old, new) == want
+
+
+def test_a_hyperdisk_vm_that_moves_with_a_pd_disk_is_an_error():
+    old = _flat({"svc": dict(HD, machineType="c3-highmem-4", createNewBootDisk=True)})
+    new = _flat({"svc": dict(HD, machineType="n4-highmem-2", createNewBootDisk=True,
+                             dataDiskType="pd-ssd")})
+    assert va._vm_disk_family_changes(old, new) == [
+        ("svc", _new_text("n4-highmem-2", ("data", "pd-ssd")))]
+
+
 def test_the_svc_default_name_follows_the_env():
     ident = {"appspace.prefix": "pv", "appspace.customerName": "x", "appspace.suffix": "a"}
     old = _flat({"svc": {}}, extra=ident)
@@ -336,7 +356,13 @@ def test_pr_4331_is_a_danger_and_a_gate(monkeypatch):
     lines = _vm_lines(monkeypatch, [IDENTITY], {IDENTITY: DOC_4331})
     assert LINE_4331 in lines
     assert m._merge_gates((), vm_change_lines=lines) == [
-        {"arg": "", "kind": "vm_disk", "env": "", "lifted": False}]
+        {"arg": "pv-orch-a", "kind": "vm_disk", "env": "pv-orch-a", "why": "svc n4-highmem-2",
+         "lifted": False}]
+
+
+def test_a_line_of_another_shape_still_blocks():
+    assert m._merge_gates((), vm_change_lines=[f"- \U0001f6a8 {REASON}"]) == [
+        {"arg": "", "kind": "vm_disk", "env": "", "why": "", "lifted": False}]
 
 
 def test_pr_4331_with_hyperdisk_has_no_disk_line(monkeypatch):
@@ -464,8 +490,9 @@ def test_a_failed_prereq_read_retries_the_pr(run, monkeypatch):
 def test_pr_4331_blocks_the_diff_path(run):
     body, (state, desc) = run([IDENTITY], {IDENTITY: DOC_4331})
     assert m._extract_status_token(body) == "blocked"
-    assert state == "FAILED" and desc == f"Blocked - {TEXT}{GATE_FIX} (see PR comment)"
-    assert f"- \u26d4 **{TEXT}**" in body and LINE_4331 in body
+    assert state == "FAILED" and desc == (f"Blocked - {TEXT} (svc n4-highmem-2) in pv-orch-a"
+                                          f"{GATE_FIX} (see PR comment)")
+    assert f"- \u26d4 **{TEXT} (svc n4-highmem-2)** in `pv-orch-a`" in body and LINE_4331 in body
     assert m._seen.get(SK) == (PR_SHA, BASE_SHA)
 
 
@@ -484,6 +511,7 @@ def test_a_running_vm_moved_to_n4_blocks_even_on_hyperdisk(run):
             "        desiredStatus: TERMINATED\n        dataDiskType: hyperdisk-balanced\n")
     body, (state, desc) = run([IDENTITY], {IDENTITY: head}, {IDENTITY: base})
     assert m._extract_status_token(body) == "blocked"
-    assert state == "FAILED" and desc == f"Blocked - {TEXT}{GATE_FIX} (see PR comment)"
+    assert state == "FAILED" and desc == (f"Blocked - {TEXT} (svc n2d-highmem-2 to "
+                                          f"n4-highmem-2) in pv-orch-a{GATE_FIX} (see PR comment)")
     assert ("- \U0001f6a8 `pv-orch-a` \u00b7 **linux VM (KCC) \u00b7 svc**: "
             + _move_text("n2d-highmem-2", "n4-highmem-2")) in body

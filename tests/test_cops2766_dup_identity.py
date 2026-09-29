@@ -285,9 +285,23 @@ def test_a_confirm_line_does_not_lift_it(orch):
                                ["Confirm-Clone-Sanitized: pv-orch--aec1-copy",
                                 "Confirm-Rename: pv-orch--aec1-a -> pv-orch--aec1-copy"])
     assert m._extract_status_token(body) == "blocked" and state == "FAILED"
-    assert desc == (f"Blocked - {TEXT} (live apps {', '.join(apps)} from {live}) in "
-                    f"pv-orch--aec1-copy{DUP_FIX} (see PR comment)")
+    # With the fix text the status is over 255 bytes, so the reason is cut.
+    assert len(desc.encode()) == 255
+    assert desc.startswith(f"Blocked - {TEXT} (live apps {', '.join(apps)} from gcp/aec/")
+    assert desc.endswith(f"...) in pv-orch--aec1-copy{DUP_FIX} (see PR comment)")
     assert "☑️ **Confirmed in a commit:** `Confirm-Clone-Sanitized: pv-orch--aec1-copy`" in body
+
+
+def test_a_long_name_and_a_deep_path_fit_the_status():
+    """A 20-character customerName: only the reason is cut to fit 255 bytes."""
+    ns = "pv-universalhollywood20-c"
+    live = f"gcp/prod/private-cloud/na1-b/hardcoded/monthly/{ns}/customer.yaml"
+    copy = f"gcp/prod/private-cloud/na1-b/hardcoded/monthly/{ns}x/customer.yaml"
+    apps = [f"{ns}-{s}" for s in ("ms", "ss", "glb")]
+    desc = cr.gate_status_description([_gate(copy, apps, (live,), ns=ns)])
+    assert len(desc.encode()) == 255
+    assert desc.startswith(f"Blocked - {TEXT} (live apps {apps[0]}, {apps[1]}, ")
+    assert desc.endswith(f"...) in {ns}x{DUP_FIX} (see PR comment)")
 
 
 def test_a_new_env_with_its_own_name_is_clean(orch):

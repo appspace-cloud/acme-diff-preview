@@ -410,6 +410,19 @@ def test_pr_4660_gives_one_gate_per_clone(live):
     assert body.count(f"- ⛔ **{TEXT} (zeroPods true to false)**") == 13
 
 
+@pytest.mark.parametrize("env,why", [
+    ("pv-universalhollywood--aec1-a", "zeroPods true to false"),   # the longest real name
+    ("pv-universalhollywood20--aec1-ab", "zeroPods true t..."),
+])
+def test_the_pr_4660_status_fits_and_keeps_the_trailer(env, why):
+    """13 wakes: only the reason is cut to fit 255 bytes, never the trailer."""
+    desc = cr.gate_status_description([_gate(env, "zeroPods true to false")] * 13)
+    assert len(desc.encode()) <= 255
+    assert desc == (f"Blocked - {TEXT} ({why}) in {env}. To merge anyway, add "
+                    f"'Confirm-Clone-Sanitized: {env}' to a commit message (+12 more) "
+                    "(see PR comment)")
+
+
 # ── golden ───────────────────────────────────────────────────────────────
 
 GOLDEN_DIR = os.path.join(os.path.dirname(__file__), "golden")
