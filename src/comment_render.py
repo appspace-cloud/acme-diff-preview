@@ -445,6 +445,8 @@ GATES = {
                    "Confirm-Clone-Sanitized", "blocked", ""),
     "dup_identity": ("A new environment uses the name of another environment", None,
                      "blocked", "Use git mv, or choose another customerName or suffix"),
+    "ashn_copy": ("A clone reuses the ashn of another environment", None, "blocked",
+                  "Give the clone its own ashn"),
 }
 
 

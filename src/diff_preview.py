@@ -7084,6 +7084,100 @@ def _fleet_identity_files(repo: str = None) -> list:
     return sorted(out)
 
 
+def _own_identity(doc):
+    """(customerName, suffix, ashn) as the file itself writes them, "" when unset."""
+    own = doc.get("appspace") if isinstance(doc, dict) else None
+    own = own if isinstance(own, dict) else {}
+    return tuple(str(own.get(k) or "") for k in ("customerName", "suffix", "ashn"))
+
+
+_fleet_own_cache = {}      # repo -> (base_sha, result), only the last base
+
+
+def _fleet_own_identities(repo, base_sha):
+    """COPS-2766: ({path: (customerName, suffix, ashn)} from the own customer.yaml
+    of each live env at base_sha, [paths not read]). A failed read or YAML that
+    cannot be parsed is not checked; only a complete read is kept."""
+    hit = _fleet_own_cache.get(repo)
+    if hit and hit[0] == base_sha:
+        return hit[1]
+    own, unread = {}, []
+    files = _fleet_identity_files(repo=repo)
+    for f in files:
+        try:
+            doc, state = _read_first_doc(f, base_sha, repo, True)
+        except ValueFileUnreadable:
+            state = "error"
+        if state == "ok":
+            own[f] = _own_identity(doc)
+        elif state != "absent":
+            unread.append(f)
+    if files and not unread:
+        _fleet_own_cache[repo] = (base_sha, (own, unread))
+    return own, unread
+
+
+def _detect_copied_clone_ashn(changed, renames, sha, base_sha, repo=None):
+    """COPS-2766 (C03): (ashn_copy gates, notes) for the changed clone
+    customer.yaml files whose own `appspace.ashn` is new or changed.
+
+    A gate when an env with another customerName has that ashn: a live env
+    at base, or a file of this PR at `sha`, so a move or a delete is not a
+    copy. Nothing lifts it. The fleet is read only for these clones. A failed
+    read of a PR file raises, so the PR is retried; a fleet file that cannot
+    be read is not checked, and a note says so.
+    """
+    if not base_sha:
+        return [], []
+    renames = renames or {}
+    inv = {n: o for o, n in renames.items()}
+    todo = {}
+    for f in changed:
+        if not _is_clone_env_file(f) or f in renames:
+            continue
+        ident = _own_identity(_read_first_doc(f, sha, repo)[0])
+        if ident[2] and ident[2] != _own_identity(
+                _read_first_doc(inv.get(f, f), base_sha, repo)[0])[2]:
+            todo[f] = ident
+    if not todo:
+        return [], []
+    fleet, unread = _fleet_own_identities(repo, base_sha)
+    others = {g: v for g, v in fleet.items() if g not in changed and g not in renames}
+    others.update({p: _own_identity(_read_first_doc(p, sha, repo)[0]) for p in changed
+                   if posixpath.basename(p) == "customer.yaml" and p not in todo})
+    others.update(todo)
+    gates = []
+    for f, (cn, _sfx, ashn) in sorted(todo.items()):
+        hits = sorted(g for g, (c, _s, a) in others.items() if a == ashn and c != cn)
+        if hits:
+            gates.append({"kind": "ashn_copy", "env": f.split("/")[-2],
+                          "why": "the ashn of " + ", ".join(g.split("/")[-2] for g in hits),
+                          "ashn": ashn, "path": f, "others": hits})
+    notes = [f"\u26a0\ufe0f ashn check skipped {len(unread)} environment(s) that could not "
+             "be read, so a copied ashn there is not ruled out."] if unread else []
+    if not fleet and not unread:
+        notes.append("\u26a0\ufe0f ashn check unavailable: the ArgoCD app list is not "
+                     "loaded, so the clone ashn is not compared with the live environments.")
+    return gates, notes
+
+
+def _ashn_copy_lines(gates, notes=()) -> list:
+    """COPS-2766: the panel of the ashn_copy gates, then the notes of the check.
+    Plain lines, like _dup_identity_lines."""
+    hits = [g for g in gates or () if g["kind"] == "ashn_copy"]
+    lines = ["## \u26d4 CLONE ASHN ALREADY IN USE", ""] if hits else []
+    for g in hits:
+        lines.append(f"- `{g['env']}` has `ashn: {g['ashn']}`, the ashn of "
+                     + ", ".join(f"`{p.split('/')[-2]}` (`{p}`)" for p in g["others"]) + ".")
+    if hits:
+        lines += ["", "The ashn names the environment in Customers and PDNS, so the clone "
+                  "and the other environment look like one environment there. Give the "
+                  "clone its own ashn (runbook "
+                  "https://appspace.atlassian.net/wiki/spaces/cops/pages/66093626 step 2: "
+                  "change ashn, suffix, customerName and instanceName).", ""]
+    return lines + [x for n in notes for x in (n, "")]
+
+
 def _uc_prefilter_token(identity_file: str) -> str:
     """`.../pv-gsk--aec1-c/customer.yaml` -> `pv-gsk--aec1`.
 
@@ -12348,6 +12442,9 @@ def process_pr(pr, path_map, base_sha="", repo=None):
         # A new env with the app names of another env: nothing lifts it.
         dup_gates, dup_unchecked = _detect_duplicate_identities(
             changed, renames, new_env_candidates, render_sha, repo=repo)
+        # A clone with the ashn of another env: nothing lifts it either.
+        ashn_gates, ashn_notes = _detect_copied_clone_ashn(changed, renames, render_sha,
+                                                           base_sha, repo=repo)
 
         # v2.5.10 (explicit request): detect FULL environment decommissions
         # (identity file deleted, no successor anywhere — distinct from a
@@ -12381,11 +12478,11 @@ def process_pr(pr, path_map, base_sha="", repo=None):
                 new_env_lines, structural_envs, total_new, new_env_full_lines = \
                     _evaluate_new_envs(new_env_candidates, render_sha,
                                        with_full_output=True)
-                gates = _lift_gates(_merge_gates((), extra=clone_gates + dup_gates),
+                gates = _lift_gates(_merge_gates((), extra=clone_gates + dup_gates + ashn_gates),
                                     repo, pr_id, base_sha, pr_sha)
                 body, state, desc = format_new_env_comment(
                     pr_sha, _clone_wake_lines(gates) + _dup_identity_lines(gates, dup_unchecked)
-                    + new_env_lines,
+                    + _ashn_copy_lines(gates, ashn_notes) + new_env_lines,
                     new_env_full_lines, structural_envs,
                     gates, len(new_env_candidates), total_new, base_sha)
                 # v2.25.0: this path never persisted a full-diff artifact, so
@@ -12861,10 +12958,10 @@ def process_pr(pr, path_map, base_sha="", repo=None):
         # COPS-2766: merge gates. PrCommitsUnreadable goes to the catch-all
         # below: a retry, never a lift.
         gates = _merge_gates(decommission_candidates, renames, path_map,
-                             vm_change_lines, app_results, clone_gates + dup_gates)
+                             vm_change_lines, app_results, clone_gates + dup_gates + ashn_gates)
         _lift_gates(gates, repo, pr_id, base_sha, pr_sha)
         appspace_state_lines = (_clone_wake_lines(gates) + _dup_identity_lines(gates, dup_unchecked)
-                                + appspace_state_lines)
+                                + _ashn_copy_lines(gates, ashn_notes) + appspace_state_lines)
         # Direct permalink into the full-diff view for this exact commit.
         # Only built when the view is reachable from outside the cluster
         # (base URL set), so the comment never links to something a

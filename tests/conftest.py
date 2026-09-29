@@ -81,10 +81,13 @@ def _clear_sha_fetch_cache():
     # _yaml_cache (COPS-2562) shares the (sha, path) keying of _vf_cache and
     # therefore the same cross-test poisoning risk: two tests faking the same
     # sha with different content must never see each other's parse.
-    for d in (_m._vf_cache, _m._vf_inflight, _m._retry_backoff, _m._yaml_cache):
+    # _fleet_own_cache (COPS-2766) is keyed by base sha, the same risk.
+    caches = (_m._vf_cache, _m._vf_inflight, _m._retry_backoff, _m._yaml_cache,
+              _m._fleet_own_cache)
+    for d in caches:
         d.clear()
     yield
-    for d in (_m._vf_cache, _m._vf_inflight, _m._retry_backoff, _m._yaml_cache):
+    for d in caches:
         d.clear()
 
 
