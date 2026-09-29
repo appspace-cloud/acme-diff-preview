@@ -3,9 +3,12 @@
 ## Summary
 
 acme-diff-preview blocks any config-repo PR that sets
-`appspace.microservices.definitions` to a **null or empty** map in a Helm
-value file. Left unblocked, the change silently breaks image names across an
-entire environment on merge, causing cluster-wide `ImagePullBackOff`.
+`appspace.microservices.definitions` to anything but a map with children
+(**null, empty**, a list, a string or a number) in a Helm value file. Left
+unblocked, the change silently breaks image names across an entire environment
+on merge, causing cluster-wide `ImagePullBackOff`. Since COPS-2766 this is one
+of the three YAML slips the service blocks, with a duplicate key and a bare key
+([details](internals.md#why-a-yaml-slip-is-blocked)).
 
 ## The incident
 
@@ -85,16 +88,21 @@ key no longer exists and the chart's own map (with the overrides) is kept.
 
 ## The rule the guard enforces
 
-For every changed `*.yaml` / `*.yml` value file in a PR, fetched at the PR's
-commit SHA:
+The guard reads every changed `*.yaml` / `*.yml` file of a PR at the PR's
+commit SHA (the merge preview when there is one). Only the first YAML document
+counts, because Helm and ArgoCD read only that one (COPS-2766):
 
-- **Blocked** — `appspace.microservices.definitions` is present but its value
-  is `null` or an empty mapping (`{}`).
-- **Allowed** — the `definitions` key is **absent** (the chart's own map is
+- **Blocked**: `appspace.microservices.definitions` is present and is not a
+  map with children: `null`, an empty map (`{}`), a list (`[]`), a string
+  (`""`) or a number. A bare `definitions:` before a second `---` document is
+  blocked too. Before COPS-2766 the guard missed that case, `[]` and `""`. The
+  wipe counts at the PR sha alone, so an old wipe on `main` still blocks a PR
+  that changes the file.
+- **Allowed**: the `definitions` key is **absent** (the chart's own map is
   kept intact), or it has real children, or the file is unparseable YAML (that
   fails elsewhere in the render; the guard never blocks on a parse error), or
   the file is absent at the PR sha.
-- **Retried** — Bitbucket could not serve the file (any failed read that is
+- **Retried**: Bitbucket could not serve the file (any failed read that is
   not a plain 404). The build is `FAILED` with "Diff unavailable
   (infrastructure) - will retry" and the PR is checked again after the
   backoff (COPS-2766). Before, a failed read was skipped, so a wipe could
@@ -122,13 +130,27 @@ appspace:
     definitions:
 ```
 
+`definitions: {}`, `definitions: []` and `definitions: ""` are just as
+dangerous.
+
 ## Where this lives in the code
+
+`src/yaml_hygiene.py` (pure, no I/O):
+
+- `slips(body)`: the duplicate keys, the bare keys and the wipe of the first
+  document.
+- `wipes_definitions_node(root)`: the wipe rule itself.
 
 `src/diff_preview.py`:
 
-- `_values_wipes_definitions(body)` — the pure YAML-shape classifier.
-- `_detect_wiped_definitions(changed_files, sha, repo)` — fetches each changed
-  value file at the PR sha and returns those that wipe the map.
-- `process_pr(...)` — runs the guard before any diff/app logic and blocks.
+- `_values_wipes_definitions(body)`: True when the first document wipes the
+  map.
+- `_detect_yaml_slips(changed, renames, sha, base_sha, repo)`: fetches each
+  changed YAML file and returns its slips, the wipe at the PR sha alone.
+- `_detect_wiped_definitions(changed_files, sha, repo)`: only the files that
+  wipe the map, a thin wrapper.
+- `_yaml_slip_block(hits, pr_sha, base_sha)`: the red status and the comment.
+- `process_pr(...)`: runs the guard before any diff/app logic and blocks.
 
-Tests: `tests/test_v2120_wiped_definitions_guard.py`.
+Tests: `tests/test_v2120_wiped_definitions_guard.py` and
+`tests/test_cops2766_yaml_slips.py`.
