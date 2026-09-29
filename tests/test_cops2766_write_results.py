@@ -323,6 +323,67 @@ def test_dedup_is_seen_once_the_status_is_settled(world, monkeypatch, result):
     assert m._seen.get(SK) == (PR_SHA, BASE_SHA)
 
 
+# ── a failed write, then the real recovery: red stays red ────────────────
+
+REAL_FIX_STUCK = m.fix_stuck_inprogress     # the world fixture stubs it
+
+
+def _bitbucket(world, monkeypatch, state, fail):
+    """The commit's build status as Bitbucket holds it (None: no status).
+    The first post of each state in `fail` does not land."""
+    sinks, _plan = world
+    bb = {"state": state}
+    fail = list(fail)
+
+    def post(pr_sha, st, description, pr_id=None, repo=None):
+        sinks.statuses.append((st, description))
+        if st in fail:
+            fail.remove(st)
+            return "transient"
+        bb["state"] = st
+        return "ok"
+
+    def get(url, *a, **k):
+        assert "/statuses/build/" in url, url
+        if bb["state"] is None:
+            raise _http_error(404)
+        return {"state": bb["state"]}
+    monkeypatch.setattr(m, "post_build_status", post)
+    monkeypatch.setattr(m, "http", lambda method, url, *a, **k: get(url))
+    monkeypatch.setattr(m, "fix_stuck_inprogress", REAL_FIX_STUCK)
+    return bb
+
+
+def _render_then_recover(world, monkeypatch, passes=4):
+    """One render, then the next passes find its comment up to date."""
+    sinks = world[0]
+    m.process_pr(_mk_pr(), PATH_MAP, base_sha=BASE_SHA)
+    body = sinks.upserts[-1]
+    monkeypatch.setattr(m, "find_existing_comment",
+                        lambda pr_id, repo=None: (5, PR_SHA[:8], body))
+    for _ in range(passes):
+        m.process_pr(_mk_pr(), PATH_MAP, base_sha=BASE_SHA)
+    return body
+
+
+@pytest.mark.parametrize("start,fail", [
+    ("INPROGRESS", ["FAILED"]),                  # the FAILED post was lost
+    (None, ["INPROGRESS", "FAILED"]),            # both posts were lost
+])
+def test_apps_over_the_cap_stay_red_after_a_failed_status_write(
+        world, monkeypatch, start, fail):
+    """The cap posts FAILED, but the comment said [clean], so the recovery
+    posted SUCCESSFUL "No manifest changes"."""
+    monkeypatch.setattr(m, "MAX_APPS_PER_RUN", 1)
+    bb = _bitbucket(world, monkeypatch, start, fail)
+    body = _render_then_recover(world, monkeypatch)
+    assert m._extract_status_token(body) == "permanent"
+    assert "over the cap" in body
+    assert [s for s, _ in world[0].statuses].count("SUCCESSFUL") == 0
+    assert bb["state"] == "FAILED"
+    assert m._seen.get(SK) == (PR_SHA, BASE_SHA)
+
+
 # ── every status write names its repo ────────────────────────────────────
 
 def test_every_post_build_status_call_passes_repo():

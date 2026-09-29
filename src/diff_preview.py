@@ -11478,6 +11478,7 @@ def format_comment(pr_sha, app_results, skipped_apps=None, base_sha="",
     # - clean     : all apps diffed successfully (no retry, mark seen)
     # - permanent : unresolvable hard error (no retry, mark seen).
     #   COPS-2696: oci_not_found is NOT here any more — it emits transient.
+    #   Apps over the cap are here too: the cut is the same on every retry.
     # - transient : diff unavailable on transient blip (retry next loop)
     if (any_error or new_env_structural or _arming_broken
             or _flag_typo_block or _kcc_nil_block):
@@ -11499,7 +11500,9 @@ def format_comment(pr_sha, app_results, skipped_apps=None, base_sha="",
         _status_token = ("permanent" if perm - SELF_RESOLVING_REASONS
                          else "transient")
     else:
-        _status_token = "clean"
+        # COPS-2766: apps over the cap make the build FAILED. With [clean]
+        # the status recovery (fix_stuck_inprogress) turned it green.
+        _status_token = "permanent" if skipped_apps else "clean"
 
     lines += ([
         # Above the separator, never between it and the Status line:
