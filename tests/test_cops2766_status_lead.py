@@ -7,8 +7,9 @@ the comment. A SUCCESSFUL description is now
 
     <marker> <first finding, plain text> | <the description it had before>
 
-  * 🚨 when the comment verdict is ⛔, ⚠️ when it is review, nothing when
-    it is routine. The lead never says DO NOT MERGE: the build is green.
+  * ⚠️ when the comment verdict is ⛔ or review, nothing when it is
+    routine. The lead never says DO NOT MERGE and has no red mark: the
+    build is green (block 2, the icon rule).
   * 255 UTF-8 bytes at most, which fits whatever unit Bitbucket counts.
     Only the lead is cut, never the old text.
   * The lead is read from the posted comment by one pure function, so
@@ -146,7 +147,7 @@ def _check(comment, tail):
     assert "do not merge" not in lead.lower(), lead
     assert _u8(out) <= 255, out
     assert out.endswith(tail), "the old description must survive byte for byte"
-    assert out == tail or out.startswith(("\U0001f6a8 ", "\u26a0\ufe0f ")), out
+    assert out == tail or out.startswith("\u26a0\ufe0f "), out
     return lead, out
 
 
@@ -175,7 +176,7 @@ def test_goldens_lead_as_the_verdict_says():
         "\u26a0\ufe0f 1 resource(s) deleted in 1 environment(s) (1 Service): "
         "pv-acme-a")
     assert lead("merge_summary_mixed.md") == (
-        "\U0001f6a8 VM infrastructure change flagged dangerous \u2014 see the "
+        "\u26a0\ufe0f VM infrastructure change flagged dangerous \u2014 see the "
         "VM section")
 
 
@@ -219,7 +220,7 @@ def test_markdown_links_and_the_bullet_emoji_are_removed():
 def test_only_the_first_bullet_leads():
     c = _comment(BLOCK, "\U0001f5a5\ufe0f **VM infrastructure change flagged "
                  "dangerous** \u2014 see the VM section", DELETION)
-    assert cr.status_lead(c) == ("\U0001f6a8 VM infrastructure change flagged "
+    assert cr.status_lead(c) == ("\u26a0\ufe0f VM infrastructure change flagged "
                                  "dangerous \u2014 see the VM section")
 
 
@@ -252,7 +253,7 @@ def test_the_lead_never_says_do_not_merge():
                  "or do  **not** [merge](x) it")
     lead = cr.status_lead(c)
     assert "do not merge" not in lead.lower(), lead
-    assert lead.startswith("\U0001f6a8 SHARED DATA"), lead
+    assert lead.startswith("\u26a0\ufe0f SHARED DATA"), lead
 
 
 # ── the order inside REVIEW: a cause leads its effect ────────────────────
@@ -363,7 +364,7 @@ def test_fuzz_status_lead_on_a_summary(verdict, bullet, before, after):
                                    after=after).replace("## \U0001f52d",
                                                         before + "##", 1))
     assert "do not merge" not in lead.lower(), lead
-    assert lead == "" or lead.startswith(("\U0001f6a8 ", "\u26a0\ufe0f ")), lead
+    assert lead == "" or lead.startswith("\u26a0\ufe0f "), lead
 
 
 @given(st.text(), st.text())

@@ -354,9 +354,10 @@ _REVIEW_RANK = {
     "\u23f8": 0, "\u25b6": 0,      # paused, auto-sync paused / resumed
     "\u2b07": 1,                   # chart downgrade
     "\U0001f6d1": 2,               # environment shutting down
+    "\U0001f512": 2,               # decommission or data purge armed
     "\U0001f4a5": 3,               # wide-reach config change
     "\U0001f500": 4,               # planned rename
-    "\U0001f5d1": 5,               # resources deleted
+    "\U0001f5d1": 5,               # resources deleted, env decommission
     "\U0001f9ca": 6,               # replicas scaled to zero
     "\U0001f39a": 7,               # ping-scaler activated
     "\U0001f5a5": 8,               # KCC resources unmanaged
@@ -397,6 +398,19 @@ def _fmt_env_list(apps, shown=8) -> str:
     """Environment names, the way operators say them (no -ms/-ss/-glb)."""
     envs = sorted(set(_envs_from_apps(sorted(apps))))
     return _fmt_service_list(envs, shown=shown)
+
+
+# COPS-2766: the icons follow the build colour (acme-config-dev #7372 was
+# green under a DO NOT MERGE). A green build shows no red mark in our lines.
+_RED_MARKS_RE = re.compile("\u26d4\ufe0f?|\U0001f6a8|\u274c")
+
+
+def build_marks(lines, green):
+    """On a green build, the lines with every \u26d4, \U0001f6a8 and \u274c
+    as \u26a0\ufe0f. Otherwise the lines as they are."""
+    if not (green and lines):
+        return lines
+    return [_RED_MARKS_RE.sub("\u26a0\ufe0f", l) for l in lines]
 
 
 # COPS-2766: merge gates. A gate fails the build until a Confirm-* line in a
@@ -458,7 +472,7 @@ def _build_merge_summary(results, rollup_by_sig, vm_change_lines,
                          decommission_lines, appspace_state_lines,
                          new_env_lines, new_env_structural,
                          paused_changing=None, paused_envs=None,
-                         block_headline=None, gates=None) -> list:
+                         block_headline=None, gates=None, green=False) -> list:
     """The verdict block that opens every comment.
 
     Reads the same deterministic facts the panels below use, so the
@@ -474,6 +488,9 @@ def _build_merge_summary(results, rollup_by_sig, vm_change_lines,
     gates (COPS-2766): the merge gates, first. An open one is why the build
     is red and names the line that lifts it. A lifted one stays as a review
     item, so the override is visible.
+
+    green (COPS-2766): the build is green. The verdict is then at most a
+    review and no line has a red mark. The findings are the same.
     """
     findings = []          # (severity, line)
     sev = _SEV_ROUTINE
@@ -533,6 +550,10 @@ def _build_merge_summary(results, rollup_by_sig, vm_change_lines,
         # a Sev1 of that shape; the ordinary purge wording would have read as
         # routine.
         shared_uc = _DECOM_SHARED_UC_HDR in txt
+        # COPS-2766: a teardown that is a merge gate is BLOCK. A correctly
+        # armed cascade, with or without purge, is a review: the build is
+        # green for it.
+        _sev = _SEV_BLOCK
         if shared_uc:
             _what = ("the user content bucket and DNS record are SHARED with a "
                      "surviving environment, which loses them too")
@@ -546,6 +567,7 @@ def _build_merge_summary(results, rollup_by_sig, vm_change_lines,
             _what = ("data purge is ARMED: buckets/datasets are destroyed, "
                      "not abandoned")
             _label = "Environment decommission"
+            _sev = _SEV_REVIEW
         elif orphan:
             # No cascade: the Applications go, every workload keeps running.
             # Still a BLOCK \u2014 leaving a fleet of unmanaged workloads behind is
@@ -557,7 +579,8 @@ def _build_merge_summary(results, rollup_by_sig, vm_change_lines,
         else:
             _what = "resources are deleted; data is abandoned, not purged"
             _label = "Environment decommission"
-        findings.append((_SEV_BLOCK,
+            _sev = _SEV_REVIEW
+        findings.append((_sev,
                          "\U0001f5d1\ufe0f **" + _label + "** \u2014 "
                          + _what))
         # COPS-2707: the orphan finding above says the cascade is not armed.
@@ -862,8 +885,9 @@ def _build_merge_summary(results, rollup_by_sig, vm_change_lines,
                              "never cascade-delete; workloads stay until "
                              "manual namespace/GCP cleanup (COPS-2700)"))
         elif "PURGE ARMED" in txt:
-            findings.append((_SEV_BLOCK,
-                             "\U0001f6a8 **Data purge ARMED** \u2014 the "
+            # COPS-2766: REVIEW, the build is green for an arming PR.
+            findings.append((_SEV_REVIEW,
+                             "\U0001f512 **Data purge ARMED** \u2014 the "
                              "cascade will permanently destroy the BigQuery "
                              "dataset and the user content bucket"))
         elif "DECOMMISSION ARMED" in txt and _DECOM_VM_STRIP_HDR not in txt:
@@ -872,7 +896,7 @@ def _build_merge_summary(results, rollup_by_sig, vm_change_lines,
             # Read live on PR #7113, the summary told one event four ways;
             # the generic line adds nothing next to the specific one, so it
             # stands down and the story is told once.
-            findings.append((_SEV_BLOCK,
+            findings.append((_SEV_REVIEW,
                              "\U0001f512 **Decommission ARMED** \u2014 this "
                              "environment becomes eligible for cascade "
                              "deletion when its folder is removed"))
@@ -1012,6 +1036,8 @@ def _build_merge_summary(results, rollup_by_sig, vm_change_lines,
              "\u2705 No manifest changes and no risky configuration change")))
 
     sev = max(s for s, _ in findings)
+    if green:
+        sev = min(sev, _SEV_REVIEW)
     n_check = sum(1 for s, _ in findings if s >= _SEV_REVIEW)
     verdict = _VERDICTS[sev]
     if sev >= _SEV_REVIEW:
@@ -1019,15 +1045,16 @@ def _build_merge_summary(results, rollup_by_sig, vm_change_lines,
     order = {_SEV_BLOCK: 0, _SEV_REVIEW: 1, _SEV_ROUTINE: 2}
     findings.sort(key=lambda f: (order[f[0]], _REVIEW_RANK.get(f[1][:1], 10)
                                  if f[0] == _SEV_REVIEW else 0))
-    return [MERGE_SUMMARY_HDR, "", verdict, ""] + \
-           [f"- {line}" for _s, line in findings] + [""]
+    return build_marks([MERGE_SUMMARY_HDR, "", verdict, ""] +
+                       [f"- {line}" for _s, line in findings] + [""], green)
 
 
 # COPS-2766: a green build status leads with the top finding of the merge
 # summary. The Builds panel on the PR page shows the status: #4684 was
 # approved seconds after a green "129 resource(s) will change".
-# The build is green, so the marker never says DO NOT MERGE.
-_STATUS_MARKS = {"\u26d4": "\U0001f6a8", "\u26a0": "\u26a0\ufe0f"}
+# The build is green, so the marker never says DO NOT MERGE, and it is
+# never red (the icon rule). The stop sign is for comments before 2.122.0.
+_STATUS_MARKS = {"\u26d4": "\u26a0\ufe0f", "\u26a0": "\u26a0\ufe0f"}
 
 
 def status_lead(comment_md) -> str:
@@ -1050,7 +1077,7 @@ def status_lead(comment_md) -> str:
     emoji, _, after = text.partition(" ")
     if not re.search(r"[A-Za-z0-9]", emoji):
         text = after.strip()
-    text = re.sub(r"(?i)do\s+not\s+merge", "review", text)
+    text = re.sub(r"(?i)do\s+not\s+merge", "review", build_marks([text], True)[0])
     return f"{mark} {text}" if mark and text else ""
 
 

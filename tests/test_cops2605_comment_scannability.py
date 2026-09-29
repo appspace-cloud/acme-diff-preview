@@ -617,7 +617,8 @@ def test_merge_summary_names_the_environments_jumping_version():
 
 def test_merge_summary_surfaces_a_quiet_decommission_arming():
     """PR #3892 shape: a config-only change that arms destruction and
-    rendered a 571-byte all-green comment."""
+    rendered a 571-byte all-green comment. COPS-2766: the build is green,
+    so the verdict is a review, not DO NOT MERGE (the icon rule)."""
     results = {"pv-adaptive-b-ms": _result(outcome=m.OUT_NO_DIFF)}
     body = m.format_comment(
         PR_SHA, results, base_sha=BASE_SHA,
@@ -625,7 +626,7 @@ def test_merge_summary_surfaces_a_quiet_decommission_arming():
                          "- \U0001f6a8 `pv-adaptive-b` \u00b7 **defaults**: "
                          "**added** `defaults.allowDeletion` = `True`", ""])
     head = _merge_summary_of(body)
-    assert "DO NOT MERGE" in head
+    assert "Review before merging" in head and "DO NOT MERGE" not in head
     assert "VM" in head
     assert "No manifest changes" not in head
 
@@ -792,14 +793,15 @@ def test_merge_summary_never_contradicts_an_armed_state_panel():
     "DECOMMISSION ARMED" while the summary said "Routine - nothing
     dangerous detected" and the footer said "No manifest changes". Arming
     destruction is config-only, so it never reaches the manifest diff --
-    the summary has to read the state panel."""
+    the summary has to read the state panel. COPS-2766: a review, as the
+    build is green for it."""
     results = {"pv-qa-13-a-ms": _result(outcome=m.OUT_NO_DIFF)}
     armed = m.format_comment(
         PR_SHA, results, base_sha=BASE_SHA,
         appspace_state_lines=["## \U0001f512\u26a0\ufe0f DECOMMISSION ARMED "
                               "for `pv-qa-13-a` \u26a0\ufe0f\U0001f512", ""])
     head = _merge_summary_of(armed)
-    assert "DO NOT MERGE" in head
+    assert "Review before merging" in head
     assert "Decommission ARMED" in head
     assert "nothing dangerous detected" not in head
 
@@ -808,7 +810,7 @@ def test_merge_summary_never_contradicts_an_armed_state_panel():
         appspace_state_lines=["## \U0001f6a8 PURGE ARMED for "
                               "already-decommissioned `pv-x` \U0001f6a8", ""])
     head_p = _merge_summary_of(purge)
-    assert "DO NOT MERGE" in head_p
+    assert "Review before merging" in head_p
     assert "purge" in head_p.lower()
 
 

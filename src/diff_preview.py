@@ -163,6 +163,7 @@ from comment_render import (  # comment rendering (same-dir module, stdlib only)
     _VERDICTS,
     _fmt_env_list,
     _build_merge_summary,
+    build_marks,
     status_lead,
     join_status_lead,
     gate_text,
@@ -10857,6 +10858,9 @@ def format_comment(pr_sha, app_results, skipped_apps=None, base_sha="",
     _status_token = _comment_status_token(
         results, new_env_structural, skipped_apps, _arming_broken,
         _flag_typo_block, _kcc_nil_block, gates)
+    # COPS-2766: the icons follow the build colour. The panels are built
+    # and read raw, only what this comment shows changes.
+    _green = _status_token == "clean"
 
     # ── Merge summary ────────────────────────────────────────────────
     # The verdict, before any detail: an operator decides here whether
@@ -10865,7 +10869,7 @@ def format_comment(pr_sha, app_results, skipped_apps=None, base_sha="",
         results, rollup_by_sig, vm_change_lines, decommission_lines,
         appspace_state_lines, new_env_lines, new_env_structural,
         _paused_changing, _paused_envs, block_headline=block_headline or None,
-        gates=gates)
+        gates=gates, green=_green)
     lines += ["---", ""]
 
     # COPS-2676: permanent render failures go FIRST after the verdict on the
@@ -10883,7 +10887,7 @@ def format_comment(pr_sha, app_results, skipped_apps=None, base_sha="",
     # for the whole environment while nothing else in the comment would
     # otherwise say so.
     if appspace_state_lines:
-        lines += appspace_state_lines
+        lines += build_marks(appspace_state_lines, _green)
 
     # ── Input root-cause panel (v2.6.2) ──────────────────────────────
     # WHAT the PR edits at the values level, before any symptom below —
@@ -10898,7 +10902,7 @@ def format_comment(pr_sha, app_results, skipped_apps=None, base_sha="",
     # Most critical/destructive possible finding — shown before even the
     # downgrade warning.
     if decommission_lines:
-        lines += decommission_lines
+        lines += build_marks(decommission_lines, _green)
 
     # COPR-32434: leftover Argo apps from a PRIOR decommission. Informational
     # (does not blame this PR), but visible so someone finishes the prune.
@@ -10912,7 +10916,7 @@ def format_comment(pr_sha, app_results, skipped_apps=None, base_sha="",
     # the reviewers reading these comments daily asked for it to be
     # impossible to miss.
     if vm_change_lines:
-        lines += vm_change_lines
+        lines += build_marks(vm_change_lines, _green)
 
     # ── Chart downgrade warning (v2.5.8) ─────────────────────────────
     # A chart version going DOWN is legal but dangerous (schema regressions,

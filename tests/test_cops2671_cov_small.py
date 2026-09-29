@@ -172,7 +172,8 @@ def test_an_all_provision_vm_panel_gets_the_counted_headline():
     assert "flagged dangerous" not in out, (
         "every dangerous bullet is a provision, so the generic danger flag "
         "must not also fire:\n" + out)
-    assert "DO NOT MERGE" in out, "a new machine in GCP is still a blocker"
+    # COPS-2766: the build is green for it, so the icons are too.
+    assert "Review before merging" in out and "\U0001f6a8" not in out, out
 
 
 def test_one_non_provision_danger_keeps_the_generic_wording():

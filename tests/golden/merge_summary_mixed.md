@@ -4,7 +4,7 @@
 
 ## ℹ️ Merge summary
 
-⛔ **DO NOT MERGE** without checking the item(s) below (2 item(s))
+⚠️ **Review before merging** (2 item(s))
 
 - 🖥️ **VM infrastructure change flagged dangerous** — see the VM section
 - 🗑️ **1 resource(s) deleted** in 1 environment(s) (1 Service): pv-zzz-risky
@@ -16,7 +16,7 @@
 
 **This PR touches virtual machine infrastructure (KCC linux-services). A botched VM change is slow and painful to recover from — verify every line below before merging.**
 
-- 🚨 `pv-vm-a` · `ComputeInstance pv-acme-svc-a`: `machineType` `n2d-standard-4` → `n2d-standard-8` — machineType changes while the VM is not parked TERMINATED — the runbook requires stopping the VM first
+- ⚠️ `pv-vm-a` · `ComputeInstance pv-acme-svc-a`: `machineType` `n2d-standard-4` → `n2d-standard-8` — machineType changes while the VM is not parked TERMINATED — the runbook requires stopping the VM first
 
 ## 🗑️⚠️ 1 RESOURCE(S) DELETED ⚠️
 
