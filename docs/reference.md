@@ -66,6 +66,7 @@ and QA apps when CI publishes a new chart, so they pick it up past the OCI cache
 | ⛔ NEW ENVIRONMENT NAME ALREADY IN USE / ⛔ CLONE ASHN ALREADY IN USE / ⛔ NO APPLICATIONSET READS THIS FOLDER | A new environment takes the app names of another environment, a clone has the ashn of another environment, or no ApplicationSet reads the folder of a new or moved environment. An n4 or c4 machine with a pd- disk is a ⛔ line under a new environment, or a dangerous bullet in the VM panel for a live one. Each one fails the build and nothing lifts it: the fix is a config change (COPS-2766, [Merge-blocking guards](#merge-blocking-guards)). |
 | ⚠️ **Check:** (under a new environment) | A warning about a new environment, never a block (COPS-2766). The build stays green, the merge summary counts the checks in one ⚠️ line, and the green status leads with the first one. A check says that the new environment has the `customerName` of a live one, so both manage the same BigQuery dataset, bucket or DNS record (acme-config-prod #4333); that a new VM adopts a boot disk it does not have yet (`createNewBootDisk` is not true); or that it renders no Linux VM. It also says when a check could not run: values that cannot be parsed, a live environment that cannot be read, an `aws/` folder (the legacy pipeline deploys it, not ArgoCD), or ApplicationSets that cannot be listed. |
 | 💤 Edits with no effect | The PR adds or changes keys in a live environment's `customer.yaml`, and every app of that file renders the same. Helm ignores a key that no chart reads, with no error, so the PR looks done: acme-config-prod #4463 added `autosync: true`, and #4554 wrote env vars under `microservices.library` (COPS-2766). The panel names the env and its keys, at most 5 keys for each env and 10 envs, then a count. It adds a hint for `autosync: true` (only `false` pauses), for a `replicas` key (it does nothing while an HPA or the ping-scaler runs the service) and for a `helm*` key (only the legacy pipeline reads it). Left out: versions, `appspace.infra.*`, the teardown flags, `customerName`, `suffix`, a removed key, a pause or a resume (the auto-sync panel shows those) and the keys the higher-layer note already names. In the merge summary it is a ⚠️ review line, after the other review lines and before the higher-layer note. The build stays green, and the green status leads with it. |
+| 🔌 noCore changes | The effective `appspace.infra.noCore` of a live environment changes, by a cohort or `customer.yaml` edit or by a move. It is read like Helm reads it: the `config.yaml` files above the environment, root first, then its `customer.yaml`, `main` against the PR. On GCP the URL map default moves between the Windows Core VM and `<env>-bs-agw` and about 109 Deployments restart; on Azure nginx-frontend stops or starts proxying to the Core VM. Turning it on: keep the Core VM running until each `-glb` app is Synced with `<env>-bs-agw` as the default backend, 30 to 100 minutes (COPS-2758, acme-config-prod #4684). Turning it off deletes `bs-pcs` and `hc-pcs`: check first that the Core VM runs (#4667). A ⚠️ review item, and the build stays green. The one exception is a move that turns it off only because the moved `customer.yaml` does not set it, see [Merge-blocking guards](#merge-blocking-guards). A value file that is not valid YAML gives `noCore check unavailable`, also a review item. |
 
 The one rule the tool never breaks: **a failure is never reported as "no changes".**
 If a diff could not be computed, the status says so and the PR is not marked clean.
@@ -340,6 +341,7 @@ red status give the exact line to add.
 | **Clone ashn already in use** | an AEC clone `customer.yaml` whose own `appspace.ashn` is new or changed, and is the ashn of an environment with another `customerName` | the clone and that environment look like one environment in Customers and PDNS (acme-config-prod #4042) ([details](internals.md#why-a-copied-clone-ashn-is-blocked)) | none |
 | **n4 or c4 machine with a pd- disk** | a GCP private-cloud VM (KCC) on the `n4`, `n4a`, `n4d`, `c4`, `c4a` or `c4d` family with a `pd-` data disk, or a `pd-` boot disk when `createNewBootDisk` is true, on a new environment or a new VM; or a running VM that moves into these families, unless its data disk and a boot disk KCC created are already Hyperdisk on `main`. An error already on `main` does not count. For a live environment, only a change to its own `customer.yaml` is checked, not a change to a `config.yaml` above it. A per-instance `machineType` in the mongo or rabbit `instances` list is not read | these families take only Hyperdisk, so GCP rejects the VM and KCC never creates it (acme-config-prod #4482 and #4331). A running VM keeps its disks, because a disk type cannot change in place | none |
 | **No ApplicationSet reads the folder** | a new environment, or a live one that moves, whose identity file matches no git files glob of the ApplicationSets on the hub | ArgoCD makes no apps for it, so nothing deploys on merge ([details](internals.md#why-a-new-env-needs-an-applicationset-glob)) | none |
+| **noCore lost on a move** | a move of a live environment after which `appspace.infra.noCore` is off only because the moved `customer.yaml` does not set it (acme-config-prod #4667) | the URL map goes back to the Windows Core VM and the noCore backends are deleted, a 5 h outage on #4667 | none: set `appspace.infra.noCore` in the moved `customer.yaml` (`true` or `false`) ([details](internals.md#why-a-move-that-turns-nocore-off-is-blocked)) |
 
 **The red status names the failure, not its category** (COPS-2709). Bitbucket
 shows the description and nothing else, so it is the whole message for anyone
@@ -400,12 +402,12 @@ stuck or missing status writes the same lead. Its tail is rebuilt from the
 comment and is shorter: no decommission or leftover count, and no
 higher-layer wording. FAILED descriptions do not change.
 
-**Known gap: noCore turning off.** Turning noCore off deletes `bs-pcs` and
-`hc-pcs` (acme-config-prod #4667, a 5 h outage). The ⛔ deletion verdict was
-the only stop sign for that shape, and now its ⚠️ line reads like a routine
-backend cleanup. A FAILED status when noCore goes from true to false is
-planned (COPS-2766 block 5). Until it ships, check a PR that deletes `*-pcs`
-backends by hand.
+**noCore turning off.** Turning noCore off deletes `bs-pcs` and `hc-pcs`
+(acme-config-prod #4667, a 5 h outage). A move that turns noCore off only
+because the new folder does not set it now fails the build (COPS-2766 block
+5). The fix is to set `appspace.infra.noCore` in the moved `customer.yaml`;
+there is no trailer. Every other noCore change, on or off, is a ⚠️ review
+item with the Core VM rule, and the build stays green.
 
 **Known gap: a value file Bitbucket always refuses.** When a value file
 cannot be read (any failure that is not a plain 404), the build is FAILED with

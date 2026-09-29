@@ -181,6 +181,8 @@ from comment_render import (  # comment rendering (same-dir module, stdlib only)
     _DECOM_PUBLIC_CLOUD_NOOP_HDR,
     _DECOM_PUBLIC_CLOUD_WHY,
     _BLAST_RADIUS_HDR,
+    _NOCORE_FLIP_HDR,
+    _NOCORE_UNKNOWN,
     _VALUES_REDUNDANCY_HDR,
     _INERT_EDIT_HDR,
     _IDENTITY_MIGRATION_HDR,
@@ -8536,6 +8538,184 @@ def _effective_chart_version(ordered_value_files: list, vals: dict):
     return version
 
 
+# COPS-2766: noCore per env, base against PR (COPS-2758). #4565 turned it on
+# in 57 envs with a silent comment, #4667 (a move) turned it off for 5 h.
+_NOCORE_KEY = "appspace.infra.noCore"
+
+
+def _effective_key(identity_file, sha, key, repo=None):
+    """(value, file, state) of `key` for the env of `identity_file` at `sha`.
+
+    COPS-2766. The ancestor config.yaml chain, root first, then the identity
+    file, last wins: the same files as _merged_kcc_flat_for_env, in helm -f
+    order. value is None when no file sets the key or the last one sets null
+    (Helm drops a null key); file is the one that decided it. A first
+    document that is not a map (a comment-only cohort) reads as empty. state
+    is "ok", "absent" (no identity file, and nothing else is read) or
+    "unparsable". A failed read raises ValueFileUnreadable, so the PR is
+    retried and never reads as "no change".
+    """
+    own, state = _read_first_doc(identity_file, sha, repo, True)
+    if state != "ok":
+        return None, None, state
+    chain, probe = [], identity_file.rsplit("/", 1)[0]
+    while "/" in probe:
+        probe = probe.rsplit("/", 1)[0]
+        chain.insert(0, f"{probe}/config.yaml")
+    docs = []
+    for path in chain:
+        doc, st = _read_first_doc(path, sha, repo, True)
+        if st == "unparsable":
+            return None, None, st
+        docs.append((path, doc))
+    value = src = None
+    for path, doc in docs + [(identity_file, own)]:
+        flat = _flatten_yaml(doc)
+        if key in flat:
+            value, src = flat[key], path
+    return value, src, "ok"
+
+
+def _key_changes(changed, renames, path_map, sha, base_sha, key, default=False,
+                 repo=None) -> list:
+    """COPS-2766: the live envs whose effective `key` (_effective_key) differs
+    between base_sha and sha, as {env, path, moved_from, key, old, new,
+    pinned, src, value}.
+
+    Generic, so another boolean key can use it. A move compares its old path
+    on base with its new path on sha. A changed customer.yaml, or a changed
+    config.yaml for the live envs below it, counts only when the key differs
+    in that file, so a PR that does not touch the key and moves nothing costs
+    two cached reads per file. old and new are booleans (`default` when
+    unset), None when a value file cannot be parsed. pinned: the env's own
+    file at sha sets a non-null value. src and value: the file that decided
+    the new value, and that raw value. A new env and a teardown are skipped,
+    other panels own them.
+    """
+    if not base_sha:
+        return []
+    renames = renames or {}
+    targets = set(renames.values())
+    pairs = {o: n for o, n in renames.items()
+             if o.endswith("/customer.yaml") and path_map.get(o)}
+    for f in {posixpath.normpath(f.lstrip("/")) for f in changed or ()}:
+        name = posixpath.basename(f)
+        if name not in _IDENTITY_BASENAMES or f in renames or f in targets:
+            continue
+        old_doc, old_st = _read_first_doc(f, base_sha, repo, True)
+        new_doc, new_st = _read_first_doc(f, sha, repo, True)
+        if "unparsable" not in (old_st, new_st) and repr(
+                _flatten_yaml(old_doc).get(key)) == repr(_flatten_yaml(new_doc).get(key)):
+            continue
+        folder = posixpath.dirname(f) + "/"
+        kids = [f] if name == "customer.yaml" else [
+            p for p in path_map if p.startswith(folder) and p.endswith("/customer.yaml")]
+        pairs.update({p: p for p in kids if path_map.get(p) and p not in renames})
+    out = []
+    for old_path, new_path in sorted(pairs.items()):
+        nv, src, nst = _effective_key(new_path, sha, key, repo)
+        if nst == "absent":
+            continue  # a teardown
+        ov, _src, ost = _effective_key(old_path, base_sha, key, repo)
+        if ost == "absent":
+            continue  # not on main yet
+        old, new = (None if st != "ok" else default if v is None else str(v).lower() == "true"
+                    for v, st in ((ov, ost), (nv, nst)))
+        if old == new and old is not None:
+            continue
+        own = _flatten_yaml(_read_first_doc(new_path, sha, repo, True)[0]).get(key)
+        out.append({"env": _envs_from_apps(path_map.get(old_path))[0], "path": new_path,
+                    "moved_from": old_path if old_path != new_path else None, "key": key,
+                    "old": old, "new": new, "pinned": own is not None,
+                    "src": src, "value": nv})
+    return out
+
+
+def _nocore_lost(c) -> bool:
+    """A move after which noCore is off only because the moved customer.yaml
+    does not set it (#4667)."""
+    return (c["key"] == _NOCORE_KEY and bool(c["moved_from"]) and c["old"] is True
+            and c["new"] is False and not c["pinned"])
+
+
+def _nocore_gates(changes) -> list:
+    """COPS-2766: the nocore_lost merge gates of _key_changes. No trailer:
+    setting the key in the moved customer.yaml lifts it."""
+    return [{"kind": "nocore_lost", "env": c["env"], "arg": c["env"], "lifted": False}
+            for c in changes or () if _nocore_lost(c)]
+
+
+# What a flip does, by (new value, cloud). Azure has no URL map: noCore moves
+# the nginx-frontend upstream.
+_NOCORE_TEXT = {
+    (True, "gcp"): (
+        "noCore is more than a load balancer flag. The URL map default moves "
+        "from the Windows Core VM to `<env>-bs-agw`, about 109 Deployments "
+        "restart, and the v1 API moves to v3. Keep the Core VM running until "
+        "each `-glb` app is Synced with `<env>-bs-agw` as the default backend. "
+        "This takes 30 to 100 minutes (COPS-2758). A Core VM stopped earlier "
+        "gives 502 (acme-config-prod #4684)."),
+    (False, "gcp"): (
+        "The URL map default goes back to the Windows Core VM, and the noCore "
+        "backends (`bs-pcs`, `hc-pcs`) are deleted. Before you merge, check "
+        "that the Core VM runs and its NEG is healthy. If not, every request "
+        "gets 502 (acme-config-prod #4667)."),
+    (True, "azure"): (
+        "On Azure, nginx-frontend stops proxying to the Windows Core VM. Keep "
+        "the Core VM running until every app is Synced (COPS-2758)."),
+    (False, "azure"): (
+        "On Azure, nginx-frontend proxies to the Windows Core VM again. Before "
+        "you merge, check that the Core VM runs. If not, the requests it "
+        "serves get 502."),
+}
+
+
+def _nocore_names(changes, cap=10) -> str:
+    """'`pv-a`, `pv-b` (moved from `<old cohort>`) (+N more)', by env name."""
+    names = [f"`{c['env']}`" + (
+        f" (moved from `{posixpath.dirname(posixpath.dirname(c['moved_from']))}`)"
+        if c["moved_from"] else "") for c in sorted(changes, key=lambda c: c["env"])]
+    return ", ".join(names[:cap]) + (f" (+{len(names) - cap} more)" if len(names) > cap else "")
+
+
+def _nocore_flip_lines(changes) -> list:
+    """COPS-2766: the noCore panel for _key_changes on _NOCORE_KEY, None when
+    the check crashed. Shares the appspace_state_lines channel, and the merge
+    summary reads the counts of its header."""
+    if changes is None:
+        return [f"\u26a0\ufe0f {_NOCORE_UNKNOWN} for this PR (see the service log).", ""]
+    known = [c for c in changes if c["old"] is not None and c["new"] is not None]
+    unknown = [c for c in changes if c["old"] is None or c["new"] is None]
+    lines = []
+    if known:
+        on = sum(1 for c in known if c["new"])
+        lines += [f"### \U0001f50c noCore changes in {len(known)} environment(s): "
+                  f"on in {on}, off in {len(known) - on}", ""]
+    for new in (True, False):
+        for cloud in ("gcp", "azure"):
+            group = [c for c in known if c["new"] is new
+                     and c["path"].startswith("azure/") == (cloud == "azure")]
+            if group:
+                lines += [f"\u26a0\ufe0f {_NOCORE_FLIP_HDR} `{_NOCORE_KEY}` goes from "
+                          f"`{str(not new).lower()}` to `{str(new).lower()}` in "
+                          f"{len(group)} environment(s): {_nocore_names(group)}. "
+                          f"{_NOCORE_TEXT[new, cloud]}", ""]
+    for c in (c for c in changes if _nocore_lost(c)):
+        shown = "null" if c["value"] is None else str(c["value"]).lower()
+        why = ("only because the new folder does not set it" if c["src"] is None
+               else f"because `{c['src']}` sets it to `{shown}`")
+        lines += [f"\u26d4 `{posixpath.dirname(c['moved_from'])}` moves to "
+                  f"`{posixpath.dirname(c['path'])}`, and noCore turns off {why}. "
+                  f"Set `{_NOCORE_KEY}` in the moved `customer.yaml`: `true` to keep "
+                  f"noCore, or `false` if Core must come back. The build fails until "
+                  f"the file sets it.", ""]
+    if unknown:
+        whose = "its" if len(unknown) == 1 else "their"
+        lines += [f"\u26a0\ufe0f {_NOCORE_UNKNOWN} for {_nocore_names(unknown)}: one of "
+                  f"{whose} value files is not valid YAML.", ""]
+    return lines
+
+
 
 
 def _run_one_diff(app, pr_sha, main_sha, chart_revision=None, changed_paths=None, renames=None):
@@ -13580,6 +13760,17 @@ def process_pr(pr, path_map, base_sha="", repo=None):
             logsink.log(f"    [comment] blast-radius panel failed: {e}", "WARNING")
         redundant = []
         try:
+            # COPS-2766: noCore per env, base against PR (COPS-2758). Same
+            # channel; its nocore_lost gate joins the gates below.
+            nocore_changes = _key_changes(changed, renames, path_map, render_sha,
+                                          base_sha, _NOCORE_KEY, repo=repo)
+        except Exception as e:
+            if _is_transient_exception(e):
+                raise  # a failed read retries the PR, never "no flip"
+            logsink.log(f"    [comment] noCore check failed: {e}", "WARNING")
+            nocore_changes = None
+        appspace_state_lines += _nocore_flip_lines(nocore_changes)
+        try:
             # COPS-2721: same channel — REVIEW verdict when customer.yaml
             # re-states values a parent config.yaml already sets.
             redundant = _values_redundancy_findings(
@@ -13610,7 +13801,7 @@ def process_pr(pr, path_map, base_sha="", repo=None):
         gates = _merge_gates(decommission_candidates, renames, path_map,
                              vm_change_lines, app_results,
                              clone_gates + dup_gates + ashn_gates + disk_gates + appset_gates
-                             + legacy_gates)
+                             + legacy_gates + _nocore_gates(nocore_changes))
         _lift_gates(gates, repo, pr_id, base_sha, pr_sha)
         appspace_state_lines = (_clone_wake_lines(gates) + _dup_identity_lines(gates, dup_unchecked)
                                 + _ashn_copy_lines(gates, ashn_notes)

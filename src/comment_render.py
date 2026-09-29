@@ -232,6 +232,12 @@ _DECOM_SHARED_UC_HDR = "**SHARED USER CONTENT - DO NOT MERGE WITHOUT CHECKING.**
 # via diff_preview), matched here for the REVIEW verdict line. Same one-constant
 # wiring as the headers above.
 _BLAST_RADIUS_HDR = "**Blast radius.**"
+# COPS-2766: the noCore panel (COPS-2758), written in diff_preview and
+# matched here. The counts come from its header line.
+_NOCORE_FLIP_HDR = "**noCore changes.**"
+_NOCORE_COUNTS_RE = re.compile(
+    r"noCore changes in (\d+) environment\(s\): on in (\d+), off in (\d+)")
+_NOCORE_UNKNOWN = "noCore check unavailable"
 # COPS-2721: written by values_redundancy.render_lines via diff_preview,
 # matched here for the REVIEW verdict line. Same one-constant wiring as
 # blast radius: a quiet render caused by copying parent values into
@@ -358,6 +364,7 @@ _DATA_KINDS = frozenset({
 _REVIEW_RANK = {
     "\u23f8": 0, "\u25b6": 0,      # paused, auto-sync paused / resumed
     "\u2b07": 1,                   # chart downgrade
+    "\U0001f50c": 1,               # noCore changes, before the bs-pcs deletions
     "\U0001f6d1": 2,               # environment shutting down
     "\U0001f512": 2,               # decommission or data purge armed
     "\U0001f4a5": 3,               # wide-reach config change
@@ -458,6 +465,8 @@ GATES = {
                     "blocked", "Check the cloud, tier and spoke folders"),
     "legacy_helm": ("The legacy Helm writer is switched back on", "Confirm-LegacyHelm",
                     "blocked", ""),
+    "nocore_lost": ("A move turns noCore off", None, "blocked",
+                    "Set appspace.infra.noCore in the moved customer.yaml"),
 }
 
 
@@ -989,6 +998,18 @@ def _build_merge_summary(results, rollup_by_sig, vm_change_lines,
                              + _reach +
                              "; changes to shared config bypass cohort "
                              "staging (see the blast-radius note)"))
+        # COPS-2766: a noCore flip is REVIEW. The one error, a move that turns
+        # it off, is the nocore_lost gate above.
+        nc = _NOCORE_COUNTS_RE.search(txt)
+        if nc:
+            findings.append((_SEV_REVIEW,
+                             f"\U0001f50c **noCore changes in {nc.group(1)} "
+                             f"environment(s)**: on in {nc.group(2)}, off in "
+                             f"{nc.group(3)} (read the noCore note, COPS-2758)"))
+        if _NOCORE_UNKNOWN in txt:
+            findings.append((_SEV_REVIEW,
+                             f"\U0001f50c **{_NOCORE_UNKNOWN}** for part of this "
+                             f"PR (see the noCore note)"))
         if _IDENTITY_MIGRATION_HDR in txt:
             findings.append((_SEV_REVIEW,
                              "\U0001f500 **Planned rename of a live environment** "
