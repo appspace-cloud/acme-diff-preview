@@ -7405,17 +7405,40 @@ def _evaluate_env_decommissions(candidates: list, pr_sha: str, main_sha: str,
     return lines, envs_reported, full_lines
 
 
-def _merge_gates(decommission_candidates) -> list:
+def _merge_gates(decommission_candidates, renames=None, path_map=None) -> list:
     """COPS-2766: the merge gates of this PR, one per kind and env, none lifted.
 
     From the teardowns _evaluate_env_decommissions confirmed. Arming the flag
     on cl-* deletes nothing, so that panel stays a warning; its folder
-    removal is the `public` gate.
+    removal is the `public` gate. A live cl-*/config.yaml renamed or moved
+    renames every Application of the constellation: `cl_rename`, lifted by
+    `Confirm-Rename: <old dir> -> <new dir>`.
     """
+    found = [g for c in decommission_candidates or () for g in c.get("gates", ())]
+    found += [{"kind": "cl_rename", "env": _CL_ENV_RE.match(old)[1],
+               "arg": f"{posixpath.dirname(old)} -> {posixpath.dirname(new)}"}
+              for old, new in (renames or {}).items()
+              if _CL_ENV_RE.match(old) and (path_map or {}).get(old)]
     gates = {}
-    for g in (g for c in decommission_candidates or () for g in c.get("gates", ())):
+    for g in found:
         gates.setdefault((g["kind"], g["env"]), {"arg": g["env"], **g, "lifted": False})
     return list(gates.values())
+
+
+def _rebuild_hint_lines(candidates) -> list:
+    """COPS-2766: a live env removed while the PR adds another one looks like a
+    rebuild, or a rename done with no git mv. Its orphan or public gate blocks
+    the build already; this line says the ways out, one per env. The flag arms
+    nothing on cl-*, so there it only points at git mv."""
+    kinds = {}
+    for c in candidates:
+        for g in c.get("gates", ()):
+            if g["kind"] in ("orphan", "public"):
+                kinds.setdefault(c["env_name"], g["kind"])
+    return [line for env, kind in kinds.items() for line in (
+        f"\U0001f4a1 Looks like a rebuild or rename of `{env}`: "
+        + ("arm decommission on the old env, or " if kind == "orphan" else "")
+        + "use `git mv` with `Confirm-Rename`.", "")]
 
 
 def _apps_to_skip_for_decommission(candidates: list, confirmed_envs: list) -> set:
@@ -11976,6 +11999,8 @@ def process_pr(pr, path_map, base_sha="", repo=None):
             if decommissioned_envs:
                 logsink.log(f"PR #{pr_id}: environment decommission detected: "
                             f"{decommissioned_envs}", "WARNING", pr=pr_id)
+            if new_env_candidates:
+                decommission_lines += _rebuild_hint_lines(decommission_candidates)
 
         if not affected:
             # No existing ArgoCD app matched the changed files.
@@ -12489,7 +12514,7 @@ def process_pr(pr, path_map, base_sha="", repo=None):
         # COPS-2766: merge gates. The commits are read only when a gate can be
         # lifted, so a PR with none never pays for it. PrCommitsUnreadable goes
         # to the catch-all below: a retry, never a lift.
-        gates = _merge_gates(decommission_candidates)
+        gates = _merge_gates(decommission_candidates, renames, path_map)
         if any(gate_trailer(g) for g in gates):
             confirmed = _confirmations(_pr_commit_messages(repo, pr_id, base_sha, pr_sha))
             for g in gates:
