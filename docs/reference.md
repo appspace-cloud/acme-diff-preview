@@ -349,6 +349,13 @@ stuck or missing status writes the same lead. Its tail is rebuilt from the
 comment and is shorter: no decommission or leftover count, and no
 higher-layer wording. FAILED descriptions do not change.
 
+**Known gap: noCore turning off.** Turning noCore off deletes `bs-pcs` and
+`hc-pcs` (acme-config-prod #4667, a 5 h outage). The ⛔ deletion verdict was
+the only stop sign for that shape, and now its ⚠️ line reads like a routine
+backend cleanup. A FAILED status when noCore goes from true to false is
+planned (COPS-2766 block 5). Until it ships, check a PR that deletes `*-pcs`
+backends by hand.
+
 See [docs/internals.md](internals.md) for the reasoning behind each guard,
 how mass version bumps are handled, the secret-leak hardening, and the
 full-diff web UI.
