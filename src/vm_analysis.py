@@ -739,11 +739,14 @@ _BOOT_DISK_REASON = (
     "bootDisk is fixed when the VM is created: KCC rejects any change to it, "
     "so the whole ComputeInstance fails to apply and the sync stays failed. "
     "Keep the old value, or rebuild the VM on purpose")
+# The panel is about VMs, so a data reason says first that it is about data.
 _DATA_LOCATION_REASON = (
-    "location is immutable: KCC rejects the change and the sync fails. The "
-    "data stays where it is, a move needs a new dataset or bucket and a copy")
-_DATA_PROJECT_REASON = ("the project changes: KCC rejects the change and the "
-                        "sync fails. The data stays in the old project")
+    "data location is immutable: KCC rejects the change and the sync fails. "
+    "The data stays where it is, a move needs a new dataset or bucket and a "
+    "copy")
+_DATA_PROJECT_REASON = ("the project of the data changes: KCC rejects the "
+                        "change and the sync fails. The data stays in the "
+                        "old project")
 _DATA_PROJECT_NOTE = ("the project is now set explicitly: check it is the "
                       "project where the data already is")
 

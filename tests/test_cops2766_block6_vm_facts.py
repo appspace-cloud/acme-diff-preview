@@ -231,6 +231,13 @@ def test_4517_a_bigquery_location_move_is_dangerous():
     assert f["dangerous"] == [vma._DATA_LOCATION_REASON]
 
 
+def test_the_data_reasons_say_first_that_they_are_about_data():
+    """They render under the VM panel header, so the first words place them."""
+    assert vma._DATA_LOCATION_REASON.startswith("data location is immutable: ")
+    assert vma._DATA_PROJECT_REASON.startswith(
+        "the project of the data changes: ")
+
+
 def test_a_location_case_change_is_not_a_move():
     assert _facts(SB_KEY, _bucket(location="US-CENTRAL1"),
                   _bucket(location="us-central1")) == []
