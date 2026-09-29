@@ -9344,13 +9344,16 @@ def _clean_status_description(has_redundancy: bool,
     return values_redundancy.noop_status_hint(has_redundancy, has_input_changes)
 
 
-def _flag_typo_status_description(lines) -> str:
+def _flag_typo_status_description(lines, removal=False) -> str:
     """The Bitbucket build-status line for a misspelled teardown flag.
 
     Names the key and the rename, because the checks list is where a
     reviewer who never opens the comment makes their decision. Falls back to
     the generic sentence if the pairing cannot be read back, so a parse miss
     degrades to a vaguer FAILED rather than to no failure at all.
+
+    removal (COPS-2766): the typo is in a file this PR deletes, read from
+    main, so no push to this PR fixes it. The fix goes to main first.
     """
     pairs = _teardown_flag_typo_pairs(lines)
     if not pairs:
@@ -9360,6 +9363,10 @@ def _flag_typo_status_description(lines) -> str:
                 "(see PR comment)")
     wrong, right = pairs[0]
     extra = f" (+{len(pairs) - 1} more)" if len(pairs) > 1 else ""
+    if removal:
+        return (f"Teardown flag misspelled on main: {wrong} arms nothing{extra} - "
+                f"fix it to {right} on main in a separate PR, let it sync, then "
+                f"rebase this removal")
     return (f"Teardown flag misspelled: {wrong} arms nothing{extra} - "
             f"rename it to {right} and push")
 
@@ -12819,7 +12826,9 @@ def process_pr(pr, path_map, base_sha="", repo=None):
                 # The description is the whole message for anyone reading the
                 # checks list rather than the comment, so it names the key and
                 # the fix rather than pointing at a panel.
-                desc = _flag_typo_status_description(typo_lines)
+                desc = _flag_typo_status_description(
+                    typo_lines, removal=_DECOM_FLAG_TYPO_HDR not in "\n".join(
+                        appspace_state_lines or []))
             elif kcc_nil_block:
                 desc = ("Unresolved KCC value - Compute* resources render "
                         "%!s(<nil>) / <no value>; set hostingID (or the "

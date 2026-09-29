@@ -184,7 +184,7 @@ FAILED, the comment still shows the diff, and the merge summary starts with one
 | 7-day hold | the cascade is armed, and `zeroPods` or `decommission` has been true on `main` for less than 7 days | `Confirm-Decommission: <env>` |
 | Cascade not live | the cascade is armed in config, but ArgoCD has not put `resources-finalizer.argocd.argoproj.io` on the Applications | nothing, it clears itself |
 | Paused | the cascade is armed while `appspace.autosync: false` on `main`, so the finalizer never arrives. The panel says it next to the phase table. | nothing: resume auto-sync first, let it sync, then remove the folder |
-| Flag typo | a teardown flag that is misspelled or in the wrong place, so Phase 2 reads pending | nothing: fix the key |
+| Flag typo | a teardown flag that is misspelled or in the wrong place, so Phase 2 reads pending | nothing: fix the key on `main` in a separate PR, then rebase the removal |
 
 The same mechanism has three gates outside a teardown:
 

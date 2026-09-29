@@ -45,8 +45,10 @@ def _run(sinks):
 # ── (a) the flag typo on the folder-removal panel ────────────────────────
 
 TYPO_BASE = IDENTITY_YAML + "  decomission: true\n"
-TYPO_DESC = ("Teardown flag misspelled: appspace.decomission arms nothing - "
-             "rename it to appspace.decommission and push")
+# The file is gone in this PR, so the fix goes to main first.
+TYPO_DESC = ("Teardown flag misspelled on main: appspace.decomission arms nothing - "
+             "fix it to appspace.decommission on main in a separate PR, let it "
+             "sync, then rebase this removal")
 
 
 @pytest.fixture()
@@ -77,6 +79,14 @@ def test_a_removal_with_a_misspelled_flag_fails_and_no_trailer_lifts_it(
     # The full comment, not the STOP-only one of the arming PR.
     assert "ENVIRONMENT DECOMMISSION" in body and cr._DECOM_FLAG_TYPO_HDR in body
     assert "## \u26d4 STOP" not in body and "Everything else in this PR" not in body
+
+
+def test_the_typo_status_says_where_the_fix_goes():
+    rows = ["| `appspace.decomission` | `appspace.decommission` |"]
+    assert m._flag_typo_status_description(rows, removal=True) == TYPO_DESC
+    assert m._flag_typo_status_description(rows).endswith("and push")
+    assert m._flag_typo_status_description([], removal=True).startswith(
+        "Teardown flag misspelled or misplaced")
 
 
 def test_format_comment_reads_the_typo_from_the_decommission_panel():
