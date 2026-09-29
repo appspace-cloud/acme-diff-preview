@@ -55,11 +55,11 @@ merge preview and in the same file on `main` (the old name for a move), and
 blocks only on the difference. So a file with an old slip stays green, and a
 third copy of an old duplicate is new. A key path is dotted and a list item is
 `[]`, so moving list items does not make an old slip look new. `<<` merge keys
-are skipped here, but the wipe follows them, as Helm does. A new file, or one that does not parse on `main`, counts every
-slip. A move that Bitbucket did not pair is compared with the deleted file of
-the same env folder and name. Over 6 months of acme-config-prod this would
-have blocked 6 PRs, all real slips (#3245, #3289, #3299, #3411, #3583 and
-#4322). Without the compare with `main` it would have blocked 52.
+are skipped here, but the wipe follows them, as Helm does. A new file counts
+every slip. A move that Bitbucket did not pair is compared with the deleted
+file of the same env folder and name. Over 6 months of acme-config-prod this
+would have blocked 6 PRs, all real slips (#3245, #3289, #3299, #3411, #3583
+and #4322). Without the compare with `main` it would have blocked 52.
 
 **The wipe counts at head alone**, in every changed YAML file, as in 2.121.0,
 so that guard never gets weaker. ArgoCD merges an environment's Helm value
@@ -89,6 +89,9 @@ Limits:
 - Without a merge preview the base is the tip of `main`, not the merge base.
   An old slip that `main` fixed later would then look new, so only the wipe is
   checked, and the skip is logged.
+- A file that does not parse on `main` has no old slips to compare with, so
+  only the wipe is checked, and the skip is logged. A PR that fixes the YAML
+  is not blocked for the slips that were already there.
 - A file that is absent at the PR side is skipped, and so is one that does not
   parse: the render reports bad YAML.
 - A failed read is red and retried, never a pass.

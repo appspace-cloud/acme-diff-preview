@@ -4635,9 +4635,9 @@ def _detect_yaml_slips(changed, renames, sha, base_sha, repo=None) -> list:
     A duplicate or bare key counts only in a value file under gcp/, azure/ or
     aws/, and only when this PR adds it: the multiset delta against `base_sha`.
     So an old slip stays green, and a third copy of an old duplicate is new.
-    With no `base_sha` they are not checked. A head that is absent or does not
-    parse is skipped (the render reports bad YAML); a base that is absent or
-    does not parse counts every head slip.
+    With no `base_sha`, or a base that does not parse, they are not checked. A
+    head that is absent or does not parse is skipped (the render reports bad
+    YAML); a base that is absent counts every head slip.
     """
     renames = renames or {}
     old_of = {new: old for old, new in renames.items()}
@@ -4665,13 +4665,13 @@ def _detect_yaml_slips(changed, renames, sha, base_sha, repo=None) -> list:
             continue
         found = [("wipe", yaml_hygiene.DEFINITIONS, 1)] if s["wipe"] else []
         if (s["dup"] or s["null"]) and f.split("/")[0] in ("gcp", "azure", "aws"):
-            if not base_sha:
-                logsink.log(f"[yaml-slips] {f}: duplicate or bare keys not checked, "
-                            f"no base to compare with")
+            base = yaml_hygiene.slips(base_body(f) or "") if base_sha else None
+            if base is None:
+                why = "the base does not parse" if base_sha else "no base to compare with"
+                logsink.log(f"[yaml-slips] {f}: duplicate or bare keys not checked, {why}")
             else:
-                base = yaml_hygiene.slips(base_body(f) or "") or {}
                 found += [(kind, key, n) for kind in ("dup", "null")
-                          for key, n in (s[kind] - base.get(kind, Counter())).items()]
+                          for key, n in (s[kind] - base[kind]).items()]
         # The delta gives how many copies are new; the last ones are shown.
         hits += sorted(({"path": f, "kind": kind, "key": key, "line": line, "first_line": first}
                         for kind, key, n in found for line, first in s["lines"][(kind, key)][-n:]),

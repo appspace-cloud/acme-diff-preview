@@ -234,8 +234,14 @@ def test_a_renamed_old_path_is_not_a_twin(monkeypatch):
                  renames={old: other}) == [(F, "dup", "appspace.zeroPods", 3, 2)]
 
 
-def test_a_base_that_does_not_parse_counts_every_head_slip(monkeypatch):
-    assert _hits(monkeypatch, {F: DUP}, {F: "a: [1\n"}) == [(F, "dup", "appspace.zeroPods", 3, 2)]
+def test_a_base_that_does_not_parse_checks_only_the_wipe(monkeypatch):
+    # A PR that fixes bad YAML on main is not blocked for the slips already there.
+    logged = []
+    monkeypatch.setattr(logsink, "log", lambda msg, *a, **k: logged.append(msg))
+    head = DUP + "  microservices:\n    definitions: {}\n"
+    assert _hits(monkeypatch, {F: head}, {F: "a: [1\n"}) == [(F, "wipe", yh.DEFINITIONS, 5, None)]
+    assert logged == [f"[yaml-slips] {F}: duplicate or bare keys not checked, "
+                      "the base does not parse"]
 
 
 def test_a_head_that_does_not_parse_is_left_to_the_render(monkeypatch):
