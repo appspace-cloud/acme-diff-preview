@@ -460,7 +460,7 @@ _VM_DISK_TYPE_RE = re.compile(r"^(pd-|hyperdisk-)")
 # KCC versions a parked VM gets a stop on every reconcile. The chart comment
 # that says to park first is out of date (COPS-2760 owns the chart side).
 _VM_RESIZE_REASON = ("machineType changes: KCC stops, resizes and starts the "
-                     "VM. Merge in a window. Do not park with TERMINATED.")
+                     "VM. Merge in a window. Do not park with TERMINATED")
 _VM_PARK_NOTE = ("desiredStatus moves to TERMINATED: KCC stops the VM, and on "
                  "some KCC versions it sends a stop on every reconcile "
                  "(COPR-31983, COPS-2760)")

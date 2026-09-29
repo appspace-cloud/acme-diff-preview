@@ -93,7 +93,7 @@ def test_a_start_is_a_note_and_not_a_danger():
 def test_the_texts_say_what_kcc_does():
     assert vma._VM_RESIZE_REASON == (
         "machineType changes: KCC stops, resizes and starts the VM. Merge in "
-        "a window. Do not park with TERMINATED.")
+        "a window. Do not park with TERMINATED")
     assert "COPR-31983" in vma._VM_PARK_NOTE and "COPS-2760" in vma._VM_PARK_NOTE
     assert vma._VM_START_NOTE.endswith("KCC starts the VM on sync")
 
@@ -568,6 +568,7 @@ def test_the_panel_shows_the_park_note_next_to_the_resize(monkeypatch):
     text = "\n".join(m._summarize_vm_changes([], PR_SHA, MAIN_SHA, {}, {APP: r}))
     line = next(ln for ln in text.splitlines() if "ComputeInstance" in ln)
     assert vma._VM_RESIZE_REASON in line and vma._VM_PARK_NOTE in line
+    assert ".;" not in line, "the reasons join with no stray period"
 
 
 def test_the_panel_shows_the_start_note_on_a_routine_line():
