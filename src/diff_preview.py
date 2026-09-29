@@ -365,6 +365,7 @@ from schema_errors import (  # render-failure explanation
     _NULL_VIOLATION_RE,
     _schema_fix_hints,
     _missing_value_remedies,
+    _toleration_errors,
 )
 from chart_identity import (  # chart tree digest and its memo
     _CHART_TREE_MEMO_MAX,
@@ -9054,6 +9055,11 @@ def _run_one_diff(app, pr_sha, main_sha, chart_revision=None, changed_paths=None
     _t_parse_pr0 = time.perf_counter()
     pr_resources = _parse_manifest_resources(pr_yaml)
     _record_stage("parse", _parse_main_s + (time.perf_counter() - _t_parse_pr0))
+    # COPS-2766: helm renders a toleration the API rejects on sync (#4681).
+    # Permanent like a schema violation, and only for what this PR brings.
+    bad = _toleration_errors(pr_resources, main_resources)
+    if bad:
+        return None, REASON_SCHEMA_INVALID, bad
     # v2.5.8: report the effective chart-version change (if any) so the
     # comment can shout on downgrades. pr_rev is final here — including a
     # tier-default version discovered after a folder move.

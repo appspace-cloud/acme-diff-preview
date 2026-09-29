@@ -150,6 +150,89 @@ _SCHEMA_VIOLATIONS_SHOWN = 10
 _NULL_VIOLATION_RE = re.compile(r"at '([^']+)': got null, want (\w+)")
 
 
+# COPS-2766: helm renders any string as a toleration operator or effect, but
+# the API takes only these values, case-sensitive. acme-config-prod #4681 set
+# `operator: equal`: the render passed, the sync failed and the app stayed
+# frozen. Empty and null mean the API default, so they pass.
+_TOLERATION_ENUMS = {
+    "operator": ("Equal", "Exists"),
+    "effect": ("NoSchedule", "PreferNoSchedule", "NoExecute"),
+}
+_TOLERATIONS_RE = re.compile(r"^(\s*)(- )?tolerations:\s*(?:#.*)?$")
+_TOLERATION_FIELD_RE = re.compile(r"^\s*(?:- )?(operator|effect):\s*(.*?)\s*$")
+_TOLERATION_ERRORS_SHOWN = 3
+_TOLERATION_HEADER = ("Kubernetes rejects these tolerations when ArgoCD "
+                      "syncs, helm renders them:")
+
+
+def _toleration_value(raw: str):
+    """The scalar without its comment and quotes, or None when empty or null."""
+    raw = re.sub(r"(?:^|\s+)#.*$", "", raw)
+    if len(raw) > 1 and raw[0] == raw[-1] and raw[0] in "'\"":
+        return raw[1:-1] or None
+    return None if raw in ("", "~", "null", "Null", "NULL") else raw
+
+
+def _bad_tolerations(text: str) -> list:
+    """The (field, value) pairs outside the enum in one rendered doc, in order."""
+    bad, indent = [], None
+    for line in text.splitlines():
+        body = line.lstrip()
+        col = len(line) - len(body)
+        # The block ends at a line left of the key, or at a sibling key.
+        if indent is not None and body and not body.startswith("#") and (
+                col < indent or col == indent and not body.startswith("-")):
+            indent = None
+        opened = _TOLERATIONS_RE.match(line)
+        if opened:
+            # The key column, after the dash when the key opens a list item.
+            indent = len(opened.group(1)) + len(opened.group(2) or "")
+            continue
+        field = _TOLERATION_FIELD_RE.match(line) if indent is not None else None
+        if field:
+            pair = (field.group(1), _toleration_value(field.group(2)))
+            if (pair[1] is not None and pair[1] not in _TOLERATION_ENUMS[pair[0]]
+                    and pair not in bad):
+                bad.append(pair)
+    return bad
+
+
+def _toleration_errors(resources: dict, main_resources: dict = None) -> str:
+    """The tolerations the API rejects, as a schema-style error, or ''.
+
+    Both dicts are rendered docs keyed (type_key, ns, name). Only new or
+    changed docs are read, and a bad value main already has is left out, so a
+    PR is blocked only for what it brings. The `- at` lines are what
+    _explain_schema_error lists and _short_permanent_error puts in the status.
+    """
+    main_resources = main_resources or {}
+    found = []
+    for key in sorted(resources):
+        text, old = resources[key], main_resources.get(key, "")
+        if text == old:
+            continue
+        known = _bad_tolerations(old)
+        for field, value in _bad_tolerations(text):
+            if (field, value) in known:
+                continue
+            ok = _TOLERATION_ENUMS[field]
+            want = ", ".join(f"`{v}`" for v in ok[:-1]) + f" or `{ok[-1]}`"
+            found.append(f"- at `{key[0].rsplit('/', 1)[-1]} {key[2]}`: "
+                         f"toleration {field} `{value}`, want {want}")
+    if not found:
+        return ""
+    # Whole lines only: the stored detail is cut at _HELM_ERROR_MAX, and 30
+    # characters stay free for the count line.
+    out = [_TOLERATION_HEADER]
+    for line in found[:_TOLERATION_ERRORS_SHOWN]:
+        if len(out) > 1 and len("\n".join(out + [line])) > _HELM_ERROR_MAX - 30:
+            break
+        out.append(line)
+    if len(found) > len(out) - 1:
+        out.append(f"- ... and {len(found) - len(out) + 1} more")
+    return "\n".join(out)
+
+
 def _schema_fix_hints(err: str) -> list:
     """Extra, cause-specific advice under a schema failure.
 

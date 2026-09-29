@@ -24,6 +24,7 @@ here is required to use the tool; it is for people changing it or debugging it.
 - [Superseding an in-flight render](#superseding-an-in-flight-render)
 - [Secret-leak and comment-integrity hardening](#secret-leak-and-comment-integrity-hardening)
 - [Full-diff web UI](#full-diff-web-ui-atlantis-style)
+- [Why a toleration with a wrong operator or effect is blocked](#why-a-toleration-with-a-wrong-operator-or-effect-is-blocked)
 
 ---
 
@@ -1289,3 +1290,23 @@ backend is separate follow-up work tracked in the ticket.
 
 ---
 
+### Why a toleration with a wrong operator or effect is blocked
+
+Kubernetes takes only these values in a pod toleration, and it is
+case-sensitive: `operator` is `Equal` or `Exists`, and `effect` is
+`NoSchedule`, `PreferNoSchedule` or `NoExecute`. Empty or null means the
+default. Helm does not check this. It renders any string, so the diff looks
+normal, and the API rejects the Deployment when ArgoCD syncs. On
+acme-config-prod #4681, `operator: equal` froze the app until someone fixed
+the value.
+
+The check (COPS-2766) reads the tolerations in the PR render. It reads only
+the resources that are new or changed in this PR, and it leaves out a bad
+value that `main` already has in the same resource. So an old mistake never
+blocks an unrelated PR, for example a fleet chart bump. An affinity
+`operator: In` is not in a `tolerations:` block, so it is never read.
+
+It fails the build as a render error. The comment shows it as SCHEMA
+VALIDATION FAILED, the red status names the resource and the value, and it is
+not retried. There is no trailer, because the fix is always a config change:
+correct the value in `customer.yaml`, or in the cohort `config.yaml`.
