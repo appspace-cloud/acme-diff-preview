@@ -106,9 +106,21 @@ def test_mirror_disabled_is_none(repo, monkeypatch):
     assert m._mirror_is_ancestor(m.BB_REPO, repo["fork"], repo["base"]) is None
 
 
-def test_a_mirror_not_cloned_yet_is_none(tmp_path, monkeypatch):
+def test_a_mirror_off_after_a_hard_failure_is_none(repo, monkeypatch):
+    """_mirror_disabled is set at runtime when the mirror breaks. The real
+    mirror would answer True, so only the guard gives None."""
+    monkeypatch.setattr(m, "_mirror_disabled", True)
+    assert m._mirror_is_ancestor(m.BB_REPO, repo["fork"], repo["base"]) is None
+
+
+def test_a_mirror_not_cloned_yet_is_none_and_starts_no_git(tmp_path, monkeypatch):
+    """Every pod without a mirror and every world test goes through here,
+    so it must not start a git process per PR."""
     monkeypatch.setattr(m, "GIT_MIRROR_DIR", str(tmp_path))
     monkeypatch.setattr(m, "GIT_MIRROR_ENABLED", True)
+    monkeypatch.setattr(m, "_git_run", lambda *a, **k: pytest.fail("git was called"))
+    monkeypatch.setattr(m, "_mirror_has_sha",
+                        lambda *a, **k: pytest.fail("the sha check was called"))
     assert m._mirror_is_ancestor(m.BB_REPO, PR_SHA, BASE_SHA) is None
 
 
