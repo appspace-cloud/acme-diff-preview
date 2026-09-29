@@ -8,6 +8,7 @@ here is required to use the tool; it is for people changing it or debugging it.
 - [Why an empty `microservices.definitions` is blocked](#why-an-empty-microservicesdefinitions-is-blocked)
 - [Why a clone without its `--aec1` token is blocked](#why-a-clone-without-its---aec1-token-is-blocked)
 - [Why renaming a live environment is blocked](#why-renaming-a-live-environment-is-blocked)
+- [Why a teardown is blocked](#why-a-teardown-is-blocked)
 - [Why removing a cohort `config.yaml` is blocked](#why-removing-a-cohort-configyaml-is-blocked)
 - [Why an environment without a chart version is blocked](#why-an-environment-without-a-chart-version-is-blocked)
 - [Handling mass version bumps](#handling-mass-version-bumps-hundreds-of-apps-in-one-pr)
@@ -147,12 +148,14 @@ Limits:
 - Bitbucket pairs renamed files by similar content. A PR that removes one env
   and adds a different, similar one can look like a rename: split it into two
   PRs.
-- A live env that leaves the ApplicationSets is not blocked: a rename to
-  `Customer.yaml`, a move out of `<cloud>/<tier>/private-cloud/`, or a delete +
-  add with a new name that Bitbucket does not pair. ArgoCD then removes the
-  apps without pruning, like any deletion without `decommission` (a plain
-  deletion only gets a warning in the decommission panel). A move to a folder
-  without a cohort `config.yaml` is blocked by COPS-2552.
+- A live env that leaves the ApplicationSets is not a rename for this guard:
+  a rename to `Customer.yaml`, a move out of `<cloud>/<tier>/private-cloud/`,
+  or a delete + add with a new name that Bitbucket does not pair. ArgoCD then
+  removes the apps without pruning, like any deletion without `decommission`.
+  The delete + add is a teardown of the old env: with no cascade armed it is
+  blocked until `Confirm-Teardown: <env>`, and the panel says it looks like a
+  rebuild or a rename (next section). A move to a folder without a cohort `config.yaml` is
+  blocked by COPS-2552.
 - Without a merge preview the guard reads the branch tip, which can only
   over-block.
 
@@ -162,6 +165,90 @@ renaming an environment (`customerName`, `suffix`, or a folder move), deleting
 a `customer.yaml`, or deleting a cohort `config.yaml`. The pipeline commits on
 `main` only change versions (`version`, `cicd-versions.yaml`): they never
 touch these keys, and never add, delete or move a file.
+
+### Why a teardown is blocked
+
+Removing an environment folder is Phase 3 of `acme-components`
+`documentation/decommission-environment.md`, the only destructive step. Up to
+2.121.0 the comment could say DO NOT MERGE while the build stayed green, and a
+green tick outranks a red paragraph. Since COPS-2766 every case where the
+teardown does not do what the reader expects is a merge gate. The build is
+FAILED, the comment still shows the diff, and the merge summary starts with one
+⛔ line per open gate.
+
+| Check | When | Lifted by |
+|---|---|---|
+| No cascade | a private-cloud folder removal with no `appspace.decommission` on `main`. The Applications go and every workload keeps running, unmanaged. | `Confirm-Teardown: <env>` |
+| Public cloud | any `cl-*` folder or block removal. Public cloud has no cascade (COPS-2700), so nothing is deleted by itself. | `Confirm-Teardown: <constellation>` |
+| Shared user content | the purge is armed, and a surviving environment uses the same user content bucket and DNS record | `Confirm-Teardown: <env>` |
+| 7-day hold | the cascade is armed, and `zeroPods` or `decommission` has been true on `main` for less than 7 days | `Confirm-Decommission: <env>` |
+| Cascade not live | the cascade is armed in config, but ArgoCD has not put `resources-finalizer.argocd.argoproj.io` on the Applications | nothing, it clears itself |
+| Paused | the cascade is armed while `appspace.autosync: false` on `main`, so the finalizer never arrives | nothing: resume auto-sync first |
+| Flag typo | a teardown flag that is misspelled or in the wrong place, so Phase 2 reads pending | nothing: fix the key |
+
+The same mechanism has three gates outside a teardown:
+
+- `Confirm-IP-Release: <env>`: a `ComputeAddress` or `DNSRecordSet` leaves the
+  render of a live env with no explicit `deletion-policy: abandon`, so GCP
+  releases the IP. For these two kinds a new name is a new IP, so it is never
+  read as a rename.
+- `Confirm-Rename: <old dir> -> <new dir>`: a live `cl-*/config.yaml` is
+  renamed or moved, which renames every Application of the constellation. The
+  two sides are the full folder paths. The rename guard above uses the same
+  trailer with namespaces.
+- A disk shrink: nothing lifts it, because GCP cannot shrink a disk in place.
+
+How the line is read:
+
+- `<env>` is the name the gate line shows: the pv folder name, or the
+  constellation for `cl-*`, so one line covers every block of a constellation.
+  The ⛔ line in the comment and the red status both give the exact line to add.
+- It can be in any commit message of the PR, on its own line. Case does not
+  matter. Backticks, a final `.` and a leading `>` or `*` are ignored, and `→`
+  reads as `->`. An empty commit is fine:
+  `git commit --allow-empty -m "Confirm-Teardown: pv-x-a"`.
+- One line lifts every open gate with the same trailer and env.
+  `Confirm-Teardown: pv-x-a` lifts the no-cascade and the shared user content
+  gates of `pv-x-a`, never its hold.
+- A lifted gate stays in the merge summary as a ☑️ `Confirmed in a commit`
+  review line, so the override is visible. The build is then green, so that
+  finding shows ⚠️ like every other line.
+- It is a commit for the same reasons as the rename: Bitbucket Cloud PRs have
+  no labels, and a new commit is a new sha, so the check runs again. Earlier
+  approvals stay (smart approval reset), so approve after the confirmation.
+
+It fails closed:
+
+- The commit messages are read only when an open gate has a trailer, so a PR
+  with no gate never reads them. They come from the git mirror first, then from
+  the Bitbucket API with every page and a check that the list already has the
+  new head. When they cannot be read, the status is red and a blip is
+  retried. It is never a lift.
+- The hold reads the first-parent history of the removed `customer.yaml` on the
+  git mirror, newest first, so the time of a commit is when it landed on
+  `main`. A history that cannot be read (mirror off, a missing commit) is never
+  "hold met": the gate says "history unreadable" and still needs
+  `Confirm-Decommission`.
+- The finalizer is read from ArgoCD. Not live is a red status with the token
+  `[transient]`: the poll loop retries it with the usual backoff (COPS-2546),
+  and it clears itself after ArgoCD syncs. When the lookup fails, the panel
+  shows one ⚠️ line that asks you to check `argocd app get`, and the build stays
+  green: a red build on every failed lookup would teach people to skip the
+  panel.
+
+When the PR also adds an environment, the decommission panel adds one 💡 line:
+it looks like a rebuild or a rename of the old env, so arm decommission on the
+old env, or use `git mv` with `Confirm-Rename`. On `cl-*` the flag arms
+nothing, so there the line only names `git mv`.
+
+Replay on the acme-config-prod history: the teardown gates would have
+stopped one PR that was fine, of 525 (#4396). About one Phase 3 PR a month
+needs `Confirm-Decommission`, because most of them arm and remove on the same
+day, and one was a real catch: #4298 removed `pv-fordpoc-a` 37 minutes after
+the PR that armed it. In six months the IP gate would have stopped two PRs
+that were fine (#3222 and #3668, planned IP cutovers).
+
+Direct pushes to `main` are not checked, as for every guard.
 
 ### Why removing a cohort `config.yaml` is blocked
 
