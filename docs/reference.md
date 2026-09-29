@@ -446,7 +446,9 @@ A chart downgrade also adds ` | CHART DOWNGRADE in N environment(s)` to the
 green description, so the status names it when another finding leads
 (#4549). The recovery of a stuck status does not add it, like the
 decommission count. An image downgrade adds
-` | IMAGE DOWNGRADE in N environment(s)` in the same way.
+` | IMAGE DOWNGRADE in N environment(s)` in the same way. Like the
+decommission count, both also go on the red `Diff unavailable` description.
+No other FAILED description changes.
 
 **noCore turning off.** Turning noCore off deletes `bs-pcs` and `hc-pcs`
 (acme-config-prod #4667, a 5 h outage). A move that turns noCore off only
