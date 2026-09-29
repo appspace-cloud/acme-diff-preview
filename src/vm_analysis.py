@@ -95,7 +95,7 @@ def _detect_replicas_released(main_resources, pr_resources) -> list:
     An HPA or acme-ping-scaler takes over, so the chart stops rendering
     `replicas`. On sync the field goes away and Kubernetes runs 1 replica
     until the new owner scales it back (acme-config-prod #4523, 10 to 1).
-    Only a workload on both sides, with n > 0 before.
+    Only a workload on both sides, with n > 1 before: from 1, nothing drops.
     """
     out = []
     pr_resources = pr_resources or {}
@@ -105,7 +105,8 @@ def _detect_replicas_released(main_resources, pr_resources) -> list:
         if kind not in _WORKLOAD_KINDS or not name or head is None:
             continue
         n = _manifest_replicas(body)
-        if n and not any(_REPLICAS_FIELD_RE.match(l) for l in head.splitlines()):
+        if n is not None and n > 1 and \
+                not any(_REPLICAS_FIELD_RE.match(l) for l in head.splitlines()):
             out.append((name, n))
     return sorted(out)
 
@@ -366,7 +367,8 @@ def _detect_capacity_floor_risk(main_resources, pr_resources) -> list:
       with min 6 on signschannel);
     - a cut of 4 or more on any workload (#4608, 12 to 8). A cut to 0 stays
       the zeroed-replicas finding;
-    - a main container CPU request under 30m that is new in this PR.
+    - a main container CPU request under 30m that is new or lower in this
+      PR. A raise, 10m to 20m, is no cut.
 
     The floor compares fixed replicas with an HPA min. A workload with no
     floor on a side (acme-ping-scaler) is not compared.
@@ -393,9 +395,10 @@ def _detect_capacity_floor_risk(main_resources, pr_resources) -> list:
         new_cpu = _main_container_cpu(pr_resources[key], key[2])
         if new_cpu is None or new_cpu >= 30:
             continue
-        if key in main_resources and \
-                _main_container_cpu(main_resources[key], key[2]) == new_cpu:
-            continue
+        old_cpu = (_main_container_cpu(main_resources[key], key[2])
+                   if key in main_resources else None)
+        if old_cpu is not None and new_cpu >= old_cpu:
+            continue    # the same or a raise: no cut
         cpu[key[2]] = new_cpu
     out = []
     for w in sorted(changed):

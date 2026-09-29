@@ -950,25 +950,29 @@ def _build_merge_summary(results, rollup_by_sig, vm_change_lines,
                          f"{_fmt_env_list(clean_partial_apps)}"))
 
     # COPS-2766 (COPR-32597): capacity facts from the full renders. Warnings
-    # only, because a planned right-sizing looks the same.
+    # only, because a planned right-sizing looks the same. The action first:
+    # the green status lead is cut at 255 bytes. An item names its env only
+    # when the finding has more than one.
     cap = {a: r.capacity for a, r in sorted(results.items())
            if getattr(r, "capacity", None)}
-    for part, text, tail in (
-            ("cuts", "\U0001f4c9 **Capacity cut**",
+    for part, text, action, tail in (
+            ("cuts", "\U0001f4c9 **Capacity cut**", "check that it is planned",
              "Keep 2 replicas or more, keep the floor of the connection "
              "services, and a CPU request of 30m or more (COPR-32597)."),
             ("released", "\U0001f501 **Fixed replicas released**",
+             "merge in a quiet window",
              "On sync the field goes away, and Kubernetes runs 1 replica until "
-             "the HPA or acme-ping-scaler scales it back. Merge in a quiet "
-             "window (acme-config-prod #4523).")):
+             "the HPA or acme-ping-scaler scales it back (acme-config-prod "
+             "#4523).")):
         apps = [a for a in cap if cap[a].get(part)]
-        items = [f"{_envs_from_apps([a])[0]} `{w}` "
-                 + (f"({what})" if part == "released" else what)
+        envs = sorted(set(_envs_from_apps(apps)))
+        items = [f"`{w}` " + (f"({what})" if part == "released" else what)
+                 + (f" in `{_envs_from_apps([a])[0]}`" if len(envs) > 1 else "")
                  for a in apps for w, what in cap[a][part]]
         if items:
             findings.append((_SEV_REVIEW,
-                             f"{text} in {_fmt_env_list(apps, shown=3)}: "
-                             f"{_fmt_service_list(items, 4)}. {tail}"))
+                             f"{text} in {_fmt_service_list([f'`{e}`' for e in envs], 3)}"
+                             f", {action}: {_fmt_service_list(items, 4)}. {tail}"))
 
     if appspace_state_lines:
         txt = "\n".join(appspace_state_lines)

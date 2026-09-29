@@ -174,6 +174,15 @@ def test_the_same_low_cpu_on_both_sides_is_not_a_cut():
                  [_dep("svc", 2, "20m", image="v2")]) == []
 
 
+def test_a_cpu_raise_under_30m_is_not_a_cut():
+    """10m to 20m is more capacity, so it is not listed. A new workload with
+    a low request has no base to compare, so it is."""
+    assert _cuts([_dep("svc", 2, "10m")], [_dep("svc", 2, "20m")]) == []
+    assert _cuts([_dep("svc", 2, "20m")], [_dep("svc", 2, "10m")]) == [
+        ("svc", "CPU request 10m")]
+    assert _cuts([], [_dep("svc", 2, "10m")]) == [("svc", "CPU request 10m")]
+
+
 def test_only_the_main_container_counts():
     assert _cuts([_dep("svc", 2, "100m")], [_dep("svc", 2, "100m", init_cpu="5m")]) == []
     assert _cuts([_dep("svc", 2, "100m")], [_dep("svc", 2, "100m", sidecar_cpu="5m")]) == []
@@ -238,8 +247,11 @@ def test_fixed_replicas_that_go_away_are_released():
                      [_dep("svc"), _hpa("svc", 6, 12), _dep("api", 2)]) == [("svc", 10)]
 
 
-def test_zero_or_no_replicas_before_is_not_released():
+def test_zero_one_or_no_replicas_before_is_not_released():
+    """From 1, Kubernetes still runs 1 replica, so nothing drops."""
     assert _released([_dep("svc", 0)], [_dep("svc")]) == []
+    assert _released([_dep("svc", 1)], [_dep("svc"), _hpa("svc", 2, 4)]) == []
+    assert _released([_dep("svc", 2)], [_dep("svc"), _hpa("svc", 2, 4)]) == [("svc", 2)]
     assert _released([_dep("svc", image="v1")], [_dep("svc", image="v2")]) == []
 
 
@@ -336,8 +348,7 @@ def _bullets(results):
 CUT_TAIL = (". Keep 2 replicas or more, keep the floor of the connection services, "
             "and a CPU request of 30m or more (COPR-32597).")
 REL_TAIL = (". On sync the field goes away, and Kubernetes runs 1 replica until the "
-            "HPA or acme-ping-scaler scales it back. Merge in a quiet window "
-            "(acme-config-prod #4523).")
+            "HPA or acme-ping-scaler scales it back (acme-config-prod #4523).")
 
 
 def test_both_findings_are_review_with_the_exact_text():
@@ -348,10 +359,11 @@ def test_both_findings_are_review_with_the_exact_text():
                             "released": []})})
     assert verdict.startswith("⚠️ **Review before merging** (2 item(s))"), verdict
     assert b == [
-        "\U0001f4c9 **Capacity cut** in pv-bnym-b, pv-fedex-c: pv-bnym-b `reservation` "
-        "floor 12 → 8, pv-fedex-c `signschannel` floor 10 → 6" + CUT_TAIL,
-        "\U0001f501 **Fixed replicas released** in pv-fedex-c: pv-fedex-c "
-        "`signschannel` (10)" + REL_TAIL]
+        "\U0001f4c9 **Capacity cut** in `pv-bnym-b`, `pv-fedex-c`, check that it is "
+        "planned: `reservation` floor 12 → 8 in `pv-bnym-b`, `signschannel` floor "
+        "10 → 6 in `pv-fedex-c`" + CUT_TAIL,
+        "\U0001f501 **Fixed replicas released** in `pv-fedex-c`, merge in a quiet "
+        "window: `signschannel` (10)" + REL_TAIL]
     assert not any(d in line for line in b for d in DASHES)
 
 
@@ -359,11 +371,43 @@ def test_the_items_stop_at_4():
     cuts = [(f"svc{i}", "CPU request 20m") for i in range(6)]
     _verdict, b = _bullets({"pv-x-ms": _r({"cuts": cuts, "released": [("svc0", 5)]}),
                             "pv-y-ms": _r({"cuts": [], "released": [("api", 3)]})})
-    assert b[0] == ("\U0001f4c9 **Capacity cut** in pv-x: pv-x `svc0` CPU request 20m, "
-                    "pv-x `svc1` CPU request 20m, pv-x `svc2` CPU request 20m, "
-                    "pv-x `svc3` CPU request 20m (+2 more)" + CUT_TAIL)
-    assert b[1].startswith("\U0001f501 **Fixed replicas released** in pv-x, pv-y: "
-                           "pv-x `svc0` (5), pv-y `api` (3). On sync"), b
+    assert b[0] == ("\U0001f4c9 **Capacity cut** in `pv-x`, check that it is planned: "
+                    "`svc0` CPU request 20m, `svc1` CPU request 20m, `svc2` CPU "
+                    "request 20m, `svc3` CPU request 20m (+2 more)" + CUT_TAIL)
+    assert b[1].startswith("\U0001f501 **Fixed replicas released** in `pv-x`, `pv-y`, "
+                           "merge in a quiet window: `svc0` (5) in `pv-x`, `api` (3) "
+                           "in `pv-y`. On sync"), b
+
+
+def test_an_env_with_two_apps_is_named_once():
+    """-ms and -ss of one env are one env, so the items give no env name."""
+    _verdict, b = _bullets({"pv-x-ms": _r({"cuts": [("api", "floor 12 → 8")],
+                                           "released": []}),
+                            "pv-x-ss": _r({"cuts": [("db", "floor 6 → 2")],
+                                           "released": []})})
+    assert b[0].startswith("\U0001f4c9 **Capacity cut** in `pv-x`, check that it is "
+                           "planned: `api` floor 12 → 8, `db` floor 6 → 2. Keep"), b
+
+
+def test_the_green_status_keeps_the_action_with_4_long_items():
+    """The action comes first, so the status lead cut at 255 bytes still says
+    what to do, with long aec names and 4 long items."""
+    tail = "44 resource(s) will change - review comment"
+    what = "HPA minReplicas 1 (max 3) and floor 10 → 1"
+    for n, part, action in ((1, "cuts", "check that it is planned"),
+                            (4, "cuts", "check that it is planned"),
+                            (1, "released", "merge in a quiet window"),
+                            (4, "released", "merge in a quiet window")):
+        items = [(f"signschannelgateway{i}", what if part == "cuts" else 10)
+                 for i in range(4 // n)]
+        results = {f"pv-cust{i:02}--aec1-a-ms": _r(
+            {"cuts": items if part == "cuts" else [],
+             "released": items if part == "released" else []}) for i in range(n)}
+        desc = cr.join_status_lead(cr.status_lead("\n".join(cr._build_merge_summary(
+            results, {}, None, None, None, None, False))), tail)
+        assert len(desc.encode()) <= 255 and desc.endswith(" | " + tail), desc
+        assert action in desc, desc
+        assert desc.count("pv-cust00--aec1-a") == (1 if n == 1 else 2), desc
 
 
 def test_capacity_sorts_after_the_deletions():
@@ -413,6 +457,6 @@ def test_a_capacity_plan_stays_green(world, monkeypatch):
     body, (state, desc) = sinks.upserts[-1], sinks.statuses[-1]
     assert state == "SUCCESSFUL", desc
     assert m._extract_status_token(body) == "clean"
-    assert desc.startswith("⚠️ Capacity cut in pv-orch-a: pv-orch-a "
+    assert desc.startswith("⚠️ Capacity cut in pv-orch-a, check that it is planned: "
                            "signschannel floor 10 → 6. Keep 2 replicas"), desc
-    assert "\U0001f501 **Fixed replicas released** in pv-orch-a" in body
+    assert "\U0001f501 **Fixed replicas released** in `pv-orch-a`, merge in" in body

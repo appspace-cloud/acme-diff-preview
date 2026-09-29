@@ -599,8 +599,8 @@ Direct pushes to `main` are not checked, as for every guard.
 
 `appspace.infra.noCore` is more than a load balancer flag. On GCP it moves
 the URL map default from the Windows Core VM to `<env>-bs-agw`, about 109
-Deployments restart, and the v1 API moves to v3. On Azure it switches the
-nginx-frontend upstream. Turning it off deletes the noCore backends `bs-pcs`
+Deployments restart, and the v1 API moves to v3. On Azure and AWS it switches
+the nginx-frontend upstream. Turning it off deletes the noCore backends `bs-pcs`
 and `hc-pcs`. The rendered diff shows none of this as a risk:
 acme-config-prod #4565 turned it on in 57 environments with a silent comment,
 and #4684 gave 48 minutes of 502 because the Core VM was stopped before the

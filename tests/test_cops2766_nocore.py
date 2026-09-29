@@ -493,7 +493,8 @@ def test_the_gate_is_do_not_merge():
     gated = _change(env="pv-m-a", path=NEW, moved_from=OLD, old=True, new=False)
     verdict, b = _bullets(m._nocore_flip_lines([gated]), gates=m._nocore_gates([gated]))
     assert verdict.startswith("⛔ **DO NOT MERGE**")
-    assert b[0] == "⛔ **A move turns noCore off** in `pv-m-a`"
+    assert b[0] == ("⛔ **A move turns noCore off** in `pv-m-a`. Set "
+                    "appspace.infra.noCore in the moved customer.yaml")
     assert b[1].startswith("\U0001f50c **noCore changes** in `pv-m-a`: on in 0, off in 1")
 
 
@@ -512,10 +513,29 @@ def test_an_unknown_is_a_review_not_a_routine():
 
 
 def test_the_gate_table_has_the_kind():
-    assert cr.GATES["nocore_lost"] == ("A move turns noCore off", None, "blocked")
+    """No trailer lifts it, so the red status and the summary line give the
+    fix. On main's 4-tuple GATES, _gate_way_out prints the same text."""
+    assert cr.GATES["nocore_lost"] == ("A move turns noCore off", None, "blocked",
+                                       "Set appspace.infra.noCore in the moved "
+                                       "customer.yaml")
     assert cr.gate_status_description(m._nocore_gates([_change(
-        env="pv-m-a", moved_from=OLD, old=True, new=False)])) == \
-        "Blocked - A move turns noCore off in pv-m-a (see PR comment)"
+        env="pv-m-a", moved_from=OLD, old=True, new=False)])) == (
+        "Blocked - A move turns noCore off in pv-m-a. Set appspace.infra.noCore "
+        "in the moved customer.yaml (see PR comment)")
+
+
+def test_the_gate_status_fits_with_a_long_env():
+    """customerName has 20 characters at most, so a real env is shorter than
+    this one. The fix and the tail stay in the 255 bytes of a Bitbucket
+    build status, with 2 more gates."""
+    env = "pv-" + "x" * 40 + "--aec1-a"
+    gates = [{"kind": k, "env": env, "arg": env, "lifted": False}
+             for k in ("nocore_lost", "paused", "shrink")]
+    desc = cr.gate_status_description(gates)
+    assert len(desc.encode()) <= 255, len(desc.encode())
+    assert desc == (f"Blocked - A move turns noCore off in {env}. Set "
+                    "appspace.infra.noCore in the moved customer.yaml (+2 more) "
+                    "(see PR comment)")
 
 
 # ── (f) process_pr ───────────────────────────────────────────────────────
@@ -526,7 +546,8 @@ MONTHLY = "gcp/dev/private-cloud/ap1/monthly"
 MOVED = f"{MONTHLY}/pv-orch-a/customer.yaml"
 ORCH_APPS = ["pv-orch-a-ms", "pv-orch-a-ss"]
 PMAP = {IDENTITY: ORCH_APPS, ANCILLARY: ORCH_APPS, f"{CUSTOM}/config.yaml": ORCH_APPS}
-GATED_DESC = "Blocked - A move turns noCore off in pv-orch-a (see PR comment)"
+GATED_DESC = ("Blocked - A move turns noCore off in pv-orch-a. Set "
+              "appspace.infra.noCore in the moved customer.yaml (see PR comment)")
 
 
 @pytest.fixture()
@@ -554,7 +575,8 @@ def test_the_4667_shape_fails_the_build(move):
     body, (state, desc), _reads = move()
     assert (state, desc) == ("FAILED", GATED_DESC)
     assert m._extract_status_token(body) == "blocked"
-    assert "- ⛔ **A move turns noCore off** in `pv-orch-a`" in body
+    assert ("- ⛔ **A move turns noCore off** in `pv-orch-a`. Set "
+            "appspace.infra.noCore in the moved customer.yaml\n") in body
     assert "### \U0001f50c noCore changes in 1 environment(s): on in 0, off in 1" in body
     assert "noCore turns off only because the new folder does not set it" in body
     assert m._seen.get(SK) == (PR_SHA, BASE_SHA)
