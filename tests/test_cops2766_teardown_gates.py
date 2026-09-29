@@ -388,3 +388,31 @@ def test_an_older_guard_keeps_its_status_text(world, monkeypatch, result, desc):
     assert got == (desc or m._permanent_failure_status_description(
         {"pv-orch-a-ms": result}))
     assert "| ⛔ BLOCKED" in sinks.upserts[-1], "the comment still shows the gate"
+
+
+# ── a blocked gate next to a transient app ───────────────────────────────
+# A design choice, pinned here. Like a permanent error next to a transient
+# one, the PR is marked seen and not retried: every blocked gate clears only
+# with a new commit (a trailer, a fixed size) or a move of main (a pause
+# lifted), and both run every app again.
+
+TIMEOUT = m.DiffResult("", [], 0, False, "slow", m.OUT_INDETERMINATE, m.REASON_TIMEOUT)
+
+
+def test_comment_status_token_puts_a_blocked_gate_before_a_transient_app():
+    args = ({"pv-x-a-ms": TIMEOUT}, False, None, False, False, False)
+    assert m._comment_status_token(*args, [_gate("orphan")]) == "blocked"
+    assert m._comment_status_token(*args, [_gate("not_live")]) == "transient"
+    assert m._comment_status_token(*args, None) == "transient"
+
+
+def test_a_blocked_gate_with_a_transient_app_is_seen_not_retried(world, monkeypatch):
+    sinks, plan = world
+    monkeypatch.setattr(m, "_retry_backoff", {})
+    monkeypatch.setattr(m, "_merge_gates", lambda *a: [_gate("orphan", env="pv-orch-a")])
+    monkeypatch.setattr(m, "_pr_commit_messages", lambda *a: [])
+    plan["pv-orch-a-ms"] = TIMEOUT
+    m.process_pr(_mk_pr(), PATH_MAP, base_sha=BASE_SHA)
+    assert m._extract_status_token(sinks.upserts[-1]) == "blocked"
+    assert sinks.statuses[-1][0] == "FAILED"
+    assert m._seen.get(SK) == (PR_SHA, BASE_SHA) and SK not in m._retry_backoff
