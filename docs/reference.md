@@ -356,6 +356,18 @@ backend cleanup. A FAILED status when noCore goes from true to false is
 planned (COPS-2766 block 5). Until it ships, check a PR that deletes `*-pcs`
 backends by hand.
 
+**Known gap: a value file Bitbucket always refuses.** When a value file
+cannot be read (any failure that is not a plain 404), the build is FAILED with
+`Diff unavailable (infrastructure) - will retry: value file unreadable ...`
+(the error names the file) and the PR is retried after the backoff (at most
+every 8 iterations), with no end. This fails closed, but when the refusal is
+stable (a 400 or 403, or a commit Bitbucket does not know) the text blames
+the infrastructure and the retries cost a full render each. The read returns
+no HTTP code, so a retry cap could not tell this from a long Bitbucket
+outage, and would turn every PR polled during the outage into a red that
+needs a push. So there is no cap yet: if the same file stays in that status,
+ask CloudOps.
+
 See [docs/internals.md](internals.md) for the reasoning behind each guard,
 how mass version bumps are handled, the secret-leak hardening, and the
 full-diff web UI.
