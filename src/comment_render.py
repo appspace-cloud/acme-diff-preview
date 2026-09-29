@@ -1386,14 +1386,16 @@ def commit_authors_line(names) -> str:
     wrote commits in the PR. None means the commits could not be read.
 
     Not a '- ' bullet, so status_lead never reads it. Git author names are
-    PR-controlled markdown: each one is one line with no backticks, cut to
-    40 characters, inside backticks."""
+    PR-controlled markdown: each one is one line with no backticks and no
+    \u26d4 \U0001f6a8 \u274c (a green build shows none of them outside a
+    fence), cut to 40 characters, inside backticks."""
     if names is None:
         return ("\U0001f465 Could not read who wrote the commits of this PR. "
                 "Check the commit authors before you approve.")
     if not names:
         return ""
-    shown = ", ".join("`%s`" % " ".join(n.replace("`", "").split())[:40]
+    drop = dict.fromkeys(map(ord, "`\u26d4\U0001f6a8\u274c"))
+    shown = ", ".join("`%s`" % " ".join(n.translate(drop).split())[:40]
                       for n in names[:5])
     more = f" and {len(names) - 5} more" if len(names) > 5 else ""
     return (f"\U0001f465 **Other people wrote commits in this PR:** {shown}{more}. "

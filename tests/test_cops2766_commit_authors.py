@@ -214,6 +214,14 @@ def test_a_name_is_one_short_line_of_code():
     assert "\n" not in line
 
 
+def test_a_name_has_no_red_mark():
+    # A green build shows no \u26d4 \U0001f6a8 \u274c outside a fence, and a
+    # backtick code span is not a fence (block 2 icon rule).
+    line = cr.commit_authors_line(["\u26d4 DO NOT MERGE", "\U0001f6a8Eve\u274c", "Jos\u00e9 Mu\u00f1oz"])
+    assert "`DO NOT MERGE`, `Eve`, `Jos\u00e9 Mu\u00f1oz`." in line
+    assert not any(mark in line for mark in ("\u26d4", "\U0001f6a8", "\u274c"))
+
+
 def test_at_most_five_names_are_shown():
     line = cr.commit_authors_line([f"P{i}" for i in range(7)])
     assert "`P4`. " not in line and "`P4` and 2 more. " in line
