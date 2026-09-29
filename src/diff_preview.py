@@ -11158,6 +11158,24 @@ def _render_creates_a_kcc_vm(app_results) -> bool:
     return not seen
 
 
+def _render_covers(apps, app_results) -> bool:
+    """Whether every app mapped to a value file rendered, with or without a diff.
+
+    COPS-2766: then the rendered ComputeInstance decides a KCC machineType
+    change. It says only that those apps rendered, not that the VM app was
+    found. False when unsure: path_map can hold True instead of app names,
+    and a missing, failed or decommissioned app confirms nothing.
+    """
+    if not isinstance(apps, (list, tuple, set)) or not apps:
+        return False
+    results = app_results or {}
+    for app in apps:
+        r = results.get(app) or results.get(str(app).rsplit("/", 1)[-1])
+        if getattr(r, "outcome", None) not in (OUT_DIFF, OUT_NO_DIFF):
+            return False
+    return True
+
+
 def _summarize_vm_changes(changed_files, pr_sha, base_sha, path_map,
                           app_results, repo=None) -> list:
     """Markdown panel for VM-domain (KCC linux-services) changes.
@@ -11335,8 +11353,6 @@ def _summarize_vm_changes(changed_files, pr_sha, base_sha, path_map,
                               "prune under `deletion-policy: abandon`; GCP "
                               "VM/disk/IP stay")
             elif leaf == "machineType":
-                ds = (new_flat.get(prefix + role + ".desiredStatus")
-                      or new_flat.get(prefix + "defaults.desiredStatus"))
                 # Suppressed only for a classified adoption, and only on the
                 # linux key trees it applies to: the value is not changing,
                 # it is moving key. Windows and any unclassified file keep
@@ -11349,12 +11365,22 @@ def _summarize_vm_changes(changed_files, pr_sha, base_sha, path_map,
                 # what sent an operator to file a bug against the tool
                 # (acme-config-stage #2807). The provision itself is still
                 # flagged, once, by the group line built after this loop.
-                if (str(ds) != "TERMINATED" and not adopted_move
-                        and not domain_new):
+                # COPS-2766: no desiredStatus escape. For a key right under
+                # the prefix it read `<prefix>machineType.desiredStatus`, and
+                # KCC resizes a parked VM too. On GCP the render decides when
+                # every app of the file rendered: the ComputeInstance line
+                # flags a real resize once. Legacy Terraform, Windows and
+                # ASO keep their rule, because the render level sees no VM.
+                if adopted_move or domain_new:
+                    pass
+                elif prefix != _KCC_PREFIX or not clean.startswith("gcp/"):
                     danger = True
                     reason = ("machineType changes while desiredStatus is "
                               "not TERMINATED \u2014 the runbook requires "
                               "stopping the VM first")
+                elif not _render_covers(path_map.get(clean), app_results):
+                    danger = True
+                    reason = _VM_RESIZE_REASON
             elif leaf == "zone":
                 # Creation attributes on a NEW domain describe the machine
                 # being built, not a mutation of one that exists; nothing

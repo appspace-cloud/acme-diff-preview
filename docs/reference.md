@@ -175,6 +175,14 @@ do not park the VM with `TERMINATED` for it: on some KCC versions a parked
 VM gets a stop on every reconcile (COPR-31983). The chart template comment
 that says to park the VM first is out of date. COPS-2760 covers the chart
 side of that stop loop.
+In a value file under `gcp/`, the values level flags a `deployLinuxServicesK8s`
+`machineType` change only when the render cannot confirm it: an app of that
+file failed, was not diffed or is missing. When every app mapped to the file
+rendered, the `ComputeInstance` line decides, so a new role or a key that
+moves (#4640, #3784) is a routine line and a real resize is flagged once.
+That means every app of the file rendered, not that the VM app was found.
+ASO on Azure, the legacy key and Windows keep their rule, because the render
+level does not read those VMs.
 Also flagged: a `bootDisk` change on an existing VM, a disk `location`
 change, and a BigQueryDataset or StorageBucket `location` or project change.
 The chart renders `bootDiskSizeGb`, `bootImage` and the boot disk type into

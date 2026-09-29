@@ -77,7 +77,9 @@ def _is_danger(out):
 
 
 def _machinetype_danger(out):
-    return "runbook requires" in out
+    # COPS-2766: a KCC resize carries _VM_RESIZE_REASON, the legacy key the
+    # runbook text. Both, or a `not` below passes for nothing.
+    return m._VM_RESIZE_REASON in out or "runbook requires" in out
 
 
 # --- 1. the bug itself ---------------------------------------------------
