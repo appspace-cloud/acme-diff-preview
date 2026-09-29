@@ -172,6 +172,8 @@ from comment_render import (  # comment rendering (same-dir module, stdlib only)
     _BLAST_RADIUS_HDR,
     _VALUES_REDUNDANCY_HDR,
     _IDENTITY_MIGRATION_HDR,
+    _AUTOSYNC_PAUSED_HDR,
+    _AUTOSYNC_RESUMED_HDR,
     _DECOM_VM_STRIP_HDR,
     _DECOM_FLAG_TYPO_HDR,
     _SHUTDOWN_MIN_WORKLOADS,
@@ -9260,7 +9262,7 @@ def _summarize_appspace_state_changes(changed_files, pr_sha, base_sha, path_map,
         was_paused, is_paused = _autosync_paused(old_flat), _autosync_paused(new_flat)
         if not was_paused and is_paused:
             lines += [
-                f"### \u23f8\ufe0f Auto-sync PAUSED for `{env_name}`",
+                f"### \u23f8\ufe0f {_AUTOSYNC_PAUSED_HDR} `{env_name}`",
                 "",
                 f"`appspace.autosync: false` was added to this environment's " +
                 f"`customer.yaml`. Automated sync stops for {app_list} \u2014 " +
@@ -9271,7 +9273,7 @@ def _summarize_appspace_state_changes(changed_files, pr_sha, base_sha, path_map,
             ]
         elif was_paused and not is_paused:
             lines += [
-                f"### \u25b6\ufe0f Auto-sync RESUMED for `{env_name}`",
+                f"### \u25b6\ufe0f {_AUTOSYNC_RESUMED_HDR} `{env_name}`",
                 "",
                 f"`appspace.autosync: false` was removed from this environment's " +
                 f"`customer.yaml`. Automated sync resumes for {app_list}. If this " +

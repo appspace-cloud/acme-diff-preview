@@ -239,6 +239,12 @@ _VALUES_REDUNDANCY_HDR = "**Higher-layer values.**"
 # Written by the identity-change guard in diff_preview for a confirmed rename of
 # a live environment, matched here for the REVIEW verdict line.
 _IDENTITY_MIGRATION_HDR = "**Planned rename.**"
+# COPS-2766: the auto-sync panel headers, written in diff_preview and matched
+# here. The summary used `"PAUSED" in txt.upper()`, which also matched the
+# resume panel ("drifted while paused") and the "remains paused" reminder, so
+# every resume was announced as a pause.
+_AUTOSYNC_PAUSED_HDR = "Auto-sync PAUSED for"
+_AUTOSYNC_RESUMED_HDR = "Auto-sync RESUMED for"
 
 # COPS-2668: and a third state. The summary used to know only purge-vs-not,
 # so an environment with NO cascade armed — where the Applications go and
@@ -731,11 +737,11 @@ def _build_merge_summary(results, rollup_by_sig, vm_change_lines,
             findings.append((_SEV_ROUTINE,
                              "\U0001f513 decommission disarmed (safe "
                              "direction)"))
-        if "PAUSED" in txt.upper():
+        if _AUTOSYNC_PAUSED_HDR in txt:
             findings.append((_SEV_REVIEW,
                              "\u23f8\ufe0f **ArgoCD auto-sync paused** for an "
                              "environment \u2014 changes stop being applied"))
-        elif "RESUMED" in txt.upper():
+        elif _AUTOSYNC_RESUMED_HDR in txt:
             findings.append((_SEV_REVIEW,
                              "\u25b6\ufe0f **ArgoCD auto-sync resumed** \u2014 "
                              "pending drift will be applied"))
