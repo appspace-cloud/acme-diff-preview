@@ -13,9 +13,10 @@ not diffed) the values line keeps the danger with the KCC resize reason.
 
 The role bug goes too: for a key right under the prefix the old code read
 `<prefix>machineType.desiredStatus`, and a TERMINATED escape no KCC resize
-needs any more. Legacy Terraform, Windows and ASO on Azure keep today's rule
-and text: the render level cannot see those machines, and the Terraform path
-is being replaced by KCC and ASO.
+needs any more. ASO on Azure reads no desiredStatus: every resize there is
+flagged, with its own text. Legacy Terraform and Windows keep the rule and
+text of main: the render level cannot see those machines, and the Terraform
+path is being replaced by KCC and ASO.
 """
 import os
 import sys
@@ -364,15 +365,20 @@ ASO_OLD = (
 ASO_NEW = ASO_OLD.replace("Standard_E4as_v5", "Standard_E8as_v5")
 
 
-def test_an_aso_resize_on_azure_keeps_its_rule_with_a_render(monkeypatch):
+def test_an_aso_resize_on_azure_is_flagged_with_its_own_text(monkeypatch):
     """The pv-nicewatch-a shape. On Azure the same key renders an ASO
     VirtualMachine, and the render level reads only KCC kinds, so a full
-    render cannot confirm this resize."""
+    render cannot confirm this resize. ASO reads no desiredStatus, so the
+    text does not name it."""
     lines = _panel(monkeypatch, ASO, ASO_OLD, ASO_NEW, *_rendered(ASO))
     assert lines[0] == m._VM_PANEL_DANGER_HDR
     ln = _mt_lines(lines)[0]
     assert ln.startswith("- \U0001f6a8 `pv-nicewatch-a`")
-    assert ln.endswith("\u2014 " + LEGACY_REASON), ln
+    assert ln.endswith("\u2014 " + m._VM_ASO_RESIZE_REASON), ln
+    assert m._VM_ASO_RESIZE_REASON == (
+        "machineType changes: Azure restarts the VM to resize it. Merge in "
+        "a window")
+    assert "desiredStatus" not in m._VM_ASO_RESIZE_REASON
 
 
 def test_a_terminated_sibling_hides_no_aso_resize(monkeypatch):
@@ -381,7 +387,29 @@ def test_a_terminated_sibling_hides_no_aso_resize(monkeypatch):
     new = old.replace("Standard_E4as_v5", "Standard_E8as_v5")
     lines = _panel(monkeypatch, ASO, old, new, *_rendered(ASO))
     assert lines[0] == m._VM_PANEL_DANGER_HDR
-    assert _mt_lines(lines)[0].startswith("- \U0001f6a8 `pv-nicewatch-a`")
+    ln = _mt_lines(lines)[0]
+    assert ln.startswith("- \U0001f6a8 `pv-nicewatch-a`")
+    assert ln.endswith("\u2014 " + m._VM_ASO_RESIZE_REASON), ln
+
+
+@pytest.mark.parametrize("parked", [
+    "      svc:\n        desiredStatus: TERMINATED\n",
+    "      defaults:\n        desiredStatus: TERMINATED\n"])
+def test_a_parked_legacy_resize_stays_as_on_main(monkeypatch, parked):
+    """Marcos: the Terraform path is replaced by KCC and ASO, so it keeps
+    the rule of main as it is. A TERMINATED role or defaults hides it."""
+    path = "gcp/prod/private-cloud/au1-b/monthly/pv-deloitte-c/customer.yaml"
+    old = ("appspace:\n  infra:\n    deployLinuxServices:\n" + parked
+           + "        machineType: n2d-custom-16-49152\n")
+    new = old.replace("n2d-custom-16-49152", "n2-custom-12-49152")
+    lines = _panel(monkeypatch, path, old, new, _rendered(path)[0], {})
+    assert lines[0] == m._VM_PANEL_ROUTINE_HDR, lines
+    assert LEGACY_REASON not in "\n".join(lines)
+    running = old.replace("TERMINATED", "RUNNING")
+    lines = _panel(monkeypatch, path, running,
+                   running.replace("n2d-custom-16-49152", "n2-custom-12-49152"),
+                   _rendered(path)[0], {})
+    assert _mt_lines(lines)[0].endswith("\u2014 " + LEGACY_REASON)
 
 
 def test_an_ancestor_file_needs_every_app_below_it_rendered(monkeypatch):

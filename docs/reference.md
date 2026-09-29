@@ -181,8 +181,10 @@ file failed, was not diffed or is missing. When every app mapped to the file
 rendered, the `ComputeInstance` line decides, so a new role or a key that
 moves (#4640, #3784) is a routine line and a real resize is flagged once.
 That means every app of the file rendered, not that the VM app was found.
-ASO on Azure, the legacy key and Windows keep their rule, because the render
-level does not read those VMs.
+The render level does not read an ASO, legacy or Windows VM. ASO on Azure
+reads no `desiredStatus`, so the values level flags every `machineType` change
+there, with its own text: Azure restarts the VM to resize it. The legacy key
+and Windows keep the rule and the text they had.
 Also flagged: a `bootDisk` change on an existing VM, a disk `location`
 change, and a BigQueryDataset or StorageBucket `location` or project change.
 The chart renders `bootDiskSizeGb`, `bootImage` and the boot disk type into

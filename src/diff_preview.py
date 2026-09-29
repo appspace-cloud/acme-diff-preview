@@ -287,6 +287,7 @@ from vm_analysis import (  # VM/KCC infrastructure analysis (same-dir module)
     _IMMUTABLE_RENDER_KINDS,
     _render_immutable_facts,
     _merge_vm_facts,
+    _VM_ASO_RESIZE_REASON,
 )
 from decommission import (
     _PH_DONE,  # environment teardown and creation analysis
@@ -11365,19 +11366,25 @@ def _summarize_vm_changes(changed_files, pr_sha, base_sha, path_map,
                 # what sent an operator to file a bug against the tool
                 # (acme-config-stage #2807). The provision itself is still
                 # flagged, once, by the group line built after this loop.
-                # COPS-2766: no desiredStatus escape. For a key right under
-                # the prefix it read `<prefix>machineType.desiredStatus`, and
-                # KCC resizes a parked VM too. On GCP the render decides when
+                # COPS-2766: KCC resizes a parked VM too, so the KCC key has
+                # no desiredStatus escape. On GCP the render decides when
                 # every app of the file rendered: the ComputeInstance line
-                # flags a real resize once. Legacy Terraform, Windows and
-                # ASO keep their rule, because the render level sees no VM.
+                # flags a real resize once. ASO reads no desiredStatus. The
+                # legacy Terraform key and Windows keep the rule of main as
+                # it is, because KCC and ASO replace that path.
                 if adopted_move or domain_new:
                     pass
-                elif prefix != _KCC_PREFIX or not clean.startswith("gcp/"):
+                elif prefix != _KCC_PREFIX:
+                    ds = (new_flat.get(prefix + role + ".desiredStatus")
+                          or new_flat.get(prefix + "defaults.desiredStatus"))
+                    if str(ds) != "TERMINATED":
+                        danger = True
+                        reason = ("machineType changes while desiredStatus "
+                                  "is not TERMINATED \u2014 the runbook "
+                                  "requires stopping the VM first")
+                elif not clean.startswith("gcp/"):
                     danger = True
-                    reason = ("machineType changes while desiredStatus is "
-                              "not TERMINATED \u2014 the runbook requires "
-                              "stopping the VM first")
+                    reason = _VM_ASO_RESIZE_REASON
                 elif not _render_covers(path_map.get(clean), app_results):
                     danger = True
                     reason = _VM_RESIZE_REASON

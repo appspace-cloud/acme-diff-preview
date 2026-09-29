@@ -466,6 +466,10 @@ _VM_PARK_NOTE = ("desiredStatus moves to TERMINATED: KCC stops the VM, and on "
                  "(COPR-31983, COPS-2760)")
 _VM_START_NOTE = ("desiredStatus moves from TERMINATED to RUNNING: KCC starts "
                   "the VM on sync")
+# ASO on Azure reads no desiredStatus, and Azure restarts a running VM to
+# resize it. The render level reads no ASO VM, so every resize is flagged.
+_VM_ASO_RESIZE_REASON = ("machineType changes: Azure restarts the VM to "
+                         "resize it. Merge in a window")
 
 
 def _vm_unquote(v: str) -> str:
