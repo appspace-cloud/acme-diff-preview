@@ -12800,8 +12800,6 @@ def process_pr(pr, path_map, base_sha="", repo=None):
                 desc = ("Unresolved KCC value - Compute* resources render "
                         "%!s(<nil>) / <no value>; set hostingID (or the "
                         "missing field) before merging (see PR comment)")
-            elif gate_tok:
-                desc = gate_status_description(gates)
             elif structural_envs:
                 # COPS-2709: "structural config problem" is a category, not a
                 # problem. When the render named one, lead with it.
@@ -12837,6 +12835,10 @@ def process_pr(pr, path_map, base_sha="", repo=None):
                 desc = (f"Diff failed: {_errs[0].splitlines()[0][:180]} "
                         f"- check PR comment" if _errs else
                         "Diff failed - check PR comment")
+            elif not has_blocking_indet:
+                # COPS-2766: a merge gate comes last, so it never hides the
+                # text of an older guard.
+                desc = gate_status_description(gates)
             else:
                 # Permanent indeterminate reason other than oci_not_found.
                 # COPS-2709: this branch is reached by four different

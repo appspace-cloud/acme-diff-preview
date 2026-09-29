@@ -368,3 +368,23 @@ def test_a_pr_with_no_gate_never_reads_the_commits(world, monkeypatch):
     m.process_pr(_mk_pr(), PATH_MAP, base_sha=BASE_SHA)
     assert m._extract_status_token(sinks.upserts[-1]) == "clean"
     assert sinks.statuses[-1][0] == "SUCCESSFUL"
+
+
+@pytest.mark.parametrize("result,desc", [
+    (m.DiffResult("", [], 0, False, "helm: boom", m.OUT_ERROR, ""),
+     "Diff failed: helm: boom - check PR comment"),
+    (m.DiffResult("", [], 0, False, "bad yaml", m.OUT_INDETERMINATE,
+                  m.REASON_INVALID_YAML), None),
+])
+def test_an_older_guard_keeps_its_status_text(world, monkeypatch, result, desc):
+    """A gate never hides the FAILED text an older guard had before it."""
+    sinks, plan = world
+    monkeypatch.setattr(m, "_merge_gates", lambda *a: [_gate("orphan", env="pv-orch-a")])
+    monkeypatch.setattr(m, "_pr_commit_messages", lambda *a: [])
+    plan["pv-orch-a-ms"] = result
+    m.process_pr(_mk_pr(), PATH_MAP, base_sha=BASE_SHA)
+    state, got = sinks.statuses[-1]
+    assert state == "FAILED" and not got.startswith("Blocked"), got
+    assert got == (desc or m._permanent_failure_status_description(
+        {"pv-orch-a-ms": result}))
+    assert "| ⛔ BLOCKED" in sinks.upserts[-1], "the comment still shows the gate"
