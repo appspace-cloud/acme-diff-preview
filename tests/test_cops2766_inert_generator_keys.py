@@ -20,6 +20,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
 sys.path.insert(0, os.path.dirname(__file__))
 
 import diff_preview as m  # noqa: E402
+import yaml_hygiene as yh  # noqa: E402
 
 from test_coverage_orchestration import (  # noqa: E402,F401
     world, _mk_pr, PATH_MAP, BASE_SHA, PR_SHA, IDENTITY, IDENTITY_YAML, ANCILLARY)
@@ -323,6 +324,33 @@ def test_a_version_that_is_not_a_string():
            "Quote it: `version: \"2604.0\"`." in body
     assert "`2604.0` becomes `2604`" in body and "COPS-2684" not in body
     assert "—" not in body and "–" not in body
+
+
+def test_a_number_keeps_the_text_the_author_wrote(monkeypatch):
+    # 2603.10 loads as the float 2603.1: quoting that would pin another chart.
+    _serve(monkeypatch, {"head1": {ENV: _body(version="2603.10"),
+                                   CICD: _body(version='"2603.3.10"', autosync="true")}})
+    hits = m._detect_inert_generator_keys([ENV, CICD], {}, MAP, "head1", None)
+    assert [(h["key"], h["value"], h["text"]) for h in hits] == [
+        ("version", 2603.1, "2603.10"), ("version", "2603.3.10", None), ("autosync", True, "true")]
+    _, body = m._inert_key_block(hits, PR_SHA, None)
+    assert f"- `{ENV}`: `appspace.version: 2603.10` is not a string in YAML. " \
+           "Quote it: `version: \"2603.10\"`." in body
+    assert f"- `{CICD}`: `appspace.version: \"2603.3.10\"`. The" in body
+    assert f"- `{CICD}`: `appspace.autosync: true`. The" in body
+    assert "2603.1`" not in body and '"2603.1"' not in body
+
+
+@pytest.mark.parametrize("body,want", [
+    ("appspace:\n  version: 2604.10\n", "2604.10"),
+    ("appspace:\n  version: 1\n  version: 2604.10\n", "2604.10"),    # the last copy
+    ("b: &b\n  version: 2604.10\nappspace:\n  <<: *b\n", "2604.10"),  # a merge
+    ("appspace:\n  version:\n    AppVersion: x\n", None),
+    ("appspace: [\n", None),
+    (None, None),
+])
+def test_the_text_of_a_scalar_as_written(body, want):
+    assert yh.scalar_text(body, "appspace", "version") == want
 
 
 def test_a_version_map_points_to_versions():

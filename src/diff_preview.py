@@ -5432,7 +5432,8 @@ def _generator_reads(path, sha, path_map, changed, repo=None):
 def _detect_inert_generator_keys(changed, renames, path_map, sha, base_sha, repo=None) -> list:
     """COPS-2766: appspace.version, autosync or decommission that this PR sets in
     a file the ApplicationSet does not read (why "inert"), or a version that is
-    not a string (why "type", in any file), as hits {path, key, value, why}.
+    not a string (why "type", in any file), as hits {path, key, value, why,
+    text}, `text` the value as written when it is not a string, else None.
 
     A removed key, or one with the same value at `base_sha` (under the old name
     of a move), is not a hit. With no base every key counts. A public-cloud
@@ -5464,7 +5465,11 @@ def _detect_inert_generator_keys(changed, renames, path_map, sha, base_sha, repo
         if found and base_sha:
             old = appspace(old_of.get(f, f), base_sha)
             found = [(k, why) for k, why in found if not (k in old and old[k] == own[k])]
-        hits += [{"path": f, "key": k, "value": own[k], "why": why} for k, why in found]
+        # The text as written: 2604.10 loads as 2604.1, so the value cannot say it.
+        text = {k: yaml_hygiene.scalar_text(_value_body(f, sha, repo), "appspace", k)
+                for k, _ in found if not isinstance(own[k], str)}
+        hits += [{"path": f, "key": k, "value": own[k], "why": why, "text": text.get(k)}
+                 for k, why in found]
     return hits
 
 
@@ -5493,7 +5498,7 @@ def _inert_key_block(hits: list, pr_sha: str, base_sha: str):
         return "decommission" if x["key"] == "decommission" else x["why"]
 
     def line(x):
-        v = json.dumps(x["value"], default=str)
+        v = x.get("text") or json.dumps(x["value"], default=str)
         # acme-config-dev #6845 wrote version.AppVersion for versions.AppVersion.
         tip = (" For the chart's app versions, the key is `appspace.versions`."
                if x["key"] == "version" and isinstance(x["value"], dict) else "")

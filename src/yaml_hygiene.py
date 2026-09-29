@@ -93,3 +93,15 @@ def slips(body):
         out["wipe"] = True
         out["lines"][("wipe", DEFINITIONS)] = [(wiped.start_mark.line + 1, None)]
     return out
+
+
+def scalar_text(body, *keys):
+    """The text of the plain scalar at `keys` in the first document of `body`,
+    as the author wrote it (`2604.10`, where a loader gives 2604.1), or None."""
+    try:
+        node = next(yaml.compose_all(body or "", Loader=_LOADER), None)
+        for key in keys:
+            node = _get(node, key)[1]
+    except yaml.YAMLError:
+        return None
+    return node.value if isinstance(node, yaml.ScalarNode) else None
