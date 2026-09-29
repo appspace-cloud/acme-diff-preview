@@ -236,7 +236,6 @@ def test_early_exit_not_leader_neither_seen_nor_backed_off(world, monkeypatch, n
 
 @pytest.mark.parametrize("name", EXITS)
 def test_early_exit_status_carries_the_repo(world, monkeypatch, name):
-    sinks, _plan = world
     repos = []
     EXITS[name][0](monkeypatch)
     monkeypatch.setattr(m, "post_build_status",
@@ -490,7 +489,9 @@ def test_every_post_build_status_call_passes_repo():
     src = os.path.join(os.path.dirname(__file__), "..", "src")
     missing, calls = [], 0
     for path in sorted(glob.glob(os.path.join(src, "*.py"))):
-        for node in ast.walk(ast.parse(open(path).read())):
+        with open(path) as fh:
+            tree = ast.parse(fh.read())
+        for node in ast.walk(tree):
             if not isinstance(node, ast.Call):
                 continue
             fn = node.func

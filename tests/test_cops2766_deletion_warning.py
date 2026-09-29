@@ -106,3 +106,13 @@ def test_every_listed_data_kind_is_recognised():
     for kind in sorted(cr._DATA_KINDS):
         assert "**Data or IP deleted: 1 " + kind + "**" in \
             _summary([f"/x/{kind} ns/name"])
+
+
+def test_a_gcp_kind_is_read_from_the_api_group_only():
+    """The group decides, not a substring anywhere in the header (CodeQL)."""
+    assert cr._is_kcc_header(
+        "/compute.cnrm.cloud.google.com/v1beta1/ComputeBackendService ns/bs")
+    assert cr._is_kcc_header("/iam.cnrm.cloud.google.com/v1beta1/IAMPolicyMember x")
+    assert not cr._is_kcc_header("/v1/Secret ns/cnrm.cloud.google.com")
+    assert not cr._is_kcc_header("/evilcnrm.cloud.google.com/v1/Kind ns/x")
+    assert not cr._is_kcc_header("/apps/v1/Deployment ns/web")

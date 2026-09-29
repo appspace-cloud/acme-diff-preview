@@ -359,6 +359,13 @@ _REVIEW_RANK = {
 }
 
 
+def _is_kcc_header(header) -> bool:
+    """'/compute.cnrm.cloud.google.com/v1beta1/X ns/name' -> True: the API
+    group of the header ends in .cnrm.cloud.google.com."""
+    group = header.split(" ", 1)[0].lstrip("/").split("/", 1)[0]
+    return group.endswith(".cnrm.cloud.google.com")
+
+
 def _deletion_finding(headers, n_envs, envs) -> str:
     """The deletion bullet, kinds with counts. Data kinds come first in the
     text, so the ~30 characters Bitbucket shows of the status say it.
@@ -366,8 +373,7 @@ def _deletion_finding(headers, n_envs, envs) -> str:
     top two, or all three when there are three. A BackendService (#4684)
     must not hide in "+1 kind(s)" behind Secrets and ConfigMaps."""
     n = Counter(_section_kind(h) for h in headers)
-    gcp = {_section_kind(h) for h in headers
-           if "cnrm.cloud.google.com/" in h.split(" ", 1)[0]}
+    gcp = {_section_kind(h) for h in headers if _is_kcc_header(h)}
     kinds = sorted(n, key=lambda k: (k not in gcp, -n[k], k))
     count = f"{len(headers)} resource(s)"
     data = [f"{n[k]} {k}" for k in kinds if k in _DATA_KINDS]
