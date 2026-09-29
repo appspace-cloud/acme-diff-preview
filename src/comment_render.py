@@ -9,9 +9,10 @@ A leaf on the hub, though it may use the other leaves. It imports nothing
 from the service and must stay that way.
 """
 import re
+from collections import Counter
 
 import diff_ui
-from manifest import _is_kcc_blocking_artifact, _hpa_headers
+from manifest import _is_kcc_blocking_artifact, _hpa_headers, _section_kind
 from vocabulary import (
     OUT_DIFF,
     OUT_ERROR,
@@ -322,6 +323,29 @@ _VERDICTS = {
 }
 
 
+# COPS-2766: kinds whose deletion loses data or a public address. The
+# deletion bullet names them, all of them, so a bucket cannot hide among 60
+# IAM bindings under "68 resource(s) deleted".
+_DATA_KINDS = frozenset({
+    "StorageBucket", "BigQueryDataset", "BigQueryTable", "ComputeDisk",
+    "ComputeSnapshot", "SQLInstance", "SQLDatabase", "RedisInstance",
+    "SecretManagerSecret", "ComputeAddress", "DNSRecordSet", "DNSManagedZone",
+    "PersistentVolumeClaim", "PersistentVolume", "StorageAccount",
+})
+
+
+def _deleted_kinds(headers) -> str:
+    """The kinds part of the deletion bullet: data kinds if any, else the
+    top two kinds, each with its count."""
+    n = Counter(_section_kind(h) for h in headers)
+    kinds = sorted(n, key=lambda k: (-n[k], k))
+    data = [f"{n[k]} {k}" for k in kinds if k in _DATA_KINDS]
+    if data:
+        return f", **including data or a public address: {', '.join(data)}**"
+    more = f", +{len(kinds) - 2} kind(s)" if len(kinds) > 2 else ""
+    return f" ({', '.join(f'{n[k]} {k}' for k in kinds[:2])}{more})"
+
+
 def _fmt_env_list(apps, shown=8) -> str:
     """Environment names, the way operators say them (no -ms/-ss/-glb)."""
     envs = sorted(set(_envs_from_apps(sorted(apps))))
@@ -464,9 +488,9 @@ def _build_merge_summary(results, rollup_by_sig, vm_change_lines,
     if deleted_apps:
         # COPS-2682: KCC CRs leaving the render under deletion-policy
         # abandon (or snapshot attachments that only drop the schedule
-        # binding) are not GCP destroys. Pull them out of the BLOCK
+        # binding) are not GCP destroys. Pull them out of the
         # "resource(s) deleted" count so unmanage PRs stop looking like
-        # DO NOT MERGE destroy changes (acme-config-prod #4326).
+        # destroy changes (acme-config-prod #4326).
         orphan_hdrs = set()
         for r in results.values():
             for f in (getattr(r, "vm_changes", None) or []):
@@ -476,28 +500,33 @@ def _build_merge_summary(results, rollup_by_sig, vm_change_lines,
                     orphan_hdrs.add(f.get("header"))
         # COPS-2714: HPAs removed because this same PR enables the
         # ping-scaler are the chart's documented contract, not a destroy.
-        # They get their own REVIEW line below instead of the BLOCK count.
+        # They get their own REVIEW line below instead of the deletion count.
         ps_hdrs = _pingscaler_reclass(results)
-        hard_n = 0
+        hard_hdrs = []
         hard_apps = []
         orphan_n = 0
         for a in deleted_apps:
             hard = [h for h in (results[a].deleted_resources or [])
                     if h not in orphan_hdrs and h not in ps_hdrs.get(a, ())]
             if hard:
-                hard_n += len(hard)
+                hard_hdrs += hard
                 hard_apps.append(a)
             orphan_n += sum(
                 1 for h in (results[a].deleted_resources or [])
                 if h in orphan_hdrs)
-        if hard_n:
+        if hard_hdrs:
             # COPS-2683: count environments to match `_fmt_env_list` (same
             # class of app-vs-env lie as COPS-2675 on the render-blocked
             # headline). Orphan/abandon wording above is unchanged.
+            #
+            # COPS-2766: REVIEW, not BLOCK. The build never went red for a
+            # deletion, and a stop sign on every planned cleanup taught
+            # approvers to skip it. The kinds say what goes instead.
             n_envs = len(set(_envs_from_apps(hard_apps)))
-            findings.append((_SEV_BLOCK,
-                             f"\u274c **{hard_n} resource(s) deleted** in "
-                             f"{n_envs} environment(s): "
+            findings.append((_SEV_REVIEW,
+                             f"\U0001f5d1\ufe0f **{len(hard_hdrs)} resource(s) "
+                             f"deleted** in {n_envs} environment(s)"
+                             f"{_deleted_kinds(hard_hdrs)}: "
                              f"{_fmt_env_list(hard_apps)}"))
         if orphan_n:
             findings.append((_SEV_REVIEW,

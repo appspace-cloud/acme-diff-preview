@@ -579,16 +579,20 @@ def _merge_summary_of(body):
     return body.split("Merge summary", 1)[1].split("\n---", 1)[0]
 
 
-def test_merge_summary_blocks_on_real_deletions():
+def test_merge_summary_reviews_real_deletions():
+    """COPS-2766: a deletion is a warning, not a merge block. It must still
+    be named, with its kind, in the summary and in the panel."""
     secs = [("/v1/Service gone", TRUE_DELETION)]
     results = {"pv-acme-a-ms": _result(
         TRUE_DELETION, secs, 1, True, outcome=m.OUT_DIFF,
         deleted_resources=["/v1/Service gone"])}
     body = m.format_comment(PR_SHA, results, base_sha=BASE_SHA)
     head = _merge_summary_of(body)
-    assert "DO NOT MERGE" in head
-    assert "delet" in head.lower()
-    assert "pv-acme-a" in head
+    assert "Review before merging" in head
+    assert "DO NOT MERGE" not in head
+    assert ("\U0001f5d1\ufe0f **1 resource(s) deleted** in 1 environment(s) "
+            "(1 Service): pv-acme-a") in head, head
+    assert "1 RESOURCE(S) DELETED" in body
 
 
 def test_merge_summary_is_green_for_a_pure_routine_bump():

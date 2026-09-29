@@ -178,21 +178,27 @@ def test_pure_activation_is_calm_review_not_block(monkeypatch):
     assert "scaling.md" in body
 
 
-def test_a_secret_deleted_alongside_still_blocks(monkeypatch):
+def test_a_secret_deleted_alongside_is_still_named(monkeypatch):
+    """COPS-2766: deletions are REVIEW now, like the ping-scaler line, so the
+    verdict alone cannot catch a Secret swallowed into the calm path. The
+    deletion bullet, the panel count and the 🔐 row must all name it."""
     monkeypatch.setattr(m, "generate_ai_summary", lambda *a, **k: None)
     body = m.format_comment("c" * 12, _ford([HPA_A, HPA_B], [SECRET]))
-    assert "DO NOT MERGE" in body
+    summary = body.split("Merge summary", 1)[1].split("\n---\n", 1)[0]
+    assert ("\U0001f5d1\ufe0f **1 resource(s) deleted** in 1 environment(s) "
+            "(1 Secret): pv-ford--aec1-b") in summary, summary
     assert "1 RESOURCE(S) DELETED" in body, (
         "the count must exclude the reclassified HPAs, not hide the Secret")
-    assert "\U0001f510" in body
+    assert "- \U0001f510 `pv-ford--aec1-b-ms` \u2192 `/v1/Secret db-credentials`" in body
     assert "takes over replica control" in body, (
         "the calm panel and the alarm coexist; each says its own truth")
 
 
-def test_hpas_without_an_activation_still_shout(monkeypatch):
+def test_hpas_without_an_activation_still_count_as_deleted(monkeypatch):
     monkeypatch.setattr(m, "generate_ai_summary", lambda *a, **k: None)
     body = m.format_comment("c" * 12, {
         "pv-x-ms": _mk(deleted=[HPA_A, HPA_B])})
     assert "2 RESOURCE(S) DELETED" in body
-    assert "DO NOT MERGE" in body
+    assert ("**2 resource(s) deleted** in 1 environment(s) "
+            "(2 HorizontalPodAutoscaler): pv-x") in body
     assert "takes over replica control" not in body

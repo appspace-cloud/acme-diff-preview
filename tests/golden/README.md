@@ -16,7 +16,7 @@ Each golden below maps to a real incident:
 | File | Guards against |
 |---|---|
 | `minus_only_no_deletion_block.md` | COPS-2563. Live PR 3829 announced "110 RESOURCE(S) DELETED" for Deployments whose only change was a removed `replicas:` line. |
-| `true_deletion_shouts.md` | The other half of COPS-2563: a real deletion must stay loud. A "fix" that silenced this would be worse than the bug. |
+| `true_deletion_shouts.md` | The other half of COPS-2563: a real deletion must stay loud. A "fix" that silenced this would be worse than the bug. Since COPS-2766 the verdict is ⚠️ review, not ⛔: loud means the panel and a summary line that names the kind. |
 | `schema_failure_readable.md` | COPS-2564. 53 schema violations were cut mid-path at 400 characters, ending in `definitions/a`. |
 | `failed_app_not_green.md` | The most dangerous failure mode in the product: a computation failure rendered as "no changes". |
 | `new_env_rides_along.md` | v2.5.4 Finding 4: a clean existing-app diff must not show a green check while an unvalidated new environment rode in on the same PR. |
