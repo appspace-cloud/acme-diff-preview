@@ -7,8 +7,12 @@ and the bullet says which kinds go, so the fact is still there to read:
 
   🗑️ **N resource(s) deleted** in E environment(s) (2 Kind, 1 Kind, +K kind(s)): envs
 
-A data or public-address kind replaces the top-two list and is always named,
-so a bucket cannot hide among IAM bindings (acme-config-prod #4672).
+A data or public-address kind replaces the top-two list, is always named,
+and leads the bullet, so a bucket cannot hide among IAM bindings
+(acme-config-prod #4672), not even in the ~30 characters Bitbucket shows of
+the green status:
+
+  🗑️ **Data or IP deleted: 1 StorageBucket, ...** (N resource(s) in E environment(s)): envs
 """
 import os
 import sys
@@ -51,24 +55,33 @@ def test_the_top_two_kinds_lead_and_the_rest_are_counted():
             "pv-nbc-a") in out, out
 
 
-def test_data_kinds_replace_the_top_two_and_are_all_named():
-    """The #4672 shape: 60 IAM bindings would lead a count-only list."""
-    out = _summary(
-        [f"/iam.cnrm.cloud.google.com/IAMPolicyMember pv-nbc-a/m-{i}"
+_NBC = ([f"/iam.cnrm.cloud.google.com/IAMPolicyMember pv-nbc-a/m-{i}"
          for i in range(60)]
         + [f"{KCC}/StorageBucket pv-nbc-a/uc",
            "/bigquery.cnrm.cloud.google.com/BigQueryDataset pv-nbc-a/ds",
            "/dns.cnrm.cloud.google.com/DNSRecordSet pv-nbc-a/rs",
            "/compute.cnrm.cloud.google.com/ComputeAddress pv-nbc-a/ip",
            "/compute.cnrm.cloud.google.com/ComputeAddress pv-nbc-a/ip2"])
-    assert ("**65 resource(s) deleted** in 1 environment(s), **including data "
-            "or a public address: 2 ComputeAddress, 1 BigQueryDataset, "
-            "1 DNSRecordSet, 1 StorageBucket**: pv-nbc-a") in out, out
+
+
+def test_data_kinds_replace_the_top_two_and_are_all_named():
+    """The #4672 shape: 60 IAM bindings would lead a count-only list."""
+    out = _summary(_NBC)
+    assert ("- \U0001f5d1\ufe0f **Data or IP deleted: 2 ComputeAddress, "
+            "1 BigQueryDataset, 1 DNSRecordSet, 1 StorageBucket** "
+            "(65 resource(s) in 1 environment(s)): pv-nbc-a") in out, out
     assert "IAMPolicyMember" not in out
     assert "Review before merging" in out
 
 
+def test_data_leads_what_bitbucket_shows_of_the_green_status():
+    """Bitbucket shows ~30 characters before '...'. A routine GLB cleanup
+    reads '⚠️ 1044 resource(s) deleted in', so the data must come first."""
+    lead = cr.status_lead(_summary(_NBC) + "\n---\n")
+    assert lead.startswith("\u26a0\ufe0f Data or IP deleted: 2 ComputeAddress"), lead
+
+
 def test_every_listed_data_kind_is_recognised():
     for kind in sorted(cr._DATA_KINDS):
-        assert "including data or a public address: 1 " + kind in \
+        assert "**Data or IP deleted: 1 " + kind + "**" in \
             _summary([f"/x/{kind} ns/name"])

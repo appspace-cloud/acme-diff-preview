@@ -325,8 +325,8 @@ _VERDICTS = {
 
 
 # COPS-2766: kinds whose deletion loses data or a public address. The
-# deletion bullet names them, all of them, so a bucket cannot hide among 60
-# IAM bindings under "68 resource(s) deleted".
+# deletion bullet leads with them, all of them, so a bucket cannot hide among
+# 60 IAM bindings under "68 resource(s) deleted".
 _DATA_KINDS = frozenset({
     "StorageBucket", "BigQueryDataset", "BigQueryTable", "ComputeDisk",
     "ComputeSnapshot", "SQLInstance", "SQLDatabase", "RedisInstance",
@@ -335,16 +335,20 @@ _DATA_KINDS = frozenset({
 })
 
 
-def _deleted_kinds(headers) -> str:
-    """The kinds part of the deletion bullet: data kinds if any, else the
-    top two kinds, each with its count."""
+def _deletion_finding(headers, n_envs, envs) -> str:
+    """The deletion bullet, kinds with counts. Data kinds come first in the
+    text, so the ~30 characters Bitbucket shows of the status say it.
+    Otherwise the top two kinds by count."""
     n = Counter(_section_kind(h) for h in headers)
     kinds = sorted(n, key=lambda k: (-n[k], k))
+    count = f"{len(headers)} resource(s)"
     data = [f"{n[k]} {k}" for k in kinds if k in _DATA_KINDS]
     if data:
-        return f", **including data or a public address: {', '.join(data)}**"
+        return (f"\U0001f5d1\ufe0f **Data or IP deleted: {', '.join(data)}** "
+                f"({count} in {n_envs} environment(s)): {envs}")
     more = f", +{len(kinds) - 2} kind(s)" if len(kinds) > 2 else ""
-    return f" ({', '.join(f'{n[k]} {k}' for k in kinds[:2])}{more})"
+    return (f"\U0001f5d1\ufe0f **{count} deleted** in {n_envs} environment(s) "
+            f"({', '.join(f'{n[k]} {k}' for k in kinds[:2])}{more}): {envs}")
 
 
 def _fmt_env_list(apps, shown=8) -> str:
@@ -523,12 +527,9 @@ def _build_merge_summary(results, rollup_by_sig, vm_change_lines,
             # COPS-2766: REVIEW, not BLOCK. The build never went red for a
             # deletion, and a stop sign on every planned cleanup taught
             # approvers to skip it. The kinds say what goes instead.
-            n_envs = len(set(_envs_from_apps(hard_apps)))
-            findings.append((_SEV_REVIEW,
-                             f"\U0001f5d1\ufe0f **{len(hard_hdrs)} resource(s) "
-                             f"deleted** in {n_envs} environment(s)"
-                             f"{_deleted_kinds(hard_hdrs)}: "
-                             f"{_fmt_env_list(hard_apps)}"))
+            findings.append((_SEV_REVIEW, _deletion_finding(
+                hard_hdrs, len(set(_envs_from_apps(hard_apps))),
+                _fmt_env_list(hard_apps))))
         if orphan_n:
             findings.append((_SEV_REVIEW,
                              f"\U0001f5a5\ufe0f **{orphan_n} KCC resource(s) "
