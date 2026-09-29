@@ -163,6 +163,8 @@ from comment_render import (  # comment rendering (same-dir module, stdlib only)
     _VERDICTS,
     _fmt_env_list,
     _build_merge_summary,
+    status_lead,
+    join_status_lead,
     _DECOM_ORPHAN_HDR,
     _DECOM_PURGE_HDR,
     _DECOM_SHARED_UC_HDR,
@@ -8440,6 +8442,8 @@ def fix_stuck_inprogress(pr_sha, pr_id, comment_raw, repo=None):
             state, desc = "FAILED", "Diff unavailable - review comment"
         else:
             state, desc = "SUCCESSFUL", "No manifest changes"
+        if state == "SUCCESSFUL":
+            desc = join_status_lead(status_lead(comment_raw), desc)
         res = post_build_status(pr_sha, state, desc, pr_id=pr_id, repo=repo)
         if res == "ok":
             logsink.log(f"Fixed {'stuck INPROGRESS' if st else 'missing'} status "
@@ -12708,6 +12712,10 @@ def process_pr(pr, path_map, base_sha="", repo=None):
                     has_redundancy=_VALUES_REDUNDANCY_HDR in _joined,
                     has_input_changes=bool(input_change_lines))
                 state, desc = "SUCCESSFUL", f"{_clean}{status_extra}"
+        if state == "SUCCESSFUL":
+            # COPS-2766: lead with the top finding of the comment just
+            # posted; fix_stuck_inprogress rebuilds the same text from it.
+            desc = join_status_lead(status_lead(body), desc)
         st = post_build_status(pr_sha, state, desc, pr_id=pr_id, repo=repo)
 
         # Mark as seen logic:

@@ -324,6 +324,25 @@ the author to fix and push would send them to change a version that is
 probably correct. Apps failing the same way are grouped, so a fleet PR reads
 as one problem with an environment count rather than fifty lines.
 
+**The green status leads with the top finding** (COPS-2766). People approve
+from the merge dialog, and the green status there used to say only
+`N resource(s) will change - review comment` (acme-config-prod #4684 was
+approved seconds later, with its deletions only in the comment). When the
+merge summary is not routine, the description now starts with its first
+finding as plain text, then ` | ` and the text it had before:
+
+```
+⚠️ 1 resource(s) deleted in 1 environment(s) (1 Secret): pv-uwm-a | 3 resource(s) will change - review comment
+🚨 VM infrastructure change flagged dangerous — see the VM section | 6 resource(s) will change - review comment
+```
+
+🚨 means the comment verdict is ⛔, and ⚠️ means review. A routine PR keeps
+the old text. The status never says DO NOT MERGE, because the build is green.
+The whole description fits in 255 UTF-16 units: only the finding is cut
+(it ends in `...`), never the old text. The finding is read back from our own
+merge summary in the posted comment, so the recovery of a stuck INPROGRESS
+status writes the same text. FAILED descriptions do not change.
+
 See [docs/internals.md](internals.md) for the reasoning behind each guard,
 how mass version bumps are handled, the secret-leak hardening, and the
 full-diff web UI.

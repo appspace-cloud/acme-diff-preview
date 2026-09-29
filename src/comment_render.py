@@ -315,6 +315,7 @@ def _pingscaler_reclass(results) -> dict:
 PINGSCALER_DOCS_URL = ("https://appspace.atlassian.net/wiki/spaces/cops/"
                        "pages/1181089800")
 
+MERGE_SUMMARY_HDR = "## \u2139\ufe0f Merge summary"
 _SEV_ROUTINE, _SEV_REVIEW, _SEV_BLOCK = 0, 1, 2
 _VERDICTS = {
     _SEV_BLOCK: "\u26d4 **DO NOT MERGE** without checking the item(s) below",
@@ -905,8 +906,60 @@ def _build_merge_summary(results, rollup_by_sig, vm_change_lines,
         verdict += f" ({n_check} item(s))"
     order = {_SEV_BLOCK: 0, _SEV_REVIEW: 1, _SEV_ROUTINE: 2}
     findings.sort(key=lambda f: order[f[0]])
-    return ["## \u2139\ufe0f Merge summary", "", verdict, ""] + \
+    return [MERGE_SUMMARY_HDR, "", verdict, ""] + \
            [f"- {line}" for _s, line in findings] + [""]
+
+
+# COPS-2766: a green build status leads with the top finding of the merge
+# summary. Bitbucket shows the status in the merge dialog, where approvers
+# look: #4684 was approved seconds after a green "129 resource(s) will change".
+# The build is green, so the marker never says DO NOT MERGE.
+_STATUS_MARKS = {"\u26d4": "\U0001f6a8", "\u26a0": "\u26a0\ufe0f"}
+
+
+def status_lead(comment_md) -> str:
+    """'<marker> <first finding as plain text>', or '' when the verdict is
+    routine or there is no summary.
+
+    Reads only our own summary, before the first '---' of the comment, so
+    author content further down cannot fake it. Pure: process_pr and
+    fix_stuck_inprogress call it on the same comment and get the same text."""
+    lines = (comment_md or "").split("\n---\n", 1)[0].splitlines()
+    if MERGE_SUMMARY_HDR not in lines:
+        return ""
+    rest = [l for l in lines[lines.index(MERGE_SUMMARY_HDR) + 1:] if l.strip()]
+    mark = _STATUS_MARKS.get(rest[0][:1]) if rest else None
+    bullet = next((l[2:] for l in rest[1:] if l.startswith("- ")), "")
+    text = re.sub(r"\[([^\]]*)\]\([^)]*\)", r"\1", bullet)
+    text = text.replace("**", "").replace("`", "").strip()
+    emoji, _, after = text.partition(" ")
+    if not re.search(r"[A-Za-z0-9]", emoji):
+        text = after.strip()
+    text = re.sub(r"(?i)do\s+not\s+merge", "review", text)
+    return f"{mark} {text}" if mark and text else ""
+
+
+def _utf16_len(s) -> int:
+    return sum(2 if ord(c) > 0xFFFF else 1 for c in s)
+
+
+def join_status_lead(lead, description, limit=255) -> str:
+    """'<lead> | <description>' in `limit` UTF-16 units, the unit Bitbucket
+    counts. Only the lead is cut, ending in '...'. The description is never
+    cut: when it leaves no room for a lead, it comes back unchanged."""
+    if not lead:
+        return description
+    tail = f" | {description}"
+    room = limit - _utf16_len(tail)
+    if _utf16_len(lead) <= room:
+        return lead + tail
+    cut, n = "", 3                       # 3 for the "..."
+    for c in lead:
+        n += 2 if ord(c) > 0xFFFF else 1
+        if n > room:
+            break
+        cut += c
+    return f"{cut.rstrip()}...{tail}" if cut.strip() else description
 
 
 _SHUTDOWN_MIN_WORKLOADS = 2
