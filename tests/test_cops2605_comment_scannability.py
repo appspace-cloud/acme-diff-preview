@@ -214,13 +214,12 @@ def test_vm_facts_deletion_policy_flip_is_dangerous():
     assert "deletion" in " ".join(facts[0]["dangerous"]).lower()
 
 
-def test_vm_facts_whole_instance_deletion_defaults_to_abandon_orphan():
-    # COPS-2682: chart default for ComputeInstance is abandon when
-    # allowDeletion is unset. A CR leaving the render without an explicit
-    # deletion-policy: delete annotation is unmanage, not GCP destroy.
+def test_vm_facts_whole_instance_deletion_with_no_policy_is_dangerous():
+    # COPS-2766: every template writes the policy, so a CR with no policy
+    # line is not the chart's abandon. KCC's own default is delete.
     facts = m._detect_vm_changes([(CI_HDR, VM_DELETED)])
-    assert facts and facts[0]["deleted"] and facts[0].get("orphaned")
-    assert not facts[0]["dangerous"]
+    assert facts and facts[0]["deleted"] and not facts[0].get("orphaned")
+    assert facts[0]["dangerous"]
 
 
 def test_vm_facts_whole_instance_deletion_with_delete_policy_is_dangerous():

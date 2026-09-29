@@ -245,6 +245,7 @@ from vm_analysis import (  # VM/KCC infrastructure analysis (same-dir module)
     _VM_DISK_TYPE_RE,
     _vm_unquote,
     _detect_vm_changes,
+    _released_addresses,
     _vm_deletion_armed_flat,
     _vm_config_stripped,
     _VM_DISK_SIZE_KEYS,
@@ -2794,9 +2795,12 @@ DiffResult = namedtuple("DiffResult",
                          "version_change", "deleted_resources", "replicas_zeroed",
                          "fingerprint", "renamed_resources", "vm_changes",
                          "version_fold", "shutdown_stats",
-                         "template_artifacts", "pingscaler_created"],
+                         "template_artifacts", "pingscaler_created", "ip_released"],
                         defaults=[None, None, None, None, None, None, None,
-                                  None, None, None])
+                                  None, None, None, None])
+# ip_released (COPS-2766): the deleted ComputeAddress and DNSRecordSet headers
+# GCP releases (no explicit abandon), from the full pre-cap list. The `ip`
+# merge gate reads it. Only OUT_DIFF sets it, so a teardown never has it.
 # pingscaler_created (COPS-2714): True when this app's diff CREATES the
 # acme-ping-scaler Deployment. The chart skips all HPA rendering while a
 # ping-scaler is on, so the HPAs it displaces -- deleted in the SIBLING
@@ -7462,7 +7466,7 @@ def _evaluate_env_decommissions(candidates: list, pr_sha: str, main_sha: str,
 
 
 def _merge_gates(decommission_candidates, renames=None, path_map=None,
-                 vm_change_lines=None) -> list:
+                 vm_change_lines=None, app_results=None) -> list:
     """COPS-2766: the merge gates of this PR, one per kind and env, none lifted.
 
     From the teardowns _evaluate_env_decommissions confirmed. Arming the flag
@@ -7470,7 +7474,8 @@ def _merge_gates(decommission_candidates, renames=None, path_map=None,
     removal is the `public` gate. A live cl-*/config.yaml renamed or moved
     renames every Application of the constellation: `cl_rename`, lifted by
     `Confirm-Rename: <old dir> -> <new dir>`. A disk shrink in the VM panel
-    is `shrink`, one for the PR, and nothing lifts it.
+    is `shrink`, one for the PR, and nothing lifts it. An app that releases a
+    static IP or a DNS record is `ip`, lifted by `Confirm-IP-Release: <env>`.
     """
     found = [g for c in decommission_candidates or () for g in c.get("gates", ())]
     found += [{"kind": "cl_rename", "env": _CL_ENV_RE.match(old)[1],
@@ -7479,6 +7484,8 @@ def _merge_gates(decommission_candidates, renames=None, path_map=None,
               if _CL_ENV_RE.match(old) and (path_map or {}).get(old)]
     if any(_VM_SHRINK_REASON in line for line in vm_change_lines or ()):
         found.append({"kind": "shrink", "env": ""})
+    found += [{"kind": "ip", "env": _envs_from_apps([app])[0]}
+              for app, r in (app_results or {}).items() if getattr(r, "ip_released", None)]
     gates = {}
     for g in found:
         gates.setdefault((g["kind"], g["env"]), {"arg": g["env"], **g, "lifted": False})
@@ -8089,11 +8096,12 @@ def argocd_diff(app, pr_sha, main_sha, chart_revision=None, changed_paths=None, 
         # full pre-cap list.
         pingscaler_res = _detect_pingscaler_created(
             _detect_created_resources(filtered_sections))
+        ip_released = _released_addresses(filtered_sections, deleted_res)
         return DiffResult(clean_diff, capped_sections,
                           n_res, True, None, OUT_DIFF, "changes", version_change,
                           deleted_res, zeroed_res, fingerprint, renamed_res,
                           vm_changes_res, version_fold, shutdown_stats,
-                          artifacts, pingscaler_res)
+                          artifacts, pingscaler_res, ip_released)
     # Exhausted retries
     return _indeterminate(last_reason, last_detail or "unknown error")
 
@@ -12575,7 +12583,7 @@ def process_pr(pr, path_map, base_sha="", repo=None):
         # lifted, so a PR with none never pays for it. PrCommitsUnreadable goes
         # to the catch-all below: a retry, never a lift.
         gates = _merge_gates(decommission_candidates, renames, path_map,
-                             vm_change_lines)
+                             vm_change_lines, app_results)
         if any(gate_trailer(g) for g in gates):
             confirmed = _confirmations(_pr_commit_messages(repo, pr_id, base_sha, pr_sha))
             for g in gates:

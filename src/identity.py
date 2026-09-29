@@ -23,7 +23,7 @@ vm_analysis because the workload detectors happened to read it first.
 import re
 
 from comment_render import _section_name
-from manifest import _section_kind
+from manifest import _IP_KINDS, _section_kind
 
 
 _appspace_key_re      = re.compile(r"^\s*appspace:\s*(#.*)?$")
@@ -311,8 +311,12 @@ def _is_rename_of(old_header: str, new_header: str) -> bool:
     Rule B - one token inserted or removed anywhere in the hyphen-token list.
       ...-mediatransform-access -> ...-mediatransform-gsa-access
       (mediatransform moved from workload identity to a dedicated GSA)
+
+    Never for an address or a DNS record (COPS-2766): a new name is a new IP,
+    so `-ip` -> `-ip-ext` releases the old one.
     """
-    if _section_kind(old_header) != _section_kind(new_header):
+    kind = _section_kind(old_header)
+    if kind in _IP_KINDS or kind != _section_kind(new_header):
         return False
     a, b = _section_name(old_header), _section_name(new_header)
     if not a or not b or a == b:

@@ -19,7 +19,7 @@ from comment_render import (
     _VM_PANEL_ROUTINE_HDR,
     _section_name,
 )
-from manifest import _section_kind  # decoder lives with the format it decodes
+from manifest import _IP_KINDS, _section_kind  # decoder lives with the format it decodes
 
 
 # Hibernation / zeroPods counting (COPS-2683): charts scale Deployments and
@@ -288,11 +288,6 @@ def _vm_unquote(v: str) -> str:
 _VM_SHRINK_REASON = "GCP cannot shrink a disk in place"
 
 
-# Kinds whose chart template defaults deletion-policy to abandon unless
-# allowDeletion is armed. Attachments never set the annotation.
-_VM_ABANDON_DEFAULT_KINDS = ("ComputeInstance", "ComputeDisk", "ComputeAddress")
-
-
 def _vm_deleted_body_policy(body: str) -> str:
     """Return 'abandon', 'delete', or '' from minus lines of a deleted CR."""
     saw_abandon = saw_delete = False
@@ -312,6 +307,14 @@ def _vm_deleted_body_policy(body: str) -> str:
     if saw_abandon:
         return "abandon"
     return ""
+
+
+def _released_addresses(sections, deleted) -> list:
+    """COPS-2766: the deleted ComputeAddress and DNSRecordSet headers that GCP
+    releases, all but an explicit `deletion-policy: abandon`."""
+    gone = set(deleted or ())
+    return [h for h, body in sections if h in gone and _section_kind(h) in _IP_KINDS
+            and _vm_deleted_body_policy(body) != "abandon"]
 
 
 def _detect_vm_changes(sections: list) -> list:
@@ -339,8 +342,9 @@ def _detect_vm_changes(sections: list) -> list:
       - a whole VM-domain resource disappearing from the render under
         `deletion-policy: abandon` (chart default when allowDeletion is
         unset) is unmanage: GCP is kept (orphaned). The same disappearance
-        with `deletion-policy: delete` is dangerous. A snapshot-policy
-        attachment disappearing is a schedule note, not a VM destroy.
+        with `deletion-policy: delete`, or with no policy line (KCC's own
+        default is delete), is dangerous. A snapshot-policy attachment
+        disappearing is a schedule note, not a VM destroy.
     Everything else in the domain (status transitions, brand-new resources,
     an address re-pin) is reported as a routine/notable line — the panel
     only shouts when shouting is deserved, or nobody trusts it.
@@ -425,10 +429,11 @@ def _detect_vm_changes(sections: list) -> list:
                         "%s removed from the render with "
                         "`deletion-policy: delete` — Argo prune can destroy "
                         "this resource in GCP" % kind)
-                elif policy == "abandon" or kind in _VM_ABANDON_DEFAULT_KINDS:
-                    # Chart default is abandon when allowDeletion is unset.
+                elif policy == "abandon":
                     # COPS-2682 / acme-config-prod #4326: disabling KCC for a
                     # TERMINATED svc VM must read as unmanage, not destroy.
+                    # COPS-2766: only when the CR says so. kcc-linux-services
+                    # always writes the policy, and with no line KCC deletes.
                     orphaned = True
                     notes.append(
                         "%s leaves Argo under `deletion-policy: abandon` — "
