@@ -308,8 +308,9 @@ CL_APPS = ["cl-prod-b-ms", "cl-prod-b-ss"]
 CL_YAML = "appspace:\n  customerName: prod-b\n  version: 2603.2.15\n"
 
 
-def _cl_world(world, monkeypatch, vf=PROD_VF):
+def _cl_world(world, monkeypatch, vf=PROD_VF, others=None):
     sinks, plan = world
+    plan.update(others or {})
     monkeypatch.setattr(m, "generate_ai_summary", lambda app_results: None)
     for app in CL_APPS:
         monkeypatch.setitem(m._app_chart_map, app, "appspace-" + app[-2:])
@@ -347,3 +348,15 @@ def test_a_bug_in_the_tenant_check_keeps_the_comment(world, monkeypatch):
     body, (state, desc) = _cl_world(world, monkeypatch)
     assert m._extract_status_token(body) == "clean"
     assert (state, desc) == ("SUCCESSFUL", "1 resource(s) will change - review comment")
+
+
+def test_a_failed_status_keeps_its_old_text(world, monkeypatch):
+    """The tenant tail is for a green status only. A FAILED text does not
+    change, and its retry suffix stays inside the 255 characters."""
+    body, (state, desc) = _cl_world(world, monkeypatch, others={
+        "cl-prod-b-ss": m.DiffResult("", [], 0, False, "", m.OUT_INDETERMINATE,
+                                     m.REASON_TIMEOUT)})
+    assert (state, desc) == ("FAILED", "Diff unavailable for 1 app(s) | 1 resource(s) "
+                                       "confirmed changed - review comment (will retry "
+                                       "automatically if transient)")
+    assert "- \U0001f310 **Reaches every public-cloud tenant** of `cl-prod-b`" in body

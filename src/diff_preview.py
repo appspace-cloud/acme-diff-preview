@@ -14018,9 +14018,11 @@ def process_pr(pr, path_map, base_sha="", repo=None):
         leftover_extra = (
             f" | \U0001f9f9 {len(leftover_apps)} leftover app(s) from prior decommission"
             if leftover_apps else "")
-        tenant_extra = (f" | \U0001f310 every tenant of {', '.join(tenant_cls)}"
-                        if tenant_cls else "")
-        status_extra = decom_extra + leftover_extra + tenant_extra
+        status_extra = decom_extra + leftover_extra
+        # COPS-2766: the tenant reach goes only on a green status, so no
+        # FAILED text changes.
+        green_extra = status_extra + (
+            f" | \U0001f310 every tenant of {', '.join(tenant_cls)}" if tenant_cls else "")
 
         # v2.5.4 (Finding 1): traffic-light rule agreed with Marcos — green ONLY
         # when the diff was actually computed (with or without changes); ANY
@@ -14163,12 +14165,12 @@ def process_pr(pr, path_map, base_sha="", repo=None):
         elif sections_total > 0:
             extra = f" | +{len(new_env_candidates)} new environment(s) will be created" if new_env_candidates else ""
             state, desc = "SUCCESSFUL", (
-                f"{sections_total} resource(s) will change{extra}{status_extra} - review comment")
+                f"{sections_total} resource(s) will change{extra}{green_extra} - review comment")
         else:
             if new_env_candidates:
                 state, desc = "SUCCESSFUL", (
                     f"No manifest changes to existing apps | +{len(new_env_candidates)} "
-                    f"new environment(s) will be created{status_extra}")
+                    f"new environment(s) will be created{green_extra}")
             else:
                 # COPS-2721: SUCCESSFUL stays (nothing failed), but the
                 # description names why the render is quiet when YAML moved.
@@ -14177,7 +14179,7 @@ def process_pr(pr, path_map, base_sha="", repo=None):
                     has_redundancy=_VALUES_REDUNDANCY_HDR in _joined,
                     has_input_changes=bool(input_change_lines),
                     has_inert=_INERT_EDIT_HDR in _joined)
-                state, desc = "SUCCESSFUL", f"{_clean}{status_extra}"
+                state, desc = "SUCCESSFUL", f"{_clean}{green_extra}"
         if state == "SUCCESSFUL":
             # COPS-2766: lead with the top finding of the comment just
             # posted; fix_stuck_inprogress rebuilds the same lead from it.
