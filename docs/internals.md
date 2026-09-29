@@ -11,6 +11,9 @@ here is required to use the tool; it is for people changing it or debugging it.
 - [Why a teardown is blocked](#why-a-teardown-is-blocked)
 - [Why removing a cohort `config.yaml` is blocked](#why-removing-a-cohort-configyaml-is-blocked)
 - [Why an environment without a chart version is blocked](#why-an-environment-without-a-chart-version-is-blocked)
+- [Why waking an AEC clone is blocked](#why-waking-an-aec-clone-is-blocked)
+- [Why a copied clone ashn is blocked](#why-a-copied-clone-ashn-is-blocked)
+- [Why a new env needs an ApplicationSet glob](#why-a-new-env-needs-an-applicationset-glob)
 - [Handling mass version bumps](#handling-mass-version-bumps-hundreds-of-apps-in-one-pr)
 - [The two surfaces: comment and page](#the-two-surfaces-comment-and-page)
 - [Which resources make it into the comment body](#which-resources-make-it-into-the-comment-body)
@@ -323,6 +326,120 @@ really reads and that have live apps: `cl-*/config.yaml`, and
 `cl-*/<app>/customer.yaml` of a live `<cl-*>-<app>-glb` app (not
 `constellation/customer.yaml`, which is only a Helm values file). A removed
 environment is not checked: that is a decommission.
+
+### Why waking an AEC clone is blocked
+
+An AEC clone (a folder with an `--aec<n>` token) starts with a copy of the
+production data of the tenant it copies. When its pods run, it can call the
+customer live integrations: SSO, webhooks, mail and connected apps
+(AE-15507). So the runbook
+(https://appspace.atlassian.net/wiki/spaces/cops/pages/66093626) creates a
+clone asleep with `zeroPods: true`, restores and cleans the data, and wakes it
+in a later PR. A replay of 6 months of acme-config-prod found 18 PRs that woke
+47 clones, about 3 a month (#4660 woke 13 at once).
+
+The `clone_wake` merge gate (COPS-2766) fails the build when a PR:
+
+- adds a clone `customer.yaml` whose values do not set `zeroPods: true`,
+- or takes a live clone from `zeroPods: true` to `false` or unset. The change
+  can be in its own `customer.yaml` (a move reads the old path on `main`) or
+  in a `config.yaml` above it.
+
+The value is the one the chart sees: the `config.yaml` files above the
+environment, then its `customer.yaml`, and the last one wins. It is read at
+the head and on `main`. A version bump on a clone reads only the own
+`zeroPods` of the file, on both sides. The whole chain is read only when that
+key changes, when the file moves, or when a `config.yaml` with live clones
+below it changes its own `zeroPods`.
+
+The comment lists the Mongo collections that must be empty on the clone.
+Write their counts in the PR, then push an empty commit with
+`Confirm-Clone-Sanitized: <env>`, one line per clone. The line is read like
+the other confirmation lines: in any case, with or without backticks.
+
+It fails closed. Values that cannot be parsed are a gate too, and the same
+line lifts it. A failed Bitbucket read is not a gate: the build is red with
+`[transient]` and the PR is checked again after the backoff.
+
+Limits:
+
+- `zeroPods` stops the pods, not the Core VM, so this gate does not cover the
+  Core VM.
+- A wake written in `cicd-versions.yaml` is not seen, because the chain does
+  not read that file. The pipeline writes only versions there.
+- Only `--aec<n>` folders count as clones here, not `--sbx<n>` sandboxes.
+- Direct pushes to `main` are not checked.
+
+### Why a copied clone ashn is blocked
+
+`appspace.ashn` names an environment in Customers and PDNS. acme-config-prod
+#4042 made four AEC clones with the ashn of the production environment each
+one copies (heb, universal with the ashn of universalhollywood, blackrock and
+pfizer). So each clone and its original look like one environment there.
+`main` has no duplicate ashn today (294 environments set one).
+
+The `ashn_copy` merge gate (COPS-2766) looks at each changed clone
+`customer.yaml` (a folder with `--aec<n>`) whose own `appspace.ashn` is new or
+changed against `main`. A move reads the old path on `main`. It fails the
+build when an environment with another `customerName` has the same ashn: the
+own `customer.yaml` of a live environment on `main`, or another file of this
+PR. The b and c clones of one customer share a `customerName`, so they are no
+hit. A move or a delete is not a copy, because the old path is left out.
+
+Nothing lifts it. Give the clone its own ashn (runbook step 2: change ashn,
+suffix, customerName and instanceName). The tier token guard runs first, so a
+clone that misses `--aec1` gets that block before this one.
+
+The live environments are read only when a clone ashn changes: the own
+`customer.yaml` of each one on `main`, from the git mirror first. Only a
+complete read is kept, and only for the last `main` of each repo. A file that
+cannot be read or parsed is not checked, and a ⚠️ line says how many. When
+the ArgoCD app list is not loaded, a ⚠️ line says that the check is
+unavailable. Neither one is a gate. A failed read of a file of the PR retries
+the PR.
+
+### Why a new env needs an ApplicationSet glob
+
+ArgoCD makes the apps of an environment from the ApplicationSets on the hub.
+Their git files generators list the identity files they read as globs, for
+example `gcp/dev/private-cloud/ap1/**/customer.yaml`. A new environment, or a
+live one that moves, in a folder that no glob reads gets no apps. Nothing
+deploys on merge, and nothing says so. A replay against today's 135
+ApplicationSets found one case in 6 months, acme-config-prod #3423 (the
+nachaos spoke).
+
+The `appset_miss` merge gate (COPS-2766) runs `argocd appset list -o json`
+with the ArgoCD token of the service. It keeps the git files paths of every
+generator, nested ones too, whose `repoURL` is this repo (ssh or https, with
+or without `.git`). A path with `{{` is a template, and an exclude path
+deploys nothing, so both are left out. The list is cached for
+`PATH_MAP_TTL`. On a miss it is listed again without the cache, so an
+ApplicationSet applied a minute ago counts.
+
+It checks the identity files of each new environment, and the new side of
+each move: a private-cloud `customer.yaml`, a `cl-*/config.yaml` and a
+`cl-*/app<N>/customer.yaml`. The other `cl-*` folders (`api`, `cloud`,
+`constellation`, `user-content`) are rendered by the `cl-*/config.yaml` sets,
+so they are not checked. A move whose old side no glob reads is no miss: it
+deployed nothing on `main` either. The legacy pipeline deploys `aws/`, not
+ArgoCD, so a new `aws/` environment gets a ⚠️ check line instead.
+
+The matcher reads `**/` as zero or more folders, and `*` and `?` do not match
+`/`. The hub does not set
+`applicationsetcontroller.enable.new.git.file.globbing`, so ArgoCD uses the
+old globbing, where `*` also matches `/`. For today's globs and the checked
+shapes, both give the same result. As a self-check, every live identity file
+of a checked shape must match a glob. When one does not, or the list fails,
+is not JSON or has no glob (a token that may not list them gets an empty
+list), the check is not proven. Then a new environment gets a ⚠️ check line
+and a move gets a note, there is no gate, and the leader log says
+`ApplicationSet check unavailable`.
+
+Nothing lifts the gate. Check the cloud, tier and spoke folders. If the
+ApplicationSet is being added in acme-infrastructure, apply it first, then
+push again here (an empty commit is enough). A move to another cloud, tier or
+spoke is a rename of a live environment, so that guard stops it first. This
+gate shows for a move after the rename is confirmed.
 
 ### Handling mass version bumps (hundreds of apps in one PR)
 
