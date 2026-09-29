@@ -165,7 +165,7 @@ from comment_render import (  # comment rendering (same-dir module, stdlib only)
     _build_merge_summary,
     status_lead,
     join_status_lead,
-    GATES,
+    gate_text,
     gate_trailer,
     open_gates,
     gate_token,
@@ -183,6 +183,7 @@ from comment_render import (  # comment rendering (same-dir module, stdlib only)
     _AUTOSYNC_RESUMED_HDR,
     _DECOM_VM_STRIP_HDR,
     _DECOM_FLAG_TYPO_HDR,
+    _DECOM_CASCADE_NOT_LIVE_HDR,
     _SHUTDOWN_MIN_WORKLOADS,
     _is_env_shutdown,
 )
@@ -6648,20 +6649,24 @@ def _cascade_mismatch_note(env_name, apps, cascade: bool) -> list:
     """Markdown for the one state the panel could previously not describe:
     the config claims the cascade and the cluster does not have it.
 
-    Empty for every other state. Not-armed is the documented default and
-    the panel already warns about it in detail; adding a second voice there
-    would just make the loud one easier to skip.
+    Empty when the cascade is live or not armed. Not-armed is the documented
+    default and the panel already warns about it in detail; adding a second
+    voice there would just make the loud one easier to skip.
     """
     if not cascade:
         return []
     live = _cascade_finalizer_live(apps)
-    if live is not False:
-        # True: the promise is real. None: unknown, and a scary block on a
-        # failed lookup would train reviewers to ignore this panel.
+    if live:
         return []
+    if live is None:
+        # COPS-2766: unknown. A scary block on a failed lookup would train
+        # reviewers to ignore this panel, but they must know nobody checked.
+        app = (apps or [env_name])[0].split("/")[-1]
+        return [f"\u26a0\ufe0f Could not verify the cascade finalizer on `{env_name}` "
+                f"(ArgoCD lookup failed). Check that `argocd app get {app}` lists "
+                f"`{_ARGOCD_CASCADE_FINALIZER}` before merging.", ""]
     return [
-        "🚨 **The cascade is armed in config but NOT live in the "
-        "cluster.** `appspace.decommission: true` is set for "
+        "🚨 " + _DECOM_CASCADE_NOT_LIVE_HDR + " `appspace.decommission: true` is set for "
         f"`{env_name}`, so the phase table above reads as though deleting "
         "this folder will clean everything up. ArgoCD has not applied the "
         f"`{_ARGOCD_CASCADE_FINALIZER}` finalizer to its Application(s) "
@@ -6727,6 +6732,44 @@ def _paused_apps_for(apps, path_map, sha, repo=None) -> set:
         if _autosync_paused(flat or {}):
             paused.update(members)
     return paused
+
+
+DECOM_HOLD_DAYS = 7
+
+
+def _teardown_hold_met(identity_file, main_sha, now=None):
+    """COPS-2766: has zeroPods or decommission been true on main for
+    DECOM_HOLD_DAYS? True, False, or None when the mirror cannot say.
+
+    First-parent history of the file, newest first, so a commit's time is
+    when it landed on main. A commit with both flags off ends the walk, and
+    so does the first commit older than the hold. A history that runs out
+    first is False: the env had the flag for less than the hold.
+    """
+    repo = _repo_for_sha(main_sha)
+    if (not GIT_MIRROR_ENABLED or _mirror_disabled or not repo or not main_sha
+            or not _mirror_has_sha(repo, main_sha)):
+        return None
+    clean = posixpath.normpath(str(identity_file).replace("$config/", "").lstrip("/"))
+    r = _git_run(["--git-dir", _mirror_path(repo), "log", "--first-parent",
+                  "--format=%H %ct", main_sha, "--", clean], timeout=30)
+    if r is None or r.returncode != 0:
+        return None
+    cutoff = (now or time.time()) - DECOM_HOLD_DAYS * 86400
+    for sha, ct in (line.split() for line in r.stdout.splitlines()):
+        got = _git_read_file(repo, sha, clean)
+        if got is None:
+            return None
+        try:
+            flat = _flatten_yaml(_yaml_safe_load(got[0] or "") or {})
+        except yaml.YAMLError:
+            return None
+        if not (_decommission_armed_flat(flat)
+                or str(flat.get("appspace.zeroPods", "")).lower() == "true"):
+            return False
+        if int(ct) <= cutoff:
+            return True
+    return False
 
 
 def _decommission_cascades(identity_file: str, main_sha: str) -> bool:
@@ -7179,7 +7222,8 @@ def _evaluate_env_decommissions(candidates: list, pr_sha: str, main_sha: str,
             # everything below this point is a promise that will not be kept,
             # so the correction goes immediately after the table and before the
             # inventory it would otherwise appear to describe.
-            lines += _cascade_mismatch_note(c["env_name"], c["apps"], cascade)
+            _note = _cascade_mismatch_note(c["env_name"], c["apps"], cascade)
+            lines += _note
             # COPS-2707: the table above just reported Phase 2 as pending on
             # an environment whose file looks armed to a reader. Saying only
             # "not armed" is what left acme-config-prod #4377 arguing with
@@ -7228,6 +7272,17 @@ def _evaluate_env_decommissions(candidates: list, pr_sha: str, main_sha: str,
                       else [] if cascade else [{"kind": "orphan", "env": c["env_name"]}])
         if _DECOM_SHARED_UC_HDR in "\n".join(_uc_lines):
             c["gates"].append({"kind": "shared_uc", "env": c["env_name"]})
+        if cascade:
+            # COPS-2766: Phase 3 checks. The cascade is private cloud only, so
+            # _note is set. The finalizer not live yet clears itself on a retry.
+            if _DECOM_CASCADE_NOT_LIVE_HDR in "\n".join(_note):
+                c["gates"].append({"kind": "not_live", "env": c["env_name"]})
+            if _autosync_paused(_flat_yaml_cached(c["identity_file"], main_sha)):
+                c["gates"].append({"kind": "paused", "env": c["env_name"]})
+            hold = _teardown_hold_met(c["identity_file"], main_sha)
+            if hold is not True:
+                c["gates"].append({"kind": "hold", "env": c["env_name"], **(
+                    {} if hold is False else {"why": "history unreadable"})})
         if public_cloud:
             lines += [
                 "\u26a0\ufe0f " + _DECOM_PUBLIC_CLOUD_HDR,
@@ -11582,7 +11637,7 @@ def format_comment(pr_sha, app_results, skipped_apps=None, base_sha="",
         status += (" | \u26d4 UNRESOLVED KCC VALUE \u2014 "
                    "`%!s(<nil>)` on Compute* resources, see comment")
     if open_gates(gates):
-        status += (f" | \u26d4 BLOCKED - {GATES[open_gates(gates)[0]['kind']][0]}, "
+        status += (f" | \u26d4 BLOCKED - {gate_text(open_gates(gates)[0])}, "
                    "see comment")
 
     lines += ([

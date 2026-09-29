@@ -139,6 +139,8 @@ def _decommission_body(monkeypatch, base_yaml):
                             MANIFEST % {"a": app}))
     # Without this the note shells out to `argocd app get` per app, 30s each.
     monkeypatch.setattr(m, "_cascade_finalizer_live", lambda apps: None)
+    # COPS-2766: and the 7-day hold reads the git history of the mirror.
+    monkeypatch.setattr(m, "_teardown_hold_met", lambda *a, **k: True)
     for a in APPS:
         monkeypatch.setitem(m._app_chart_revision_map, a, "2603.1.0")
 

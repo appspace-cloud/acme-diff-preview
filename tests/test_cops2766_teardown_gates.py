@@ -152,6 +152,7 @@ def _evaluate(monkeypatch, base_yaml, cand):
                         else (base_yaml, m.BB_OK))
     monkeypatch.setattr(m, "_render_main_side_resources", lambda app, sha: {})
     monkeypatch.setattr(m, "_cascade_finalizer_live", lambda apps: None)
+    monkeypatch.setattr(m, "_teardown_hold_met", lambda *a, **k: True)
     lines, envs = m._evaluate_env_decommissions([cand], "prsha", "mainsha")
     assert envs == [cand["env_name"]]
     return lines

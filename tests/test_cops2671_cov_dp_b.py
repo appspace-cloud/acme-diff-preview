@@ -181,7 +181,8 @@ def test_cascade_finalizer_check_with_no_apps_is_unknown_not_false():
     assert m._cascade_finalizer_live([]) is None
     assert m._cascade_finalizer_live([]) is not False, \
         "an unanswerable check must never be reported as a missing finalizer"
-    assert m._cascade_mismatch_note("pv-cov2671b-a", [], True) == [], \
+    note = "\n".join(m._cascade_mismatch_note("pv-cov2671b-a", [], True))
+    assert "Could not verify" in note and "NOT live" not in note, \
         "an unknown finalizer state must not raise the mismatch alarm"
 
 

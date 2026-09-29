@@ -22,6 +22,8 @@
 | **Phase 2 — arm cascade** | ✅ **done** | `appspace.decommission` makes the Applications eligible for the cascade-delete finalizer — `decommissionPurgeData` is not armed, so the BigQuery dataset and the content bucket are abandoned and stay recoverable (backup bucket is always abandoned) |
 | **Phase 3 — remove folder** | ✅ **this PR** | deletes the Applications and every resource they manage, Config Connector cloud resources included — the destructive step, and this PR is it |
 
+⚠️ Could not verify the cascade finalizer on `pv-foo-c` (ArgoCD lookup failed). Check that `argocd app get pv-foo-c-glb` lists `resources-finalizer.argocd.argoproj.io` before merging.
+
 ✅ **Data is not purged.** The BigQuery dataset and the content bucket are abandoned rather than deleted, so they survive in GCP and stay recoverable. Destroying them needs `appspace.decommissionPurgeData: true` as a separate, reviewed change (COPS-2572).
 
 - **Resources that will be removed:** 6 total — 3 Service, 3 apps/Deployment

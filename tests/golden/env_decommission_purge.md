@@ -22,6 +22,8 @@
 | **Phase 2 — arm cascade** | ✅ **done** | `appspace.decommission` makes the Applications eligible for the cascade-delete finalizer — with `decommissionPurgeData` armed the cascade will **permanently destroy** the BigQuery dataset and the user content bucket (soft-delete off on content; backup bucket always abandoned), not just abandon them |
 | **Phase 3 — remove folder** | ✅ **this PR** | deletes the Applications and every resource they manage, Config Connector cloud resources included — the destructive step, and this PR is it |
 
+⚠️ Could not verify the cascade finalizer on `pv-foo-c` (ArgoCD lookup failed). Check that `argocd app get pv-foo-c-glb` lists `resources-finalizer.argocd.argoproj.io` before merging.
+
 🚨 **DATA WILL BE PERMANENTLY DESTROYED.** This environment also has `appspace.decommissionPurgeData: true`, so Config Connector empties and deletes the BigQuery dataset and the user content bucket as part of the cascade. **That data is not recoverable afterwards.**
 
 Soft-delete on the **content** bucket is turned off (`softDeletePolicy.retentionDurationSeconds: 0`) so `force-destroy` can complete. The **content backup** bucket always keeps `deletion-policy: abandon` and is left behind on purpose — destroy it by hand after Phase 3 if needed.

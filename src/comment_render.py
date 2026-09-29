@@ -284,6 +284,12 @@ _DECOM_PUBLIC_CLOUD_WHY = (
 _DECOM_FLAG_TYPO_HDR = (
     "**A teardown flag here is misspelled or in the wrong place, so it "
     "arms nothing (or not what you expect).**")
+# COPS-2766: the cascade is armed in config and ArgoCD has not applied its
+# finalizer. The panel writes it, the evaluator matches it for the gate.
+_DECOM_CASCADE_NOT_LIVE_HDR = ("**The cascade is armed in config but NOT live "
+                               "in the cluster.**")
+# COPS-2766: a paused env never syncs, so its finalizer never arrives.
+_DECOM_PAUSED_HDR = "Cascade armed while auto-sync is paused, it never runs"
 
 
 def _pingscaler_reclass(results) -> dict:
@@ -395,7 +401,8 @@ def _fmt_env_list(apps, shown=8) -> str:
 
 # COPS-2766: merge gates. A gate fails the build until a Confirm-* line in a
 # commit message of the PR lifts it. A kind with no trailer cannot be lifted.
-# kind: (summary text, trailer, token). A gate is {kind, env, arg, lifted}.
+# kind: (summary text, trailer, token). A gate is {kind, env, arg, lifted},
+# and `why` when its text needs a reason.
 GATES = {
     "orphan": ("Teardown with no cascade, the workloads keep running",
                "Confirm-Teardown", "blocked"),
@@ -403,14 +410,20 @@ GATES = {
                "Confirm-Teardown", "blocked"),
     "shared_uc": ("The purge deletes user content a surviving environment uses",
                   "Confirm-Teardown", "blocked"),
-    "hold": ("Decommission set less than 7 days ago", "Confirm-Decommission", "blocked"),
+    "hold": ("Decommission or zeroPods set less than 7 days ago",
+             "Confirm-Decommission", "blocked"),
     "ip": ("A static IP or DNS record is released", "Confirm-IP-Release", "blocked"),
     "cl_rename": ("A live public-cloud environment is renamed or moved",
                   "Confirm-Rename", "blocked"),
-    "paused": ("Cascade armed while auto-sync is paused, it never runs", None, "blocked"),
+    "paused": (_DECOM_PAUSED_HDR, None, "blocked"),
     "shrink": ("Disk shrink, GCP cannot shrink a disk in place", None, "blocked"),
     "not_live": ("The cascade finalizer is not live in ArgoCD yet", None, "transient"),
 }
+
+
+def gate_text(g) -> str:
+    """The summary text of gate g, with its reason when it has one."""
+    return GATES[g["kind"]][0] + (f" ({g['why']})" if g.get("why") else "")
 
 
 def gate_trailer(g) -> str:
@@ -436,7 +449,7 @@ def gate_status_description(gates) -> str:
     reads only the checks list can act."""
     todo = open_gates(gates)
     g, tr = todo[0], gate_trailer(todo[0])
-    return (f"Blocked - {GATES[g['kind']][0]}" + (f" in {g['env']}" if g["env"] else "")
+    return (f"Blocked - {gate_text(g)}" + (f" in {g['env']}" if g["env"] else "")
             + (f". To merge anyway, add '{tr}' to a commit message" if tr else "")
             + (f" (+{len(todo) - 1} more)" if len(todo) > 1 else "") + " (see PR comment)")
 
@@ -466,7 +479,7 @@ def _build_merge_summary(results, rollup_by_sig, vm_change_lines,
     sev = _SEV_ROUTINE
 
     for g in gates or ():
-        text, tr = GATES[g["kind"]][0], gate_trailer(g)
+        text, tr = gate_text(g), gate_trailer(g)
         if g.get("lifted"):
             findings.append((_SEV_REVIEW, f"\u2611\ufe0f **Confirmed in a commit:** "
                                           f"`{tr}` ({text})"))

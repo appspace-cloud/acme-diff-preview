@@ -56,6 +56,7 @@ def rebuild(world, monkeypatch):
     monkeypatch.setattr(m, "_render_main_side_resources", lambda app, sha: {})
     monkeypatch.setattr(m, "_shared_user_content_lines", lambda *a, **k: [])
     monkeypatch.setattr(m, "_cascade_finalizer_live", lambda apps: True)
+    monkeypatch.setattr(m, "_teardown_hold_met", lambda *a, **k: True)
     monkeypatch.setattr(m, "_evaluate_new_envs", lambda *a, **k: (
         ["### \U0001f195 New Environment(s) Detected", ""], [], 5, []))
 
