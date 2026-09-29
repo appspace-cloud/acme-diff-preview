@@ -8653,8 +8653,8 @@ def _nocore_gates(changes) -> list:
             for c in changes or () if _nocore_lost(c)]
 
 
-# What a flip does, by (new value, cloud). Azure has no URL map: noCore moves
-# the nginx-frontend upstream.
+# What a flip does, by (new value, cloud). Only GCP has the URL map. Azure
+# and AWS have nginx-frontend in front, and noCore moves its upstream.
 _NOCORE_TEXT = {
     (True, "gcp"): (
         "noCore is more than a load balancer flag. The URL map default moves "
@@ -8668,14 +8668,15 @@ _NOCORE_TEXT = {
         "backends (`bs-pcs`, `hc-pcs`) are deleted. Before you merge, check "
         "that the Core VM runs and its NEG is healthy. If not, every request "
         "gets 502 (acme-config-prod #4667)."),
-    (True, "azure"): (
-        "On Azure, nginx-frontend stops proxying to the Windows Core VM. Keep "
+    (True, "nginx"): (
+        "On {cloud}, nginx-frontend stops proxying to the Windows Core VM. Keep "
         "the Core VM running until every app is Synced (COPS-2758)."),
-    (False, "azure"): (
-        "On Azure, nginx-frontend proxies to the Windows Core VM again. Before "
+    (False, "nginx"): (
+        "On {cloud}, nginx-frontend proxies to the Windows Core VM again. Before "
         "you merge, check that the Core VM runs. If not, the requests it "
         "serves get 502."),
 }
+_NOCORE_CLOUDS = {"azure": "Azure", "aws": "AWS"}
 
 
 def _nocore_names(changes, cap=10) -> str:
@@ -8700,14 +8701,16 @@ def _nocore_flip_lines(changes) -> list:
         lines += [f"### \U0001f50c noCore changes in {len(known)} environment(s): "
                   f"on in {on}, off in {len(known) - on}", ""]
     for new in (True, False):
-        for cloud in ("gcp", "azure"):
+        clouds = {c["path"].split("/", 1)[0] for c in known if c["new"] is new}
+        for cloud in sorted(clouds, key=lambda x: (x != "gcp", x)):
             group = [c for c in known if c["new"] is new
-                     and c["path"].startswith("azure/") == (cloud == "azure")]
-            if group:
-                lines += [f"\u26a0\ufe0f {_NOCORE_FLIP_HDR} `{_NOCORE_KEY}` goes from "
-                          f"`{str(not new).lower()}` to `{str(new).lower()}` in "
-                          f"{len(group)} environment(s): {_nocore_names(group)}. "
-                          f"{_NOCORE_TEXT[new, cloud]}", ""]
+                     and c["path"].split("/", 1)[0] == cloud]
+            text = (_NOCORE_TEXT[new, "gcp"] if cloud == "gcp" else _NOCORE_TEXT[
+                new, "nginx"].format(cloud=_NOCORE_CLOUDS.get(cloud, cloud)))
+            lines += [f"\u26a0\ufe0f {_NOCORE_FLIP_HDR} `{_NOCORE_KEY}` goes from "
+                      f"`{str(not new).lower()}` to `{str(new).lower()}` in "
+                      f"{len(group)} environment(s): {_nocore_names(group)}. "
+                      f"{text}", ""]
     for c in (c for c in changes if _nocore_lost(c)):
         shown = "null" if c["value"] is None else str(c["value"]).lower()
         why = ("only because the new folder does not set it" if c["src"] is None

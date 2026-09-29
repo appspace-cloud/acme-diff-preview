@@ -352,13 +352,32 @@ def test_the_off_text_names_the_deleted_backends():
     assert "⛔" not in out, "no gate, no stop sign"
 
 
+AZ = "azure/prod/private-cloud/na1-a/weekly/pv-az-a/customer.yaml"
+
+
 def test_azure_gets_the_nginx_frontend_text():
-    az = "azure/prod/private-cloud/na1-a/weekly/pv-az-a/customer.yaml"
+    az = AZ
     on, off = _text([_change(path=az, env="pv-az-a")]), _text(
         [_change(path=az, env="pv-az-a", old=True, new=False)])
-    assert "nginx-frontend stops proxying to the Windows Core VM" in on
-    assert "nginx-frontend proxies to the Windows Core VM again" in off
+    assert ("On Azure, nginx-frontend stops proxying to the Windows Core VM. Keep the "
+            "Core VM running until every app is Synced (COPS-2758).") in on
+    assert "On Azure, nginx-frontend proxies to the Windows Core VM again" in off
     assert "URL map" not in on + off and "bs-pcs" not in off
+
+
+def test_aws_gets_the_nginx_frontend_text_too():
+    """acme-config-prod has a live AWS env, and the load-balancer chart
+    gates the AWS nginx-frontend upstream on noCore: no URL map there."""
+    aws = "aws/prod/private-cloud/na1-a/pv-amzn-a/customer.yaml"
+    on, off = _text([_change(path=aws, env="pv-amzn-a")]), _text(
+        [_change(path=aws, env="pv-amzn-a", old=True, new=False)])
+    assert "On AWS, nginx-frontend stops proxying to the Windows Core VM" in on
+    assert "On AWS, nginx-frontend proxies to the Windows Core VM again" in off
+    assert "URL map" not in on + off and "bs-pcs" not in off
+    out = m._nocore_flip_lines([_change(path=aws, env="pv-amzn-a"), _change(),
+                                _change(path=AZ, env="pv-az-a")])
+    flips = [l for l in out if l.startswith("⚠️ **noCore changes.**")]
+    assert ["URL map" in flips[0], "On AWS" in flips[1], "On Azure" in flips[2]] == [True] * 3
 
 
 def test_one_panel_can_mix_clouds_and_directions():
@@ -416,8 +435,10 @@ def test_names_are_capped_at_ten():
 def test_no_em_or_en_dash_in_any_line():
     gated = _change(env="pv-m-a", path=NEW, moved_from=OLD, old=True, new=False)
     az = "azure/prod/private-cloud/na1-a/weekly/pv-az-a/customer.yaml"
+    aws = "aws/prod/private-cloud/na1-a/pv-amzn-a/customer.yaml"
     for changes in (None, [gated, _change(), _change(new=None), _change(path=az),
-                           _change(path=az, old=True, new=False)]):
+                           _change(path=az, old=True, new=False), _change(path=aws),
+                           _change(path=aws, old=True, new=False)]):
         out = _text(changes)
         assert not any(d in out for d in DASHES), out
 
