@@ -383,15 +383,16 @@ def test_a_pr_with_no_gate_never_reads_the_commits(world, monkeypatch):
     assert sinks.statuses[-1][0] == "SUCCESSFUL"
 
 
-@pytest.mark.parametrize("result,desc", [
-    (m.DiffResult("", [], 0, False, "helm: boom", m.OUT_ERROR, ""),
-     "Diff failed: helm: boom - check PR comment"),
-    (m.DiffResult("", [], 0, False, "bad yaml", m.OUT_INDETERMINATE,
-                  m.REASON_INVALID_YAML), None),
+@pytest.mark.parametrize("error,outcome,reason,desc", [
+    ("helm: boom", m.OUT_ERROR, "", "Diff failed: helm: boom - check PR comment"),
+    ("bad yaml", m.OUT_INDETERMINATE, m.REASON_INVALID_YAML, None),
 ])
-def test_an_older_guard_keeps_its_status_text(world, monkeypatch, result, desc):
+def test_an_older_guard_keeps_its_status_text(world, monkeypatch, error, outcome,
+                                              reason, desc):
     """A gate never hides the FAILED text an older guard had before it."""
     sinks, plan = world
+    # Built here, not at import: another test module reloads diff_preview.
+    result = m.DiffResult("", [], 0, False, error, outcome, reason)
     monkeypatch.setattr(m, "_merge_gates", lambda *a: [_gate("orphan", env="pv-orch-a")])
     monkeypatch.setattr(m, "_pr_commit_messages", lambda *a: [])
     plan["pv-orch-a-ms"] = result
@@ -409,11 +410,12 @@ def test_an_older_guard_keeps_its_status_text(world, monkeypatch, result, desc):
 # with a new commit (a trailer, a fixed size) or a move of main (a pause
 # lifted), and both run every app again.
 
-TIMEOUT = m.DiffResult("", [], 0, False, "slow", m.OUT_INDETERMINATE, m.REASON_TIMEOUT)
+def _timeout():
+    return m.DiffResult("", [], 0, False, "slow", m.OUT_INDETERMINATE, m.REASON_TIMEOUT)
 
 
 def test_comment_status_token_puts_a_blocked_gate_before_a_transient_app():
-    args = ({"pv-x-a-ms": TIMEOUT}, False, None, False, False, False)
+    args = ({"pv-x-a-ms": _timeout()}, False, None, False, False, False)
     assert m._comment_status_token(*args, [_gate("orphan")]) == "blocked"
     assert m._comment_status_token(*args, [_gate("not_live")]) == "transient"
     assert m._comment_status_token(*args, None) == "transient"
@@ -424,7 +426,7 @@ def test_a_blocked_gate_with_a_transient_app_is_seen_not_retried(world, monkeypa
     monkeypatch.setattr(m, "_retry_backoff", {})
     monkeypatch.setattr(m, "_merge_gates", lambda *a: [_gate("orphan", env="pv-orch-a")])
     monkeypatch.setattr(m, "_pr_commit_messages", lambda *a: [])
-    plan["pv-orch-a-ms"] = TIMEOUT
+    plan["pv-orch-a-ms"] = _timeout()
     m.process_pr(_mk_pr(), PATH_MAP, base_sha=BASE_SHA)
     assert m._extract_status_token(sinks.upserts[-1]) == "blocked"
     assert sinks.statuses[-1][0] == "FAILED"
