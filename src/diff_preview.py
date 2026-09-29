@@ -8827,7 +8827,7 @@ def _chart_image_defaults(chart_dir):
     return defaults
 
 
-def _pins_behind(main_chart, pr_chart, pr_vals):
+def _pins_behind(main_chart, pr_chart, pr_vals, app):
     """COPS-2766: the value-file image pins a chart bump leaves behind. None
     when the PR chart has no versions.yaml. A main chart with none gives [],
     because no pin was compared before. 'skipped' when anything fails: it is
@@ -8844,7 +8844,8 @@ def _pins_behind(main_chart, pr_chart, pr_vals):
     except Exception as e:
         # The type only: a YAML error echoes the line, and a value file can
         # hold a secret (COPS-2668).
-        logsink.log(f"pin check skipped (non-fatal): {type(e).__name__}", "WARNING")
+        logsink.log(f"pin check skipped for {app} (non-fatal): {type(e).__name__}",
+                    "WARNING")
         return "skipped"
 
 
@@ -9164,7 +9165,7 @@ def _run_one_diff(app, pr_sha, main_sha, chart_revision=None, changed_paths=None
         logsink.log(f"[{app}] capacity check failed (non-fatal): {e}", "WARNING")
         capacity = None
     # COPS-2766: only on a chart upgrade, the pins it leaves behind.
-    pins = (_pins_behind(main_chart, pr_chart, pr_vals)
+    pins = (_pins_behind(main_chart, pr_chart, pr_vals, app)
             if version_change and _is_version_downgrade(pr_rev, main_rev)
             else None)
     # COPS-2677 / COPS-2680: HPA count and workload replica totals travel

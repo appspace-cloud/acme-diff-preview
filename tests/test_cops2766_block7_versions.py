@@ -486,6 +486,7 @@ import render_cache  # noqa: E402
 import yaml  # noqa: E402
 
 SC_PIN = "1.90.15-rc.20260923031"
+APP = "pv-pin-a-ms"
 
 
 def _defs(tags):
@@ -601,36 +602,37 @@ def test_pins_behind_names_the_pin_the_bump_leaves(tmp_path):
     pr = _chart(tmp_path, "pr", versions={"signschannel": "1.91.8"})
     vals = _pin_vals({}, {"signschannel": SC_PIN})
     vals["$config/empty.yaml"] = ""
-    assert m._pins_behind(main, pr, vals) == [("signschannel", SC_PIN, "1.91.8")]
+    assert m._pins_behind(main, pr, vals, APP) == [("signschannel", SC_PIN, "1.91.8")]
 
 
 def test_pins_behind_merges_the_value_files_last_wins(tmp_path):
     main = _chart(tmp_path, "main", versions={"signschannel": "1.90.14"})
     pr = _chart(tmp_path, "pr", versions={"signschannel": "1.91.8"})
     assert m._pins_behind(main, pr, _pin_vals({"signschannel": SC_PIN},
-                                              {"signschannel": "1.91.9"})) == []
+                                              {"signschannel": "1.91.9"}), APP) == []
     assert m._pins_behind(main, pr, _pin_vals({"signschannel": "1.91.9"},
-                                              {"signschannel": SC_PIN})) != []
+                                              {"signschannel": SC_PIN}), APP) != []
 
 
 def test_pins_behind_is_none_without_a_pr_versions_yaml(tmp_path):
     main = _chart(tmp_path, "main", versions={"signschannel": "1.90.14"})
     pr = _chart(tmp_path, "pr")
-    assert m._pins_behind(main, pr, _pin_vals({"signschannel": SC_PIN})) is None
+    assert m._pins_behind(main, pr, _pin_vals({"signschannel": SC_PIN}), APP) is None
 
 
 def test_a_main_chart_without_versions_yaml_leaves_nothing_behind(tmp_path):
     """Nothing was older before, because there was no default to compare."""
     main = _chart(tmp_path, "main")
     pr = _chart(tmp_path, "pr", versions={"signschannel": "1.91.8"})
-    assert m._pins_behind(main, pr, _pin_vals({"signschannel": SC_PIN})) == []
+    assert m._pins_behind(main, pr, _pin_vals({"signschannel": SC_PIN}), APP) == []
 
 
 def test_pins_behind_is_skipped_on_a_broken_versions_yaml(tmp_path, warnings):
     main = _chart(tmp_path, "main", versions={"signschannel": "1.90.14"})
     pr = _chart(tmp_path, "pr", versions="appspace: [unclosed\n")
-    assert m._pins_behind(main, pr, _pin_vals({"signschannel": SC_PIN})) == "skipped"
-    assert [s for s, msg in warnings if "pin check skipped" in msg] == ["WARNING"]
+    assert m._pins_behind(main, pr, _pin_vals({"signschannel": SC_PIN}), APP) == "skipped"
+    assert warnings == [("WARNING", "pin check skipped for pv-pin-a-ms "
+                                    "(non-fatal): ParserError")]
 
 
 def test_pins_behind_is_skipped_on_a_broken_value_file(tmp_path, warnings):
@@ -639,7 +641,7 @@ def test_pins_behind_is_skipped_on_a_broken_value_file(tmp_path, warnings):
     main = _chart(tmp_path, "main", versions={"signschannel": "1.90.14"})
     pr = _chart(tmp_path, "pr", versions={"signschannel": "1.91.8"})
     vals = {"$config/secrets.yaml": "password: hunter2\n  bad: [\n"}
-    assert m._pins_behind(main, pr, vals) == "skipped"
+    assert m._pins_behind(main, pr, vals, APP) == "skipped"
     assert warnings and "hunter2" not in warnings[0][1]
 
 
@@ -653,7 +655,7 @@ def test_pins_behind_never_raises(tmp_path, monkeypatch, warnings):
         raise TypeError("unexpected shape")
 
     monkeypatch.setattr(m, "_image_defaults", boom)
-    assert m._pins_behind(main, pr, _pin_vals({"signschannel": SC_PIN})) == "skipped"
+    assert m._pins_behind(main, pr, _pin_vals({"signschannel": SC_PIN}), APP) == "skipped"
     assert warnings[0][0] == "WARNING" and "TypeError" in warnings[0][1]
 
 
