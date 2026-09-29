@@ -160,6 +160,12 @@ def _identity(monkeypatch):
     monkeypatch.setattr(m, "_pr_commit_messages", lambda *a, **k: [])
 
 
+def _legacy(monkeypatch):
+    _force(monkeypatch, "_detect_legacy_writer_rearm", [
+        {"path": IDENTITY, "key": "deployGLB", "env": "pv-orch-a"}])
+    monkeypatch.setattr(m, "_pr_commit_messages", lambda *a, **k: [])
+
+
 def _new_env(monkeypatch):
     monkeypatch.setattr(m, "get_pr_changed_files", lambda pr_id, repo=None: (_ENV_ONLY, {}))
     _force(monkeypatch, "_detect_new_env_candidates", [{"name": "pv-new-a"}])
@@ -187,6 +193,7 @@ EXITS = {
     "inert_key": (lambda mp: _force(mp, "_detect_inert_generator_keys", [
         {"path": IDENTITY, "key": "autosync", "value": False, "why": "inert"}]),
                   "blocked", "does not read it"),
+    "legacy": (_legacy, "blocked", "Confirm-LegacyHelm: pv-orch-a"),
     "new_env": (_new_env, "clean", "New Environment(s) Detected"),
     "no_apps": (lambda mp: mp.setattr(m, "get_pr_changed_files", lambda pr_id, repo=None:
                                       (["docs/README.md"], {})),

@@ -5529,6 +5529,82 @@ def _inert_key_block(hits: list, pr_sha: str, base_sha: str):
     return desc, body
 
 
+# COPS-2766: under appspace.infra. helm_deploy.sh (acme-components) runs helm
+# upgrade on the ArgoCD releases when one is the literal true; no chart reads them.
+_LEGACY_WRITER_KEYS = ("deployGLB", "deployMicroservices", "deploySupportingServices")
+
+
+def _legacy_env(path):
+    """What a Confirm-LegacyHelm line names: the cl-* folder in public cloud, the
+    env folder of a customer.yaml or cicd-versions.yaml, else the file's folder."""
+    parts = path.split("/")
+    cl = [p for p in parts[:-1] if p.startswith("cl-")]
+    if "public-cloud" in parts and cl:
+        return cl[0]
+    if parts[-1] in ("customer.yaml", "cicd-versions.yaml"):
+        return parts[-2]
+    return posixpath.dirname(path)
+
+
+def _detect_legacy_writer_rearm(changed, renames, sha, base_sha, repo=None) -> list:
+    """COPS-2766: a _LEGACY_WRITER_KEYS key this PR sets to true in a value file
+    under gcp/, azure/ or aws/, as hits {path, key, env}. True at `base_sha`
+    (under the old name of a move) is not a hit; with no base every true counts.
+    A failed read raises, so the PR is retried."""
+    old_of = {new: old for old, new in (renames or {}).items()}
+
+    def on(path, at):
+        doc = _read_first_doc(path, at, repo, True)[0]
+        for k in ("appspace", "infra"):
+            doc = doc.get(k) if isinstance(doc, dict) else None
+        doc = doc if isinstance(doc, dict) else {}
+        return {k for k in _LEGACY_WRITER_KEYS if str(doc.get(k)).lower() == "true"}
+
+    hits = []
+    for f in changed:
+        if f.split("/")[0] not in ("gcp", "azure", "aws") or not f.endswith(_VALUE_FILE_SUFFIXES):
+            continue
+        keys = on(f, sha)
+        if keys and base_sha:
+            keys -= on(old_of.get(f, f), base_sha)
+        hits += [{"path": f, "key": k, "env": _legacy_env(f)}
+                 for k in _LEGACY_WRITER_KEYS if k in keys]
+    return hits
+
+
+def _legacy_writer_block(hits: list, pr_sha: str, base_sha: str):
+    """(build status description, comment body) for _detect_legacy_writer_rearm hits."""
+    trailers = list(dict.fromkeys(gate_trailer({"kind": "legacy_helm", "env": h["env"]})
+                                  for h in hits))
+    h = hits[0]
+    more = f" (+{len(hits) - 1} more)" if len(hits) > 1 else ""
+    ask = f". To merge anyway, add {trailers[0]} to a commit"
+    desc = (f"BLOCKED: {h['key']}: true in {h['env']} turns the legacy Helm writer back "
+            f"on{more}")[:255 - len(ask)] + ask
+    body = (
+        f"## \U0001f52d {STATUS_NAME}\n\n"
+        f"{_comment_header(pr_sha)}\n\n"
+        "⛔ **Blocked: this PR turns the legacy Helm writer back on.**\n\n"
+        + "\n".join(f"- `{x['path']}`: `appspace.infra.{x['key']}: true`" for x in hits)
+        + "\n\n"
+        "**Why:** ArgoCD owns these releases. No chart reads `deployGLB`, "
+        "`deployMicroservices` or `deploySupportingServices`, so the diff shows nothing. "
+        "The ADO pipeline (`helm_deploy.sh`) reads them, and with `true` it runs "
+        "`helm upgrade` on the same releases again. Two writers on one release fail with "
+        "invalid ownership metadata, or undo each other. COPS-2560 turned it off, and the "
+        "root `config.yaml` says to keep it off.\n\n"
+        "**Fix:** set the key back to `false`, or delete the line. If an environment "
+        "really needs the old writer, add its line to a commit message of this PR and "
+        "push:\n\n" + "".join(f"- `{t}`\n" for t in trailers) + "\n"
+        "This check runs again by itself on a new commit, or when `main` changes.\n\n"
+        f"---\n**Status:** ⛔ Blocked: the legacy Helm writer is back on in "
+        f"`{h['env']}`{more}\n"
+        f"*{_ts()} - {COMMENT_MARKER} [blocked]"
+        + (f" [base:{base_sha[:8]}]" if base_sha else "") + "*"
+    )
+    return desc, body
+
+
 def _detect_new_env_candidates(changed_files: list, path_map: dict, renames: dict = None, pr_sha: str = None, repo: str = None) -> list:
     """Scan changed files for patterns that indicate a brand-new environment.
 
@@ -12871,6 +12947,21 @@ def process_pr(pr, path_map, base_sha="", repo=None):
             cm = upsert_comment(pr_id, body, existing_id, repo=repo)
             _seen_after_writes(sk, pr_sha, base_sha, st, cm)
             return
+        # COPS-2766: a deploy* key set to true turns the legacy Helm writer back on.
+        # Confirm-LegacyHelm: <env> lifts it; the commits are read only on a hit.
+        legacy_hits = _detect_legacy_writer_rearm(changed, renames, render_sha, base_sha,
+                                                  repo=repo)
+        legacy_gates = [{"kind": "legacy_helm", "env": h["env"]} for h in legacy_hits]
+        if legacy_gates:
+            confirmed = _confirmations(_pr_commit_messages(repo, pr_id, base_sha, pr_sha))
+            todo = [h for h, g in zip(legacy_hits, legacy_gates)
+                    if gate_trailer(g).lower() not in confirmed]
+            if todo:
+                desc, body = _legacy_writer_block(todo, pr_sha, base_sha)
+                st = post_build_status(pr_sha, "FAILED", desc, pr_id=pr_id, repo=repo)
+                cm = upsert_comment(pr_id, body, existing_id, repo=repo)
+                _seen_after_writes(sk, pr_sha, base_sha, st, cm)
+                return
         new_env_candidates = _detect_new_env_candidates(changed, path_map, renames, pr_sha=render_sha, repo=repo)
         if new_env_candidates:
             logsink.log(f"PR #{pr_id}: {len(new_env_candidates)} new env candidate(s): "
@@ -12926,7 +13017,7 @@ def process_pr(pr, path_map, base_sha="", repo=None):
                                        with_full_output=True, base_sha=base_sha, repo=repo,
                                        changed=changed, renames=renames, prereqs=prereqs)
                 gates = _lift_gates(_merge_gates((), extra=clone_gates + dup_gates + ashn_gates
-                                                 + disk_gates + appset_gates),
+                                                 + disk_gates + appset_gates + legacy_gates),
                                     repo, pr_id, base_sha, pr_sha)
                 body, state, desc = format_new_env_comment(
                     pr_sha, _clone_wake_lines(gates) + _dup_identity_lines(gates, dup_unchecked)
@@ -13409,7 +13500,8 @@ def process_pr(pr, path_map, base_sha="", repo=None):
         # below: a retry, never a lift.
         gates = _merge_gates(decommission_candidates, renames, path_map,
                              vm_change_lines, app_results,
-                             clone_gates + dup_gates + ashn_gates + disk_gates + appset_gates)
+                             clone_gates + dup_gates + ashn_gates + disk_gates + appset_gates
+                             + legacy_gates)
         _lift_gates(gates, repo, pr_id, base_sha, pr_sha)
         appspace_state_lines = (_clone_wake_lines(gates) + _dup_identity_lines(gates, dup_unchecked)
                                 + _ashn_copy_lines(gates, ashn_notes)

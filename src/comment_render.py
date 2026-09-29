@@ -453,6 +453,8 @@ GATES = {
                 "Use hyperdisk-balanced on a new VM, or keep the machine family"),
     "appset_miss": ("No ApplicationSet reads this folder, nothing deploys", None,
                     "blocked", "Check the cloud, tier and spoke folders"),
+    "legacy_helm": ("The legacy Helm writer is switched back on", "Confirm-LegacyHelm",
+                    "blocked", ""),
 }
 
 
