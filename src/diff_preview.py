@@ -188,6 +188,7 @@ from comment_render import (  # comment rendering (same-dir module, stdlib only)
     _DECOM_PAUSED_HDR,
     _SHUTDOWN_MIN_WORKLOADS,
     _is_env_shutdown,
+    _NEW_ENV_CHECK_PREFIX,
 )
 from redact import (  # display-time redaction (same-dir module, stdlib only)
     _unquote,
@@ -5431,7 +5432,8 @@ def _detect_new_env_candidates(changed_files: list, path_map: dict, renames: dic
 
 
 def _evaluate_new_envs(new_env_candidates: list, pr_sha: str,
-                       with_full_output: bool = False) -> tuple:
+                       with_full_output: bool = False, base_sha: str = "",
+                       repo: str = None, changed=(), renames=None) -> tuple:
     """Render and classify a list of new-environment candidates.
 
     v2.5.4 (Finding 4): extracted from process_pr's inline logic so the same
@@ -5452,6 +5454,9 @@ def _evaluate_new_envs(new_env_candidates: list, pr_sha: str,
                           (FIX E) that must block the PR, not go green.
       total_new_resources — sum of resources that would be created across
                           all successfully-rendered new environments.
+
+    COPS-2766: with `base_sha`, each env section also lists the GCP objects
+    it shares with a live env (_new_env_shared_lines), as check lines.
     """
     new_env_sections = []
     full_sections = []      # (name, version, n_res, redacted manifest)
@@ -5556,6 +5561,8 @@ def _evaluate_new_envs(new_env_candidates: list, pr_sha: str,
                                      "GCP"),
             })
             continue
+        # COPS-2766: the GCP objects it shares with a live env, a warning.
+        checks = _new_env_shared_lines(env_info, pr_sha, base_sha, repo, changed, renames)
         render_result = _render_new_env_diff(env_info, pr_sha)
         # Returns (rendered_manifest, error [, n_res [, version]])
         rendered   = render_result[0]
@@ -5587,6 +5594,7 @@ def _evaluate_new_envs(new_env_candidates: list, pr_sha: str,
                 "files": env_info["all_yaml_files"], "n_res": 0,
                 "kind_counts": None, "workloads": None, "error": render_err,
             })
+        new_env_sections[-1]["checks"] = checks
 
     lines = [
         f"### \U0001f195 New Environment(s) Detected", "",
@@ -5671,6 +5679,8 @@ def _evaluate_new_envs(new_env_candidates: list, pr_sha: str,
                             "Every definitions key needs one.*")
                 elif "helm template failed" not in sec["error"]:
                     lines.append(f"  \n*Technical detail: {sec['error'][:120]}*")
+        if sec.get("checks"):
+            lines += [""] + sec["checks"]
         lines.append("")
 
     total_new = sum(s["n_res"] for s in new_env_sections)
@@ -7287,6 +7297,57 @@ def _shared_user_content_lines(identity_file: str, main_sha: str,
             + ", ".join(f"`{l}`" for l in unproven)
             + " — treated as a possible sharer rather than assumed safe.")
     lines.append("")
+    return lines
+
+
+def _new_env_shared_lines(env_info, sha, base_sha, repo=None, changed=(), renames=None):
+    """COPS-2766 (C03): check lines for the GCP objects a new env manages with
+    a live env: the BigQuery dataset, the user content bucket and its DNS
+    record. A warning, never a gate: a planned migration shares them on
+    purpose, and a shared customerName is never blocked.
+
+    The siblings are the live envs at base whose own customer.yaml has the
+    same customerName, or whose folder is `<prefix>-<customerName>-*`. The
+    folder is not enough: #4671 was pv-nbc--aec1-a with customerName nbc. An
+    env this PR deletes is left out, a moved one stays. Nothing here raises:
+    a sibling that cannot be read is a check line, and the new env's own
+    values are the render's job.
+    """
+    flat = _merged_kcc_flat_for_env(env_info["config_file"], sha, repo) if base_sha else None
+    cn = str((flat or {}).get("appspace.customerName") or "")
+    if not cn:
+        return []
+    token, renames = f"{flat.get('appspace.prefix')}-{cn}", renames or {}
+    fleet, unread = _fleet_own_identities(repo, base_sha)
+
+    def gone(p):
+        return (p in changed and p not in renames
+                and _bb_fetch_cached(p, sha, repo=repo)[1] == BB_NOT_FOUND)
+    sibs = sorted(p for p in list(fleet) + unread
+                  if (fleet.get(p, ("",))[0] == cn or _uc_prefilter_token(p) == token)
+                  and not gone(p))
+    env, target, ds = env_info["name"], user_content.identity(flat), user_content.bq_dataset(flat)
+    lines = []
+    for p in sibs:
+        label = p.split("/")[-2]
+        other = _merged_kcc_flat_for_env(p, base_sha, repo)
+        uc = user_content.shared_owners(target, {label: user_content.identity(other)})
+        uc = uc.get(label, {})
+        if other is None or uc.get("unproven"):
+            lines.append(f"{_NEW_ENV_CHECK_PREFIX}could not check live `{label}` (`{p}`): its "
+                         f"values cannot be read or are incomplete, so `{env}` may share GCP "
+                         "objects with it.")
+            continue
+        objs = ([f"BigQuery dataset `{ds}`"] if ds and ds == user_content.bq_dataset(other)
+                else []) + [f"bucket `{b}`" for b in uc.get("buckets", ())] \
+            + [f"DNS `{f}`" for f in uc.get("fqdns", ())]
+        if objs:
+            lines.append(
+                f"{_NEW_ENV_CHECK_PREFIX}`{env}` uses the same customerName as live `{label}`, "
+                f"so both manage the same GCP objects: {', '.join(objs)}. The live environment "
+                f"is `{p}`. Two KCC resources on one object fail or fight (acme-config-prod "
+                "#4333). If this is not a planned migration, change `customerName`, or set "
+                "`appspace.bigQuery.suffix` to a new value.")
     return lines
 
 
@@ -12477,7 +12538,8 @@ def process_pr(pr, path_map, base_sha="", repo=None):
                                   pr_id=pr_id, repo=repo)
                 new_env_lines, structural_envs, total_new, new_env_full_lines = \
                     _evaluate_new_envs(new_env_candidates, render_sha,
-                                       with_full_output=True)
+                                       with_full_output=True, base_sha=base_sha, repo=repo,
+                                       changed=changed, renames=renames)
                 gates = _lift_gates(_merge_gates((), extra=clone_gates + dup_gates + ashn_gates),
                                     repo, pr_id, base_sha, pr_sha)
                 body, state, desc = format_new_env_comment(
@@ -12899,7 +12961,8 @@ def process_pr(pr, path_map, base_sha="", repo=None):
         if new_env_candidates:
             new_env_lines, structural_envs, total_new, new_env_full_lines = \
                 _evaluate_new_envs(new_env_candidates, render_sha,
-                                   with_full_output=True)
+                                   with_full_output=True, base_sha=base_sha, repo=repo,
+                                   changed=changed, renames=renames)
         new_env_desc = (
             f"{len(structural_envs)} new environment(s) have a structural "
             f"config problem: {', '.join(structural_envs)}"

@@ -167,3 +167,22 @@ def _no_background_selfcheck_thread(request, monkeypatch):
     import diff_preview as _m
     monkeypatch.setattr(_m, "_start_oci_selfcheck_loop", lambda: None)
     yield
+
+
+# ── COPS-2766: no fleet read unless a test asks for it ──────────────────────
+#
+# Block 3 reads the own customer.yaml of every live env (_fleet_own_identities)
+# for each new env, and for each clone with a new ashn. An old process_pr
+# fixture never stubbed that read, so it would compare against whatever app
+# list an earlier test left behind, and its output could change while it
+# asserts only part of the body. The default here is an empty fleet, which is
+# what those fixtures saw before. A test of these checks opts back in with
+# @pytest.mark.fleet_reads.
+@pytest.fixture(autouse=True)
+def _no_fleet_reads(request, monkeypatch):
+    if request.node.get_closest_marker("fleet_reads"):
+        yield          # this test reads the fleet on purpose
+        return
+    import diff_preview as _m
+    monkeypatch.setattr(_m, "_fleet_own_identities", lambda repo, base_sha: ({}, []))
+    yield

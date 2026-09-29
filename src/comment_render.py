@@ -291,6 +291,8 @@ _DECOM_CASCADE_NOT_LIVE_HDR = ("**The cascade is armed in config but NOT live "
 # COPS-2766: a paused env still cascades on delete, but what main changed
 # during the pause may not be live. A warning, not a gate.
 _DECOM_PAUSED_HDR = "Auto-sync is paused on main"
+# COPS-2766: a warning about a new env. The summary counts these lines.
+_NEW_ENV_CHECK_PREFIX = "- ⚠️ **Check:** "
 
 
 def _pingscaler_reclass(results) -> dict:
@@ -980,7 +982,13 @@ def _build_merge_summary(results, rollup_by_sig, vm_change_lines,
                              _HIGHER_LAYER_FINDING + " \u2014 some keys match an "
                              "ancestor config.yaml, so they do not change "
                              "rendered manifests (see the higher-layer note)"))
-    if new_env_lines:
+    # COPS-2766: the checks of a new env are one REVIEW finding, led by the first.
+    checks = [l for l in new_env_lines or () if l.startswith(_NEW_ENV_CHECK_PREFIX)]
+    if checks:
+        first = checks[0][len(_NEW_ENV_CHECK_PREFIX):].split(". ", 1)[0].rstrip(".")
+        findings.append((_SEV_REVIEW, f"\U0001f195 **New environment: {len(checks)} "
+                                      f"check(s) to review** - {first}"))
+    if new_env_lines and (new_env_structural or not checks):
         findings.append((_SEV_REVIEW if new_env_structural else _SEV_ROUTINE,
                          "\U0001f195 **New environment** in this PR"
                          + (" \u2014 its configuration did not validate"

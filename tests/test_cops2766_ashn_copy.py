@@ -23,6 +23,8 @@ import diff_preview as m  # noqa: E402
 from test_coverage_orchestration import (  # noqa: E402,F401
     world, _mk_pr, PATH_MAP, BASE_SHA, PR_SHA)
 
+pytestmark = pytest.mark.fleet_reads
+
 H, B = PR_SHA, BASE_SHA
 SPOKE = "gcp/aec/private-cloud/na1-b"
 COHORT = f"{SPOKE}/monthly/config.yaml"
