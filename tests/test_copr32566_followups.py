@@ -181,6 +181,15 @@ def test_a_new_env_whose_config_cannot_be_read_is_retried_not_green(world, monke
     assert not dp._seen
 
 
+def test_the_new_env_scan_raises_on_a_failed_read(monkeypatch):
+    # In process_pr the wiped-definitions guard reads this file first and
+    # raises (COPS-2766), so the scan's own raise is tested here.
+    cf = "gcp/dev/public-cloud/na1/cl-newenv-a/config.yaml"
+    monkeypatch.setattr(dp, "_bb_fetch_status", _unreadable({cf}))
+    with pytest.raises(dp.ValueFileUnreadable, match="cl-newenv-a/config.yaml"):
+        dp._detect_new_env_candidates([cf], {}, None, pr_sha="sha1", repo="r")
+
+
 def test_a_new_env_whose_customer_file_cannot_be_read_is_retried_not_blocked(world, monkeypatch):
     sinks, _ = world
     cust = "gcp/dev/private-cloud/ap1/custom/pv-brandnew-a/customer.yaml"

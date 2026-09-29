@@ -93,7 +93,12 @@ commit SHA:
 - **Allowed** — the `definitions` key is **absent** (the chart's own map is
   kept intact), or it has real children, or the file is unparseable YAML (that
   fails elsewhere in the render; the guard never blocks on a parse error), or
-  the fetch hit a transient error (never block a merge on a flaky read).
+  the file is absent at the PR sha.
+- **Retried** — Bitbucket could not serve the file (any failed read that is
+  not a plain 404). The build is `FAILED` with "Diff unavailable
+  (infrastructure) - will retry" and the PR is checked again after the
+  backoff (COPS-2766). Before, a failed read was skipped, so a wipe could
+  pass green.
 
 On a block, the service posts a `FAILED` Bitbucket build status (which prevents
 merge where green builds are required) and a PR comment explaining the danger

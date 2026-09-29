@@ -3217,7 +3217,7 @@ def _bb_fetch_status(filepath, sha, repo=None):
     if _hit is not None:
         return _hit
     url = (f"https://api.bitbucket.org/2.0/repositories/"
-           f"{BB_WORKSPACE}/{_repo}/src/{sha}/{filepath}")
+           f"{BB_WORKSPACE}/{_repo}/src/{sha}/{urllib.parse.quote(filepath)}")
     # COPS-2550: this bypasses http() on purpose (JSON parsing there breaks
     # YAML/text content), so it must set its own User-Agent explicitly.
     # header_items() (used by _pooled_urlopen) only carries headers set
@@ -4556,13 +4556,18 @@ def _values_wipes_definitions(body: str) -> bool:
 
 def _detect_wiped_definitions(changed_files: list, sha: str, repo=None) -> list:
     """Return the changed value files whose content at `sha` wipes the
-    microservices.definitions map. Only *.yaml/*.yml files are fetched; a
-    transient fetch error is skipped (never block a merge on a flaky read)."""
+    microservices.definitions map. Only *.yaml/*.yml files are fetched; an
+    absent file is skipped. A failed read raises, so the PR is retried
+    (COPS-2766: skipping it let the wipe through green)."""
     hits = []
     for f in changed_files:
         if not f.endswith(_VALUE_FILE_SUFFIXES):
             continue
         body, status = _bb_fetch_cached(f, sha, repo=repo)
+        if status == BB_ERROR:
+            raise ValueFileUnreadable(
+                f"value file unreadable at sha {sha[:8]} "
+                f"(Bitbucket transport, not absence): {f}")
         if status != BB_OK or body is None:
             continue
         if _values_wipes_definitions(body):
@@ -5738,6 +5743,8 @@ def _resolve_effective_pr_chart_revision(app, pr_sha, main_sha=None, renames=Non
     try:
         vals = _fetch_value_files(pr_value_files, pr_sha)
     except Exception as e:
+        if _is_transient_exception(e):
+            raise  # COPS-2766: retry, a missed bump renders the old chart
         logsink.log(f"_resolve_effective_pr_chart_revision: value fetch failed for "
                     f"{app}: {str(e)[:150]}", "WARNING", app=app)
         return None
@@ -9193,6 +9200,9 @@ def _summarize_appspace_state_changes(changed_files, pr_sha, base_sha, path_map,
 
         new_txt, st_new = _bb_fetch_cached(clean, pr_sha, repo=repo)
         old_txt, st_old = _bb_fetch_cached(clean, base_sha, repo=repo)
+        if BB_ERROR in (st_new, st_old):  # COPS-2766: retry, never drop the flags
+            raise ValueFileUnreadable(
+                f"value file unreadable (Bitbucket transport, not absence): {clean}")
         if st_new != BB_OK or st_old != BB_OK:
             continue  # added/deleted file -- new-env/decommission-by-deletion territory
 
@@ -9763,6 +9773,9 @@ def _summarize_vm_changes(changed_files, pr_sha, base_sha, path_map,
         seen.add(clean)
         new_txt, st_new = _bb_fetch_cached(clean, pr_sha, repo=repo)
         old_txt, st_old = _bb_fetch_cached(clean, base_sha, repo=repo)
+        if BB_ERROR in (st_new, st_old):  # COPS-2766: retry, never drop a VM danger
+            raise ValueFileUnreadable(
+                f"value file unreadable (Bitbucket transport, not absence): {clean}")
         if st_new != BB_OK or st_old != BB_OK:
             continue  # added/deleted file: new-env / decommission territory
         try:
@@ -12016,7 +12029,9 @@ def process_pr(pr, path_map, base_sha="", repo=None):
                 app = rev_futs[fut]
                 try:
                     new_rev, invalid = fut.result()
-                except Exception:
+                except Exception as e:
+                    if _is_transient_exception(e):
+                        raise  # COPS-2766: retry, a missed bump renders the old chart
                     new_rev, invalid = None, False
                 if invalid:
                     invalid_version_apps.add(app)
@@ -12326,6 +12341,8 @@ def process_pr(pr, path_map, base_sha="", repo=None):
             appspace_state_lines = _summarize_appspace_state_changes(
                 changed, render_sha, base_sha, path_map, repo=repo)
         except Exception as e:  # state-flag panel must never break the comment
+            if _is_transient_exception(e):
+                raise  # COPS-2766: but a failed read retries the PR
             logsink.log(f"    [comment] appspace-state panel failed: {e}", "WARNING")
             appspace_state_lines = []
         appspace_state_lines += _identity_migration_lines(identity_hits)
@@ -12348,6 +12365,8 @@ def process_pr(pr, path_map, base_sha="", repo=None):
             vm_change_lines = _summarize_vm_changes(
                 changed, render_sha, base_sha, path_map, app_results, repo=repo)
         except Exception as e:  # VM panel must never break the comment
+            if _is_transient_exception(e):
+                raise  # COPS-2766: but a failed read retries the PR
             logsink.log(f"    [comment] vm-changes panel failed: {e}", "WARNING")
             vm_change_lines = []
         # Direct permalink into the full-diff view for this exact commit.

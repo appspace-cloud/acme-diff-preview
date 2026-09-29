@@ -129,17 +129,20 @@ def test_scan_ignores_non_value_files(monkeypatch):
     assert called == []
 
 
-def test_scan_transient_fetch_error_does_not_block(monkeypatch):
-    # A transient fetch error must NOT be treated as the dangerous pattern —
-    # blocking a merge on a flaky network read would be worse than the miss.
-    def fake_fetch(path, sha, repo=None):
-        return None, dp.BB_ERROR
+def test_scan_failed_read_raises_so_the_pr_retries(monkeypatch):
+    # COPS-2766: a failed read used to be skipped, so a wipe behind a flaky
+    # read went green. It now raises, and process_pr retries the PR.
+    monkeypatch.setattr(dp, "_bb_fetch_status", lambda path, sha, repo=None: (None, dp.BB_ERROR))
+    f = "gcp/qa/private-cloud/ap1/custom/pv-x/cicd-versions.yaml"
+    with pytest.raises(dp.ValueFileUnreadable, match="pv-x/cicd-versions.yaml"):
+        dp._detect_wiped_definitions([f], "deadbeef", repo="r")
 
-    monkeypatch.setattr(dp, "_bb_fetch_status", fake_fetch)
-    hits = dp._detect_wiped_definitions(
-        ["gcp/qa/private-cloud/ap1/custom/pv-x/cicd-versions.yaml"],
-        "sha", repo="r")
-    assert hits == []
+
+def test_scan_absent_file_is_skipped(monkeypatch):
+    # A 404 is a file the PR deleted: nothing to wipe, nothing to retry.
+    monkeypatch.setattr(dp, "_bb_fetch_status", lambda path, sha, repo=None: (None, dp.BB_NOT_FOUND))
+    assert dp._detect_wiped_definitions(
+        ["gcp/qa/private-cloud/ap1/custom/pv-x/cicd-versions.yaml"], "sha", repo="r") == []
 
 
 # --- Integration: process_pr must BLOCK the merge on a wiped definitions ------

@@ -17,8 +17,9 @@ What they are, and what breaks if they stop working:
   * the three "a side panel must never break the comment" guards. The
     input-changes and appspace-state guards are covered; the VM panel's
     was not, and the `paused_apps` (COPS-2655 autosync) guard was not
-    either. Both exist so a Bitbucket hiccup in a decorative panel cannot
-    cost the reviewer the whole comment.
+    either. Both exist so a bug in a decorative panel cannot cost the
+    reviewer the whole comment. (COPS-2766: a failed read in the VM panel
+    now retries the PR instead, because that panel can turn a PR red.)
 
   * COPS-2609 `fallback_inline`. The comment offers a link to the
     full-diff page BEFORE the page is written. When the write fails the
@@ -308,16 +309,15 @@ def test_the_entry_abort_is_reported_as_a_base_supersede(world):
 # ── the side panels must never cost the comment ──────────────────────────
 
 def test_a_broken_vm_panel_still_produces_the_normal_comment(world, monkeypatch):
-    """Line 9803-9805. The VM panel is decoration on top of the diff; a
-    Bitbucket blip inside it must not turn the comment into the generic
-    error comment."""
+    """A bug inside the VM panel must not turn the comment into the generic
+    error comment. Only a bug: a failed read retries (next test)."""
     sinks, plan = world
     plan[APPS[0]] = m.DiffResult(
         "--- main\n+++ pr", [("Deployment/webx", "-replicas: 2\n+replicas: 3")],
         1, True, "", m.OUT_DIFF, "")
 
     def boom(*a, **k):
-        raise ConnectionResetError("bitbucket dropped the VM panel read")
+        raise KeyError("a bug in the VM panel")
 
     monkeypatch.setattr(m, "_summarize_vm_changes", boom)
     m.process_pr(_mk_pr(), PATH_MAP, base_sha=BASE_SHA, repo=REPO)
@@ -325,10 +325,35 @@ def test_a_broken_vm_panel_still_produces_the_normal_comment(world, monkeypatch)
     assert len(sinks.upserts) == 1
     body = sinks.upserts[0][0]
     assert "Deployment/webx" in body, "the real diff must survive the panel failure"
-    assert "Error processing diff" not in body
+    assert m._extract_status_token(body) == "clean"
     assert [s for s, _ in sinks.statuses][-1] == "SUCCESSFUL"
-    assert any("vm-changes panel failed" in msg and "dropped the VM panel read" in msg
+    assert any("vm-changes panel failed" in msg and "a bug in the VM panel" in msg
                for msg in sinks.messages()), sinks.messages()
+
+
+@pytest.mark.parametrize("make_exc", [   # built late: a reload swaps the class
+    lambda: ConnectionResetError("bitbucket dropped the VM panel read"),
+    lambda: m.ValueFileUnreadable("value file unreadable: gcp/x/customer.yaml"),
+])
+def test_a_vm_panel_read_failure_retries_the_pr(world, monkeypatch, make_exc):
+    """COPS-2766: the VM panel is what turns a dangerous VM change red. A
+    failed read used to drop it, and the PR went green. Now the PR retries."""
+    exc = make_exc()
+    sinks, plan = world
+    plan[APPS[0]] = m.DiffResult(
+        "--- main\n+++ pr", [("Deployment/webx", "-replicas: 2\n+replicas: 3")],
+        1, True, "", m.OUT_DIFF, "")
+    monkeypatch.setattr(m, "_summarize_vm_changes",
+                        lambda *a, **k: (_ for _ in ()).throw(exc))
+    m.process_pr(_mk_pr(), PATH_MAP, base_sha=BASE_SHA, repo=REPO)
+
+    body = sinks.upserts[-1][0]
+    assert m._extract_status_token(body) == "transient"
+    state, desc = sinks.statuses[-1]
+    assert state == "FAILED"
+    assert desc.startswith("Diff unavailable (infrastructure) - will retry")
+    sk = (REPO, 671)
+    assert sk not in m._seen and sk in m._retry_backoff
 
 
 def test_a_broken_vm_panel_drops_only_the_vm_panel(world, monkeypatch):
