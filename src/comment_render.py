@@ -238,6 +238,10 @@ _NOCORE_FLIP_HDR = "**noCore changes.**"
 _NOCORE_COUNTS_RE = re.compile(
     r"noCore changes in (\d+) environment\(s\): on in (\d+), off in (\d+)")
 _NOCORE_UNKNOWN = "noCore check unavailable"
+# COPS-2766: legacyBackends false to true, the same wiring.
+_LEGACY_BACKENDS_HDR = "**Legacy backends come back.**"
+_LEGACY_BACKENDS_RE = re.compile(
+    re.escape(_LEGACY_BACKENDS_HDR) + r".*? in (\d+) environment\(s\)")
 # COPS-2766: a prod cl-*-ms/-ss app serves every tenant of its constellation.
 _TENANT_WIDE_HDR = "**Reaches every public-cloud tenant.**"
 # COPS-2721: written by values_redundancy.render_lines via diff_preview,
@@ -370,6 +374,7 @@ _REVIEW_RANK = {
     "\U0001f6d1": 2,               # environment shutting down
     "\U0001f512": 2,               # decommission or data purge armed
     "\U0001f4a5": 3,               # wide-reach config change
+    "\U0001f517": 4,               # NEG and BackendService, before the deletions
     "\U0001f500": 4,               # planned rename
     "\U0001f5d1": 5,               # resources deleted, env decommission
     "\U0001f9ca": 6,               # replicas scaled to zero
@@ -753,6 +758,24 @@ def _build_merge_summary(results, rollup_by_sig, vm_change_lines,
                              f"over replica control; {n_hpa} HPA(s) removed "
                              f"by design "
                              f"([how it works]({PINGSCALER_DOCS_URL}))"))
+    # COPS-2766: GKE deletes a NEG only when no BackendService uses it
+    # (acme-config-prod #3888). Paired per env: a cl-* block's -glb app
+    # (cl-qa-11-a-app1) belongs to the constellation that has the NEGs.
+    neg = _envs_from_apps([a for a, r in results.items()
+                           if getattr(r, "neg_removed", None)])
+    bs = _envs_from_apps([a for a, r in results.items()
+                          if any(_section_kind(h) == "ComputeBackendService"
+                                 for h in r.deleted_resources or ())])
+    both = [n for n in neg if any(b == n or (n.startswith("cl-") and b.startswith(n + "-"))
+                                  for b in bs)]
+    if both:
+        findings.append((_SEV_REVIEW,
+                         "\U0001f517 **NEG and BackendService removed together** in "
+                         + _fmt_service_list([f"`{n}`" for n in both])
+                         + ": GKE deletes a NEG only when no BackendService uses "
+                         "it. After the sync, check `kubectl get svcneg -n "
+                         "<namespace>`. If one is stuck, delete the BackendService, "
+                         "never the finalizer (acme-config-prod #3888)."))
     renamed_apps = sorted(a for a, r in results.items()
                           if getattr(r, "renamed_resources", None))
     if renamed_apps:
@@ -1012,6 +1035,12 @@ def _build_merge_summary(results, rollup_by_sig, vm_change_lines,
             findings.append((_SEV_REVIEW,
                              f"\U0001f50c **{_NOCORE_UNKNOWN}** for part of this "
                              f"PR (see the noCore note)"))
+        lb = _LEGACY_BACKENDS_RE.search(txt)
+        if lb:
+            findings.append((_SEV_REVIEW,
+                             f"\U0001f517 **Legacy backends come back** in "
+                             f"{lb.group(1)} environment(s): sync `-ms` and `-glb`, "
+                             f"then check `kubectl get svcneg`"))
         # COPS-2766: routine, the reach is a fact and not a risk. The names
         # come from our own line only.
         _tw = [l for l in txt.splitlines()

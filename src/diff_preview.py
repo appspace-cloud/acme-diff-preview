@@ -183,6 +183,7 @@ from comment_render import (  # comment rendering (same-dir module, stdlib only)
     _BLAST_RADIUS_HDR,
     _NOCORE_FLIP_HDR,
     _NOCORE_UNKNOWN,
+    _LEGACY_BACKENDS_HDR,
     _TENANT_WIDE_HDR,
     _VALUES_REDUNDANCY_HDR,
     _INERT_EDIT_HDR,
@@ -314,6 +315,7 @@ from manifest import (  # rendered-manifest parsing and resource diffing
     _detect_deleted_resources,
     _detect_created_resources,
     _detect_pingscaler_created,
+    _detect_neg_removed,
     _TEMPLATE_ARTIFACT_RE,
     _detect_template_artifacts,
     _is_kcc_blocking_artifact,
@@ -2809,12 +2811,17 @@ DiffResult = namedtuple("DiffResult",
                          "version_change", "deleted_resources", "replicas_zeroed",
                          "fingerprint", "renamed_resources", "vm_changes",
                          "version_fold", "shutdown_stats",
-                         "template_artifacts", "pingscaler_created", "ip_released"],
+                         "template_artifacts", "pingscaler_created", "ip_released",
+                         "neg_removed"],
                         defaults=[None, None, None, None, None, None, None,
-                                  None, None, None, None])
+                                  None, None, None, None, None])
 # ip_released (COPS-2766): the deleted ComputeAddress and DNSRecordSet headers
 # GCP releases (no explicit abandon), from the full pre-cap list. The `ip`
 # merge gate reads it. Only OUT_DIFF sets it, so a teardown never has it.
+# neg_removed (COPS-2766): headers of the Services that lose their NEG
+# annotation (manifest._detect_neg_removed), on the full pre-cap list. The
+# summary pairs them with a deleted ComputeBackendService of the same env
+# (acme-config-prod #3888). None on non-OUT_DIFF outcomes.
 # pingscaler_created (COPS-2714): True when this app's diff CREATES the
 # acme-ping-scaler Deployment. The chart skips all HPA rendering while a
 # ping-scaler is on, so the HPAs it displaces -- deleted in the SIBLING
@@ -8717,6 +8724,30 @@ def _nocore_flip_lines(changes) -> list:
     return lines
 
 
+# COPS-2766: the load-balancer chart defaults it to true, so unset is true.
+_LEGACY_BACKENDS_KEY = "appspace.loadBalancers.gatewayApi.legacyBackends"
+
+
+def _legacy_backends_lines(changes) -> list:
+    """COPS-2766: the panel line for the envs of _key_changes on
+    _LEGACY_BACKENDS_KEY that go from false to true. GCP private cloud only:
+    there the chart creates those BackendServices, and on Azure the key moves
+    nginx-frontend. True to false is not listed: the render shows it, and the
+    NEG and BackendService finding covers it."""
+    back = [c for c in changes or () if c["key"] == _LEGACY_BACKENDS_KEY
+            and c["old"] is False and c["new"] is True
+            and c["path"].startswith("gcp/") and "/private-cloud/" in c["path"]]
+    if not back:
+        return []
+    return [f"\u26a0\ufe0f {_LEGACY_BACKENDS_HDR} `{_LEGACY_BACKENDS_KEY}` goes from "
+            f"`false` to `true` in {len(back)} environment(s): {_nocore_names(back)}. "
+            "The chart creates the legacy BackendServices again in the `-glb` app, "
+            "and the NEGs they use come from the `-ms` app. Until both apps are "
+            "Synced, KCC reports those BackendServices as not ready. After the "
+            "sync, check `kubectl get svcneg -n <namespace>` and that every "
+            "BackendService is UpToDate.", ""]
+
+
 
 
 def _run_one_diff(app, pr_sha, main_sha, chart_revision=None, changed_paths=None, renames=None):
@@ -9145,11 +9176,13 @@ def argocd_diff(app, pr_sha, main_sha, chart_revision=None, changed_paths=None, 
         pingscaler_res = _detect_pingscaler_created(
             _detect_created_resources(filtered_sections))
         ip_released = _released_addresses(filtered_sections, deleted_res)
+        neg_res = _detect_neg_removed(filtered_sections)  # COPS-2766, pre-cap too
         return DiffResult(clean_diff, capped_sections,
                           n_res, True, None, OUT_DIFF, "changes", version_change,
                           deleted_res, zeroed_res, fingerprint, renamed_res,
                           vm_changes_res, version_fold, shutdown_stats,
-                          artifacts, pingscaler_res, ip_released)
+                          artifacts, pingscaler_res, ip_released=ip_released,
+                          neg_removed=neg_res)
     # Exhausted retries
     return _indeterminate(last_reason, last_detail or "unknown error")
 
@@ -13807,6 +13840,15 @@ def process_pr(pr, path_map, base_sha="", repo=None):
             logsink.log(f"    [comment] noCore check failed: {e}", "WARNING")
             nocore_changes = None
         appspace_state_lines += _nocore_flip_lines(nocore_changes)
+        try:
+            # COPS-2766: legacyBackends false to true, the same way.
+            appspace_state_lines += _legacy_backends_lines(_key_changes(
+                changed, renames, path_map, render_sha, base_sha,
+                _LEGACY_BACKENDS_KEY, default=True, repo=repo))
+        except Exception as e:
+            if _is_transient_exception(e):
+                raise
+            logsink.log(f"    [comment] legacyBackends check failed: {e}", "WARNING")
         try:
             # COPS-2721: same channel — REVIEW verdict when customer.yaml
             # re-states values a parent config.yaml already sets.
