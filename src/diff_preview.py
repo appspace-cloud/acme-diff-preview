@@ -65,6 +65,7 @@ import fleet_health  # COPS-2694 fleet health gauges (same-dir module, stdlib on
 import user_content  # COPS-2697 shared user-content identity (same-dir module, stdlib only)
 import blast_radius  # COPS-2693 Plan B blast-radius assessment (same-dir module, stdlib only)
 import values_redundancy  # COPS-2721 higher-layer redundant value callout
+import yaml_hygiene  # COPS-2766 YAML slips in a value file (same-dir module, pure)
 import render_cache  # three-tier main-render cache (same-dir module)
 from render_cache import (  # re-exported: the suite reaches these on the hub
     MAIN_RENDER_CACHE_DIR,
@@ -4594,53 +4595,141 @@ def _helm_template(chart_path: str, release: str, namespace: str,
 # that has never held an image -> ImagePullBackOff across the whole
 # environment. Root cause: acme-config-dev commit 1015bc622 "remove CICD"
 # deleted the children but left the key. This guard blocks any PR that
-# reintroduces the pattern before it can be merged.
+# reintroduces the pattern before it can be merged. COPS-2766: it is now one of
+# the three YAML slips (yaml_hygiene), with a duplicate key and a bare key.
 _VALUE_FILE_SUFFIXES = (".yaml", ".yml")
 
 
 def _values_wipes_definitions(body: str) -> bool:
-    """True iff this value-file body sets appspace.microservices.definitions to
-    an empty/null map (the dangerous pattern). A missing key, a populated map,
-    or unparseable YAML all return False: only an explicitly present-but-empty
-    definitions map is a wipe, and we never block on a mere parse error."""
-    if not body or not body.strip():
-        return False
-    try:
-        doc = _yaml_safe_load(body)
-    except Exception:
-        return False  # malformed YAML fails elsewhere; never block on it here
-    if not isinstance(doc, dict):
-        return False
-    ms = (doc.get("appspace") or {})
-    ms = ms.get("microservices") if isinstance(ms, dict) else None
-    if not isinstance(ms, dict):
-        return False
-    if "definitions" not in ms:
-        return False  # absent key: merge leaves the chart's map intact — safe
-    defs = ms["definitions"]
-    # Present key with null (None) or an empty mapping is the wipe.
-    return defs is None or defs == {}
+    """True iff the first document of this value file sets
+    appspace.microservices.definitions to anything but a non-empty map (null,
+    {}, [], "" or a scalar). A missing key, or YAML that does not parse, is
+    False: a parse error fails in the render, never here."""
+    s = yaml_hygiene.slips(body)
+    return bool(s and s["wipe"])
 
 
 def _detect_wiped_definitions(changed_files: list, sha: str, repo=None) -> list:
-    """Return the changed value files whose content at `sha` wipes the
-    microservices.definitions map. Only *.yaml/*.yml files are fetched; an
-    absent file is skipped. A failed read raises, so the PR is retried
-    (COPS-2766: skipping it let the wipe through green)."""
+    """The changed value files whose first document at `sha` wipes
+    microservices.definitions. A failed read raises, so the PR is retried."""
+    return [h["path"] for h in _detect_yaml_slips(changed_files, {}, sha, None, repo=repo)]
+
+
+def _value_body(path, sha, repo=None):
+    """The text of `path` at `sha`, or None when it is absent. A failed read
+    raises, so the PR is retried (COPS-2766: skipping it let a wipe through)."""
+    body, status = _bb_fetch_cached(path, sha, repo=repo)
+    if status == BB_ERROR:
+        raise ValueFileUnreadable(
+            f"value file unreadable at sha {sha[:8]} "
+            f"(Bitbucket transport, not absence): {path}")
+    return body if status == BB_OK else None
+
+
+def _detect_yaml_slips(changed, renames, sha, base_sha, repo=None) -> list:
+    """COPS-2766: the YAML slips in the changed files at `sha`, as hits
+    {path, kind, key, line, first_line}, kind "dup", "null" or "wipe".
+
+    A wipe counts at head alone, as in 2.121.0, so that guard never gets weaker.
+    A duplicate or bare key counts only in a value file under gcp/, azure/ or
+    aws/, and only when this PR adds it: the multiset delta against `base_sha`.
+    So an old slip stays green, and a third copy of an old duplicate is new.
+    With no `base_sha` they are not checked. A head that is absent or does not
+    parse is skipped (the render reports bad YAML); a base that is absent or
+    does not parse counts every head slip.
+    """
+    renames = renames or {}
+    old_of = {new: old for old, new in renames.items()}
+    heads, gone = {}, []
+    for f in changed:
+        if f.endswith(_VALUE_FILE_SUFFIXES):
+            body = _value_body(f, sha, repo)
+            if body is None:
+                gone.append(f)
+            else:
+                heads[f] = yaml_hygiene.slips(body)
+
+    def base_body(f):
+        body = _value_body(old_of.get(f, f), base_sha, repo)
+        if body is None and f not in old_of:
+            # A move Bitbucket did not pair: the same env folder and file, deleted here.
+            twin = next((g for g in gone if g not in renames
+                         and g.split("/")[-2:] == f.split("/")[-2:]), None)
+            body = twin and _value_body(twin, base_sha, repo)
+        return body
+
     hits = []
-    for f in changed_files:
-        if not f.endswith(_VALUE_FILE_SUFFIXES):
+    for f, s in heads.items():
+        if not s:
             continue
-        body, status = _bb_fetch_cached(f, sha, repo=repo)
-        if status == BB_ERROR:
-            raise ValueFileUnreadable(
-                f"value file unreadable at sha {sha[:8]} "
-                f"(Bitbucket transport, not absence): {f}")
-        if status != BB_OK or body is None:
-            continue
-        if _values_wipes_definitions(body):
-            hits.append(f)
+        found = [("wipe", yaml_hygiene.DEFINITIONS, 1)] if s["wipe"] else []
+        if (s["dup"] or s["null"]) and f.split("/")[0] in ("gcp", "azure", "aws"):
+            if not base_sha:
+                logsink.log(f"[yaml-slips] {f}: duplicate or bare keys not checked, "
+                            f"no base to compare with")
+            else:
+                base = yaml_hygiene.slips(base_body(f) or "") or {}
+                found += [(kind, key, n) for kind in ("dup", "null")
+                          for key, n in (s[kind] - base.get(kind, Counter())).items()]
+        # The delta gives how many copies are new; the last ones are shown.
+        hits += sorted(({"path": f, "kind": kind, "key": key, "line": line, "first_line": first}
+                        for kind, key, n in found for line, first in s["lines"][(kind, key)][-n:]),
+                       key=lambda h: h["line"])
     return hits
+
+
+_SLIP_DESC = {"dup": "duplicate key {key}", "null": "bare key {key}",
+              "wipe": "empty microservices.definitions (wipes image names)"}
+_SLIP_WHAT = {
+    "dup": "duplicate key `{key}` (first copy at line {first_line})",
+    "null": "bare key `{key}` (it reads as null)",
+    "wipe": "`appspace.microservices.definitions` is empty or not a map",
+}
+_SLIP_WHY = {
+    "dup": "A duplicate key keeps only its last copy. The first copy is dropped with no "
+           "error (COPR-31148: a login whitelist was lost for 53 h).",
+    "null": "A bare key (`key:` with no value) is null. Helm then deletes that key from "
+            "the chart defaults, for example the probes or the HPA policies.",
+    "wipe": "An empty or non-map `definitions` deletes every image name the chart ships, "
+            "so the whole environment fails with ImagePullBackOff (COPR-31637).",
+}
+_SLIP_FIX = {
+    "dup": "Keep one copy of a duplicate key and delete the other.",
+    "null": "Give a bare key a value, or delete the line. To remove a chart default on "
+            "purpose, write `null`.",
+    "wipe": "Delete the `definitions:` line, so the chart's map stays, or give it real "
+            "children.",
+}
+
+
+def _yaml_slip_block(hits: list, pr_sha: str, base_sha: str):
+    """(build status description, comment body) for _detect_yaml_slips hits."""
+    h = hits[0]
+    more = f" (+{len(hits) - 1} more)" if len(hits) > 1 else ""
+    tail = " - see PR comment"
+    desc = (f"BLOCKED: YAML slip in {'/'.join(h['path'].split('/')[-2:])} line {h['line']}: "
+            + _SLIP_DESC[h["kind"]].format(**h) + more)[:255 - len(tail)] + tail
+    kinds = [k for k in _SLIP_WHY if any(x["kind"] == k for x in hits)]
+    paths = list(dict.fromkeys(x["path"] for x in hits))
+    old = (" Old duplicate or bare keys in these files do not block, only the ones "
+           "this PR adds." if kinds != ["wipe"] else "")
+    body = (
+        f"## \U0001f52d {STATUS_NAME}\n\n"
+        f"{_comment_header(pr_sha)}\n\n"
+        "\u26d4 **Blocked: this PR adds a YAML slip. It changes config, and no diff "
+        "line shows it clearly.**\n\n"
+        + "\n".join(f"- `{x['path']}` line {x['line']}: " + _SLIP_WHAT[x["kind"]].format(**x)
+                    for x in hits) + "\n\n"
+        "**Why:** Helm and ArgoCD read only the first YAML document of a file.\n\n"
+        + "".join(f"- {_SLIP_WHY[k]}\n" for k in kinds) + "\n"
+        "**Fix:** " + " ".join(_SLIP_FIX[k] for k in kinds) + old + "\n\n"
+        "This check runs again by itself on a new commit, or when `main` changes.\n\n"
+        f"---\n**Status:** \u26d4 Blocked: YAML slip in `{paths[0]}`"
+        + (f" (+{len(paths) - 1} more)" if len(paths) > 1 else "") + "\n"
+        f"*{_ts()} - {COMMENT_MARKER} [blocked]"
+        + (f" [base:{base_sha[:8]}]" if base_sha else "") + "*"
+    )
+    return desc, body
 
 
 def _read_first_doc(path, sha, repo=None, lenient=False):
@@ -12566,45 +12655,16 @@ def process_pr(pr, path_map, base_sha="", repo=None):
                     "DEBUG", pr=pr_id, repo=repo,
                     changed_files=len(changed), affected_apps=len(affected))
 
-        # v2.12.0 (COPR-31637): hard guard. A value file that sets
-        # appspace.microservices.definitions to null/empty wipes every
-        # per-service image.name override on merge (helm `merge` collapses the
-        # map), silently breaking image names -> ImagePullBackOff across the
-        # whole environment. This is checked BEFORE any diff/app logic and, if
-        # found, blocks the merge outright with a red status: no rendered diff
-        # would make the danger obvious, so we refuse instead of commenting a
-        # green diff. Runs on every PR regardless of affected apps.
-        wiped = _detect_wiped_definitions(changed, render_sha, repo=repo)
-        if wiped:
-            _files_md = "\n".join(f"- `{w}`" for w in wiped)
-            desc = (f"BLOCKED: {len(wiped)} file(s) empty out "
-                    f"microservices.definitions (wipes image overrides)")
+        # COPR-31637, COPS-2766: a YAML slip (a duplicate key, a bare key, or an
+        # empty or non-map microservices.definitions) changes config, and no diff
+        # line shows it clearly, so it blocks before any render. Only the slips
+        # this PR adds count. Without a merge preview the base is main, not the
+        # merge base, so only the wipe is checked.
+        slips = _detect_yaml_slips(changed, renames, render_sha,
+                                   base_sha if render_sha != pr_sha else None, repo=repo)
+        if slips:
+            desc, body = _yaml_slip_block(slips, pr_sha, base_sha)
             st = post_build_status(pr_sha, "FAILED", desc, pr_id=pr_id, repo=repo)
-            body = (
-                f"## \U0001f52d {STATUS_NAME}\n\n"
-                f"{_comment_header(pr_sha)}\n\n"
-                f"\u26d4 **This PR is blocked from merging — dangerous change "
-                f"detected.**\n\n"
-                f"The following value file(s) set "
-                f"`appspace.microservices.definitions` to an **empty/null "
-                f"map**:\n\n{_files_md}\n\n"
-                f"On merge, Helm merges this map **last**, so a null/empty "
-                f"`definitions` **wipes every per-service `image.name` "
-                f"override** the chart ships (e.g. `appspace-platformservice`, "
-                f"`appspace-webhookservice`, `appspace-screenshot`). Each "
-                f"affected microservice then falls back to the derived "
-                f"`appspace-<key>` name, which for these services points at a "
-                f"registry path that has never held an image \u2014 causing "
-                f"**ImagePullBackOff across the whole environment** (this is "
-                f"exactly what happened in COPR-31637).\n\n"
-                f"**How to fix:** either remove the `definitions:` key entirely "
-                f"(so the chart's own map is kept), or give it real children. "
-                f"Never leave `definitions:` present but empty.\n\n"
-                f"---\n**Status:** \u26d4 Blocked \u2014 empty "
-                f"`microservices.definitions` would break image names on merge\n"
-                f"*{_ts()} \u2014 {COMMENT_MARKER} [blocked]"
-                + (f" [base:{base_sha[:8]}]" if base_sha else "") + "*"
-            )
             cm = upsert_comment(pr_id, body, existing_id, repo=repo)
             _seen_after_writes(sk, pr_sha, base_sha, st, cm)
             return
