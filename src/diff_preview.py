@@ -4094,7 +4094,10 @@ def _seen_after_writes(sk, pr_sha, base_sha, *results) -> bool:
     """COPS-2766: mark a PR seen only when its comment and status writes
     landed. "permanent" counts as landed: a retry would fail the same way.
     "transient" backs off and retries. "skipped" (not the leader) does
-    neither, because the new leader owns the PR."""
+    neither, because the new leader owns the PR.
+
+    Once seen, the PR published a real result, so its retry backoff and
+    its supersede abort streak (COPS-2575) are over too."""
     if "transient" in results:
         _backoff_register_transient(sk, pr_sha)
         logsink.log(f"PR #{sk[1]}: a comment or status write failed, will retry",
@@ -4103,6 +4106,8 @@ def _seen_after_writes(sk, pr_sha, base_sha, *results) -> bool:
     if all(r in ("ok", "permanent") for r in results):
         with _seen_lock:
             _seen[sk] = (pr_sha, base_sha)
+        _backoff_clear(sk)
+        _note_supersede_complete(sk)
         return True
     return False
 
@@ -12761,11 +12766,8 @@ def process_pr(pr, path_map, base_sha="", repo=None):
             # Mark seen for both clean runs AND permanent failures so we don't
             # spam the PR with repeated "not found" comments every 60s.
             # COPS-2766: only once the comment and the status really landed.
-            if _seen_after_writes(sk, pr_sha, base_sha, cm, st):
-                _backoff_clear(sk)
-                # COPS-2575: this PR published a real result, so the livelock
-                # guard's consecutive-abort streak is over.
-                _note_supersede_complete(sk)
+            # That also clears the backoff and the COPS-2575 abort streak.
+            _seen_after_writes(sk, pr_sha, base_sha, cm, st)
         else:
             # COPS-2546: still unseen (so it retries), but with escalating
             # spacing instead of every iteration.

@@ -165,9 +165,12 @@ def test_early_exit_with_a_transient_write_retries(world, monkeypatch, status, c
 @pytest.mark.parametrize("status,comment", [("ok", "ok"), ("permanent", "ok"),
                                             ("ok", "permanent")])
 def test_early_exit_with_landed_or_rejected_writes_is_seen(world, monkeypatch, status, comment):
+    m._retry_backoff[SK] = [0, 4, PR_SHA]     # an earlier transient pass
+    monkeypatch.setitem(m._pr_supersede_aborts, SK, 1)
     _conflict_world(world, monkeypatch, status=status, comment=comment)
     assert m._seen.get(SK) == (PR_SHA, BASE_SHA)
-    assert SK not in m._retry_backoff
+    assert SK not in m._retry_backoff, "a published result ends the backoff"
+    assert SK not in m._pr_supersede_aborts, "and the supersede abort streak"
 
 
 def test_early_exit_not_leader_neither_seen_nor_backed_off(world, monkeypatch):
@@ -319,8 +322,10 @@ def test_dedup_retries_when_the_status_fix_did_not_land(world, monkeypatch):
 
 @pytest.mark.parametrize("result", ["ok", "permanent"])
 def test_dedup_is_seen_once_the_status_is_settled(world, monkeypatch, result):
+    m._retry_backoff[SK] = [0, 8, PR_SHA]     # a status write that failed before
     _dedup_world(world, monkeypatch, result)
     assert m._seen.get(SK) == (PR_SHA, BASE_SHA)
+    assert SK not in m._retry_backoff, "the next failure starts at 1 again"
 
 
 # ── a failed write, then the real recovery: red stays red ────────────────
