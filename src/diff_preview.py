@@ -7234,16 +7234,14 @@ def _evaluate_env_decommissions(candidates: list, pr_sha: str, main_sha: str,
             # inventory it would otherwise appear to describe.
             _note = _cascade_mismatch_note(c["env_name"], c["apps"], cascade)
             lines += _note
-            # COPS-2766: the table says Phase 2 is done from the flag alone. A
-            # paused env never syncs, so the panel says so next to the table.
-            paused = cascade and _autosync_paused(
-                _flat_yaml_cached(c["identity_file"], main_sha))
-            if paused:
-                lines += [f"\U0001f6a8 **{_DECOM_PAUSED_HDR}.** `appspace.autosync: false` "
-                          f"is set for `{c['env_name']}` on `main`. A paused environment "
-                          "never syncs, so the cascade finalizer never arrives. Resume "
-                          "auto-sync in a separate PR, let it sync, then remove the "
-                          "folder.", ""]
+            # COPS-2766: a paused env keeps its finalizer and still cascades
+            # (live on pv-qa88-a), but main's latest changes may not be live.
+            if cascade and _autosync_paused(
+                    _flat_yaml_cached(c["identity_file"], main_sha)):
+                lines += [f"\u26a0\ufe0f **{_DECOM_PAUSED_HDR}** for `{c['env_name']}`. "
+                          "The cascade still runs when the folder goes, but changes made "
+                          "on main during the pause (zeroPods, the purge policy) may not "
+                          "be live yet. Check the live Applications before merging.", ""]
             # COPS-2707: the table above just reported Phase 2 as pending on
             # an environment whose file looks armed to a reader. Saying only
             # "not armed" is what left acme-config-prod #4377 arguing with
@@ -7297,8 +7295,6 @@ def _evaluate_env_decommissions(candidates: list, pr_sha: str, main_sha: str,
             # _note is set. The finalizer not live yet clears itself on a retry.
             if _DECOM_CASCADE_NOT_LIVE_HDR in "\n".join(_note):
                 c["gates"].append({"kind": "not_live", "env": c["env_name"]})
-            if paused:
-                c["gates"].append({"kind": "paused", "env": c["env_name"]})
             # A mirror blip is a retry, never a reason to override the hold.
             hold = _teardown_hold_met(c["identity_file"], main_sha)
             if hold is not True:

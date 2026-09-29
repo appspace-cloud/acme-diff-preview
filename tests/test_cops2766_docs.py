@@ -63,9 +63,10 @@ def test_every_gate_has_a_row_in_the_guards_table():
     assert named == TRAILERS, named ^ TRAILERS
     assert all(o.startswith(("`Confirm-", "none")) for o in overrides), overrides
     guards = " ".join(r.split("|")[1] for r in body)
-    for name in ("Teardown hold", "Cascade not live", "Cascade armed while paused",
+    for name in ("Teardown hold", "Cascade not live",
                  "Disk shrink", "Released static IP or DNS record"):
         assert name in guards, name
+    assert "paused" not in guards, "a pause is a warning, not a guard"
 
 
 def test_the_green_status_lead_is_never_red_in_the_docs():
