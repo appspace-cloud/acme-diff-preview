@@ -7378,6 +7378,136 @@ def _new_env_prereqs(new_env_candidates, sha, repo=None) -> tuple:
     return gates, lines
 
 
+# COPS-2766 (C24): the git files globs of the ApplicationSets, by repo slug.
+_appset_globs_cache = {}   # repo -> (monotonic time, globs), a proven list only
+_APPSET_NONE = "ApplicationSet check unavailable (could not list ApplicationSets)"
+
+
+def _glob_re(glob):
+    """A git files glob as a regex: `**/` is zero or more folders, `*` and `?`
+    do not match `/`. The hub runs the old globbing (git ls-files), where `*`
+    also matches `/`. For today's globs and the checked shapes both agree, and
+    the self-check of _appset_file_globs catches a glob where they do not."""
+    return re.compile(re.escape(glob).replace(r"\*\*/", "(?:.*/)?").replace(r"\*\*", ".*")
+                      .replace(r"\*", "[^/]*").replace(r"\?", "[^/]"))
+
+
+def _appset_reads(path, globs):
+    return any(_glob_re(g).fullmatch(path) for g in globs)
+
+
+def _appset_checked(path):
+    """An identity file that an ApplicationSet must read: a private-cloud
+    customer.yaml, a cl-*/config.yaml or a cl-*/app<N>/customer.yaml. The other
+    cl-* folders are rendered by the cl-*/config.yaml ApplicationSets."""
+    app = _CL_APP_RE.match(path)
+    return _is_pv_env_file(path) or bool(_CL_ENV_RE.match(path)) \
+        or bool(app and re.fullmatch(r"app\d+", app[2]))
+
+
+def _git_file_globs(node, repo):
+    """The git files paths in a generator tree whose repoURL is `repo`. A path
+    with `{{` is a template, and an exclude path deploys nothing."""
+    if isinstance(node, list):
+        return [g for x in node for g in _git_file_globs(x, repo)]
+    if not isinstance(node, dict):
+        return []
+    # The repoURL rule of the apps: an ssh or https URL, with or without .git.
+    own = node.get("files") if _extract_app_git_repo({"spec": {"source": node}}) == repo else ()
+    return [f["path"] for f in own or () if isinstance(f, dict) and not f.get("exclude")
+            and isinstance(f.get("path"), str) and "{{" not in f["path"]] \
+        + [g for v in node.values() for g in _git_file_globs(v, repo)]
+
+
+def _appset_file_globs(repo, fresh=False):
+    """COPS-2766 (C24): the git files globs of the ApplicationSets that read
+    `repo`, or None when they are not proven: `argocd appset list` failed, it
+    gave no glob (an RBAC filter lists nothing), or a live identity file of a
+    checked shape matches none, so this matcher does not agree with ArgoCD. A
+    proven list is cached for PATH_MAP_TTL; `fresh` lists again."""
+    hit = _appset_globs_cache.get(repo)
+    if hit and not fresh and time.monotonic() - hit[0] < PATH_MAP_TTL:
+        return hit[1]
+    try:
+        r = subprocess.run([ARGOCD_BIN, "appset", "list", "-o", "json"] + _auth_flags(),
+                           capture_output=True, text=True, timeout=90,
+                           env=_argocd_subprocess_env())
+        if r.returncode != 0:
+            raise RuntimeError(f"rc {r.returncode}: {r.stderr[:200]}")
+        raw = json.loads(r.stdout)
+    except (OSError, RuntimeError, ValueError, subprocess.SubprocessError) as exc:
+        logsink.log(f"{_APPSET_NONE}: {exc}", "WARNING")
+        return None
+    items = raw.get("items") if isinstance(raw, dict) else raw
+    globs = sorted({g for a in (items if isinstance(items, list) else ()) if isinstance(a, dict)
+                    for g in _git_file_globs((a.get("spec") or {}).get("generators"), repo)})
+    live = {vf.split("$config/", 1)[-1].lstrip("/")
+            for app, vfs in (_app_value_files_map or {}).items()
+            if (_app_repo_map or {}).get(app) in (None, repo) for vf in vfs or ()}
+    bad = sorted(f for f in live if _appset_checked(f) and not _appset_reads(f, globs))
+    if not globs or bad:
+        logsink.log(f"{_APPSET_NONE}: " + (f"live {bad[0]} matches no glob" if globs
+                                            else f"no git files glob reads {repo}"), "WARNING")
+        return None
+    _appset_globs_cache[repo] = (time.monotonic(), globs)
+    return globs
+
+
+def _appset_misses(new_env_candidates, renames, repo=None) -> tuple:
+    """COPS-2766 (C24, row 34): (appset_miss gates, {config_file: check lines},
+    notes). An identity file of a new env, or the new side of a move out of an
+    ApplicationSet, that no git files glob reads makes no apps, so nothing
+    deploys on merge. A miss lists the ApplicationSets again without the cache,
+    so one applied a minute ago counts. aws/, and globs that are not proven,
+    give a warning and never a gate."""
+    todo = [(c["name"], c["config_file"], f, None) for c in new_env_candidates or ()
+            for f in c.get("all_yaml_files", ())
+            if _appset_checked(f) or (f.startswith("aws/") and f.endswith("/customer.yaml"))]
+    for old, new in sorted((renames or {}).items()):
+        if _appset_checked(new):
+            cl = _CL_ENV_RE.match(new) or _CL_APP_RE.match(new)
+            todo.append((cl[1] if cl else new.split("/")[-2], None, new, old))
+    lines = {k: [f"{_NEW_ENV_CHECK_PREFIX}`{e}`: `aws/` is deployed by the legacy pipeline, "
+                 "not by ArgoCD, so no ApplicationSet check ran."]
+             for e, k, f, _old in todo if f.startswith("aws/")}
+    rest = [t for t in todo if not t[2].startswith("aws/")]
+
+    def missed(globs):
+        return [t for t in rest if not _appset_reads(t[2], globs)
+                and (t[3] is None or _appset_reads(t[3], globs))]
+    globs = _appset_file_globs(repo or BB_REPO) if rest else []
+    if globs and missed(globs):
+        globs = _appset_file_globs(repo or BB_REPO, fresh=True)   # it may be applied just now
+    if globs is None:
+        for e, k, _f, _old in rest:
+            if k:
+                lines.setdefault(k, [f"{_NEW_ENV_CHECK_PREFIX}`{e}`: {_APPSET_NONE}, so it is "
+                                     "not proven that ArgoCD makes apps for it."])
+        moved = [f"`{f}`" for _e, k, f, _old in rest if not k]
+        notes = [f"\u26a0\ufe0f {_APPSET_NONE}, so it is not proven that ArgoCD makes apps "
+                 f"for the moved {', '.join(moved)}."] if moved else []
+        return [], lines, notes
+    by_env = {}
+    for e, _k, f, _old in missed(globs):
+        by_env.setdefault(e, []).append(f)
+    return [{"kind": "appset_miss", "env": e, "paths": ps}
+            for e, ps in sorted(by_env.items())], lines, []
+
+
+def _appset_miss_lines(gates, notes=()) -> list:
+    """COPS-2766: the panel of the appset_miss gates, then the notes of the
+    check. Plain lines, like _dup_identity_lines."""
+    hits = [g for g in gates or () if g["kind"] == "appset_miss"]
+    lines = ["## \u26d4 NO APPLICATIONSET READS THIS FOLDER", ""] if hits else []
+    lines += [f"- `{p}` matches no ApplicationSet, so ArgoCD makes no apps for it and "
+              "nothing deploys on merge." for g in hits for p in g["paths"]]
+    if hits:
+        lines += ["", "Check the cloud, tier and spoke folders. If the ApplicationSet is being "
+                  "added in acme-infrastructure, apply it first, then push again here (an "
+                  "empty commit is enough).", ""]
+    return lines + [x for n in notes for x in (n, "")]
+
+
 def _env_declares_live_kcc_vms(identity_file: str, sha: str,
                                repo: str = None) -> tuple:
     """(declares_live_vms, allowDeletion_armed) from the merged hierarchy.
@@ -12549,6 +12679,11 @@ def process_pr(pr, path_map, base_sha="", repo=None):
                                                            base_sha, repo=repo)
         # A new GCP env on an n4 or c4 machine with a pd- disk: GCP rejects it.
         disk_gates, prereqs = _new_env_prereqs(new_env_candidates, render_sha, repo=repo)
+        # A new or moved env that no ApplicationSet reads: nothing deploys.
+        appset_gates, appset_lines, appset_notes = _appset_misses(new_env_candidates, renames,
+                                                                  repo=repo)
+        for f, ls in appset_lines.items():
+            prereqs[f] = prereqs.get(f, []) + ls
 
         # v2.5.10 (explicit request): detect FULL environment decommissions
         # (identity file deleted, no successor anywhere — distinct from a
@@ -12584,11 +12719,12 @@ def process_pr(pr, path_map, base_sha="", repo=None):
                                        with_full_output=True, base_sha=base_sha, repo=repo,
                                        changed=changed, renames=renames, prereqs=prereqs)
                 gates = _lift_gates(_merge_gates((), extra=clone_gates + dup_gates + ashn_gates
-                                                 + disk_gates),
+                                                 + disk_gates + appset_gates),
                                     repo, pr_id, base_sha, pr_sha)
                 body, state, desc = format_new_env_comment(
                     pr_sha, _clone_wake_lines(gates) + _dup_identity_lines(gates, dup_unchecked)
-                    + _ashn_copy_lines(gates, ashn_notes) + new_env_lines,
+                    + _ashn_copy_lines(gates, ashn_notes)
+                    + _appset_miss_lines(gates, appset_notes) + new_env_lines,
                     new_env_full_lines, structural_envs,
                     gates, len(new_env_candidates), total_new, base_sha)
                 # v2.25.0: this path never persisted a full-diff artifact, so
@@ -13066,10 +13202,11 @@ def process_pr(pr, path_map, base_sha="", repo=None):
         # below: a retry, never a lift.
         gates = _merge_gates(decommission_candidates, renames, path_map,
                              vm_change_lines, app_results,
-                             clone_gates + dup_gates + ashn_gates + disk_gates)
+                             clone_gates + dup_gates + ashn_gates + disk_gates + appset_gates)
         _lift_gates(gates, repo, pr_id, base_sha, pr_sha)
         appspace_state_lines = (_clone_wake_lines(gates) + _dup_identity_lines(gates, dup_unchecked)
-                                + _ashn_copy_lines(gates, ashn_notes) + appspace_state_lines)
+                                + _ashn_copy_lines(gates, ashn_notes)
+                                + _appset_miss_lines(gates, appset_notes) + appspace_state_lines)
         # Direct permalink into the full-diff view for this exact commit.
         # Only built when the view is reachable from outside the cluster
         # (base URL set), so the comment never links to something a

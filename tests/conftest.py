@@ -83,7 +83,7 @@ def _clear_sha_fetch_cache():
     # sha with different content must never see each other's parse.
     # _fleet_own_cache (COPS-2766) is keyed by base sha, the same risk.
     caches = (_m._vf_cache, _m._vf_inflight, _m._retry_backoff, _m._yaml_cache,
-              _m._fleet_own_cache)
+              _m._fleet_own_cache, _m._appset_globs_cache)
     for d in caches:
         d.clear()
     yield
@@ -203,4 +203,23 @@ def _no_prereq_reads(request, monkeypatch):
         return
     import diff_preview as _m
     monkeypatch.setattr(_m, "_new_env_prereqs", lambda *a, **k: ([], {}))
+    yield
+
+
+# ── COPS-2766: no ApplicationSet list unless a test asks for it ─────────────
+#
+# Block 3 lists the ApplicationSets (`argocd appset list`) for each new env and
+# each moved identity file. An old process_pr fixture never stubbed that
+# command, so the real one would run, fail and add the "ApplicationSet check
+# unavailable" line, which changes its verdict while it asserts only part of
+# the body. The default here is one glob that reads every file, so there is no
+# finding, which is what those fixtures saw before. A test of the list itself
+# opts back in with @pytest.mark.appset_reads.
+@pytest.fixture(autouse=True)
+def _no_appset_reads(request, monkeypatch):
+    if request.node.get_closest_marker("appset_reads"):
+        yield          # this test lists the ApplicationSets on purpose
+        return
+    import diff_preview as _m
+    monkeypatch.setattr(_m, "_appset_file_globs", lambda repo, fresh=False: ["**"])
     yield
