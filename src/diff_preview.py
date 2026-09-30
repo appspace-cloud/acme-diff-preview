@@ -163,6 +163,7 @@ from comment_render import (  # comment rendering (same-dir module, stdlib only)
     _SEV_BLOCK,
     _VERDICTS,
     _fmt_env_list,
+    _downgrade_mix_note,
     _build_merge_summary,
     build_marks,
     status_lead,
@@ -181,6 +182,10 @@ from comment_render import (  # comment rendering (same-dir module, stdlib only)
     _DECOM_PUBLIC_CLOUD_NOOP_HDR,
     _DECOM_PUBLIC_CLOUD_WHY,
     _BLAST_RADIUS_HDR,
+    _NOCORE_FLIP_HDR,
+    _NOCORE_UNKNOWN,
+    _LEGACY_BACKENDS_HDR,
+    _TENANT_WIDE_HDR,
     _VALUES_REDUNDANCY_HDR,
     _INERT_EDIT_HDR,
     _IDENTITY_MIGRATION_HDR,
@@ -193,6 +198,8 @@ from comment_render import (  # comment rendering (same-dir module, stdlib only)
     _SHUTDOWN_MIN_WORKLOADS,
     _is_env_shutdown,
     _NEW_ENV_CHECK_PREFIX,
+    MERGE_SUMMARY_HDR,
+    commit_authors_line,
 )
 from redact import (  # display-time redaction (same-dir module, stdlib only)
     _unquote,
@@ -222,6 +229,9 @@ from version_fold import (  # version-transition fold (same-dir module, stdlib o
     _split_image,
     _classify_fold_pair,
     _classify_version_fold,
+    _detect_image_downgrades,
+    _image_defaults,
+    _pins_left_behind,
 )
 import uptime_schedule  # VM uptime-schedule advisory notes (same-dir module, stdlib only)
 from grouping import (  # same-change grouping and rollup (same-dir module)
@@ -246,6 +256,8 @@ from vm_analysis import (  # VM/KCC infrastructure analysis (same-dir module)
     _detect_workload_shutdown,
     _count_hpas_remaining,
     _count_workload_replicas,
+    _detect_capacity_floor_risk,
+    _detect_replicas_released,
     _VM_KINDS,
     _VM_DELETION_POLICY_KEY,
     _VM_TRACKED_FIELDS,
@@ -275,6 +287,13 @@ from vm_analysis import (  # VM/KCC infrastructure analysis (same-dir module)
     _VM_REPEAT_MIN,
     _collapse_repeated_vm_lines,
     _vm_panel_lines,
+    _VM_RESIZE_REASON,
+    _VM_PARK_NOTE,
+    _VM_START_NOTE,
+    _IMMUTABLE_RENDER_KINDS,
+    _render_immutable_facts,
+    _merge_vm_facts,
+    _VM_ASO_RESIZE_REASON,
 )
 from decommission import (
     _PH_DONE,  # environment teardown and creation analysis
@@ -311,6 +330,7 @@ from manifest import (  # rendered-manifest parsing and resource diffing
     _detect_deleted_resources,
     _detect_created_resources,
     _detect_pingscaler_created,
+    _detect_neg_removed,
     _TEMPLATE_ARTIFACT_RE,
     _detect_template_artifacts,
     _is_kcc_blocking_artifact,
@@ -358,6 +378,7 @@ from schema_errors import (  # render-failure explanation
     _NULL_VIOLATION_RE,
     _schema_fix_hints,
     _missing_value_remedies,
+    _toleration_errors,
 )
 from chart_identity import (  # chart tree digest and its memo
     _CHART_TREE_MEMO_MAX,
@@ -407,8 +428,11 @@ except ImportError:  # pragma: no cover - production image always has the wheel
 
 # COPS-2631 stage 2: CSafeLoader for values-file YAML. Rendered manifests
 # never touch PyYAML; every former yaml.safe_load site parses customer.yaml /
-# config.yaml. Prefer the C loader when libyaml is present, fall back so a
+# config.yaml. One bounded exception (COPS-2766): vm_analysis parses only the
+# changed ComputeInstance, BigQueryDataset and StorageBucket docs of a
+# render. Prefer the C loader when libyaml is present, fall back so a
 # libyaml-less environment still boots. Call sites keep catching YAMLError.
+# COPS-2766: vm_analysis also parses changed workloads, for the CPU request.
 _YAML_SAFE_LOADER = getattr(yaml, "CSafeLoader", yaml.SafeLoader)
 
 
@@ -492,6 +516,8 @@ ARGOCD_USER          = os.environ.get("ARGOCD_USER", "diff-preview")
 ARGOCD_PASS          = os.environ["ARGOCD_PASS"]
 # Comma-separated list of ArgoCD projects the webhook hard-refresh targets.
 ARGOCD_PROJECTS      = os.environ.get("ARGOCD_PROJECTS", "appspace-dev,appspace-qa").split(",")
+# COPS-2766: the JFrog webhook never hard-refreshes an app in this project.
+JFROG_SKIP_PROJECT   = "appspace-prod"
 # HMAC-SHA256 key for verifying incoming JFrog webhook requests.
 # HMAC-SHA256 secret for verifying incoming Bitbucket PR webhook requests.
 # Bitbucket signs the payload with X-Hub-Signature: sha256=<hex>.
@@ -1358,6 +1384,8 @@ _app_chart_registry_map: dict = {}
 _app_value_files_map: dict = {}
 # app full_name -> destination namespace.
 _app_namespace_map: dict = {}
+# app full_name -> ArgoCD project (spec.project), e.g. "appspace-prod".
+_app_project_map: dict = {}
 # Total app-reference count across all path entries. Used to detect when a new
 # app appears under an *existing* path key (which would not change len(path_map)
 # and would be missed by the old key-count invalidation check).
@@ -1880,7 +1908,8 @@ def _jfrog_refresh_guarded(chart_name: str, chart_version: str) -> None:
 
 
 def _jfrog_hard_refresh(chart_name: str, chart_version: str) -> None:
-    """Hard-refresh all ArgoCD apps tracking chart_name:chart_version.
+    """Hard-refresh all ArgoCD apps tracking chart_name:chart_version,
+    except the appspace-prod ones.
 
     Called in a daemon thread after responding 202 to the JFrog webhook.
     Bypasses the repo-server OCI cache so ArgoCD picks up the new image
@@ -1929,6 +1958,18 @@ def _jfrog_hard_refresh(chart_name: str, chart_version: str) -> None:
                 if c == chart_name
                 and _app_chart_revision_map.get(a) == chart_version]
     source = f"path map, {len(_app_chart_map)} apps"
+
+    # COPS-2766: a -dev tag pushed again must not reach a prod app in one
+    # minute. Prod waits for its own refresh.
+    prod = [a for a in matching if _app_project_map.get(a) == JFROG_SKIP_PROJECT]
+    if prod:
+        matching = [a for a in matching
+                    if _app_project_map.get(a) != JFROG_SKIP_PROJECT]
+        logsink.log(f"JFrog webhook: skipped {len(prod)} {JFROG_SKIP_PROJECT} app(s) on "
+                    f"{chart_name}:{chart_version}, prod is never hard-refreshed: "
+                    f"{', '.join(prod[:5])}{'...' if len(prod) > 5 else ''}", "WARNING")
+        if not matching:
+            return
 
     if not matching:
         logsink.log(f"JFrog webhook: no apps found for {chart_name}:{chart_version}"
@@ -2470,7 +2511,8 @@ def _discover_path_app_map_locked():
     """The rebuild itself. Only ever entered holding _path_map_lock."""
     global _path_map_cache, _path_map_ts, _path_map_count, _path_map_app_count, \
            _app_chart_map, _app_chart_revision_map, _app_chart_registry_map, \
-           _app_value_files_map, _app_namespace_map, _app_repo_map, _repo_path_maps
+           _app_value_files_map, _app_namespace_map, _app_repo_map, _repo_path_maps, \
+           _app_project_map
     r = subprocess.run(
         [ARGOCD_BIN, "app", "list", "-o", "json"] + _auth_flags(),
         capture_output=True, text=True, timeout=90,
@@ -2498,6 +2540,7 @@ def _discover_path_app_map_locked():
     chart_reg_map = {}
     value_files_map = {}
     namespace_map = {}
+    project_map = {}
     app_repo_map = {}
     repo_maps = {slug: {} for slug in REPOS}
     unknown_repos_seen = set()
@@ -2517,6 +2560,9 @@ def _discover_path_app_map_locked():
         dest = app.get("spec", {}).get("destination", {})
         if dest.get("namespace"):
             namespace_map[full_name] = dest["namespace"]
+        project = app.get("spec", {}).get("project")
+        if project:
+            project_map[full_name] = project
         # COPS-2507 multi-repo: record which git config repo this app renders
         # from (sources[0], the `ref: config` git source). A PR in repo R may
         # only ever match apps whose git source is R — makes cross-repo
@@ -2549,6 +2595,7 @@ def _discover_path_app_map_locked():
     _app_chart_registry_map  = chart_reg_map
     _app_value_files_map     = value_files_map
     _app_namespace_map       = namespace_map
+    _app_project_map         = project_map
     _app_repo_map            = app_repo_map
     _repo_path_maps          = repo_maps
     _path_map_ts        = time.monotonic()
@@ -2806,12 +2853,28 @@ DiffResult = namedtuple("DiffResult",
                          "version_change", "deleted_resources", "replicas_zeroed",
                          "fingerprint", "renamed_resources", "vm_changes",
                          "version_fold", "shutdown_stats",
-                         "template_artifacts", "pingscaler_created", "ip_released"],
+                         "template_artifacts", "pingscaler_created", "ip_released",
+                         "neg_removed", "capacity", "image_downgrades", "pins_behind"],
                         defaults=[None, None, None, None, None, None, None,
-                                  None, None, None, None])
+                                  None, None, None, None, None, None, None, None])
 # ip_released (COPS-2766): the deleted ComputeAddress and DNSRecordSet headers
 # GCP releases (no explicit abandon), from the full pre-cap list. The `ip`
 # merge gate reads it. Only OUT_DIFF sets it, so a teardown never has it.
+# capacity (COPS-2766): {"cuts": [(workload, what)], "released": [(workload,
+# n)]} from vm_analysis on the full main and PR renders, or None. Warnings
+# only (COPR-32597, acme-config-prod #4523).
+# neg_removed (COPS-2766): headers of the Services that lose their NEG
+# annotation (manifest._detect_neg_removed), on the full pre-cap list. The
+# summary pairs them with a deleted ComputeBackendService of the same env
+# (acme-config-prod #3888). None on non-OUT_DIFF outcomes.
+# pins_behind (COPS-2766): on a chart upgrade, [(service, pinned tag, new
+# chart default), ...] for every value-file pin the bump leaves behind
+# (_pins_behind), or 'skipped' when the check could not read its inputs.
+# None when the chart does not go up or has no versions.yaml.
+# image_downgrades (COPS-2766): ((header, repo, old tag, new tag), ...) for
+# every image tag that goes down (_detect_image_downgrades), counted on the
+# full pre-cap list (#4679). None when there is none, and when the chart
+# moves and does not go up (_images_may_go_down).
 # pingscaler_created (COPS-2714): True when this app's diff CREATES the
 # acme-ping-scaler Deployment. The chart skips all HPA rendering while a
 # ping-scaler is on, so the HPAs it displaces -- deleted in the SIBLING
@@ -2831,7 +2894,9 @@ DiffResult = namedtuple("DiffResult",
 # vm_changes: structured facts about KCC linux-services (VM) resources this
 # diff touches, extracted by _detect_vm_changes on the FULL pre-cap section
 # list (same design as deleted_resources: safety facts never depend on
-# display caps). None on non-OUT_DIFF outcomes and legacy/coerced results.
+# display caps), plus the _render_immutable_facts of _run_one_diff (COPS-2766:
+# bootDisk, BigQueryDataset and StorageBucket changes KCC rejects on sync).
+# None on non-OUT_DIFF outcomes and legacy/coerced results.
 # fingerprint (COPS-2579): stable hash of this app's FULL (pre-cap) section
 # list, set only on the OUT_DIFF success path. Two apps whose changes are
 # byte-for-byte identical (a shared ancestor-file edit rolled out the same
@@ -5024,16 +5089,8 @@ def _identity_block_reason(hit, confirmed):
     return None if hit["paused_head"] else "keep_paused"
 
 
-def _pr_commit_messages(repo, pr_id, base_sha, pr_sha):
-    """Commit messages of the PR (base_sha..pr_sha): the mirror first, else the API."""
-    path = _mirror_path(repo) if repo else ""
-    if (GIT_MIRROR_ENABLED and not _mirror_disabled and path and base_sha
-            and os.path.isdir(os.path.join(path, "objects"))
-            and _mirror_has_sha(repo, pr_sha) and _mirror_has_sha(repo, base_sha)):
-        r = _git_run(["--git-dir", path, "log", "--format=%B%x00",
-                      f"{base_sha}..{pr_sha}"], timeout=30)
-        if r is not None and r.returncode == 0:
-            return r.stdout.split("\x00")
+def _pr_commits(repo, pr_id, pr_sha):
+    """The commits of the PR from the API, every page, up to the head pr_sha."""
     commits, page, base = [], f"pullrequests/{pr_id}/commits?pagelen=100", _bb_api_base(repo)
     for _ in range(_BB_MAX_PAGES):
         try:
@@ -5053,7 +5110,63 @@ def _pr_commit_messages(repo, pr_id, base_sha, pr_sha):
     # Right after a push the list can still miss the new head: retry, never "unconfirmed".
     if not any((c.get("hash") or "").startswith(pr_sha) for c in commits):
         raise PrCommitsUnreadable(f"commit list of PR #{pr_id} does not have {pr_sha[:8]} yet")
-    return [c.get("message") or "" for c in commits]
+    return commits
+
+
+def _pr_commit_messages(repo, pr_id, base_sha, pr_sha):
+    """Commit messages of the PR (base_sha..pr_sha): the mirror first, else the API."""
+    path = _mirror_path(repo) if repo else ""
+    if (GIT_MIRROR_ENABLED and not _mirror_disabled and path and base_sha
+            and os.path.isdir(os.path.join(path, "objects"))
+            and _mirror_has_sha(repo, pr_sha) and _mirror_has_sha(repo, base_sha)):
+        r = _git_run(["--git-dir", path, "log", "--format=%B%x00",
+                      f"{base_sha}..{pr_sha}"], timeout=30)
+        if r is not None and r.returncode == 0:
+            return r.stdout.split("\x00")
+    return [c.get("message") or "" for c in _pr_commits(repo, pr_id, pr_sha)]
+
+
+def _pr_commit_authors(repo, pr, pr_sha):
+    """COPS-2766: the other people who wrote commits in the PR, by name.
+
+    API only: the mirror has git names and emails, not the Bitbucket account.
+    A list without the head pr_sha raises, so the comment says it could not
+    read the authors: the head author could be the one that is missing. The
+    same head is not rendered again until a push or a move of main."""
+    me = pr.get("author") or {}
+    bot = me.get("type") == "app_user"  # a repository access token
+    if not bot and not me.get("account_id"):
+        raise PrCommitsUnreadable(f"PR #{pr['id']} has no author")
+    mine = {(me.get(k) or "").casefold() for k in ("display_name", "nickname")}
+    names = set()
+    for c in _pr_commits(repo, pr["id"], pr_sha):
+        if len(c.get("parents") or ()) > 1:
+            continue  # a merge commit brings no change of its own
+        a = c.get("author") or {}
+        u = a.get("user") or {}
+        name = u.get("display_name") or (a.get("raw") or "").split(" <")[0]
+        if bot:  # its commits carry another git name: only a person counts
+            same = u.get("type") != "user" or not u.get("account_id")
+        elif u.get("account_id"):
+            same = u["account_id"] == me["account_id"]
+        else:  # a git email with no account: the name is all there is
+            same = name.casefold() in mine
+        if not same:
+            names.add(name)
+    return sorted(names)
+
+
+def _pr_authors_line(repo, pr, pr_sha):
+    """COPS-2766: the \U0001f465 line of the comment. An approval from someone
+    who wrote commits here is not independent. Informational: a failed read
+    says so and changes nothing else."""
+    try:
+        names = _pr_commit_authors(repo, pr, pr_sha)
+    except Exception as e:
+        logsink.log(f"    [comment] commit authors unreadable: {e}", "WARNING",
+                    pr=pr["id"], repo=repo, event="commit_authors_unreadable")
+        names = None
+    return commit_authors_line(names)
 
 
 _IDENTITY_SECRETS = ("dm-ui, mongodb-password, rabbitmq-password, redis-password, "
@@ -6484,7 +6597,8 @@ def _fingerprint_sections(sections: list) -> str:
     return hashlib.sha256(blob.encode("utf-8", errors="replace")).hexdigest()
 
 
-def _package_sections(filtered_sections: list, version_change=None):
+def _package_sections(filtered_sections: list, version_change=None,
+                      render_facts=None):
     """Build (clean_diff, stored_sections, deleted, zeroed, fingerprint,
     renamed, vm_changes, version_fold)
     from the FULL filtered section list. Detection runs here — before the
@@ -6508,7 +6622,9 @@ def _package_sections(filtered_sections: list, version_change=None):
     # cap. The headers join the risk reservation below so the actual VM
     # section is visible in the comment, not just named by the panel —
     # detecting a risk is only half the job (the PR-3845 lesson).
-    vm_changes = _detect_vm_changes(filtered_sections)
+    # COPS-2766: the render facts join here, so they are exempt too.
+    vm_changes = _merge_vm_facts(_detect_vm_changes(filtered_sections),
+                                 render_facts)
     # COPS-2632: same rule for unresolved chart values. The blocking finding
     # names the resource, so the resource has to be reachable in the comment.
     artifacts = _detect_template_artifacts(filtered_sections)
@@ -8536,6 +8652,253 @@ def _effective_chart_version(ordered_value_files: list, vals: dict):
     return version
 
 
+# COPS-2766: noCore per env, base against PR (COPS-2758). #4565 turned it on
+# in 57 envs with a silent comment, #4667 (a move) turned it off for 5 h.
+_NOCORE_KEY = "appspace.infra.noCore"
+
+
+def _effective_key(identity_file, sha, key, repo=None):
+    """(value, file, state) of `key` for the env of `identity_file` at `sha`.
+
+    COPS-2766. The ancestor config.yaml chain, root first, then the identity
+    file, last wins: the same files as _merged_kcc_flat_for_env, in helm -f
+    order. value is None when no file sets the key or the last one sets null
+    (Helm drops a null key); file is the one that decided it. A first
+    document that is not a map (a comment-only cohort) reads as empty. state
+    is "ok", "absent" (no identity file, and nothing else is read) or
+    "unparsable". A failed read raises ValueFileUnreadable, so the PR is
+    retried and never reads as "no change".
+    """
+    own, state = _read_first_doc(identity_file, sha, repo, True)
+    if state != "ok":
+        return None, None, state
+    chain, probe = [], identity_file.rsplit("/", 1)[0]
+    while "/" in probe:
+        probe = probe.rsplit("/", 1)[0]
+        chain.insert(0, f"{probe}/config.yaml")
+    docs = []
+    for path in chain:
+        doc, st = _read_first_doc(path, sha, repo, True)
+        if st == "unparsable":
+            return None, None, st
+        docs.append((path, doc))
+    value = src = None
+    for path, doc in docs + [(identity_file, own)]:
+        flat = _flatten_yaml(doc)
+        if key in flat:
+            value, src = flat[key], path
+    return value, src, "ok"
+
+
+def _key_changes(changed, renames, path_map, sha, base_sha, key, default=False,
+                 repo=None) -> list:
+    """COPS-2766: the live envs whose effective `key` (_effective_key) differs
+    between base_sha and sha, as {env, path, moved_from, key, old, new,
+    pinned, src, value}.
+
+    Generic, so another boolean key can use it. A move compares its old path
+    on base with its new path on sha. A changed customer.yaml, or a changed
+    config.yaml for the live envs below it, counts only when the key differs
+    in that file, so a PR that does not touch the key and moves nothing costs
+    two cached reads per file. old and new are booleans (`default` when
+    unset), None when a value file cannot be parsed. pinned: the env's own
+    file at sha sets a non-null value. src and value: the file that decided
+    the new value, and that raw value. A new env and a teardown are skipped,
+    other panels own them.
+    """
+    if not base_sha:
+        return []
+    renames = renames or {}
+    targets = set(renames.values())
+    pairs = {o: n for o, n in renames.items()
+             if o.endswith("/customer.yaml") and path_map.get(o)}
+    for f in {posixpath.normpath(f.lstrip("/")) for f in changed or ()}:
+        name = posixpath.basename(f)
+        if name not in _IDENTITY_BASENAMES or f in renames or f in targets:
+            continue
+        old_doc, old_st = _read_first_doc(f, base_sha, repo, True)
+        new_doc, new_st = _read_first_doc(f, sha, repo, True)
+        if "unparsable" not in (old_st, new_st) and repr(
+                _flatten_yaml(old_doc).get(key)) == repr(_flatten_yaml(new_doc).get(key)):
+            continue
+        folder = posixpath.dirname(f) + "/"
+        kids = [f] if name == "customer.yaml" else [
+            p for p in path_map if p.startswith(folder) and p.endswith("/customer.yaml")]
+        pairs.update({p: p for p in kids if path_map.get(p) and p not in renames})
+    out = []
+    for old_path, new_path in sorted(pairs.items()):
+        nv, src, nst = _effective_key(new_path, sha, key, repo)
+        if nst == "absent":
+            continue  # a teardown
+        ov, _src, ost = _effective_key(old_path, base_sha, key, repo)
+        if ost == "absent":
+            continue  # not on main yet
+        old, new = (None if st != "ok" else default if v is None else str(v).lower() == "true"
+                    for v, st in ((ov, ost), (nv, nst)))
+        if old == new and old is not None:
+            continue
+        own = _flatten_yaml(_read_first_doc(new_path, sha, repo, True)[0]).get(key)
+        out.append({"env": _envs_from_apps(path_map.get(old_path))[0], "path": new_path,
+                    "moved_from": old_path if old_path != new_path else None, "key": key,
+                    "old": old, "new": new, "pinned": own is not None,
+                    "src": src, "value": nv})
+    return out
+
+
+def _nocore_lost(c) -> bool:
+    """A move after which noCore is off only because the moved customer.yaml
+    does not set it (#4667)."""
+    return (c["key"] == _NOCORE_KEY and bool(c["moved_from"]) and c["old"] is True
+            and c["new"] is False and not c["pinned"])
+
+
+def _nocore_gates(changes) -> list:
+    """COPS-2766: the nocore_lost merge gates of _key_changes. No trailer:
+    setting the key in the moved customer.yaml lifts it."""
+    return [{"kind": "nocore_lost", "env": c["env"], "arg": c["env"], "lifted": False}
+            for c in changes or () if _nocore_lost(c)]
+
+
+# What a flip does, by (new value, cloud). Only GCP has the URL map. Azure
+# and AWS have nginx-frontend in front, and noCore moves its upstream.
+_NOCORE_TEXT = {
+    (True, "gcp"): (
+        "noCore is more than a load balancer flag. The URL map default moves "
+        "from the Windows Core VM to `<env>-bs-agw`, about 109 Deployments "
+        "restart, and the v1 API moves to v3. Keep the Core VM running until "
+        "each `-glb` app is Synced with `<env>-bs-agw` as the default backend. "
+        "This takes 30 to 100 minutes (COPS-2758). A Core VM stopped earlier "
+        "gives 502 (acme-config-prod #4684)."),
+    (False, "gcp"): (
+        "The URL map default goes back to the Windows Core VM, and the noCore "
+        "backends (`bs-pcs`, `hc-pcs`) are deleted. Before you merge, check "
+        "that the Core VM runs and its NEG is healthy. If not, every request "
+        "gets 502 (acme-config-prod #4667)."),
+    (True, "nginx"): (
+        "On {cloud}, nginx-frontend stops proxying to the Windows Core VM. Keep "
+        "the Core VM running until every app is Synced (COPS-2758)."),
+    (False, "nginx"): (
+        "On {cloud}, nginx-frontend proxies to the Windows Core VM again. Before "
+        "you merge, check that the Core VM runs. If not, the requests it "
+        "serves get 502."),
+}
+_NOCORE_CLOUDS = {"azure": "Azure", "aws": "AWS"}
+
+
+def _nocore_names(changes, cap=10) -> str:
+    """'`pv-a`, `pv-b` (moved from `<old cohort>`) (+N more)', by env name."""
+    names = [f"`{c['env']}`" + (
+        f" (moved from `{posixpath.dirname(posixpath.dirname(c['moved_from']))}`)"
+        if c["moved_from"] else "") for c in sorted(changes, key=lambda c: c["env"])]
+    return ", ".join(names[:cap]) + (f" (+{len(names) - cap} more)" if len(names) > cap else "")
+
+
+def _nocore_flip_lines(changes) -> list:
+    """COPS-2766: the noCore panel for _key_changes on _NOCORE_KEY, None when
+    the check crashed. Shares the appspace_state_lines channel, and the merge
+    summary reads the counts of its header."""
+    if changes is None:
+        return [f"\u26a0\ufe0f {_NOCORE_UNKNOWN} for this PR. Check `{_NOCORE_KEY}` of "
+                "the changed environments by hand before you merge.", ""]
+    known = [c for c in changes if c["old"] is not None and c["new"] is not None]
+    unknown = [c for c in changes if c["old"] is None or c["new"] is None]
+    lines = []
+    if known:
+        on = sum(1 for c in known if c["new"])
+        lines += [f"### \U0001f50c noCore changes in {len(known)} environment(s): "
+                  f"on in {on}, off in {len(known) - on}", ""]
+    for new in (True, False):
+        clouds = {c["path"].split("/", 1)[0] for c in known if c["new"] is new}
+        for cloud in sorted(clouds, key=lambda x: (x != "gcp", x)):
+            group = [c for c in known if c["new"] is new
+                     and c["path"].split("/", 1)[0] == cloud]
+            text = (_NOCORE_TEXT[new, "gcp"] if cloud == "gcp" else _NOCORE_TEXT[
+                new, "nginx"].format(cloud=_NOCORE_CLOUDS.get(cloud, cloud)))
+            lines += [f"\u26a0\ufe0f {_NOCORE_FLIP_HDR} `{_NOCORE_KEY}` goes from "
+                      f"`{str(not new).lower()}` to `{str(new).lower()}` in "
+                      f"{len(group)} environment(s): {_nocore_names(group)}. "
+                      f"{text}", ""]
+    for c in (c for c in changes if _nocore_lost(c)):
+        shown = "null" if c["value"] is None else str(c["value"]).lower()
+        why = ("only because the new folder does not set it" if c["src"] is None
+               else f"because `{c['src']}` sets it to `{shown}`")
+        lines += [f"\u26d4 `{posixpath.dirname(c['moved_from'])}` moves to "
+                  f"`{posixpath.dirname(c['path'])}`, and noCore turns off {why}. "
+                  f"Set `{_NOCORE_KEY}` in the moved `customer.yaml`: `true` to keep "
+                  f"noCore, or `false` if Core must come back. The build fails until "
+                  f"the file sets it.", ""]
+    if unknown:
+        whose, them = (("its", "this environment") if len(unknown) == 1
+                       else ("their", "these environments"))
+        lines += [f"\u26a0\ufe0f {_NOCORE_UNKNOWN} for {_nocore_names(unknown)}: one of "
+                  f"{whose} value files is not valid YAML. Check `{_NOCORE_KEY}` of "
+                  f"{them} by hand before you merge.", ""]
+    return lines
+
+
+# COPS-2766: the load-balancer chart defaults it to true, so unset is true.
+_LEGACY_BACKENDS_KEY = "appspace.loadBalancers.gatewayApi.legacyBackends"
+
+
+def _legacy_backends_lines(changes) -> list:
+    """COPS-2766: the panel line for the envs of _key_changes on
+    _LEGACY_BACKENDS_KEY that go from false to true. GCP private cloud only:
+    there the chart creates those BackendServices, and on Azure the key moves
+    nginx-frontend. True to false is not listed: the render shows it, and the
+    NEG and BackendService finding covers it."""
+    back = [c for c in changes or () if c["key"] == _LEGACY_BACKENDS_KEY
+            and c["old"] is False and c["new"] is True
+            and c["path"].startswith("gcp/") and "/private-cloud/" in c["path"]]
+    if not back:
+        return []
+    return [f"\u26a0\ufe0f {_LEGACY_BACKENDS_HDR} `{_LEGACY_BACKENDS_KEY}` goes from "
+            f"`false` to `true` in {len(back)} environment(s): {_nocore_names(back)}. "
+            "The chart creates the legacy BackendServices again in the `-glb` app, "
+            "and the NEGs they use come from the `-ms` app. Until both apps are "
+            "Synced, KCC reports those BackendServices as not ready. After the "
+            "sync, check `kubectl get svcneg -n <namespace>` and that every "
+            "BackendService is UpToDate.", ""]
+
+
+def _chart_image_defaults(chart_dir):
+    """COPS-2766: the chart's default image tag per service, or None when it
+    has no versions.yaml (only the micro-services chart has one). The chart
+    merges its values.yaml over versions.yaml, so values.yaml wins. Raises
+    on a read or parse error."""
+    path = os.path.join(chart_dir, "versions.yaml")
+    if not os.path.isfile(path):
+        return None
+    with open(path, encoding="utf-8") as f:
+        defaults = _image_defaults(_yaml_safe_load(f.read()))
+    values = os.path.join(chart_dir, "values.yaml")
+    if os.path.isfile(values):
+        with open(values, encoding="utf-8") as f:
+            defaults.update(_image_defaults(_yaml_safe_load(f.read())))
+    return defaults
+
+
+def _pins_behind(main_chart, pr_chart, pr_vals, app):
+    """COPS-2766: the value-file image pins a chart bump leaves behind. None
+    when the PR chart has no versions.yaml. A main chart with none gives [],
+    because no pin was compared before. 'skipped' when anything fails: it is
+    a warning, and it must never turn a green bump red."""
+    try:
+        new = _chart_image_defaults(pr_chart)
+        if new is None:
+            return None
+        old = _chart_image_defaults(main_chart) or {}
+        pins = {}
+        for content in pr_vals.values():       # helm -f order, last wins
+            pins.update(_image_defaults(_yaml_safe_load(content)))
+        return _pins_left_behind(pins, old, new)
+    except Exception as e:
+        # The type only: a YAML error echoes the line, and a value file can
+        # hold a secret (COPS-2668).
+        logsink.log(f"pin check skipped for {app} (non-fatal): {type(e).__name__}",
+                    "WARNING")
+        return "skipped"
+
+
 
 
 def _run_one_diff(app, pr_sha, main_sha, chart_revision=None, changed_paths=None, renames=None):
@@ -8830,6 +9193,11 @@ def _run_one_diff(app, pr_sha, main_sha, chart_revision=None, changed_paths=None
     _t_parse_pr0 = time.perf_counter()
     pr_resources = _parse_manifest_resources(pr_yaml)
     _record_stage("parse", _parse_main_s + (time.perf_counter() - _t_parse_pr0))
+    # COPS-2766: helm renders a toleration the API rejects on sync (#4681).
+    # Permanent like a schema violation, and only for what this PR brings.
+    bad = _toleration_errors(pr_resources, main_resources)
+    if bad:
+        return None, REASON_SCHEMA_INVALID, bad
     # v2.5.8: report the effective chart-version change (if any) so the
     # comment can shout on downgrades. pr_rev is final here — including a
     # tier-default version discovered after a folder move.
@@ -8837,14 +9205,34 @@ def _run_one_diff(app, pr_sha, main_sha, chart_revision=None, changed_paths=None
     _t_diff0 = time.perf_counter()
     diff_text = _diff_resources(main_resources, pr_resources)
     _record_stage("diff", time.perf_counter() - _t_diff0)
+    # COPS-2766: capacity facts need both full renders, like the counts
+    # below. A bug here must not turn a working diff into an error.
+    try:
+        cuts = _detect_capacity_floor_risk(main_resources, pr_resources)
+        released = _detect_replicas_released(main_resources, pr_resources)
+        capacity = {"cuts": cuts, "released": released} if cuts or released else None
+    except Exception as e:
+        logsink.log(f"[{app}] capacity check failed (non-fatal): {e}", "WARNING")
+        capacity = None
+    # COPS-2766: only on a chart upgrade, the pins it leaves behind.
+    pins = (_pins_behind(main_chart, pr_chart, pr_vals, app)
+            if version_change and _is_version_downgrade(pr_rev, main_rev)
+            else None)
     # COPS-2677 / COPS-2680: HPA count and workload replica totals travel
     # with the diff — argocd_diff only sees the unified text, and unchanged
     # Deployments / HPAs never appear there. Without the full-render
     # workload totals, scaling two services to 0 looked like a whole-env
     # shutdown (acme-config-prod #4321).
+    # COPS-2766: element 6 is the capacity facts, element 7 what KCC rejects
+    # on sync (bootDisk, a dataset or bucket location or project), both read
+    # from both renders, element 8 the pins a chart upgrade leaves behind.
+    # Index: 0 diff, 1 reason, 2 detail, 3 version_change, 4 hpas_remaining,
+    # 5 replica_stats, 6 capacity, 7 render facts, 8 pins_behind. A new
+    # element goes at the end, with its own index.
     return (diff_text, None, None, version_change,
             _count_hpas_remaining(pr_resources),
-            _count_workload_replicas(pr_resources))
+            _count_workload_replicas(pr_resources), capacity,
+            _render_immutable_facts(main_resources, pr_resources), pins)
 
 
 def _indeterminate(reason, detail):
@@ -8900,12 +9288,16 @@ def argocd_diff(app, pr_sha, main_sha, chart_revision=None, changed_paths=None, 
             chart_revision=chart_revision, changed_paths=changed_paths, renames=renames)
         # v2.5.8: success returns a 4-tuple with the version change; COPS-2677
         # extends to 5 with hpas_remaining; COPS-2680 adds replica_stats
-        # (total, zeroed) from the PR-side render. Failure paths keep
-        # returning 3-tuples.
+        # (total, zeroed) from the PR-side render; COPS-2766 adds the capacity
+        # facts, the render facts and pins_behind. Failure paths keep returning
+        # 3-tuples.
         diff_text, reason, detail = step[0], step[1], step[2]
         version_change = step[3] if len(step) > 3 else None
         hpas_remaining = step[4] if len(step) > 4 else 0
         replica_stats = step[5] if len(step) > 5 else None
+        capacity = step[6] if len(step) > 6 else None  # COPS-2766
+        render_facts = step[7] if len(step) > 7 else None
+        pins_behind = step[8] if len(step) > 8 else None
 
         if reason is not None:
             last_detail, last_reason = detail or reason, reason
@@ -8937,13 +9329,13 @@ def argocd_diff(app, pr_sha, main_sha, chart_revision=None, changed_paths=None, 
         # diff_text == "" means manifests are identical
         if not diff_text:
             return DiffResult("", [], 0, False, None, OUT_NO_DIFF, "clean",
-                              version_change)
+                              version_change, pins_behind=pins_behind)
 
         # Filter noise sections (checksums, version annotations that always drift)
         filtered_sections = _filter_diff_sections(parse_diff_sections(diff_text))
         if not filtered_sections:
             return DiffResult("", [], 0, False, None, OUT_NO_DIFF, "noise_only",
-                              version_change)
+                              version_change, pins_behind=pins_behind)
 
         n_res = len(filtered_sections)
         # Truncate to display budget NOW so we never hold the full YAML in
@@ -8951,7 +9343,8 @@ def argocd_diff(app, pr_sha, main_sha, chart_revision=None, changed_paths=None, 
         # (v2.5.26: the PR-6773 lesson, see _package_sections).
         clean_diff, capped_sections, deleted_res, zeroed_res, fingerprint, \
             renamed_res, vm_changes_res, version_fold = _package_sections(
-                filtered_sections, version_change=version_change)
+                filtered_sections, version_change=version_change,
+                render_facts=render_facts)
         # Counted on the full pre-cap list, like every other safety fact.
         # hpas_remaining + replica_stats come from the PR-side render in
         # _run_one_diff (COPS-2677 / COPS-2680).
@@ -8964,11 +9357,16 @@ def argocd_diff(app, pr_sha, main_sha, chart_revision=None, changed_paths=None, 
         pingscaler_res = _detect_pingscaler_created(
             _detect_created_resources(filtered_sections))
         ip_released = _released_addresses(filtered_sections, deleted_res)
+        neg_res = _detect_neg_removed(filtered_sections)  # COPS-2766, pre-cap too
+        image_downgrades = _detect_image_downgrades(
+            filtered_sections, version_change) or None
         return DiffResult(clean_diff, capped_sections,
                           n_res, True, None, OUT_DIFF, "changes", version_change,
                           deleted_res, zeroed_res, fingerprint, renamed_res,
                           vm_changes_res, version_fold, shutdown_stats,
-                          artifacts, pingscaler_res, ip_released)
+                          artifacts, pingscaler_res, ip_released=ip_released,
+                          neg_removed=neg_res, capacity=capacity,
+                          image_downgrades=image_downgrades, pins_behind=pins_behind)
     # Exhausted retries
     return _indeterminate(last_reason, last_detail or "unknown error")
 
@@ -9882,6 +10280,8 @@ def _routine_bump_signature(r):
         return None
     if r.version_change and _is_version_downgrade(*r.version_change):
         return None
+    if getattr(r, "image_downgrades", None):
+        return None                # COPS-2766: #4679 said "jumping"
     minus, plus = {}, {}
     for _hdr, body in r.sections:
         for line in body.splitlines():
@@ -10058,7 +10458,7 @@ def _blast_radius_lines(changed_files, pr_sha, base_sha, path_map,
     decommission panels) or transiently unreadable - either way the diff and
     those panels tell the story, so this one stays quiet rather than guessing.
     """
-    findings = []
+    findings, singles = [], []
     for f in changed_files or []:
         clean = posixpath.normpath(f.lstrip("/"))
         if posixpath.basename(clean) != "config.yaml":
@@ -10068,11 +10468,11 @@ def _blast_radius_lines(changed_files, pr_sha, base_sha, path_map,
         if st_new != BB_OK or st_old != BB_OK:
             continue
         try:
-            keys = blast_radius.changed_keys(
-                _flatten_yaml(_yaml_safe_load(old_txt) or {}),
-                _flatten_yaml(_yaml_safe_load(new_txt) or {}))
+            old_flat = _flatten_yaml(_yaml_safe_load(old_txt) or {})
+            new_flat = _flatten_yaml(_yaml_safe_load(new_txt) or {})
         except yaml.YAMLError:
             continue  # unparseable - the input-changes panel already flags it
+        keys = blast_radius.changed_keys(old_flat, new_flat)
         affected = get_affected_apps([clean], path_map)
         env_files = set()
         for app in affected:
@@ -10086,8 +10486,40 @@ def _blast_radius_lines(changed_files, pr_sha, base_sha, path_map,
                                       DIFF_BLAST_ENVS, DIFF_BLAST_SPOKES)
         if finding:
             findings.append(finding)
+        else:
+            singles.append((clean, old_flat, new_flat, env_files))
+    # COPS-2766: the same change over sibling files (#4565), same thresholds.
+    findings += blast_radius.sibling_findings(
+        singles, DIFF_BLAST_ENVS, DIFF_BLAST_SPOKES, hide=_SENSITIVE_KEY_RE.search)
     return blast_radius.render_lines(findings, _BLAST_RADIUS_HDR,
                                      DIFF_BLAST_ENVS, DIFF_BLAST_SPOKES)
+
+
+_TENANT_APP_RE = re.compile(r"cl-.+-(ms|ss)")
+
+
+def _tenant_wide(app_results) -> list:
+    """COPS-2766: the prod public-cloud constellations whose shared ms or ss
+    app changes in this PR. Those apps serve every customer of the
+    constellation, while the blast radius counts them as one environment.
+    Info only: an app with no value files in discovery is not flagged."""
+    return sorted({
+        _envs_from_apps([a])[0] for a, r in (app_results or {}).items()
+        if _result(r).outcome == OUT_DIFF
+        and _TENANT_APP_RE.fullmatch(a.split("/")[-1])
+        and any("/prod/public-cloud/" in vf
+                for vf in (_app_value_files_map or {}).get(a) or [])})
+
+
+def _tenant_wide_lines(cls) -> list:
+    """The routine note for _tenant_wide, in the appspace_state channel."""
+    if not cls:
+        return []
+    names = ", ".join(f"`{c}`" for c in cls)
+    return ["\U0001f310 " + _TENANT_WIDE_HDR + f" This PR changes the shared ms "
+            f"or ss app of {names}. It serves every customer of its "
+            "constellation, so the change reaches every tenant there, not one "
+            "environment.", ""]
 
 
 def _value_file_parent_chain(changed_path: str, apps, sha: str,
@@ -10862,6 +11294,24 @@ def _render_creates_a_kcc_vm(app_results) -> bool:
     return not seen
 
 
+def _render_covers(apps, app_results) -> bool:
+    """Whether every app mapped to a value file rendered, with or without a diff.
+
+    COPS-2766: then the rendered ComputeInstance decides a KCC machineType
+    change. It says only that those apps rendered, not that the VM app was
+    found. False when unsure: path_map can hold True instead of app names,
+    and a missing, failed or decommissioned app confirms nothing.
+    """
+    if not isinstance(apps, (list, tuple, set)) or not apps:
+        return False
+    results = app_results or {}
+    for app in apps:
+        r = results.get(app) or results.get(str(app).rsplit("/", 1)[-1])
+        if getattr(r, "outcome", None) not in (OUT_DIFF, OUT_NO_DIFF):
+            return False
+    return True
+
+
 def _summarize_vm_changes(changed_files, pr_sha, base_sha, path_map,
                           app_results, repo=None) -> list:
     """Markdown panel for VM-domain (KCC linux-services) changes.
@@ -11039,8 +11489,6 @@ def _summarize_vm_changes(changed_files, pr_sha, base_sha, path_map,
                               "prune under `deletion-policy: abandon`; GCP "
                               "VM/disk/IP stay")
             elif leaf == "machineType":
-                ds = (new_flat.get(prefix + role + ".desiredStatus")
-                      or new_flat.get(prefix + "defaults.desiredStatus"))
                 # Suppressed only for a classified adoption, and only on the
                 # linux key trees it applies to: the value is not changing,
                 # it is moving key. Windows and any unclassified file keep
@@ -11053,12 +11501,28 @@ def _summarize_vm_changes(changed_files, pr_sha, base_sha, path_map,
                 # what sent an operator to file a bug against the tool
                 # (acme-config-stage #2807). The provision itself is still
                 # flagged, once, by the group line built after this loop.
-                if (str(ds) != "TERMINATED" and not adopted_move
-                        and not domain_new):
+                # COPS-2766: KCC resizes a parked VM too, so the KCC key has
+                # no desiredStatus escape. On GCP the render decides when
+                # every app of the file rendered: the ComputeInstance line
+                # flags a real resize once. ASO reads no desiredStatus. The
+                # legacy Terraform key and Windows keep the rule of main as
+                # it is, because KCC and ASO replace that path.
+                if adopted_move or domain_new:
+                    pass
+                elif prefix != _KCC_PREFIX:
+                    ds = (new_flat.get(prefix + role + ".desiredStatus")
+                          or new_flat.get(prefix + "defaults.desiredStatus"))
+                    if str(ds) != "TERMINATED":
+                        danger = True
+                        reason = ("machineType changes while desiredStatus "
+                                  "is not TERMINATED \u2014 the runbook "
+                                  "requires stopping the VM first")
+                elif not clean.startswith("gcp/"):
                     danger = True
-                    reason = ("machineType changes while desiredStatus is "
-                              "not TERMINATED \u2014 the runbook requires "
-                              "stopping the VM first")
+                    reason = _VM_ASO_RESIZE_REASON
+                elif not _render_covers(path_map.get(clean), app_results):
+                    danger = True
+                    reason = _VM_RESIZE_REASON
             elif leaf == "zone":
                 # Creation attributes on a NEW domain describe the machine
                 # being built, not a mutation of one that exists; nothing
@@ -11163,13 +11627,15 @@ def _summarize_vm_changes(changed_files, pr_sha, base_sha, path_map,
                 "`%s` `%s` \u2192 `%s`" % (k, o or "(absent)", n or "(removed)")
                 for k, o, n in fact["fields"])
             if fact["dangerous"]:
+                # COPS-2766: the notes ride along, so a resize with a park
+                # still names the stop loop.
                 dangerous_lines.append(
                     "- \U0001f6a8 %s: %s \u2014 %s" % (
                         where,
                         field_txt or ("resource DELETED from the render"
                                       if fact["deleted"] else
                                       "resource-level change"),
-                        "; ".join(fact["dangerous"])))
+                        "; ".join(fact["dangerous"] + fact["notes"])))
             elif fact.get("orphaned") or (
                     fact["deleted"] and fact.get("notes")):
                 # COPS-2682: abandon unmanage and snapshot-attachment notes.
@@ -11186,8 +11652,9 @@ def _summarize_vm_changes(changed_files, pr_sha, base_sha, path_map,
                     _prov_kinds.setdefault(env, set()).add(fact["kind"])
                     continue
                 routine_lines.append(
-                    (env, "- %s: %s" % (where,
-                                        field_txt or "; ".join(fact["notes"]))))
+                    (env, "- %s: %s" % (where, " \u2014 ".join(
+                        t for t in (field_txt, "; ".join(fact["notes"]))
+                        if t))))
 
     # COPS-2635: one statement per provision signature. 🚨 because a new
     # machine in GCP deserves the operator's eyes, but said once, in the
@@ -11355,6 +11822,16 @@ def _permanent_failure_status_description(app_results) -> str:
     return f"{error}{suffix}"
 
 
+def _fit_downgrade_notes(desc, notes, limit=255):
+    """COPS-2766: `desc` without the optional `notes` while it passes `limit`
+    UTF-8 bytes, so the text we had before is never cut. `notes` is one note
+    or a list of them, dropped in that order."""
+    for note in ([notes] if isinstance(notes, str) else notes):
+        if note and len(desc.encode("utf-8", "surrogatepass")) > limit:
+            desc = desc.replace(note, "", 1)
+    return desc
+
+
 def _permanent_failure_top_panel(results, failure_group_for_app, quiet: bool) -> list:
     """Error-first panel(s) for permanent render failures (COPS-2676).
 
@@ -11498,7 +11975,7 @@ def format_comment(pr_sha, app_results, skipped_apps=None, base_sha="",
                     appspace_state_lines=None, appendix_lines=None,
                     vm_change_lines=None, artifact_url="",
                     readable_budget=None, profile=None, paused_apps=None,
-                    gates=None):
+                    gates=None, authors_line=""):
     """Format the full PR comment. Never uses <details>/<summary> — Bitbucket
     does not render them. Large changesets get a compact summary table at the
     top (all apps, one row each) and, for the diff sections below, apps
@@ -11844,6 +12321,9 @@ def format_comment(pr_sha, app_results, skipped_apps=None, base_sha="",
         _paused_changing, _paused_envs, block_headline=block_headline or None,
         gates=gates, green=_green)
     lines += ["---", ""]
+    if authors_line:  # COPS-2766: right under the verdict
+        at = lines.index(MERGE_SUMMARY_HDR) + 3
+        lines[at:at] = ["", authors_line]
 
     # COPS-2676: permanent render failures go FIRST after the verdict on the
     # COMMENT. The full-diff page keeps one block per app (COPS-2629
@@ -11910,6 +12390,9 @@ def format_comment(pr_sha, app_results, skipped_apps=None, base_sha="",
             "intentional before merging.**",
             "",
         ]
+        _mix = _downgrade_mix_note(results)
+        if _mix:
+            lines += [_mix, ""]
         for app, (cur_v, new_v) in downgrades:
             lines.append(f"### \U0001f53b `{app}`: `{cur_v}` \u2192 **`{new_v}`**")
         lines += [""]
@@ -12006,11 +12489,13 @@ def format_comment(pr_sha, app_results, skipped_apps=None, base_sha="",
             f"### \U0001f39a\ufe0f acme-ping-scaler takes over replica "
             f"control in {_fmt_env_list(ps_apps_p)}",
             "",
-            "This PR enables `acme-ping-scaler` here. From now on it owns "
+            ("This PR enables `acme-ping-scaler` here. From now on it owns "
             "the replica counts: it pings its target host every minute, "
             "scales every Deployment in the namespace to **0** while the "
-            "host is down, and restores the configured replicas when the "
-            "host answers.",
+            "host is down. When the host answers, it sets the default "
+            "replica count (2 on AEC) or the value in "
+            "`acmePingScaler.customReplicas`. It never reads "
+            "`definitions.<service>.replicas`."),
             "",
             f"The {n_ps} HorizontalPodAutoscaler(s) this PR deletes go "
             "**by design**: the chart never renders HPA while a "
@@ -12039,9 +12524,9 @@ def format_comment(pr_sha, app_results, skipped_apps=None, base_sha="",
         lines += [
             f"### \U0001f504 {n_ren} resource(s) RENAMED",
             "",
-            "Deleted and recreated under a new name in this PR, so nothing is " +
-            "lost. Common when a name carries a content hash, or when a " +
-            "resource moves to a new identity.",
+            "Deleted and recreated under a new name in this PR. Common when " +
+            "a name carries a content hash, or when a resource moves to a " +
+            "new identity.",
             "",
         ]
         for app, old_h, new_h in all_renamed[:10]:
@@ -12655,17 +13140,21 @@ def format_comment(pr_sha, app_results, skipped_apps=None, base_sha="",
 
 def format_new_env_comment(pr_sha, new_env_lines, new_env_full_lines,
                            structural_envs, gates, n_envs, total_new,
-                           base_sha=""):
+                           base_sha="", authors_line=""):
     """COPS-2766: (body, state, desc) for a PR that only adds environments.
 
     The merge summary and the gates of a diff comment, with the same token
     and status rules. A structural problem stays [blocked] with its old
-    description; an open gate comes next. Pure, like format_comment."""
+    description; an open gate comes next. The authors line goes right under
+    the verdict, as in format_comment. Pure, like format_comment."""
     token = "blocked" if structural_envs else (gate_token(gates) or "clean")
     lines = [f"## \U0001f52d {STATUS_NAME}", "", _comment_header(pr_sha), ""]
     green = token == "clean"
     lines += _build_merge_summary({}, {}, None, None, None, new_env_lines,
                                   bool(structural_envs), gates=gates, green=green)
+    if authors_line:  # COPS-2766: right under the verdict
+        at = lines.index(MERGE_SUMMARY_HDR) + 3
+        lines[at:at] = ["", authors_line]
     lines += ["---", ""] + build_marks(new_env_lines, green)
     # v2.25.0: complete rendered output after the summary. The comment
     # inlines what fits (footer-preserving truncation in upsert_comment);
@@ -13122,7 +13611,8 @@ def process_pr(pr, path_map, base_sha="", repo=None):
                     + _ashn_copy_lines(gates, ashn_notes)
                     + _appset_miss_lines(gates, appset_notes) + new_env_lines,
                     new_env_full_lines, structural_envs,
-                    gates, len(new_env_candidates), total_new, base_sha)
+                    gates, len(new_env_candidates), total_new, base_sha,
+                    authors_line=_pr_authors_line(repo, pr, pr_sha))
                 # v2.25.0: this path never persisted a full-diff artifact, so
                 # new-env-only PRs had no full-output page at all. Save it
                 # BEFORE the final build status so the status icon deep-links
@@ -13142,11 +13632,13 @@ def process_pr(pr, path_map, base_sha="", repo=None):
                         pr=pr_id, repo=repo, event="no_apps_affected")
             st = post_build_status(pr_sha, "SUCCESSFUL",
                 "No ArgoCD apps affected by this PR", pr_id=pr_id, repo=repo)
+            authors_line = _pr_authors_line(repo, pr, pr_sha)
             no_apps_body = (
                 f"## \U0001f52d {STATUS_NAME}\n\n"
                 f"{_comment_header(pr_sha)}\n\n"
                 f"\u2705 **No ArgoCD apps are currently affected by the files "
                 f"changed in this commit.**\n\n"
+                + (f"{authors_line}\n\n" if authors_line else "") +
                 f"This is expected for documentation, tooling, or script changes that "
                 f"do not affect any ArgoCD-managed environment configuration.\n\n"
                 f"---\n**Status:** \u2705 No ArgoCD apps affected\n"
@@ -13571,14 +14063,38 @@ def process_pr(pr, path_map, base_sha="", repo=None):
             logsink.log(f"    [comment] appspace-state panel failed: {e}", "WARNING")
             appspace_state_lines = []
         appspace_state_lines += _identity_migration_lines(identity_hits)
+        tenant_cls = []
         try:
             # COPS-2693 Plan B: shares the appspace_state_lines channel so the
             # verdict scan in comment_render sees it without new plumbing.
             appspace_state_lines += _blast_radius_lines(
                 changed, render_sha, base_sha, path_map, repo=repo)
+            # COPS-2766: info only, the green status tail carries it too.
+            tenant_cls = _tenant_wide(app_results)
+            appspace_state_lines += _tenant_wide_lines(tenant_cls)
         except Exception as e:  # informational panel must never break the comment
             logsink.log(f"    [comment] blast-radius panel failed: {e}", "WARNING")
         redundant = []
+        try:
+            # COPS-2766: noCore per env, base against PR (COPS-2758). Same
+            # channel; its nocore_lost gate joins the gates below.
+            nocore_changes = _key_changes(changed, renames, path_map, render_sha,
+                                          base_sha, _NOCORE_KEY, repo=repo)
+        except Exception as e:
+            if _is_transient_exception(e):
+                raise  # a failed read retries the PR, never "no flip"
+            logsink.log(f"    [comment] noCore check failed: {e}", "WARNING")
+            nocore_changes = None
+        appspace_state_lines += _nocore_flip_lines(nocore_changes)
+        try:
+            # COPS-2766: legacyBackends false to true, the same way.
+            appspace_state_lines += _legacy_backends_lines(_key_changes(
+                changed, renames, path_map, render_sha, base_sha,
+                _LEGACY_BACKENDS_KEY, default=True, repo=repo))
+        except Exception as e:
+            if _is_transient_exception(e):
+                raise
+            logsink.log(f"    [comment] legacyBackends check failed: {e}", "WARNING")
         try:
             # COPS-2721: same channel — REVIEW verdict when customer.yaml
             # re-states values a parent config.yaml already sets.
@@ -13610,7 +14126,7 @@ def process_pr(pr, path_map, base_sha="", repo=None):
         gates = _merge_gates(decommission_candidates, renames, path_map,
                              vm_change_lines, app_results,
                              clone_gates + dup_gates + ashn_gates + disk_gates + appset_gates
-                             + legacy_gates)
+                             + legacy_gates + _nocore_gates(nocore_changes))
         _lift_gates(gates, repo, pr_id, base_sha, pr_sha)
         appspace_state_lines = (_clone_wake_lines(gates) + _dup_identity_lines(gates, dup_unchecked)
                                 + _ashn_copy_lines(gates, ashn_notes)
@@ -13646,6 +14162,7 @@ def process_pr(pr, path_map, base_sha="", repo=None):
             # every release before this one had.
             logsink.log(f"autosync check failed (non-fatal): {e}", "WARNING",
                         pr=pr_id, repo=repo, event="autosync_check_failed")
+        _comment_kwargs["authors_line"] = _pr_authors_line(repo, pr, pr_sha)
         body = format_comment(pr_sha, app_results,
                               artifact_url=artifact_url, **_comment_kwargs)
         comment_kb = round(len(body.encode()) / 1024, 1)
@@ -13748,7 +14265,25 @@ def process_pr(pr, path_map, base_sha="", repo=None):
         leftover_extra = (
             f" | \U0001f9f9 {len(leftover_apps)} leftover app(s) from prior decommission"
             if leftover_apps else "")
-        status_extra = decom_extra + leftover_extra
+        # COPS-2766: the status names a downgrade even when another finding
+        # leads it (#4549). Like decom_extra, fix_stuck_inprogress does not
+        # rebuild it.
+        _dg_envs = _envs_from_apps(
+            a for a, v in app_results.items() if _result(v).version_change
+            and _is_version_downgrade(*_result(v).version_change))
+        downgrade_extra = (f" | CHART DOWNGRADE in {len(_dg_envs)} environment(s)"
+                           if _dg_envs else "")
+        _img_envs = _envs_from_apps(
+            a for a, v in app_results.items()
+            if getattr(_result(v), "image_downgrades", None))
+        image_extra = (f" | IMAGE DOWNGRADE in {len(_img_envs)} environment(s)"
+                       if _img_envs else "")
+        status_extra = decom_extra + leftover_extra + downgrade_extra + image_extra
+        # COPS-2766: the tenant reach goes only on a green status, so no
+        # FAILED text changes. Two names at most, so it never pushes out the lead.
+        tenant_extra = (f" | \U0001f310 every tenant of {_fmt_service_list(tenant_cls, 2)}"
+                        if tenant_cls else "")
+        green_extra = status_extra + tenant_extra
 
         # v2.5.4 (Finding 1): traffic-light rule agreed with Marcos — green ONLY
         # when the diff was actually computed (with or without changes); ANY
@@ -13891,12 +14426,12 @@ def process_pr(pr, path_map, base_sha="", repo=None):
         elif sections_total > 0:
             extra = f" | +{len(new_env_candidates)} new environment(s) will be created" if new_env_candidates else ""
             state, desc = "SUCCESSFUL", (
-                f"{sections_total} resource(s) will change{extra}{status_extra} - review comment")
+                f"{sections_total} resource(s) will change{extra}{green_extra} - review comment")
         else:
             if new_env_candidates:
                 state, desc = "SUCCESSFUL", (
                     f"No manifest changes to existing apps | +{len(new_env_candidates)} "
-                    f"new environment(s) will be created{status_extra}")
+                    f"new environment(s) will be created{green_extra}")
             else:
                 # COPS-2721: SUCCESSFUL stays (nothing failed), but the
                 # description names why the render is quiet when YAML moved.
@@ -13905,7 +14440,9 @@ def process_pr(pr, path_map, base_sha="", repo=None):
                     has_redundancy=_VALUES_REDUNDANCY_HDR in _joined,
                     has_input_changes=bool(input_change_lines),
                     has_inert=_INERT_EDIT_HDR in _joined)
-                state, desc = "SUCCESSFUL", f"{_clean}{status_extra}"
+                state, desc = "SUCCESSFUL", f"{_clean}{green_extra}"
+        # Past 255 bytes the tenant reach goes first, then the downgrade notes.
+        desc = _fit_downgrade_notes(desc, [tenant_extra, downgrade_extra + image_extra])
         if state == "SUCCESSFUL":
             # COPS-2766: lead with the top finding of the comment just
             # posted; fix_stuck_inprogress rebuilds the same lead from it.

@@ -17,8 +17,8 @@ What these tests pin down, module by module:
     being switched off" in the merge summary.
   * `_detect_vm_changes` parses a hunk line by line, and three of its
     filters were never exercised: a VM already parked TERMINATED in
-    context (the second, separate escape hatch from the machineType
-    danger -- the covered one is a `desiredStatus` +/- pair), a changed
+    context (since COPS-2766 no longer an escape hatch from the
+    machineType danger), a changed
     line with no `key: value` shape at all, and a `type:` whose value is
     not disk-shaped. The last two both feed the COPS-2618 untracked-keys
     note, so a regression there does not go quiet: it invents fields.
@@ -163,10 +163,9 @@ def _fact(header, body):
 
 
 # -- 2a. the VM was already parked before this PR -------------------------
-# The covered escape hatch is a `desiredStatus: RUNNING -> TERMINATED` pair
-# in the same hunk. The other one is a VM that was ALREADY stopped in an
-# earlier PR: desiredStatus then appears only as unchanged context, and the
-# resize is the whole diff. That is the ordinary two-PR runbook sequence.
+# A VM that was ALREADY stopped in an earlier PR: desiredStatus then appears
+# only as unchanged context, and the resize is the whole diff. Until
+# COPS-2766 that was an escape hatch from the danger. Now any resize is one.
 
 RESIZE_ALREADY_PARKED = (
     "     zone: europe-west1-d\n"
@@ -177,19 +176,19 @@ RESIZE_ALREADY_PARKED = (
 RESIZE_WHILE_RUNNING = RESIZE_ALREADY_PARKED.replace("TERMINATED", "RUNNING")
 
 
-def test_resize_on_a_vm_parked_in_an_earlier_pr_is_not_dangerous():
+def test_resize_on_a_vm_parked_in_an_earlier_pr_is_dangerous_now():
+    """COPS-2766: KCC stops, resizes and starts the VM itself, so a park
+    does not make a resize safe. It still needs a window."""
     f = _fact(CI_HDR, RESIZE_ALREADY_PARKED)
     assert ("machineType", "n2d-standard-4", "n2d-standard-8") in f["fields"]
-    assert not f["dangerous"], (
-        "the VM is already TERMINATED in the unchanged context; the runbook "
-        "step has been done: %r" % (f["dangerous"],))
+    assert f["dangerous"] == [vma._VM_RESIZE_REASON]
 
 
 def test_the_same_resize_on_a_running_vm_still_is_dangerous():
-    """The contrast that gives the test above its meaning: only the word in
-    the context line differs between the two bodies."""
+    """The same reason as the test above: only the word in the context line
+    differs between the two bodies."""
     f = _fact(CI_HDR, RESIZE_WHILE_RUNNING)
-    assert any("runbook" in d for d in f["dangerous"]), f["dangerous"]
+    assert f["dangerous"] == [vma._VM_RESIZE_REASON]
 
 
 # -- 2b. a changed line with no `key: value` shape ------------------------
@@ -261,7 +260,9 @@ def test_a_requoted_size_is_not_a_changed_field():
     assert ("location", "europe-west1-d", "europe-west4-a") in f["fields"]
     assert not any(k == "size" for k, _, _ in f["fields"]), (
         "200 did not become 200: %r" % (f["fields"],))
-    assert not f["dangerous"]
+    # COPS-2766: the location move is a danger now, the re-quote still is not.
+    assert f["dangerous"] == [("disk location is immutable: KCC rejects the "
+                              "change and the sync fails")]
 
 
 # ══ Part 3 ── _detect_vm_changes: two unreached verdicts ═════════════════

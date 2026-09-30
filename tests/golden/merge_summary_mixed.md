@@ -16,7 +16,7 @@
 
 **This PR touches virtual machine infrastructure (KCC linux-services). A botched VM change is slow and painful to recover from — verify every line below before merging.**
 
-- ⚠️ `pv-vm-a` · `ComputeInstance pv-acme-svc-a`: `machineType` `n2d-standard-4` → `n2d-standard-8` — machineType changes while the VM is not parked TERMINATED — the runbook requires stopping the VM first
+- ⚠️ `pv-vm-a` · `ComputeInstance pv-acme-svc-a`: `machineType` `n2d-standard-4` → `n2d-standard-8` — machineType changes: KCC stops, resizes and starts the VM. Merge in a window. Do not park with TERMINATED
 
 ## 🗑️⚠️ 1 RESOURCE(S) DELETED ⚠️
 

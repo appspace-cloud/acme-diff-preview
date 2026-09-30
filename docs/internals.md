@@ -16,6 +16,7 @@ here is required to use the tool; it is for people changing it or debugging it.
 - [Why a new env needs an ApplicationSet glob](#why-a-new-env-needs-an-applicationset-glob)
 - [Why a key in a file the ApplicationSet does not read is blocked](#why-a-key-in-a-file-the-applicationset-does-not-read-is-blocked)
 - [Why turning the legacy Helm writer back on is blocked](#why-turning-the-legacy-helm-writer-back-on-is-blocked)
+- [Why a move that turns noCore off is blocked](#why-a-move-that-turns-nocore-off-is-blocked)
 - [Handling mass version bumps](#handling-mass-version-bumps-hundreds-of-apps-in-one-pr)
 - [The two surfaces: comment and page](#the-two-surfaces-comment-and-page)
 - [Which resources make it into the comment body](#which-resources-make-it-into-the-comment-body)
@@ -23,6 +24,7 @@ here is required to use the tool; it is for people changing it or debugging it.
 - [Superseding an in-flight render](#superseding-an-in-flight-render)
 - [Secret-leak and comment-integrity hardening](#secret-leak-and-comment-integrity-hardening)
 - [Full-diff web UI](#full-diff-web-ui-atlantis-style)
+- [Why a toleration with a wrong operator or effect is blocked](#why-a-toleration-with-a-wrong-operator-or-effect-is-blocked)
 
 ---
 
@@ -594,6 +596,52 @@ cannot be read is red and retried, never a lift, as for `Confirm-Rename`.
 The replay found no hit in 1023 acme-config-prod PRs (6 months). Stage had 3
 PRs and dev 1 (#6509), all from before the legacy retirement in July 2026.
 Direct pushes to `main` are not checked, as for every guard.
+### Why a move that turns noCore off is blocked
+
+`appspace.infra.noCore` is more than a load balancer flag. On GCP it moves
+the URL map default from the Windows Core VM to `<env>-bs-agw`, about 109
+Deployments restart, and the v1 API moves to v3. On Azure and AWS it switches
+the nginx-frontend upstream. Turning it off deletes the noCore backends `bs-pcs`
+and `hc-pcs`. The rendered diff shows none of this as a risk:
+acme-config-prod #4565 turned it on in 57 environments with a silent comment,
+and #4684 gave 48 minutes of 502 because the Core VM was stopped before the
+apps were Synced (COPS-2758).
+
+So every PR compares the effective value of each live environment, `main`
+against the merge preview. The effective value is the last one set in the
+ancestor `config.yaml` chain, root first, and then in the environment's
+`customer.yaml`: the same files `_merged_kcc_flat_for_env` reads, in helm `-f`
+order. They differ from the ApplicationSet value files only in
+`cicd-versions.yaml`, which never sets `infra`. A null counts as unset,
+because Helm drops a null key, and a file whose first document is not a map
+(a cohort with only comments) reads as empty. A move is read at its old path
+on `main` and at its new path in the PR. A changed `config.yaml` checks the
+live environments below it, but only when the key differs in that file, so a
+PR that does not touch the key costs two cached reads per changed file. Every
+flip is a ⚠️ review item with the Core VM rule, and the build stays green.
+
+One shape fails the build: a move of a live environment after which noCore is
+off only because the moved `customer.yaml` does not set it. That is
+acme-config-prod #4667. pv-myschroders-a moved from `gb1-b/weekly`, where the
+cohort sets noCore, to `gb1-b/hardcoded/weekly`, a cohort with only comments.
+noCore went off, the URL map went back to the Core VM and the backends were
+deleted: a 5 h outage. The spoke and the identity did not change, so the
+rename guard lets it pass by design. The check is a merge gate
+(`nocore_lost`), not an early stop, so the comment keeps the full diff with
+the deletions. A replay over acme-config-prod `main` since 2026-03-29 (1465
+commits, 78 `customer.yaml` moves) found 2 moves that flip noCore (#4684 on,
+#4667 off) and one gate hit, #4667.
+
+There is no trailer, because the fix is always a config change: set
+`appspace.infra.noCore` in the moved `customer.yaml`, `true` to keep noCore
+or `false` if Core must come back. A value there (not null) lifts the gate.
+When a cohort at the destination sets `false`, the fix line names that file.
+A move into noCore (#4684) is only a warning.
+
+The reads fail closed. A value file Bitbucket cannot serve retries the PR,
+never "no flip". A value file that is not valid YAML gives a `noCore check
+unavailable` review line. The check never breaks the comment: a bug in it
+gives the same line for the whole PR, with the error in the service log.
 
 ### Handling mass version bumps (hundreds of apps in one PR)
 
@@ -807,7 +855,12 @@ an unambiguous carrier (an image tag, a chart label, `targetRevision`, or the
 app-level chart `version_change`). That is why a `MAX_WORKERS: 4 -> 16`
 change can never fold. Fewer than `_VERSION_FOLD_MIN` foldable sections
 means no fold at all, because one fold line costs more attention than the
-two hunks it would hide.
+two hunks it would hide. An image tag that goes down (`_image_tag_downgrade`)
+never classifies, so its section stays inline and the merge summary names it
+(COPS-2766, #4679). The rule is off when the app's chart moves and does not
+go up (`_images_may_go_down`): a chart downgrade takes every image down with
+it and has its own finding, and another tag of the same version is not a
+downgrade. Then the images fold as before.
 
 Like every other safety fact, this is computed in `_package_sections` on the
 FULL pre-cap list, so what folds never depends on a display cap. Sections
@@ -1242,3 +1295,26 @@ backend is separate follow-up work tracked in the ticket.
 
 ---
 
+### Why a toleration with a wrong operator or effect is blocked
+
+Kubernetes takes only these values in a pod toleration, and it is
+case-sensitive: `operator` is `Equal` or `Exists`, and `effect` is
+`NoSchedule`, `PreferNoSchedule` or `NoExecute`. Empty or null means the
+default. Helm does not check this. It renders any string, so the diff looks
+normal, and the API rejects the Deployment when ArgoCD syncs. On
+acme-config-prod #4681, `operator: equal` froze the app until someone fixed
+the value.
+
+The check (COPS-2766) reads the tolerations in the PR render. It reads only
+the resources that are new or changed in this PR, and it leaves out a bad
+value that `main` already has in the same resource. So an old mistake never
+blocks an unrelated PR, for example a fleet chart bump. An affinity
+`operator: In` is not in a `tolerations:` block, so it is never read.
+
+It fails the build as a render error. The comment shows it as SCHEMA
+VALIDATION FAILED, but each line says that the Kubernetes API rejects the
+value, and a hint says that helm and `values.schema.json` do not check it. The
+red status names the resource and the value, and it is not retried. There is
+no trailer, because the fix is a change of the value: in `customer.yaml`, or
+in the cohort `config.yaml`. When the bad value comes from the chart itself,
+for example in a chart bump, the fix goes in the chart.

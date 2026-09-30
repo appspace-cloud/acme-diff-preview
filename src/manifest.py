@@ -285,6 +285,30 @@ def _hpa_headers(deleted) -> list:
     return [h for h in (deleted or []) if h.startswith(_HPA_HDR_PREFIX)]
 
 
+# COPS-2766: GKE deletes a NEG only when no BackendService uses it. On
+# acme-config-prod #3888 NEG Services and their BackendServices went in one
+# merge, the NEGs got stuck and 22 -glb apps were Degraded.
+_NEG_ANNOTATION = "cloud.google.com/neg:"
+
+
+def _detect_neg_removed(sections: list) -> list:
+    """Headers of the Services that lose their NEG annotation.
+
+    A removed line with the annotation and no added one: a deleted Service,
+    or a Service that stays without it. A changed value (a removed and an
+    added line) is not a loss. The '---' and '+++' diff headers never count.
+    """
+    out = []
+    for header, body in sections:
+        if _section_kind(header) != "Service":
+            continue
+        lines = [l for l in body.splitlines() if _NEG_ANNOTATION in l]
+        if (any(l.startswith("-") and not l.startswith("---") for l in lines)
+                and not any(l.startswith("+") and not l.startswith("+++") for l in lines)):
+            out.append(header)
+    return out
+
+
 # Go's own output for a nil or missing template/printf argument. Matched
 # tightly on purpose: a bare "%!" or the word "value" appears in legitimate
 # ConfigMap data (log format strings, embedded templates), and a block that
@@ -341,6 +365,12 @@ def _is_kcc_blocking_artifact(header: str) -> bool:
     return any(k in header for k in _KCC_BLOCKING_ARTIFACT_KINDS)
 
 
+def _resource_header(type_key: str, ns: str, name: str) -> str:
+    """The section header of one resource key. A resource with no namespace
+    (a BigQueryDataset, a cluster-scoped kind) has no `ns/` part."""
+    return f"/{type_key} {ns}/{name}" if ns else f"/{type_key} {name}"
+
+
 def _diff_resources(main_res: dict, pr_res: dict) -> str:
     """Diff two pre-parsed resource dicts (from _parse_manifest_resources).
 
@@ -362,7 +392,7 @@ def _diff_resources(main_res: dict, pr_res: dict) -> str:
         delta = list(difflib.unified_diff(a_lines, b_lines, lineterm="\n"))
         if not delta:   # pragma: no cover - differing text always diffs non-empty
             continue
-        hdr = f"/{type_key} {ns}/{name}" if ns else f"/{type_key} {name}"
+        hdr = _resource_header(type_key, ns, name)
         parts.append(f"===== {hdr} ======\n" + "".join(delta))
     return "\n".join(parts)
 

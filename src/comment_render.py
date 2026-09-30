@@ -46,12 +46,25 @@ def _parse_version_tuple(version: str):
     return tuple(int(x) for x in mnum.group(1).split("."))
 
 
+_RELEASE_TAG_RE = re.compile(r"\d+(?:\.\d+)*(?:-rev(\d+))?")
+
+
+def _rev_number(v):
+    """N of a release tag '2603.1.38-revN', 0 for the bare tag, None for
+    any other tag (-dev and feature tags have unrelated revs)."""
+    m = _RELEASE_TAG_RE.fullmatch((v or "").strip())
+    return int(m.group(1) or 0) if m else None
+
+
 def _is_version_downgrade(current: str, new: str) -> bool:
     """True when `new` is a strictly LOWER chart version than `current`.
 
     v2.5.8: downgrades are legal but dangerous (schema regressions, data
     migrations that do not run backwards), so the PR comment must shout.
-    Unparseable versions return False — never block on noise."""
+    Unparseable versions return False — never block on noise.
+
+    COPS-2766: a -revN is newer than the bare tag, and rev2 is newer than
+    rev1, only when both are release tags."""
     cur_t = _parse_version_tuple(current)
     new_t = _parse_version_tuple(new)
     if cur_t is None or new_t is None:
@@ -60,7 +73,10 @@ def _is_version_downgrade(current: str, new: str) -> bool:
     length = max(len(cur_t), len(new_t))
     cur_t += (0,) * (length - len(cur_t))
     new_t += (0,) * (length - len(new_t))
-    return new_t < cur_t
+    cur_r, new_r = _rev_number(current), _rev_number(new)
+    if cur_r is None or new_r is None:
+        cur_r = new_r = 0
+    return (new_t, new_r) < (cur_t, cur_r)
 
 
 def parse_diff_sections(diff_text):
@@ -189,6 +205,15 @@ def _fmt_service_list(services: list, shown: int = 8) -> str:
     return f"{head}{more}"
 
 
+def _panel_names(*segments, shown=3) -> str:
+    """COPS-2766: '`a`, `b`, `c` (+N more)' from the name lists of our own
+    panel lines, like '`pv-a` (moved from `x`), `pv-b` (+8 more)'."""
+    names = [n for seg in segments for n in re.findall(r"(?:^|, )(`[^`]+`)", seg)]
+    rest = len(names) - shown + sum(
+        int(x) for seg in segments for x in re.findall(r"\(\+(\d+) more\)$", seg))
+    return ", ".join(names[:shown]) + (f" (+{rest} more)" if rest > 0 else "")
+
+
 def _routine_bump_label(sig) -> str:
     """One human line naming the transition a rollup group shares."""
     old_rev, new_rev, items = sig
@@ -232,6 +257,21 @@ _DECOM_SHARED_UC_HDR = "**SHARED USER CONTENT - DO NOT MERGE WITHOUT CHECKING.**
 # via diff_preview), matched here for the REVIEW verdict line. Same one-constant
 # wiring as the headers above.
 _BLAST_RADIUS_HDR = "**Blast radius.**"
+# COPS-2766: the noCore panel (COPS-2758), written in diff_preview and
+# matched here. The counts come from its header line.
+_NOCORE_FLIP_HDR = "**noCore changes.**"
+_NOCORE_COUNTS_RE = re.compile(
+    r"noCore changes in (\d+) environment\(s\): on in (\d+), off in (\d+)")
+_NOCORE_NAMES_RE = re.compile(re.escape(_NOCORE_FLIP_HDR) + r" `[^`]+` goes from "
+                              r"`\w+` to `\w+` in \d+ environment\(s\): (.+?)\. ")
+_NOCORE_UNKNOWN = "noCore check unavailable"
+_NOCORE_UNKNOWN_RE = re.compile(re.escape(_NOCORE_UNKNOWN) + r" for (.+?): one of ")
+# COPS-2766: legacyBackends false to true, the same wiring.
+_LEGACY_BACKENDS_HDR = "**Legacy backends come back.**"
+_LEGACY_BACKENDS_RE = re.compile(
+    re.escape(_LEGACY_BACKENDS_HDR) + r".*? in \d+ environment\(s\): (.+?)\. ")
+# COPS-2766: a prod cl-*-ms/-ss app serves every tenant of its constellation.
+_TENANT_WIDE_HDR = "**Reaches every public-cloud tenant.**"
 # COPS-2721: written by values_redundancy.render_lines via diff_preview,
 # matched here for the REVIEW verdict line. Same one-constant wiring as
 # blast radius: a quiet render caused by copying parent values into
@@ -358,13 +398,17 @@ _DATA_KINDS = frozenset({
 _REVIEW_RANK = {
     "\u23f8": 0, "\u25b6": 0,      # paused, auto-sync paused / resumed
     "\u2b07": 1,                   # chart downgrade
+    "\U0001f50c": 1,               # noCore changes, before the bs-pcs deletions
     "\U0001f6d1": 2,               # environment shutting down
     "\U0001f512": 2,               # decommission or data purge armed
     "\U0001f4a5": 3,               # wide-reach config change
+    "\U0001f517": 4,               # NEG and BackendService, before the deletions
     "\U0001f500": 4,               # planned rename
     "\U0001f5d1": 5,               # resources deleted, env decommission
     "\U0001f9ca": 6,               # replicas scaled to zero
+    "\U0001f4c9": 6,               # capacity cut
     "\U0001f39a": 7,               # ping-scaler activated
+    "\U0001f501": 7,               # fixed replicas released
     "\U0001f5a5": 8,               # KCC resources unmanaged
     "\U0001f9ec": 9,               # unresolved chart value
     "\U0001f4da": 99,              # higher-layer values
@@ -419,6 +463,20 @@ def build_marks(lines, green):
     return [_RED_MARKS_RE.sub("\u26a0\ufe0f", l) for l in lines]
 
 
+def _downgrade_mix_note(results) -> str:
+    """COPS-2766: a PR that moves 3+ environments, some down and some up,
+    is how a stale branch looks (#3315 reverted a bump merged 1 h before).
+    '' otherwise."""
+    vcs = {a: r.version_change for a, r in results.items() if r.version_change}
+    down = set(_envs_from_apps(a for a, vc in vcs.items() if _is_version_downgrade(*vc)))
+    up = set(_envs_from_apps(a for a, vc in vcs.items()
+                             if _is_version_downgrade(vc[1], vc[0]))) - down
+    if not (down and up and len(down | up) >= 3):
+        return ""
+    return (f"{len(up)} other environment(s) in this PR move up: check that "
+            f"the branch is not out of date.")
+
+
 # COPS-2766: merge gates. A gate fails the build until a Confirm-* line in a
 # commit message of the PR lifts it. A kind with no trailer cannot be lifted:
 # its fix says what to do. A transient kind is checked again by itself.
@@ -458,6 +516,8 @@ GATES = {
                     "blocked", "Check the cloud, tier and spoke folders"),
     "legacy_helm": ("The legacy Helm writer is switched back on", "Confirm-LegacyHelm",
                     "blocked", ""),
+    "nocore_lost": ("A move turns noCore off", None, "blocked",
+                    "Set appspace.infra.noCore in the moved customer.yaml"),
 }
 
 
@@ -742,6 +802,26 @@ def _build_merge_summary(results, rollup_by_sig, vm_change_lines,
                              f"over replica control; {n_hpa} HPA(s) removed "
                              f"by design "
                              f"([how it works]({PINGSCALER_DOCS_URL}))"))
+    # COPS-2766: GKE deletes a NEG only when no BackendService uses it
+    # (acme-config-prod #3888). Paired per env: a cl-* block's -glb app
+    # (cl-qa-11-a-app1) belongs to the constellation that has the NEGs.
+    neg = _envs_from_apps([a for a, r in results.items()
+                           if getattr(r, "neg_removed", None)])
+    bs = _envs_from_apps([a for a, r in results.items()
+                          if any(_section_kind(h) == "ComputeBackendService"
+                                 for h in r.deleted_resources or ())])
+    both = [n for n in neg if any(b == n or (n.startswith("cl-") and b.startswith(n + "-"))
+                                  for b in bs)]
+    if both:
+        # The action first: the green status lead is cut at 255 bytes.
+        findings.append((_SEV_REVIEW,
+                         "\U0001f517 **NEG and BackendService removed together** in "
+                         + _fmt_service_list([f"`{n}`" for n in both], 3)
+                         + ": after the sync, check `kubectl get svcneg -n "
+                         "<namespace>`, and if one is stuck, delete the "
+                         "BackendService, never the finalizer. GKE deletes a NEG "
+                         "only when no BackendService uses it (acme-config-prod "
+                         "#3888)."))
     renamed_apps = sorted(a for a, r in results.items()
                           if getattr(r, "renamed_resources", None))
     if renamed_apps:
@@ -760,9 +840,61 @@ def _build_merge_summary(results, rollup_by_sig, vm_change_lines,
         _dg = ", ".join(f"`{o}` \u2192 `{n}`" for o, n in
                         sorted({results[a].version_change
                                 for a in downgraded}))
+        _mix = _downgrade_mix_note(results)
         findings.append((_SEV_REVIEW,
                          f"\u2b07\ufe0f **Chart version downgrade** {_dg} in "
-                         f"{_fmt_env_list(downgraded)}"))
+                         f"{_fmt_env_list(downgraded)}"
+                         + (f". {_mix}" if _mix else "")))
+    # COPS-2766: a new -dev chart in a PR that also takes release charts
+    # (#4382). A -dev tag is mutable. A lone -dev pin is normal testing.
+    dev_new = sorted(a for a, r in results.items() if r.version_change
+                     and str(r.version_change[1]).endswith("-dev")
+                     and not str(r.version_change[0]).endswith("-dev"))
+    if dev_new and any(r.version_change and not str(r.version_change[1]).endswith("-dev")
+                       for r in results.values()):
+        _vers = ", ".join(f"`{v}`" for v in sorted({results[a].version_change[1]
+                                                     for a in dev_new}))
+        findings.append((_SEV_REVIEW,
+                         f"\U0001f9ea **-dev chart next to release charts** {_vers} "
+                         f"in {_fmt_env_list(dev_new)}. A -dev tag can be pushed "
+                         f"again at any time: check that it belongs in this PR."))
+    # COPS-2766: an image tag that goes down while the chart stays or goes up
+    # (#4679 took device 1.117.4 -> 1.116.10 on pv-gsk--aec1-c: "Routine").
+    img_apps = sorted(a for a, r in results.items()
+                      if getattr(r, "image_downgrades", None))
+    if img_apps:
+        _pairs = sorted({(_section_name(h), o, n) for a in img_apps
+                         for h, _repo, o, n in results[a].image_downgrades})
+        _more = f" (+{len(_pairs) - 3} more)" if len(_pairs) > 3 else ""
+        findings.append((_SEV_REVIEW,
+                         f"\u2b07\ufe0f **Image downgrade** in "
+                         f"{_fmt_env_list(img_apps)}: "
+                         + ", ".join(f"`{s}` `{o}` \u2192 `{n}`"
+                                     for s, o, n in _pairs[:3])
+                         + f"{_more}. Check that an old pin or an old branch "
+                         f"is not moving it back."))
+    # COPS-2766: a chart bump ships a newer default, and a pin that was not
+    # older before now holds the service back (COPR-32582).
+    pin_apps = sorted(a for a, r in results.items()
+                      if isinstance(getattr(r, "pins_behind", None), list)
+                      and r.pins_behind)
+    if pin_apps:
+        _pins = sorted({tuple(p) for a in pin_apps for p in results[a].pins_behind})
+        _more = f" (+{len(_pins) - 3} more)" if len(_pins) > 3 else ""
+        findings.append((_SEV_REVIEW,
+                         f"\U0001f4cc **Image pin left behind** in "
+                         f"{_fmt_env_list(pin_apps)}: "
+                         + "; ".join(f"`{s}` pinned `{p}`, the new chart "
+                                     f"ships `{n}`" for s, p, n in _pins[:3])
+                         + f"{_more}. The pin now holds the service back: "
+                         f"bump it or remove it."))
+    pin_skipped = sorted(a for a, r in results.items()
+                         if getattr(r, "pins_behind", None) == "skipped")
+    if pin_skipped:
+        findings.append((_SEV_ROUTINE,
+                         f"\u2139\ufe0f Pin check skipped in "
+                         f"{_fmt_env_list(pin_skipped)}: the chart versions.yaml "
+                         f"or a value file could not be read."))
     # COPS-2632 / COPS-2677: a rendered `%!s(<nil>)` or `<no value>` is a
     # value the chart read and this environment does not set. Live proof:
     # pv-stage1-a shipped `hosting-id: hst-%!s(<nil>)` and KCC rejected every
@@ -899,6 +1031,31 @@ def _build_merge_summary(results, rollup_by_sig, vm_change_lines,
                          "\U0001f9ca **Replicas scaled to zero** in "
                          f"{_fmt_env_list(clean_partial_apps)}"))
 
+    # COPS-2766 (COPR-32597): capacity facts from the full renders. Warnings
+    # only, because a planned right-sizing looks the same. The action first:
+    # the green status lead is cut at 255 bytes. An item names its env only
+    # when the finding has more than one.
+    cap = {a: r.capacity for a, r in sorted(results.items())
+           if getattr(r, "capacity", None)}
+    for part, text, action, tail in (
+            ("cuts", "\U0001f4c9 **Capacity cut**", "check that it is planned",
+             ("Keep 2 replicas or more, keep the floor of the connection "
+             "services, and a CPU request of 30m or more (COPR-32597).")),
+            ("released", "\U0001f501 **Fixed replicas released**",
+             "merge in a quiet window",
+             ("On sync the field goes away, and Kubernetes runs 1 replica until "
+             "the HPA or acme-ping-scaler scales it back (acme-config-prod "
+             "#4523)."))):
+        apps = [a for a in cap if cap[a].get(part)]
+        envs = sorted(set(_envs_from_apps(apps)))
+        items = [f"`{w}` " + (f"({what})" if part == "released" else what)
+                 + (f" in `{_envs_from_apps([a])[0]}`" if len(envs) > 1 else "")
+                 for a in apps for w, what in cap[a][part]]
+        if items:
+            findings.append((_SEV_REVIEW,
+                             f"{text} in {_fmt_service_list([f'`{e}`' for e in envs], 3)}"
+                             f", {action}: {_fmt_service_list(items, 4)}. {tail}"))
+
     if appspace_state_lines:
         txt = "\n".join(appspace_state_lines)
         # COPS-2660: its own finding ON TOP of the arming one below, because
@@ -989,6 +1146,38 @@ def _build_merge_summary(results, rollup_by_sig, vm_change_lines,
                              + _reach +
                              "; changes to shared config bypass cohort "
                              "staging (see the blast-radius note)"))
+        # COPS-2766: a noCore flip is REVIEW. The one error, a move that turns
+        # it off, is the nocore_lost gate above.
+        nc = _NOCORE_COUNTS_RE.search(txt)
+        if nc:
+            # The names first: the Builds panel shows only the start.
+            names = (_panel_names(*_NOCORE_NAMES_RE.findall(txt))
+                     or f"{nc.group(1)} environment(s)")
+            findings.append((_SEV_REVIEW,
+                             f"\U0001f50c **noCore changes** in {names}: on in "
+                             f"{nc.group(2)}, off in {nc.group(3)} (read the noCore "
+                             f"note, COPS-2758)"))
+        if _NOCORE_UNKNOWN in txt:
+            # Named envs when a value file is bad YAML, the PR when it crashed.
+            unk = _NOCORE_UNKNOWN_RE.search(txt)
+            findings.append((_SEV_REVIEW,
+                             f"\U0001f50c **{_NOCORE_UNKNOWN}** for "
+                             f"{_panel_names(unk.group(1)) if unk else 'this PR'}: "
+                             f"check `appspace.infra.noCore` by hand before you merge"))
+        lb = _LEGACY_BACKENDS_RE.search(txt)
+        if lb:
+            findings.append((_SEV_REVIEW,
+                             f"\U0001f517 **Legacy backends come back** in "
+                             f"{_panel_names(lb.group(1))}: sync `-ms` and `-glb`, "
+                             f"then check `kubectl get svcneg`"))
+        # COPS-2766: routine, the reach is a fact and not a risk. The names
+        # come from our own line only.
+        _tw = [l for l in txt.splitlines()
+               if l.startswith("\U0001f310 " + _TENANT_WIDE_HDR)]
+        if _tw:
+            findings.append((_SEV_ROUTINE,
+                             "\U0001f310 **Reaches every public-cloud tenant** of "
+                             + ", ".join(f"`{c}`" for c in re.findall(r"`([^`]+)`", _tw[0]))))
         if _IDENTITY_MIGRATION_HDR in txt:
             findings.append((_SEV_REVIEW,
                              "\U0001f500 **Planned rename of a live environment** "
@@ -1190,6 +1379,27 @@ def join_status_lead(lead, description, limit=255) -> str:
             break
         cut += c
     return f"{cut.rstrip()}...{tail}" if cut.strip() else description
+
+
+def commit_authors_line(names) -> str:
+    """COPS-2766: the line under the verdict that names the other people who
+    wrote commits in the PR. None means the commits could not be read.
+
+    Not a '- ' bullet, so status_lead never reads it. Git author names are
+    PR-controlled markdown: each one is one line with no backticks and no
+    \u26d4 \U0001f6a8 \u274c (a green build shows none of them outside a
+    fence), cut to 40 characters, inside backticks."""
+    if names is None:
+        return ("\U0001f465 Could not read who wrote the commits of this PR. "
+                "Check the commit authors before you approve.")
+    if not names:
+        return ""
+    drop = dict.fromkeys(map(ord, "`\u26d4\U0001f6a8\u274c"))
+    shown = ", ".join("`%s`" % " ".join(n.translate(drop).split())[:40]
+                      for n in names[:5])
+    more = f" and {len(names) - 5} more" if len(names) > 5 else ""
+    return (f"\U0001f465 **Other people wrote commits in this PR:** {shown}{more}. "
+            "Their approval is not independent, so ask another person to approve.")
 
 
 _SHUTDOWN_MIN_WORKLOADS = 2

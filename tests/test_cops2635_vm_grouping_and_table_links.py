@@ -84,7 +84,7 @@ def test_a_new_vm_never_gets_the_resize_runbook(monkeypatch):
     """The #2807 confusion: 'the runbook requires stopping the VM first'
     for a VM that does not exist. There is nothing to stop."""
     out = _panel(monkeypatch, _files(ENVS8), envs_new=set(ENVS8))
-    assert "stopping the VM first" not in out
+    assert dp._VM_RESIZE_REASON not in out
 
 
 def test_grouped_envs_lose_their_per_key_lines(monkeypatch):
@@ -106,14 +106,14 @@ def test_every_provisioned_env_is_still_accounted_for(monkeypatch):
 def test_a_single_new_vm_says_provisions_not_resize(monkeypatch):
     out = _panel(monkeypatch, _files(["pv-solo-a"]), envs_new={"pv-solo-a"})
     assert "1 environment provisions a new linux VM" in out
-    assert "stopping the VM first" not in out
+    assert dp._VM_RESIZE_REASON not in out
 
 
 def test_a_real_resize_keeps_the_runbook_untouched(monkeypatch):
-    """Regression guard: mutations of an existing VM keep today's wording,
-    including the runbook, per line."""
+    """Regression guard: mutations of an existing VM keep the resize reason,
+    per line. path_map holds True here, so no render covers it."""
     out = _panel(monkeypatch, _files(["pv-old-a"]), envs_resize={"pv-old-a"})
-    assert "stopping the VM first" in out
+    assert dp._VM_RESIZE_REASON in out
     assert "provision" not in out
 
 
@@ -122,7 +122,7 @@ def test_mixed_pr_keeps_the_resize_line_and_groups_the_rest(monkeypatch):
     out = _panel(monkeypatch, _files(envs), envs_new=set(ENVS8),
                  envs_resize={"pv-old-a"})
     assert "8 environments provision a new linux VM" in out
-    assert "stopping the VM first" in out
+    assert dp._VM_RESIZE_REASON in out
     assert "`pv-old-a`" in out
 
 

@@ -17,8 +17,11 @@
 **This PR touches virtual machine infrastructure (KCC linux-services). A botched VM change is slow and painful to recover from — verify every line below before merging.**
 
 - ⚠️ `pv-acme-a` · **linux VM (KCC) · svc**: **added** `svc.allowDeletion` = `True` — deletion-policy flips to `delete` and deletionProtection turns off for this role's VM, disk and address — the next cascade can destroy them in GCP
-- ⚠️ `pv-acme-a` · **linux VM (KCC) · svc**: `svc.machineType`: `n2d-standard-4` → `n2d-standard-8` — machineType changes while desiredStatus is not TERMINATED — the runbook requires stopping the VM first
-- ⚠️ `pv-acme-a` · `ComputeInstance pv-acme-svc-a`: `machineType` `n2d-standard-4` → `n2d-standard-8` — machineType changes while the VM is not parked TERMINATED — the runbook requires stopping the VM first
+- ⚠️ `pv-acme-a` · `ComputeInstance pv-acme-svc-a`: `machineType` `n2d-standard-4` → `n2d-standard-8` — machineType changes: KCC stops, resizes and starts the VM. Merge in a window. Do not park with TERMINATED
+
+Routine VM changes in the same PR:
+
+- `pv-acme-a` · **linux VM (KCC) · svc**: `svc.machineType`: `n2d-standard-4` → `n2d-standard-8`
 
 ---
 

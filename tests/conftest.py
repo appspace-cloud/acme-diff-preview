@@ -223,3 +223,20 @@ def _no_appset_reads(request, monkeypatch):
     import diff_preview as _m
     monkeypatch.setattr(_m, "_appset_file_globs", lambda repo, fresh=False: ["**"])
     yield
+
+
+# ── COPS-2766: the commit authors read ──────────────────────────────────────
+#
+# process_pr reads who wrote the commits of every PR it renders. A test that
+# does not stub it reaches the real Bitbucket, fails, and only gets the
+# "Could not read" line, so it stays green for the wrong reason. The stub
+# answers "no other author". A test of the read opts out with
+# @pytest.mark.real_commit_authors.
+@pytest.fixture(autouse=True)
+def _no_commit_authors_read(request, monkeypatch):
+    if request.node.get_closest_marker("real_commit_authors"):
+        yield          # this test reads the authors on purpose
+        return
+    import diff_preview as _m
+    monkeypatch.setattr(_m, "_pr_commit_authors", lambda *a, **k: [])
+    yield

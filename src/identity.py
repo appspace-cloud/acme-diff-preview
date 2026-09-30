@@ -305,7 +305,8 @@ def _is_rename_of(old_header: str, new_header: str) -> bool:
     two explainable rules rather than a similarity score. Both additionally
     require the same kind.
 
-    Rule A - hash rename: identical except the final `-<token>` segment.
+    Rule A - hash rename: identical except the final `-<token>` segment, and
+      that token is a hash of 6 or more hex characters on both sides.
       pv-x-acme-secret-generator-cb71f3d8 -> pv-x-acme-secret-generator-3abbd629
       (the Job name carries a content hash, so every version bump renames it)
 
@@ -325,9 +326,11 @@ def _is_rename_of(old_header: str, new_header: str) -> bool:
 
     ta, tb = a.split("-"), b.split("-")
 
-    # Rule A: same length, differ only in the final token.
+    # Rule A: same length, differ only in the final token, and that token is a
+    # hash on both sides (6+ hex: the uptime policy uses trunc 6). A word there
+    # is another object, like bs-cdn to bs-acl (#4684).
     if len(ta) == len(tb) and len(ta) > 1 and ta[:-1] == tb[:-1]:
-        return True
+        return all(re.fullmatch(r"[0-9a-f]{6,}", t) for t in (ta[-1], tb[-1]))
 
     # Rule B: exactly one token inserted or removed.
     if abs(len(ta) - len(tb)) == 1:

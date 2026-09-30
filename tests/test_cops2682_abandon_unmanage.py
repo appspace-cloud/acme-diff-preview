@@ -169,7 +169,7 @@ def test_machineType_removal_under_disable_is_not_resize_runbook(monkeypatch):
     lines = m._summarize_vm_changes(
         [PATH], PR_SHA, BASE_SHA, {PATH: ["argocd/pv-dpdhl-c-ss"]}, {})
     body = "\n".join(lines)
-    assert "stopping the VM first" not in body
+    assert m._VM_RESIZE_REASON not in body
     assert "machineType changes while desiredStatus" not in body
 
 

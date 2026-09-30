@@ -14,13 +14,21 @@ that might be shrinking is a disk that gets flagged.
 """
 import re
 
+import yaml  # PyYAML (requirements.txt): the render facts parse a few docs
+
+import logsink  # structured logging seam (same-dir module)
 from comment_render import (
     _NEW_ENV_CHECK_PREFIX,
     _VM_PANEL_DANGER_HDR,
     _VM_PANEL_ROUTINE_HDR,
     _section_name,
 )
-from manifest import _IP_KINDS, _section_kind  # decoder lives with the format it decodes
+from manifest import (  # decoder lives with the format it decodes
+    _IP_KINDS,
+    _flatten_yaml,
+    _resource_header,
+    _section_kind,
+)
 
 
 # Hibernation / zeroPods counting (COPS-2683): charts scale Deployments and
@@ -75,6 +83,38 @@ def _detect_replicas_zeroed(sections: list) -> list:
         if ends_zero and not ends_pos:
             zeroed.append(header)
     return zeroed
+
+
+def _res_kind_name(key):
+    """(Kind, name) of a _parse_manifest_resources key, name None if absent."""
+    if not isinstance(key, tuple):
+        return str(key).rsplit("/", 1)[-1], None
+    return key[0].rsplit("/", 1)[-1], (key[2] if len(key) > 2 else None)
+
+
+_REPLICAS_FIELD_RE = re.compile(r"^\s{0,4}replicas:")
+
+
+def _detect_replicas_released(main_resources, pr_resources) -> list:
+    """[(workload, n)]: fixed replicas whose field goes away (COPS-2766).
+
+    An HPA or acme-ping-scaler takes over, so the chart stops rendering
+    `replicas`. On sync the field goes away and Kubernetes runs 1 replica
+    until the new owner scales it back (acme-config-prod #4523, 10 to 1).
+    Only a workload on both sides, with n > 1 before: from 1, nothing drops.
+    """
+    out = []
+    pr_resources = pr_resources or {}
+    for key, body in (main_resources or {}).items():
+        kind, name = _res_kind_name(key)
+        head = pr_resources.get(key)
+        if kind not in _WORKLOAD_KINDS or not name or head is None:
+            continue
+        n = _manifest_replicas(body)
+        if n is not None and n > 1 and \
+                not any(_REPLICAS_FIELD_RE.match(l) for l in head.splitlines()):
+            out.append((name, n))
+    return sorted(out)
 
 
 def _count_hpas_remaining(pr_resources) -> int:
@@ -242,6 +282,146 @@ def _detect_workload_shutdown(sections: list, pr_resources=None,
             "hpas_targeting_zeroed": int(targeting or 0)}
 
 
+# ── Capacity floors (COPS-2766, COPR-32597) ──────────────────────────
+# Warnings only: a planned right-sizing looks the same as a mistake.
+# The connection services hold long-lived device connections, so any
+# smaller floor there is flagged, not only a cut of 4.
+_CONN_SERVICES = frozenset({"devicegateway", "signschannel",
+                            "signschannelgateway", "pushnotification"})
+_HPA_BOUND_RE = re.compile(r"^(\s*)(minReplicas|maxReplicas):\s*(.*?)\s*(?:#.*)?$")
+_YAML_LOADER = getattr(yaml, "CSafeLoader", yaml.SafeLoader)
+
+
+def _yaml_doc(text):
+    return yaml.load(text, Loader=_YAML_LOADER)
+
+
+def _hpa_bounds(body):
+    """(minReplicas, maxReplicas) of an HPA body. min defaults to 1 like
+    Kubernetes. A value that is not a number gives None."""
+    lo, hi = 1, None
+    for line in body.splitlines():
+        mt = _HPA_BOUND_RE.match(line)
+        if not mt or len(mt.group(1)) > 4:
+            continue
+        v = mt.group(3).strip("\"'")
+        v = int(v) if v.isdigit() else None
+        if mt.group(2) == "minReplicas":
+            lo = v
+        else:
+            hi = v
+    return lo, hi
+
+
+def _replica_floors(resources) -> dict:
+    """{workload: (floor, max)}. A Deployment or StatefulSet gives
+    (spec.replicas, None). An HPA overrides its scaleTargetRef (else its own
+    name) with (minReplicas, maxReplicas). No replicas field and no HPA
+    (acme-ping-scaler), or HPA bounds that are not numbers: no entry."""
+    floors, hpas = {}, {}
+    for key, body in (resources or {}).items():
+        kind, name = _res_kind_name(key)
+        if not name:
+            continue
+        if kind in _WORKLOAD_KINDS:
+            n = _manifest_replicas(body)
+            if n is not None:
+                floors[name] = (n, None)
+        elif kind == "HorizontalPodAutoscaler":
+            hpas[_hpa_scale_target_name(body) or name] = _hpa_bounds(body)
+    for target, (lo, hi) in hpas.items():
+        if lo is None or hi is None:
+            floors.pop(target, None)
+        else:
+            floors[target] = (lo, hi)
+    return floors
+
+
+def _cpu_millicores(v):
+    """'20m' -> 20, '0.02' -> 20, '1' or 1 -> 1000; anything else None."""
+    if v is None or isinstance(v, bool):
+        return None
+    try:
+        s = str(v).strip()
+        if s.endswith("m"):
+            return int(s[:-1])
+        return round(float(s) * 1000)
+    except (ValueError, OverflowError):
+        return None
+
+
+def _main_container_cpu(body, name):
+    """CPU request of the main container in millicores, or None. The main
+    container is the one named like the workload (the chart names it
+    `<service>-container`), else the first. initContainers never count."""
+    try:
+        containers = _yaml_doc(body)["spec"]["template"]["spec"]["containers"]
+        main = next((c for c in containers
+                     if c.get("name") in (name, f"{name}-container")), containers[0])
+        return _cpu_millicores(main["resources"]["requests"]["cpu"])
+    except Exception:
+        return None
+
+
+def _detect_capacity_floor_risk(main_resources, pr_resources) -> list:
+    """[(workload, what)] for the workloads whose render changes and whose
+    capacity drops (COPR-32597):
+
+    - an HPA floor under 2 with room to scale (max > 1), unless the base
+      already had one;
+    - a smaller floor on a connection service (#4523: 10 replicas to an HPA
+      with min 6 on signschannel);
+    - a cut of 4 or more on any workload (#4608, 12 to 8). A cut to 0 stays
+      the zeroed-replicas finding;
+    - a main container CPU request under 30m that is new or lower in this
+      PR. A raise, 10m to 20m, is no cut.
+
+    The floor compares fixed replicas with an HPA min. A workload with no
+    floor on a side (acme-ping-scaler) is not compared.
+    """
+    main_resources, pr_resources = main_resources or {}, pr_resources or {}
+    changed, bodies = set(), set()
+    for key in set(main_resources) | set(pr_resources):
+        old, new = main_resources.get(key), pr_resources.get(key)
+        kind, name = _res_kind_name(key)
+        if old == new or not name:
+            continue
+        if kind in _WORKLOAD_KINDS:
+            changed.add(name)
+            bodies.add(key)
+        elif kind == "HorizontalPodAutoscaler":
+            changed.update(_hpa_scale_target_name(b) or name for b in (old, new) if b)
+    if not changed:
+        return []
+    before, after = _replica_floors(main_resources), _replica_floors(pr_resources)
+    cpu = {}
+    for key in bodies:
+        if key not in pr_resources:
+            continue
+        new_cpu = _main_container_cpu(pr_resources[key], key[2])
+        if new_cpu is None or new_cpu >= 30:
+            continue
+        old_cpu = (_main_container_cpu(main_resources[key], key[2])
+                   if key in main_resources else None)
+        if old_cpu is not None and new_cpu >= old_cpu:
+            continue    # the same or a raise: no cut
+        cpu[key[2]] = new_cpu
+    out = []
+    for w in sorted(changed):
+        o, n = before.get(w), after.get(w)
+        parts = []
+        if n and n[1] is not None and n[0] < 2 and n[1] > 1 \
+                and not (o and o[1] is not None and o[0] < 2):
+            parts.append(f"HPA minReplicas {n[0]} (max {n[1]})")
+        if o and n and 0 < n[0] < o[0] and (w in _CONN_SERVICES or o[0] - n[0] >= 4):
+            parts.append(f"floor {o[0]} \u2192 {n[0]}")
+        if w in cpu:
+            parts.append(f"CPU request {cpu[w]}m")
+        if parts:
+            out.append((w, " and ".join(parts)))
+    return out
+
+
 # ── VM-domain (KCC linux-services) risk detection ────────────────────
 # The slowest thing on this platform to recover from is a botched virtual
 # machine change: unlike a Kubernetes rollout there is no quick rollback
@@ -275,6 +455,21 @@ _VM_TRACKED_FIELDS = {
     "ComputeDiskResourcePolicyAttachment": ("resourceID", "zone"),
 }
 _VM_DISK_TYPE_RE = re.compile(r"^(pd-|hyperdisk-)")
+# COPS-2766: the chart sets allow-stopping-for-update, so KCC itself stops,
+# resizes and starts the VM. A park with TERMINATED is not needed, and on some
+# KCC versions a parked VM gets a stop on every reconcile. The chart comment
+# that says to park first is out of date (COPS-2760 owns the chart side).
+_VM_RESIZE_REASON = ("machineType changes: KCC stops, resizes and starts the "
+                     "VM. Merge in a window. Do not park with TERMINATED")
+_VM_PARK_NOTE = ("desiredStatus moves to TERMINATED: KCC stops the VM, and on "
+                 "some KCC versions it sends a stop on every reconcile "
+                 "(COPR-31983, COPS-2760)")
+_VM_START_NOTE = ("desiredStatus moves from TERMINATED to RUNNING: KCC starts "
+                  "the VM on sync")
+# ASO on Azure reads no desiredStatus, and Azure restarts a running VM to
+# resize it. The render level reads no ASO VM, so every resize is flagged.
+_VM_ASO_RESIZE_REASON = ("machineType changes: Azure restarts the VM to "
+                         "resize it. Merge in a window")
 
 
 def _vm_unquote(v: str) -> str:
@@ -323,20 +518,18 @@ def _detect_vm_changes(sections: list) -> list:
 
     Returns a list of dicts:
       {header, kind, name, fields: [(field, old, new)], created, deleted,
-       dangerous: [reason, ...], notes: [note, ...]}
+       dangerous: [reason, ...], notes: [note, ...], untracked: [key, ...]}
 
     The severity rules come straight from the rendering templates and their
     runbook comments in acme-components:
       - deletion-policy moving to `delete`, or deletionProtection turning
         false, means the next cascade/prune can actually destroy the
         resource in GCP (both are driven by allowDeletion) — dangerous.
-      - a machineType change requires parking the VM first (desiredStatus:
-        TERMINATED, wait for KCC, then back to RUNNING). A machineType
-        change with no TERMINATED transition or TERMINATED state anywhere
-        in the section is exactly the mistake the template comment warns
-        about — dangerous.
+      - any machineType change: KCC stops, resizes and starts the VM, so
+        it needs a window. Parked or not, it is dangerous (COPS-2766). A
+        move to TERMINATED and a TERMINATED to RUNNING are notes.
       - zone and disk `type` are immutable in GCP: changing them means
-        destroy-and-recreate — dangerous.
+        destroy-and-recreate — dangerous. A ComputeDisk `location` too.
       - a disk size DECREASE is impossible in place (GCP only grows disks),
         so it implies recreation and data loss — dangerous. Growth is the
         routine case.
@@ -359,15 +552,12 @@ def _detect_vm_changes(sections: list) -> list:
         minus_vals, plus_vals = {}, {}
         untracked_keys = set()
         minus_n = plus_n = context_n = 0
-        context_terminated = False
         for line in body.splitlines():
             if line.startswith("+++") or line.startswith("---"):
                 continue
             sign = line[:1]
             if sign == " ":
                 context_n += 1
-                if "desiredStatus:" in line and "TERMINATED" in line:
-                    context_terminated = True
                 continue
             if sign not in ("+", "-"):
                 continue
@@ -458,11 +648,13 @@ def _detect_vm_changes(sections: list) -> list:
                 dangerous.append("deletionProtection turns OFF — GCP-side "
                                  "delete protection is removed")
             if "machineType" in byk:
-                ds_new = byk.get("desiredStatus", ("", ""))[1]
-                if ds_new != "TERMINATED" and not context_terminated:
-                    dangerous.append("machineType changes while the VM is "
-                                     "not parked TERMINATED — the runbook "
-                                     "requires stopping the VM first")
+                dangerous.append(_VM_RESIZE_REASON)
+            if "desiredStatus" in byk:
+                o, n = byk["desiredStatus"]
+                if o != "TERMINATED" and n == "TERMINATED":
+                    notes.append(_VM_PARK_NOTE)
+                elif o == "TERMINATED" and n == "RUNNING":
+                    notes.append(_VM_START_NOTE)
             if "deviceName" in byk:
                 o, n = byk["deviceName"]
                 if o and n:
@@ -485,6 +677,9 @@ def _detect_vm_changes(sections: list) -> list:
             if "zone" in byk:
                 dangerous.append("zone is immutable — changing it means "
                                  "destroy-and-recreate")
+            if kind == "ComputeDisk" and "location" in byk:
+                dangerous.append("disk location is immutable: KCC rejects "
+                                 "the change and the sync fails")
             if "type" in byk:
                 dangerous.append("disk type is immutable — changing it "
                                  "means destroy-and-recreate")
@@ -515,18 +710,161 @@ def _detect_vm_changes(sections: list) -> list:
         # tell a taxonomy-label rollout from something worth opening the diff
         # for -- and guarantees the caller never renders "no changes" over a
         # section that visibly moved.
-        if untracked_keys and not deleted and not created:
-            shown = sorted(untracked_keys)
-            notes.append(
-                "other field(s) changed, not individually tracked by this "
-                "panel: %s%s" % (", ".join("`%s`" % k for k in shown[:8]),
-                                 "" if len(shown) <= 8
-                                 else " and %d more" % (len(shown) - 8)))
+        untracked = (sorted(untracked_keys)
+                     if not deleted and not created else [])
+        if untracked:
+            notes.append(_untracked_note(untracked))
         facts.append({"header": header, "kind": kind,
                       "name": _section_name(header), "fields": fields,
                       "created": created, "deleted": deleted,
                       "orphaned": orphaned,
-                      "dangerous": dangerous, "notes": notes})
+                      "dangerous": dangerous, "notes": notes,
+                      "untracked": untracked})
+    return facts
+
+
+def _untracked_note(keys: list) -> str:
+    """The note that names the changed keys the tracked list cannot describe."""
+    return ("other field(s) changed, not individually tracked by this "
+            "panel: %s%s" % (", ".join("`%s`" % k for k in keys[:8]),
+                             "" if len(keys) <= 8
+                             else " and %d more" % (len(keys) - 8)))
+
+
+# COPS-2766: fields that render fine and that KCC rejects on sync. The hunk
+# cannot show where a line sits (3 context lines, mostly template comments),
+# so these few kinds are read from both parsed renders.
+_IMMUTABLE_RENDER_KINDS = ("ComputeInstance", "BigQueryDataset", "StorageBucket")
+_BOOT_DISK_REASON = (
+    "bootDisk is fixed when the VM is created: KCC rejects any change to it, "
+    "so the whole ComputeInstance fails to apply and the sync stays failed. "
+    "Keep the old value, or rebuild the VM on purpose")
+# The panel is about VMs, so a data reason says first that it is about data.
+_DATA_LOCATION_REASON = (
+    "data location is immutable: KCC rejects the change and the sync fails. "
+    "The data stays where it is, a move needs a new dataset or bucket and a "
+    "copy")
+_DATA_PROJECT_REASON = ("the project of the data changes: KCC rejects the "
+                        "change and the sync fails. The data stays in the "
+                        "old project")
+_DATA_PROJECT_NOTE = ("the project is now set explicitly: check it is the "
+                      "project where the data already is")
+
+
+def _yaml_map(text):
+    """One rendered doc as a dict, or None when it is not one."""
+    try:
+        doc = yaml.load(text, Loader=_YAML_LOADER)
+    except yaml.YAMLError:
+        return None
+    return doc if isinstance(doc, dict) else None
+
+
+def _sub_map(node, key) -> dict:
+    """node[key] when both are mappings, else {}: a null or a string never
+    crashes the read."""
+    v = node.get(key) if isinstance(node, dict) else None
+    return v if isinstance(v, dict) else {}
+
+
+def _fact_text(v) -> str:
+    """A parsed leaf as the panel prints it: None is '', a bool is YAML."""
+    if v is None:
+        return ""
+    return str(v).lower() if isinstance(v, bool) else str(v)
+
+
+def _data_project(doc) -> str:
+    """The project id. `external`, `name` and `projects/<id>` all name the
+    same project, so a format change in the chart is not a move."""
+    ref = _sub_map(_sub_map(doc, "spec"), "projectRef")
+    ann = _sub_map(_sub_map(doc, "metadata"), "annotations")
+    v = _fact_text(ref.get("external") or ref.get("name")
+                   or ann.get("cnrm.cloud.google.com/project-id")).strip()
+    return v[len("projects/"):] if v.startswith("projects/") else v
+
+
+def _render_immutable_facts(main_res, pr_res) -> list:
+    """VM-panel facts for changes KCC rejects on sync, from both renders.
+
+    Only keys on both sides with different text, of the kinds above. The
+    facts have the _detect_vm_changes shape, so _merge_vm_facts can fold
+    them into the hunk fact of the same resource. They are warnings: a
+    failure here is logged and gives [], a crashed diff is worse.
+    """
+    try:
+        facts = []
+        for key in sorted(pr_res):
+            type_key, ns, name = key
+            kind = type_key.rsplit("/", 1)[-1]
+            old_txt, new_txt = main_res.get(key), pr_res[key]
+            if (kind not in _IMMUTABLE_RENDER_KINDS or old_txt is None
+                    or old_txt == new_txt):
+                continue
+            old, new = _yaml_map(old_txt), _yaml_map(new_txt)
+            if old is None or new is None:
+                continue
+            o_spec, n_spec = _sub_map(old, "spec"), _sub_map(new, "spec")
+            fields, dangerous, notes = [], [], []
+            if kind == "ComputeInstance":
+                of = _flatten_yaml(o_spec.get("bootDisk"), "bootDisk")
+                nf = _flatten_yaml(n_spec.get("bootDisk"), "bootDisk")
+                fields = [(k, _fact_text(of.get(k)), _fact_text(nf.get(k)))
+                          for k in sorted(set(of) | set(nf))]
+                fields = [t for t in fields if t[1] != t[2]]
+                if fields:
+                    dangerous.append(_BOOT_DISK_REASON)
+            else:
+                ol = _fact_text(o_spec.get("location")).strip()
+                nl = _fact_text(n_spec.get("location")).strip()
+                if ol and nl and ol.lower() != nl.lower():
+                    fields.append(("location", ol, nl))
+                    dangerous.append(_DATA_LOCATION_REASON)
+                op, np_ = _data_project(old), _data_project(new)
+                if np_ and op != np_:
+                    fields.append(("project", op, np_))
+                    if op:
+                        dangerous.append(_DATA_PROJECT_REASON)
+                    else:
+                        notes.append(_DATA_PROJECT_NOTE)
+            if dangerous or notes:
+                facts.append({"header": _resource_header(type_key, ns, name),
+                              "kind": kind, "name": name, "fields": fields,
+                              "created": False, "deleted": False,
+                              "orphaned": False, "dangerous": dangerous,
+                              "notes": notes})
+        return facts
+    except Exception as e:
+        logsink.log(f"[vm] render facts skipped: {e}", "WARNING")
+        return []
+
+
+def _merge_vm_facts(facts: list, extra) -> list:
+    """Fold each extra fact into the fact with the same header, or append it.
+
+    One resource keeps one fact, so the panel names it once. Mutates and
+    returns `facts`."""
+    by_header = {f["header"]: f for f in facts}
+    for x in extra or []:
+        f = by_header.get(x["header"])
+        if f is None:
+            facts.append(x)
+            continue
+        # The hunk reads the boot disk `size` and `type` with no path. The
+        # render fact names the same change with its path: keep that one.
+        same = {(k.rsplit(".", 1)[1], o, n) for k, o, n in x["fields"]
+                if k.startswith("bootDisk.initializeParams.")}
+        f["fields"] = [t for t in f["fields"] if t not in same]
+        # A key the render fact names by its path is tracked now (#4239).
+        named = {k.rsplit(".", 1)[-1] for k, _o, _n in x["fields"]}
+        untracked = f.get("untracked") or []
+        if named & set(untracked):
+            f["notes"].remove(_untracked_note(untracked))
+            f["untracked"] = [k for k in untracked if k not in named]
+            if f["untracked"]:
+                f["notes"].append(_untracked_note(f["untracked"]))
+        for k in ("fields", "dangerous", "notes"):
+            f[k] += [v for v in x[k] if v not in f[k]]
     return facts
 
 
