@@ -16,7 +16,6 @@ os.environ.setdefault("BB_TOKEN", "t")
 os.environ.setdefault("ARGOCD_PASS", "t")
 import diff_preview as m  # noqa: E402
 import schema_errors  # noqa: E402
-from schema_errors import _toleration_errors  # noqa: E402
 
 KEY = ("apps/Deployment", "pv-statestreet-c", "appspace-mediatransform")
 HEADER = "Kubernetes rejects these tolerations:"
@@ -62,7 +61,7 @@ def _tol(operator="Equal", effect="NoSchedule"):
 
 
 def _errors(text):
-    return _toleration_errors({KEY: text})
+    return schema_errors._toleration_errors({KEY: text})
 
 
 # ── (a) the scanner ──────────────────────────────────────────────────────
@@ -177,7 +176,7 @@ def test_a_repeated_bad_value_in_one_doc_is_listed_once():
 def test_five_bad_values_show_three_lines_and_the_rest_as_a_count():
     docs = {("apps/Deployment", "pv-x", f"svc-{i}"): _deploy(
         _tol(operator=f"bad{i}"), name=f"svc-{i}") for i in range(5)}
-    out = _toleration_errors(docs).splitlines()
+    out = schema_errors._toleration_errors(docs).splitlines()
     assert out[0] == HEADER
     assert [l.split("`")[1] for l in out[1:4]] == [
         "Deployment svc-0", "Deployment svc-1", "Deployment svc-2"]
@@ -191,7 +190,7 @@ def test_long_names_never_get_a_line_cut_by_the_400_char_limit():
         name = f"appspace-elasticsearch-master-long-name-{i}"
         docs[("apps/StatefulSet", "pv-x", name)] = _deploy(
             _tol(effect="noschedule"), name=name)
-    out = _toleration_errors(docs)
+    out = schema_errors._toleration_errors(docs)
     stored = m._redact_error_detail(out)[:400]
     assert stored == out, "the stored detail must not be cut"
     lines = out.splitlines()
@@ -206,29 +205,29 @@ def test_a_very_long_first_line_is_still_shown():
                 _tol(operator="equal"), name=name),
             ("apps/Deployment", "pv-x", "y"): _deploy(
                 _tol(operator="equal"), name="y")}
-    lines = _toleration_errors(docs).splitlines()
+    lines = schema_errors._toleration_errors(docs).splitlines()
     assert lines[1].startswith("- at `Deployment xxx")
     assert lines[2] == "- ... and 1 more"
 
 
 def test_empty_input_gives_empty():
-    assert _toleration_errors({}) == ""
-    assert _toleration_errors({}, {}) == ""
+    assert schema_errors._toleration_errors({}) == ""
+    assert schema_errors._toleration_errors({}, {}) == ""
 
 
 def test_a_bad_value_main_already_has_is_not_reported():
     main = {KEY: _deploy(_tol(operator="equal"), image="img:1")}
     pr = {KEY: _deploy(_tol(operator="equal"), image="img:2")}
-    assert _toleration_errors(pr, main) == "", \
+    assert schema_errors._toleration_errors(pr, main) == "", \
         "an old bad value must not block an unrelated PR"
-    assert _toleration_errors(main, main) == ""
+    assert schema_errors._toleration_errors(main, main) == ""
     pr2 = {KEY: _deploy(_tol(operator="equal", effect="noschedule"))}
-    out = _toleration_errors(pr2, main).splitlines()
+    out = schema_errors._toleration_errors(pr2, main).splitlines()
     assert len(out) == 2 and "toleration effect `noschedule`" in out[1]
 
 
 def test_a_new_resource_is_read_in_full():
-    assert _toleration_errors({KEY: _deploy(_tol(operator="equal"))},
+    assert schema_errors._toleration_errors({KEY: _deploy(_tol(operator="equal"))},
                               {}) == HEADER + "\n" + OP_LINE
 
 
