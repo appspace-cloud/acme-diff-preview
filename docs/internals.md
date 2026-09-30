@@ -517,12 +517,12 @@ file that no generator reads:
 
 | Tree | Read by the generator | Not read |
 |---|---|---|
-| Private cloud, `<gcp or azure>/<tier>/private-cloud/<spoke>/` | every `customer.yaml` below the spoke, and the cohort `config.yaml` one folder up (the spoke `config.yaml` for an env right under the spoke) | `cicd-versions.yaml` and the other value files, a `config.yaml` next to a `customer.yaml`, and every `config.yaml` above the spoke (`gcp/config.yaml`, the tier file) |
+| Private cloud, `<gcp or azure>/<tier>/private-cloud/<spoke>/` | every `customer.yaml` below the spoke, and the cohort `config.yaml` one folder up (the spoke `config.yaml` for an env right under the spoke) | `cicd-versions.yaml` and the other value files, a `config.yaml` next to a `customer.yaml`, a spoke or grandparent `config.yaml` above a cohort (`<spoke>/hardcoded/config.yaml`), and every `config.yaml` above the spoke (`gcp/config.yaml`, the tier file) |
 | Public cloud, `gcp/<tier>/public-cloud/<spoke>/` | `cl-*/config.yaml` (the whole environment) and `cl-*/appN/customer.yaml` (one numbered GLB app) | `cl-*/constellation/customer.yaml`, the fixed GLB folders (`api`, `cloud`, `user-content`) and `cicd-versions.yaml` |
 | `aws/` | not checked: it has no ApplicationSet | |
 
-A private-cloud `config.yaml` with no `customer.yaml` next to it counts as
-read even when no env uses it yet, so a fleet bump stays green.
+A private-cloud `config.yaml` with no env below it yet counts as read, so a
+fleet bump stays green.
 
 It is also blocked when `appspace.version` is not a string, in any file under
 `gcp/` or `azure/`. The ApplicationSet prints a YAML number as a number, so

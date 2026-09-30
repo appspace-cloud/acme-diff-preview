@@ -48,6 +48,8 @@ panels, and must be skipped here to avoid a duplicate/contradictory message.
 import os
 import sys
 
+import pytest
+
 os.environ.setdefault("BB_USER", "t")
 os.environ.setdefault("BB_TOKEN", "t")
 os.environ.setdefault("ARGOCD_PASS", "t")
@@ -223,6 +225,20 @@ def test_file_not_in_path_map_is_skipped(monkeypatch):
     }))
     out = "\n".join(m._summarize_appspace_state_changes([shared], "prsha", "mainsha", PATH_MAP))
     assert out == ""
+
+
+@pytest.mark.parametrize("path,paused", [
+    ("gcp/dev/private-cloud/ap1/config.yaml", False),        # the spoke: no generator reads it
+    ("gcp/dev/private-cloud/ap1/custom/config.yaml", True),  # the cohort of pv-dev-07-a
+])
+def test_autosync_pauses_only_from_a_file_the_generator_reads(monkeypatch, path, paused):
+    monkeypatch.setattr(m, "_bb_fetch_status", _mk_fetch({
+        (path, "mainsha"): "appspace:\n  zeroPods: false\n",
+        (path, "prsha"):   "appspace:\n  autosync: false\n  zeroPods: false\n",
+    }))
+    out = "\n".join(m._summarize_appspace_state_changes(
+        [path], "prsha", "mainsha", {**PATH_MAP, path: APPS}))
+    assert ("Auto-sync PAUSED" in out) is paused
 
 
 def test_non_identity_file_is_ignored(monkeypatch):
