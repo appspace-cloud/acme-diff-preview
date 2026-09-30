@@ -34,6 +34,8 @@ from test_coverage_orchestration import (  # noqa: E402,F401
 from test_cops2766_shrink_and_typo import values_pr, QA88  # noqa: E402,F401
 from test_cops2766_teardown_gates import teardown  # noqa: E402,F401
 from test_cops2766_ip_release import ip_pr, _gone, CA  # noqa: E402,F401
+from test_cops2766_clone_wake import (  # noqa: E402,F401
+    new_clone, live, _doc, X, TRAILER as CLONE_TRAILER)
 
 settings.register_profile("suite", deadline=None)
 settings.load_profile("suite")
@@ -181,6 +183,36 @@ def test_arming_the_flag_on_cl_is_green_and_shows_warnings(world, monkeypatch):
     _assert_green(body, desc)
     assert cr._DECOM_PUBLIC_CLOUD_NOOP_HDR in body
     assert f"{WARN} " + cr._DECOM_PUBLIC_CLOUD_NOOP_HDR in body
+
+
+def test_a_lifted_new_clone_is_green_and_shows_warnings(new_clone):
+    """Block 3: the new-env-only path. The clone panel is red while the gate is open."""
+    body, (state, desc) = new_clone([f"Add the clone\n\n{CLONE_TRAILER}\n"])
+    assert state == "SUCCESSFUL"
+    _assert_green(body, desc)
+    assert f"{WARN} AEC CLONE STARTS RUNNING" in body
+
+
+def test_a_lifted_clone_wake_is_green_and_shows_warnings(live):
+    """Block 3: the diff path, a live clone that wakes."""
+    body, (state, desc) = live({X: (_doc("true"), _doc("false"))}, [CLONE_TRAILER])
+    assert state == "SUCCESSFUL"
+    _assert_green(body, desc)
+    assert f"{WARN} AEC CLONE STARTS RUNNING" in body
+
+
+def test_the_new_env_section_of_a_diff_comment_follows_the_token():
+    """Block 3: a new env bundled with a live-app diff, next to a lifted gate."""
+    diff = {"pv-x-a-ms": m.DiffResult("--- main\n+++ pr", [("/v1/ConfigMap pv-x-a/c", "-a\n+b")],
+                                      1, True, "", m.OUT_DIFF, "")}
+    new_env = ["# \U0001f195 New Environment(s) Detected", "", "- \u26d4 `pv-n-a` x", ""]
+    for lifted, token in ((True, "clean"), (False, "blocked")):
+        body = m.format_comment("a" * 40, diff, base_sha="b" * 40, new_env_lines=new_env,
+                                gates=[_gate("clone_wake", lifted=lifted)])
+        assert m._extract_status_token(body) == token
+        assert (f"- {WARN} `pv-n-a` x" if lifted else "- \u26d4 `pv-n-a` x") in body
+        if lifted:
+            _assert_green(body)
 
 
 # ── format_comment: the three panels follow the token ────────────────────

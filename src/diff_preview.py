@@ -12151,7 +12151,7 @@ def format_comment(pr_sha, app_results, skipped_apps=None, base_sha="",
     # change) get their own section here, using the exact same rendering
     # and classification path as a new-env-only PR (_evaluate_new_envs).
     if new_env_lines:
-        lines += ["---"] + new_env_lines
+        lines += ["---"] + build_marks(new_env_lines, _green)
 
     # ── Appendix (v2.25.0): full rendered output of new environments ──
     # Always the LAST content before the footer: the middle-cut truncation
