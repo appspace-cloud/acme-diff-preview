@@ -233,7 +233,8 @@ def test_7372_disk_shrink_is_now_red(values_pr):
 def test_7372_with_only_machine_type_stays_green(values_pr):
     run, _plan = values_pr
     body, (state, _desc) = run(QA88, QA88.replace("n2d-standard-2", "n2d-standard-4"))
-    assert "runbook requires stopping the VM first" in body, "still a VM danger"
+    # Block 6: the render is the same, so the values line is routine.
+    assert ("`mongo.machineType`: `n2d-standard-2` \u2192 `n2d-standard-4`") in body
     assert SHRINK not in body
     assert m._extract_status_token(body) == "clean" and state == "SUCCESSFUL"
 

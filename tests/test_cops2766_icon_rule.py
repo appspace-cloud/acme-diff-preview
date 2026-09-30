@@ -118,14 +118,21 @@ def test_a_red_golden_keeps_its_stop_sign(name):
 
 # ── real scenarios, end to end ───────────────────────────────────────────
 
+CI_HDR = "/compute.cnrm.cloud.google.com/ComputeInstance pv-orch-a/pv-qa88-mongo1-a"
+
 def test_7372_with_only_machine_type_is_green_and_shows_warnings(values_pr):
     """The VM is RUNNING, so a machineType change is a danger the build does
-    not stop. 2.121.0 showed it with ⛔ and 🚨."""
-    run, _plan = values_pr
+    not stop. 2.121.0 showed it with ⛔ and 🚨. Since block 6 the render
+    decides, so the ComputeInstance hunk carries the danger."""
+    run, plan = values_pr
+    sections = [(CI_HDR, "-  machineType: n2d-standard-2\n+  machineType: n2d-standard-4\n")]
+    plan["pv-orch-a-ss"] = m.DiffResult("d", sections, 1, True, "", m.OUT_DIFF, "",
+                                        vm_changes=m._detect_vm_changes(sections))
     body, (state, desc) = run(QA88, QA88.replace("n2d-standard-2", "n2d-standard-4"))
     assert state == "SUCCESSFUL"
     _assert_green(body, desc)
-    assert "runbook requires stopping the VM first" in body, "still the danger"
+    assert f"{WARN} `pv-orch-a` \u00b7 `ComputeInstance pv-qa88-mongo1-a`" in body
+    assert "KCC stops, resizes and starts the VM" in body, "still the danger"
     assert _verdict(body).startswith(REVIEW)
     assert desc.startswith(f"{WARN} VM infrastructure change flagged dangerous"), desc
 

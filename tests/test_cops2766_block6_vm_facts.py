@@ -580,3 +580,16 @@ def test_the_panel_shows_the_start_note_on_a_routine_line():
     line = next(ln for ln in lines if "ComputeInstance" in ln)
     assert "`desiredStatus` `TERMINATED` → `RUNNING`" in line
     assert vma._VM_START_NOTE in line
+
+
+def test_a_boot_disk_shrink_keeps_the_shrink_gate(monkeypatch):
+    """Block 2 finds a disk shrink by its reason in the panel line. The render
+    names the boot disk size, so the hunk `size` field goes, but the reason
+    stays. The shrink gate still fires, and nothing lifts it."""
+    _world(monkeypatch, _ci().replace("size: 64", "size: 32"), _ci())
+    r = m.argocd_diff(APP, PR_SHA, MAIN_SHA)
+    assert r.vm_changes[0]["fields"] == [("bootDisk.initializeParams.size", "64", "32")]
+    lines = m._summarize_vm_changes([], PR_SHA, MAIN_SHA, {}, {APP: r})
+    assert any(vma._VM_SHRINK_REASON in line for line in lines), lines
+    assert m._merge_gates(None, None, None, lines, {APP: r}) == [
+        {"kind": "shrink", "env": "pv-qa88-a", "arg": "pv-qa88-a", "lifted": False}]
