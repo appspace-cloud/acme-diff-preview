@@ -495,7 +495,6 @@ def test_the_green_status_names_the_image_downgrade(world):
 # the chart's 1.90.14. A bump to a chart that ships 1.91.8 keeps them on
 # 1.90.15, and nothing said so: the pin now holds the service back.
 
-import logsink  # noqa: E402
 import render_cache  # noqa: E402
 import yaml  # noqa: E402
 
