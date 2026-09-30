@@ -99,11 +99,12 @@ Limits:
   duplicate key, give a bare key a value (or write `null`), or delete the
   `definitions:` line.
 
-The red status names the file, the line and the key:
+The red status names the file, the line and the key. When every slip is a
+wipe, it keeps the text of the 2.12.0 guard:
 
 ```
 BLOCKED: YAML slip in pv-orch-a/customer.yaml line 5: duplicate key appspace.zeroPods - see PR comment
-BLOCKED: YAML slip in pv-orch-a/cicd-versions.yaml line 3: empty microservices.definitions (wipes image names) - see PR comment
+BLOCKED: 1 file(s) empty out microservices.definitions (wipes image overrides)
 ```
 
 ### Why a clone without its `--aec1` token is blocked

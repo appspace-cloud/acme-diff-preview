@@ -459,8 +459,9 @@ def test_process_pr_blocks_a_wipe_after_a_second_document(slip_pr, monkeypatch):
     monkeypatch.setattr(m, "get_pr_changed_files", lambda pr_id, repo=None: ([ANCILLARY], {}))
     files[MERGED][ANCILLARY] = WIPES["bare, then a second document"]
     m.process_pr(_mk_pr(), PATH_MAP, base_sha=BASE_SHA)
-    body = _blocked(sinks, "BLOCKED: YAML slip in pv-orch-a/cicd-versions.yaml line 3: "
-                           "empty microservices.definitions (wipes image names) - see PR comment")
+    # The status keeps the text of the 2.12.0 guard.
+    body = _blocked(sinks, "BLOCKED: 1 file(s) empty out microservices.definitions "
+                           "(wipes image overrides)")
     assert "`appspace.microservices.definitions` is empty or not a map" in body
     assert "COPR-31637" in body and "Old duplicate" not in body
 
@@ -509,6 +510,16 @@ def test_the_block_cuts_a_long_description_and_counts_the_other_files():
     assert desc.endswith("k - see PR comment")
     assert f"**Status:** ⛔ Blocked: YAML slip in `{F}` (+1 more)\n" in body
     assert "[base:" not in body and m._extract_status_token(body) == "blocked"
+
+
+def test_only_a_wipe_keeps_the_old_status_text():
+    wipe = {"kind": "wipe", "key": yh.DEFINITIONS, "line": 3, "first_line": None}
+    desc, _ = m._yaml_slip_block([dict(wipe, path=F), dict(wipe, path=ANCILLARY)], PR_SHA, None)
+    assert desc == "BLOCKED: 2 file(s) empty out microservices.definitions (wipes image overrides)"
+    dup = {"path": F, "kind": "dup", "key": "appspace.x", "line": 2, "first_line": 1}
+    desc, _ = m._yaml_slip_block([dup, dict(wipe, path=F)], PR_SHA, None)
+    assert desc == ("BLOCKED: YAML slip in pv-x-a/customer.yaml line 2: duplicate key "
+                    "appspace.x (+1 more) - see PR comment")
 
 
 # ── (f) the recovery reads the block as red ──────────────────────────────

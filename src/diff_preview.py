@@ -4718,6 +4718,9 @@ def _yaml_slip_block(hits: list, pr_sha: str, base_sha: str):
     desc = (f"BLOCKED: YAML slip in {_status_path(h['path'])} line {h['line']}: "
             + _SLIP_DESC[h["kind"]].format(**h) + more)[:255 - len(tail)] + tail
     kinds = [k for k in _SLIP_WHY if any(x["kind"] == k for x in hits)]
+    if kinds == ["wipe"]:   # the 2.12.0 text, so an existing red status reads the same
+        desc = (f"BLOCKED: {len(hits)} file(s) empty out "
+                "microservices.definitions (wipes image overrides)")
     paths = list(dict.fromkeys(x["path"] for x in hits))
     old = (" Old duplicate or bare keys in these files do not block, only the ones "
            "this PR adds." if kinds != ["wipe"] else "")
