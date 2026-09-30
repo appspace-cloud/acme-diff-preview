@@ -11773,10 +11773,12 @@ def _permanent_failure_status_description(app_results) -> str:
 
 
 def _fit_downgrade_notes(desc, notes, limit=255):
-    """COPS-2766: `desc` without the downgrade `notes` when it passes
-    `limit` UTF-8 bytes, so the text we had before is never cut."""
-    if notes and len(desc.encode("utf-8", "surrogatepass")) > limit:
-        return desc.replace(notes, "", 1)
+    """COPS-2766: `desc` without the optional `notes` while it passes `limit`
+    UTF-8 bytes, so the text we had before is never cut. `notes` is one note
+    or a list of them, dropped in that order."""
+    for note in ([notes] if isinstance(notes, str) else notes):
+        if note and len(desc.encode("utf-8", "surrogatepass")) > limit:
+            desc = desc.replace(note, "", 1)
     return desc
 
 
@@ -14218,8 +14220,9 @@ def process_pr(pr, path_map, base_sha="", repo=None):
         status_extra = decom_extra + leftover_extra + downgrade_extra + image_extra
         # COPS-2766: the tenant reach goes only on a green status, so no
         # FAILED text changes.
-        green_extra = status_extra + (
-            f" | \U0001f310 every tenant of {', '.join(tenant_cls)}" if tenant_cls else "")
+        tenant_extra = (f" | \U0001f310 every tenant of {', '.join(tenant_cls)}"
+                        if tenant_cls else "")
+        green_extra = status_extra + tenant_extra
 
         # v2.5.4 (Finding 1): traffic-light rule agreed with Marcos — green ONLY
         # when the diff was actually computed (with or without changes); ANY
@@ -14377,7 +14380,8 @@ def process_pr(pr, path_map, base_sha="", repo=None):
                     has_input_changes=bool(input_change_lines),
                     has_inert=_INERT_EDIT_HDR in _joined)
                 state, desc = "SUCCESSFUL", f"{_clean}{green_extra}"
-        desc = _fit_downgrade_notes(desc, downgrade_extra + image_extra)
+        # Past 255 bytes the tenant reach goes first, then the downgrade notes.
+        desc = _fit_downgrade_notes(desc, [tenant_extra, downgrade_extra + image_extra])
         if state == "SUCCESSFUL":
             # COPS-2766: lead with the top finding of the comment just
             # posted; fix_stuck_inprogress rebuilds the same lead from it.

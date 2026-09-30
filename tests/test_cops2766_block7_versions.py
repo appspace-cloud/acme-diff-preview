@@ -237,6 +237,20 @@ def test_the_downgrade_notes_give_way_past_255_bytes(head, tail):
     assert cr._utf8_len(full) <= 255 and full.endswith(tail)
 
 
+def test_the_tenant_reach_gives_way_before_the_downgrade_notes():
+    """Release 2.124.0: block 5 puts the tenant reach on a green status, after
+    the downgrade notes. Past 255 bytes it goes first, and the notes stay
+    while they fit."""
+    tail = " - review comment"
+    tenant = " | \U0001f310 every tenant of cl-prod-b, cl-prod-c, cl-prod-d"
+    notes = [tenant, BOTH_NOTES]
+    for n, kept in ((0, BOTH_NOTES + tenant), (2, BOTH_NOTES), (4, "")):
+        head = "600 resource(s) will change" + " | +12 new environment(s) will be created" * n
+        desc = m._fit_downgrade_notes(head + BOTH_NOTES + tenant + tail, notes)
+        assert desc == head + kept + tail, n
+        assert cr._utf8_len(desc) <= 255
+
+
 def test_the_downgrade_notes_stay_when_they_fit():
     desc = "1 resource(s) will change" + BOTH_NOTES + " - review comment"
     assert m._fit_downgrade_notes(desc, BOTH_NOTES) == desc

@@ -172,7 +172,7 @@ def test_the_green_status_keeps_the_action_at_the_3888_size():
 def test_a_result_without_the_field_does_not_crash():
     Old = collections.namedtuple(
         "Old", [f for f in m.DiffResult._fields if f != "neg_removed"],
-        defaults=[None] * 10)
+        defaults=[None] * (len(m.DiffResult._fields) - 10))  # 9 given below
     old = Old("d", [], 1, True, "", m.OUT_DIFF, "", None, [BS])
     _verdict, b = _bullets({"pv-x-glb": old, "pv-x-ms": _r(neg=[SVC])})
     assert b[0].startswith("\U0001f517"), b
