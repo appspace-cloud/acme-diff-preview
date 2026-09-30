@@ -167,6 +167,8 @@ from comment_render import (  # comment rendering (same-dir module, stdlib only)
     build_marks,
     status_lead,
     join_status_lead,
+    _utf8_len,
+    _cut_utf8,
     gate_trailer,
     gate_token,
     open_gates,
@@ -4713,10 +4715,9 @@ def _status_path(path):
 def _yaml_slip_block(hits: list, pr_sha: str, base_sha: str):
     """(build status description, comment body) for _detect_yaml_slips hits."""
     h = hits[0]
-    more = f" (+{len(hits) - 1} more)" if len(hits) > 1 else ""
-    tail = " - see PR comment"
-    desc = (f"BLOCKED: YAML slip in {_status_path(h['path'])} line {h['line']}: "
-            + _SLIP_DESC[h["kind"]].format(**h) + more)[:255 - len(tail)] + tail
+    tail = (f" (+{len(hits) - 1} more)" if len(hits) > 1 else "") + " - see PR comment"
+    desc = _cut_utf8(f"BLOCKED: YAML slip in {_status_path(h['path'])} line {h['line']}: "
+                     + _SLIP_DESC[h["kind"]].format(**h), 255 - _utf8_len(tail)) + tail
     kinds = [k for k in _SLIP_WHY if any(x["kind"] == k for x in hits)]
     if kinds == ["wipe"]:   # the 2.12.0 text, so an existing red status reads the same
         desc = (f"BLOCKED: {len(hits)} file(s) empty out "
@@ -5521,9 +5522,9 @@ def _inert_key_block(hits: list, pr_sha: str, base_sha: str):
     h = hits[0]
     more = f" (+{len(hits) - 1} more)" if len(hits) > 1 else ""
     what = "is not a string" if h["why"] == "type" else "is never read by the ApplicationSet"
-    tail = " - see PR comment"
-    desc = (f"BLOCKED: appspace.{h['key']} in {_status_path(h['path'])} "
-            f"{what}{more}")[:255 - len(tail)] + tail
+    tail = more + " - see PR comment"
+    desc = _cut_utf8(f"BLOCKED: appspace.{h['key']} in {_status_path(h['path'])} {what}",
+                     255 - _utf8_len(tail)) + tail
     kinds = [k for k in _INERT_WHY if any(kind(x) == k for x in hits)]
     head = ("sets `appspace.version` to a value that is not a string" if kinds == ["type"]
             else "sets a key where ArgoCD does not read it")
@@ -5594,9 +5595,9 @@ def _legacy_writer_block(hits: list, pr_sha: str, base_sha: str):
                                   for h in hits))
     h = hits[0]
     more = f" (+{len(hits) - 1} more)" if len(hits) > 1 else ""
-    ask = f". To merge anyway, add {trailers[0]} to a commit"
-    desc = (f"BLOCKED: {h['key']}: true in {h['env']} turns the legacy Helm writer back "
-            f"on{more}")[:255 - len(ask)] + ask
+    ask = f"{more}. To merge anyway, add {trailers[0]} to a commit"
+    desc = _cut_utf8(f"BLOCKED: {h['key']}: true in {h['env']} turns the legacy Helm writer "
+                     "back on", 255 - _utf8_len(ask)) + ask
     body = (
         f"## \U0001f52d {STATUS_NAME}\n\n"
         f"{_comment_header(pr_sha)}\n\n"

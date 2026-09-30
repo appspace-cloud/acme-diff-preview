@@ -384,7 +384,10 @@ def test_a_version_map_points_to_versions():
 
 def test_a_long_description_is_cut():
     desc, _ = m._inert_key_block([_hit(f"{PV}/{'k' * 300}.yaml", "version", "x")], PR_SHA, None)
-    assert len(desc) == 255 and desc.endswith("kkk - see PR comment")
+    assert len(desc) == 255 and desc.endswith("kkk... - see PR comment")
+    hit = _hit(PV + "/" + "\u00e9" * 300 + ".yaml", "version", "x")
+    desc, _ = m._inert_key_block([hit, hit], PR_SHA, None)
+    assert len(desc.encode()) <= 255 and desc.endswith("\u00e9... (+1 more) - see PR comment")
 
 
 # ── process_pr ───────────────────────────────────────────────────────────

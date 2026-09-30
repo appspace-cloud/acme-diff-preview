@@ -221,6 +221,10 @@ def test_a_long_description_is_cut_and_keeps_the_trailer():
     env = "pv-" + "k" * 150
     desc, _ = m._legacy_writer_block([_hit(ENV, env=env)], PR_SHA, None)
     assert len(desc) == 255 and desc.endswith(f"add Confirm-LegacyHelm: {env} to a commit")
+    env = "pv-" + "\u00e9" * 60
+    desc, _ = m._legacy_writer_block([_hit(ENV, env=env)] * 2, PR_SHA, None)
+    assert len(desc.encode()) <= 255 and desc.endswith(
+        f"... (+1 more). To merge anyway, add Confirm-LegacyHelm: {env} to a commit")
 
 
 # ── process_pr ───────────────────────────────────────────────────────────

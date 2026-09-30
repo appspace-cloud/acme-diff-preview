@@ -507,9 +507,16 @@ def test_the_block_cuts_a_long_description_and_counts_the_other_files():
     desc, body = m._yaml_slip_block(hits, PR_SHA, None)
     assert len(desc) == 255 and desc.startswith(
         "BLOCKED: YAML slip in pv-x-a/customer.yaml line 9: duplicate key appspace.kkk")
-    assert desc.endswith("k - see PR comment")
+    assert desc.endswith("kkk... (+1 more) - see PR comment")
     assert f"**Status:** ⛔ Blocked: YAML slip in `{F}` (+1 more)\n" in body
     assert "[base:" not in body and m._extract_status_token(body) == "blocked"
+
+
+def test_the_block_cuts_by_utf8_bytes():
+    key = "appspace." + "\u00e9" * 150
+    hits = [{"path": F, "kind": "dup", "key": key, "line": 9, "first_line": 2}] * 2
+    desc = m._yaml_slip_block(hits, PR_SHA, None)[0]
+    assert len(desc.encode()) <= 255 and desc.endswith("\u00e9... (+1 more) - see PR comment")
 
 
 def test_only_a_wipe_keeps_the_old_status_text():
