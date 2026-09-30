@@ -447,9 +447,8 @@ A chart downgrade also adds ` | CHART DOWNGRADE in N environment(s)` to the
 green description, so the status names it when another finding leads
 (#4549). The recovery of a stuck status does not add it, like the
 decommission count. An image downgrade adds
-` | IMAGE DOWNGRADE in N environment(s)` in the same way. Like the
-decommission count, both also go on the red `Diff unavailable` description.
-No other FAILED description changes. A green description ends with the
+` | IMAGE DOWNGRADE in N environment(s)` in the same way. Both go only on a
+green description: no FAILED description changes. A green description ends with the
 tenant reach, `| 🌐 every tenant of <constellation>`, after these notes.
 It names 2 constellations at most, then `(+N more)`, so a long list
 never pushes the finding out.
