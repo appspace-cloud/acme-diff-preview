@@ -180,8 +180,8 @@ def bq_dataset(flat):
     supporting-services `appspace.bigQueryDatasetName`, where `bigQuery` is
     {enabled: true, suffix: a} in the chart values:
       {prefix}_{customerName}_analytics_{bigQuery.suffix}, "-" to "_", lower
-    Every env uses the one project appspace-cloud-private-bq, so one name is
-    one dataset.
+    The dataset lives in `bigQuery.project`, which is not the same for every
+    env (stage uses appspace-cloud-stage-bq), so compare with same_bq_dataset.
     """
     flat = flat or {}
     if not _truthy(flat.get("appspace.bigQuery.enabled"), default=True):
@@ -191,6 +191,14 @@ def bq_dataset(flat):
         return None
     suffix = flat.get("appspace.bigQuery.suffix") or "a"
     return f"{prefix}_{customer}_analytics_{suffix}".replace("-", "_").lower()
+
+
+def same_bq_dataset(a, b) -> bool:
+    """COPS-2772: one dataset name in one `bigQuery.project`. A project missing
+    on either side counts as the same one."""
+    pa, pb = ((f or {}).get("appspace.bigQuery.project") for f in (a, b))
+    ds = bq_dataset(a)
+    return bool(ds) and ds == bq_dataset(b) and (not pa or not pb or pa == pb)
 
 
 def shared_owners(target: dict, siblings: dict) -> dict:
