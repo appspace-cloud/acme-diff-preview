@@ -265,12 +265,44 @@ _RESULTS = {
     "kcc_nil": lambda: m.DiffResult(
         "d", [], 1, True, "", m.OUT_DIFF, "",
         template_artifacts=["/compute.cnrm.cloud.google.com/ComputeInstance vm-a"]),
+    # Release 2.124.0: the findings of blocks 5 and 7.
+    "neg_bs": lambda: m.DiffResult(
+        "d", [], 1, True, "", m.OUT_DIFF, "", None,
+        ["/compute.cnrm.cloud.google.com/ComputeBackendService pv-x-a/bs-user"],
+        neg_removed=["/Service pv-x-a/user"]),
+    "capacity": lambda: m.DiffResult(
+        "d", [], 1, True, "", m.OUT_DIFF, "",
+        capacity={"cuts": [("signschannel", "floor 10 → 6")],
+                  "released": [("signschannel", 10)]}),
+    "image_down": lambda: m.DiffResult(
+        "d", [], 1, True, "", m.OUT_DIFF, "",
+        image_downgrades=(("/apps/Deployment pv-x-a/web", "web", "2.0.0", "1.9.9"),)),
+    "pins_behind": lambda: m.DiffResult(
+        "d", [], 1, True, "", m.OUT_DIFF, "", ("2603.0.1", "2603.1.0"),
+        pins_behind=[("signschannel", "1.90.0", "1.91.8")]),
+    "pins_skipped": lambda: m.DiffResult(
+        "d", [], 1, True, "", m.OUT_DIFF, "", ("2603.0.1", "2603.1.0"),
+        pins_behind="skipped"),
 }
 _STATE = [cr._DECOM_VM_STRIP_HDR, "\U0001f6a8 " + cr._DECOM_FLAG_TYPO_HDR,
           "\U0001f6a8 " + cr._DECOM_PUBLIC_CLOUD_NOOP_HDR,
           "## \U0001f6a8 PURGE ARMED for `pv-x-a` \U0001f6a8",
           "## \U0001f512 DECOMMISSION ARMED for `pv-x-a`", cr._AUTOSYNC_PAUSED_HDR,
           cr._BLAST_RADIUS_HDR, cr._IDENTITY_MIGRATION_HDR, cr._VALUES_REDUNDANCY_HDR]
+_NOCORE_PATH = "gcp/prod/private-cloud/na1-a/weekly/pv-x-a/customer.yaml"
+_STATE += [line for line in (
+    m._nocore_flip_lines([
+        {"env": "pv-x-a", "path": _NOCORE_PATH, "key": m._NOCORE_KEY,
+         "moved_from": "gcp/prod/private-cloud/na1-a/old/pv-x-a/customer.yaml",
+         "old": True, "new": False, "pinned": False, "src": None, "value": None},
+        {"env": "pv-y-b", "path": _NOCORE_PATH, "key": m._NOCORE_KEY,
+         "moved_from": None, "old": None, "new": True, "pinned": False,
+         "src": None, "value": None}])
+    + m._nocore_flip_lines(None)
+    + m._legacy_backends_lines([
+        {"env": "pv-x-a", "path": _NOCORE_PATH, "key": m._LEGACY_BACKENDS_KEY,
+         "moved_from": None, "old": False, "new": True}])
+    + m._tenant_wide_lines(["cl-prod-b"])) if line]
 _DECOM_LINES = ["\U0001f6a8 " + cr._DECOM_PURGE_HDR, cr._DECOM_ORPHAN_HDR,
                 cr._DECOM_PUBLIC_CLOUD_HDR, "\U0001f6a8 " + cr._DECOM_SHARED_UC_HDR,
                 "\U0001f6a8 " + cr._DECOM_FLAG_TYPO_HDR, "# ENVIRONMENT DECOMMISSION"]
