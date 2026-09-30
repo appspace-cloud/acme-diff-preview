@@ -530,7 +530,7 @@ def test_the_gate_status_fits_with_a_long_env():
     build status, with 2 more gates."""
     env = "pv-" + "x" * 40 + "--aec1-a"
     gates = [{"kind": k, "env": env, "arg": env, "lifted": False}
-             for k in ("nocore_lost", "paused", "shrink")]
+             for k in ("nocore_lost", "not_live", "shrink")]
     desc = cr.gate_status_description(gates)
     assert len(desc.encode()) <= 255, len(desc.encode())
     assert desc == (f"Blocked - A move turns noCore off in {env}. Set "
