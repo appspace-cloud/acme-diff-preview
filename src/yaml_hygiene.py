@@ -34,6 +34,8 @@ def wipes_definitions_node(root):
     and is not a non-empty map (null, {}, [], "" or any scalar), else None."""
     ms = _get(_get(root, "appspace")[1], "microservices")[1]
     k, v = _get(ms, "definitions")
+    if isinstance(v, yaml.MappingNode):
+        _MERGE.flatten_mapping(v)     # `<<: *empty` loads as {}
     return k if k is not None and not (isinstance(v, yaml.MappingNode) and v.value) else None
 
 

@@ -160,6 +160,17 @@ def test_a_wipe_through_a_merge_key_is_a_wipe():
     assert m._values_wipes_definitions(over) is False, "a key of its own wins over the merge"
 
 
+def test_a_definitions_that_merges_only_an_empty_map_is_a_wipe():
+    # 2.122.1 blocked it, because yaml.safe_load gives {}.
+    body = "x: &d {}\nappspace:\n  microservices:\n    definitions:\n      <<: *d\n"
+    assert m._values_wipes_definitions(body) is True
+    assert yh.slips(body)["lines"][("wipe", yh.DEFINITIONS)] == [(4, None)]
+    full = "x: &d {account: {}}\n" + body.split("\n", 1)[1]
+    assert m._values_wipes_definitions(full) is False, "a merge that brings a key is not a wipe"
+    bad = "x: &d 1\n" + body.split("\n", 1)[1]
+    assert yh.slips(bad) is None, "a `<<` that is not a map does not load"
+
+
 def test_a_merge_key_that_is_not_a_map_does_not_parse():
     assert yh.slips("appspace:\n  microservices:\n    <<: 1\n") is None
 
