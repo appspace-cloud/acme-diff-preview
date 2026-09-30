@@ -16,6 +16,8 @@ says so as a routine line, and the green status carries it in its tail.
 import os
 import sys
 
+import pytest
+
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
 sys.path.insert(0, os.path.dirname(__file__))
 
@@ -360,3 +362,41 @@ def test_a_failed_status_keeps_its_old_text(world, monkeypatch):
                                        "confirmed changed - review comment (will retry "
                                        "automatically if transient)")
     assert "- \U0001f310 **Reaches every public-cloud tenant** of `cl-prod-b`" in body
+
+
+@pytest.mark.parametrize("n", [7, 30])
+def test_a_long_tenant_list_never_pushes_out_the_lead(world, monkeypatch, n):
+    """Release 2.124.0 review: with 7 or more constellations, a chart and an
+    image downgrade, the full tenant list took the room of the lead, and
+    at 9 only '⚠️ Cha...' was left. The tenant reach names 2 constellations
+    at most, so the lead keeps its finding, versions and first env."""
+    sinks, plan = world
+    monkeypatch.setattr(m, "generate_ai_summary", lambda app_results: None)
+    cls = [f"cl-prod-{i:02}" for i in range(n)]
+    changed = [f"gcp/prod/public-cloud/na1-a/{c}/constellation/cicd-versions.yaml"
+               for c in cls]
+    monkeypatch.setattr(m, "_app_value_files_map", {f"{c}-ms": ["$config/" + p]
+                                                    for c, p in zip(cls, changed)})
+    for c in cls:
+        monkeypatch.setitem(m._app_chart_map, f"{c}-ms", "appspace-ms")
+        monkeypatch.setitem(m._app_chart_revision_map, f"{c}-ms", "2603.3.10")
+        plan[f"{c}-ms"] = m.DiffResult(
+            "--- main\n+++ pr", [(f"/apps/Deployment {c}/device",
+                                  "-image: r/d:1.117.4\n+image: r/d:1.116.10")],
+            1, True, "", m.OUT_DIFF, "", version_change=("2603.3.10", "2603.2.19"),
+            image_downgrades=((f"/apps/Deployment {c}/device", "d", "1.117.4",
+                               "1.116.10"),))
+    monkeypatch.setattr(m, "get_pr_changed_files", lambda pr_id, repo=None: (changed, {}))
+    monkeypatch.setattr(m, "_bb_fetch_status",
+                        lambda path, sha, repo=None: (None, m.BB_NOT_FOUND))
+    m.process_pr(_mk_pr(), {p: [f"{c}-ms"] for c, p in zip(cls, changed)},
+                 base_sha=BASE_SHA)
+    state, desc = sinks.statuses[-1]
+    assert m._extract_status_token(sinks.upserts[-1]) == "clean"
+    assert state == "SUCCESSFUL" and cr._utf8_len(desc) <= 255, desc
+    assert desc.startswith("⚠️ Chart version downgrade 2603.3.10 → 2603.2.19 in "
+                           "cl-prod-00, "), desc
+    assert desc.endswith(
+        f" resource(s) will change | CHART DOWNGRADE in {n} environment(s)"
+        f" | IMAGE DOWNGRADE in {n} environment(s) | \U0001f310 every tenant of "
+        f"cl-prod-00, cl-prod-01 (+{n - 2} more) - review comment"), desc

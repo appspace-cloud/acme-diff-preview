@@ -14280,8 +14280,8 @@ def process_pr(pr, path_map, base_sha="", repo=None):
                        if _img_envs else "")
         status_extra = decom_extra + leftover_extra + downgrade_extra + image_extra
         # COPS-2766: the tenant reach goes only on a green status, so no
-        # FAILED text changes.
-        tenant_extra = (f" | \U0001f310 every tenant of {', '.join(tenant_cls)}"
+        # FAILED text changes. Two names at most, so it never pushes out the lead.
+        tenant_extra = (f" | \U0001f310 every tenant of {_fmt_service_list(tenant_cls, 2)}"
                         if tenant_cls else "")
         green_extra = status_extra + tenant_extra
 
