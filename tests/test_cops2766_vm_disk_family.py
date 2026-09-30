@@ -182,7 +182,7 @@ def test_pr_4331_a_role_enabled_on_n4_is_an_error():
         ("svc", _new_text("n4-highmem-2", ("data", "pd-ssd"), ("boot", "pd-ssd")))]
 
 
-def test_pr_4331_with_hyperdisk_is_clean():
+def test_pr_4331_values_with_hyperdisk_are_clean():
     old = {K + "enabled": True}
     new = _flat({"svc": dict({"machineType": "n4-highmem-2", "createNewBootDisk": True}, **HD)})
     assert va._vm_disk_family_changes(old, new) == []
