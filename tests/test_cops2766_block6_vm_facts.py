@@ -7,10 +7,11 @@ TERMINATED to RUNNING gets a note too. A ComputeDisk `location` change is
 immutable like the zone.
 
 Item 1. Some changes render fine and KCC rejects them on sync: a bootDisk
-change on an existing VM (#3931, #4239), and a BigQueryDataset or
-StorageBucket location or project change (#4517). The hunk cannot show where
-a line sits, so both renders are parsed. Everything here is a warning: the
-token stays [clean] and the build stays green.
+change on an existing VM (#3931, #4239), a BigQueryDataset or StorageBucket
+location or project change (#4517), and an IAMPolicyMember binding change
+(COPS-2772). The hunk cannot show where a line sits, so both renders are
+parsed. Everything here is a warning: the token stays [clean] and the build
+stays green.
 """
 import os
 import sys
@@ -32,6 +33,8 @@ BQ_KEY = ("bigquery.cnrm.cloud.google.com/BigQueryDataset", "",
           "pv-acme-analytics-a")
 SB_KEY = ("storage.cnrm.cloud.google.com/StorageBucket", "",
           "pv-acme-content-backup")
+IAM_KEY = ("iam.cnrm.cloud.google.com/IAMPolicyMember", "pv-stage-corporate-b",
+           "pv-stage-corporate-analytics-a-bq-jobuser-binding")
 HOSTING = "bootDisk.initializeParams.labels.hosting-id"
 
 
@@ -178,6 +181,22 @@ def _bucket(project="appspace-backup", location="US-CENTRAL1"):
         f"  location: \"{location}\"\n")
 
 
+def _iam(project="appspace-cloud-private-bq", role="roles/bigquery.jobUser"):
+    """A rendered IAMPolicyMember, the PR #2939 binding."""
+    return (
+        "apiVersion: iam.cnrm.cloud.google.com/v1beta1\n"
+        "kind: IAMPolicyMember\n"
+        "metadata:\n"
+        "  name: pv-stage-corporate-analytics-a-bq-jobuser-binding\n"
+        "  namespace: pv-stage-corporate-b\n"
+        "spec:\n"
+        "  member: serviceAccount:analytics@p.iam.gserviceaccount.com\n"
+        f"  role: {role}\n"
+        "  resourceRef:\n"
+        "    kind: Project\n"
+        f"    external: projects/{project}\n")
+
+
 def _facts(key, old, new):
     return vma._render_immutable_facts({key: old}, {key: new})
 
@@ -268,6 +287,33 @@ def test_a_bucket_project_id_annotation_change_is_dangerous():
                    _bucket(project="appspace-backup-2"))
     assert facts[0]["kind"] == "StorageBucket"
     assert facts[0]["dangerous"] == [vma._DATA_PROJECT_REASON]
+
+
+def test_2939_an_iam_member_resource_ref_move_is_dangerous():
+    facts = _facts(IAM_KEY, _iam(), _iam(project="appspace-cloud-stage-bq"))
+    assert len(facts) == 1
+    f = facts[0]
+    assert f["kind"] == "IAMPolicyMember"
+    assert f["name"] == "pv-stage-corporate-analytics-a-bq-jobuser-binding"
+    assert f["fields"] == [("resourceRef.external",
+                            "projects/appspace-cloud-private-bq",
+                            "projects/appspace-cloud-stage-bq")]
+    assert f["dangerous"] == [vma._IAM_MEMBER_REASON]
+    assert vma._IAM_MEMBER_REASON.startswith("the IAM binding is immutable: ")
+    assert "deletion-policy: abandon" in vma._IAM_MEMBER_REASON
+
+
+def test_an_iam_member_role_change_is_dangerous():
+    facts = _facts(IAM_KEY, _iam(), _iam(role="roles/bigquery.dataViewer"))
+    assert facts[0]["fields"] == [
+        ("role", "roles/bigquery.jobUser", "roles/bigquery.dataViewer")]
+    assert facts[0]["dangerous"] == [vma._IAM_MEMBER_REASON]
+
+
+def test_an_iam_member_change_outside_the_immutable_fields_gives_nothing():
+    new = _iam().replace("spec:\n", "  annotations:\n    %s: abandon\nspec:\n"
+                         % vma._VM_DELETION_POLICY_KEY)
+    assert _facts(IAM_KEY, _iam(), new) == []
 
 
 def test_a_new_resource_gives_nothing():

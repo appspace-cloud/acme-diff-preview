@@ -734,7 +734,8 @@ def _untracked_note(keys: list) -> str:
 # COPS-2766: fields that render fine and that KCC rejects on sync. The hunk
 # cannot show where a line sits (3 context lines, mostly template comments),
 # so these few kinds are read from both parsed renders.
-_IMMUTABLE_RENDER_KINDS = ("ComputeInstance", "BigQueryDataset", "StorageBucket")
+_IMMUTABLE_RENDER_KINDS = ("ComputeInstance", "BigQueryDataset",
+                           "StorageBucket", "IAMPolicyMember")
 _BOOT_DISK_REASON = (
     "bootDisk is fixed when the VM is created: KCC rejects any change to it, "
     "so the whole ComputeInstance fails to apply and the sync stays failed. "
@@ -749,6 +750,13 @@ _DATA_PROJECT_REASON = ("the project of the data changes: KCC rejects the "
                         "old project")
 _DATA_PROJECT_NOTE = ("the project is now set explicitly: check it is the "
                       "project where the data already is")
+# COPS-2772: the KCC 1.157.0 CRD marks these immutable (CEL self == oldSelf).
+_IAM_MEMBER_KEYS = ("resourceRef", "member", "memberFrom", "role", "condition")
+_IAM_MEMBER_REASON = (
+    "the IAM binding is immutable: KCC rejects the change and the sync fails "
+    "until the CR is recreated. Annotate it with `cnrm.cloud.google.com/"
+    "deletion-policy: abandon` before the delete, or the old binding is "
+    "removed in GCP")
 
 
 def _yaml_map(text):
@@ -814,6 +822,14 @@ def _render_immutable_facts(main_res, pr_res) -> list:
                 fields = [t for t in fields if t[1] != t[2]]
                 if fields:
                     dangerous.append(_BOOT_DISK_REASON)
+            elif kind == "IAMPolicyMember":
+                of = _flatten_yaml({k: o_spec.get(k) for k in _IAM_MEMBER_KEYS})
+                nf = _flatten_yaml({k: n_spec.get(k) for k in _IAM_MEMBER_KEYS})
+                fields = [(k, _fact_text(of.get(k)), _fact_text(nf.get(k)))
+                          for k in sorted(set(of) | set(nf))]
+                fields = [t for t in fields if t[1] != t[2]]
+                if fields:
+                    dangerous.append(_IAM_MEMBER_REASON)
             else:
                 ol = _fact_text(o_spec.get("location")).strip()
                 nl = _fact_text(n_spec.get("location")).strip()
