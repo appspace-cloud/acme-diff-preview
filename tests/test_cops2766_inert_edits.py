@@ -85,8 +85,8 @@ def test_4463_autosync_true_changes_nothing(monkeypatch):
         f"{cr._INERT_EDIT_HDR} 1 key changed, but no rendered manifest changed:", ""]
     assert _rows(lines) == ["- `pv-chevron-c`: `appspace.autosync`"]
     assert AUTOSYNC_HINT in lines
-    assert lines[-2:] == ["*Check the key path and the service name. Helm ignores a key "
-                          "that no chart reads, with no error.*", ""]
+    assert lines[-2:] == [("*Check the key path and the service name. Helm ignores a key "
+                          "that no chart reads, with no error.*"), ""]
 
 
 def test_4554_keys_under_a_service_no_chart_reads(monkeypatch):
@@ -113,8 +113,8 @@ def test_many_envs_show_ten_rows_and_a_count(monkeypatch):
     assert _rows(lines)[0] == "- `pv-e00-a`: `appspace.web`"
     assert _rows(lines)[10:] == ["- ... and 2 more environment(s)"]
     _l, b = _bullets(lines)
-    assert b == ["\U0001f4a4 **An edit changes nothing rendered**: `appspace.web` in "
-                 "`pv-e00-a` (+11 more)"]
+    assert b == [("\U0001f4a4 **An edit changes nothing rendered**: `appspace.web` in "
+                 "`pv-e00-a` (+11 more)")]
 
 
 def test_4647_keys_the_higher_layer_note_lists_stay_out(monkeypatch):
@@ -242,8 +242,8 @@ def _bullets(state):
 
 def test_the_summary_names_the_first_key_and_counts_the_rest(monkeypatch):
     _l, b = _bullets(_lines(monkeypatch, BASE + "  autosync: true\n"))
-    assert b == ["\U0001f4a4 **An edit changes nothing rendered**: `appspace.autosync` "
-                 "in `pv-chevron-c`"]
+    assert b == [("\U0001f4a4 **An edit changes nothing rendered**: `appspace.autosync` "
+                 "in `pv-chevron-c`")]
     _l, b = _bullets(_lines(monkeypatch, BASE + LIBRARY))
     assert b == ["\U0001f4a4 **An edit changes nothing rendered**: "
                  f"`{LIBRARY_KEYS[0]}` in `pv-chevron-c` (+2 more)"]

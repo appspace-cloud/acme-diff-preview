@@ -459,10 +459,10 @@ def test_a_new_env_on_hyperdisk_is_clean(run):
 
 
 @pytest.mark.parametrize("svc,check,lead", [
-    ([], W1, "adopts a boot disk for svc that a new VM does not have yet "
-             "(createNewBootDisk is not true)"),
-    (None, W2, "renders no Linux VM (svc, mongo or rabbit) from deployLinuxServicesK8s, so "
-               "KCC creates no VM for it"),
+    ([], W1, ("adopts a boot disk for svc that a new VM does not have yet "
+             "(createNewBootDisk is not true)")),
+    (None, W2, ("renders no Linux VM (svc, mongo or rabbit) from deployLinuxServicesK8s, so "
+               "KCC creates no VM for it")),
 ])
 def test_a_check_stays_green_and_leads_the_status(run, svc, check, lead):
     body, (state, desc) = run([NEW], {NEW: _doc(svc)})

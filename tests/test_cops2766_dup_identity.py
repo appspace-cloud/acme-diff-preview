@@ -195,11 +195,11 @@ def test_the_panel_names_the_apps_and_the_ways_out():
         f"- `{COPY}` names its apps `{NS}-*`, but live apps already use these names: "
         f"`pv-qa88-a-glb`, `pv-qa88-a-ms`, `pv-qa88-a-ss` (from `{ORIG}`).",
         f"- `{AZ}` names its apps `pv-qa89-a-*`, like `pv-qa88-b2` in this PR.", "",
-        "Two environments cannot share one namespace. To move an environment, use "
+        ("Two environments cannot share one namespace. To move an environment, use "
         "`git mv`, so the old folder goes in the same PR. Otherwise choose another "
-        "`customerName` or `suffix`.", "",
-        "If the old environment is being removed, wait until its apps are gone in "
-        "ArgoCD, then push again (an empty commit is enough).", "",
+        "`customerName` or `suffix`."), "",
+        ("If the old environment is being removed, wait until its apps are gone in "
+        "ArgoCD, then push again (an empty commit is enough)."), "",
         NOTE, ""]
 
 

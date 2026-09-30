@@ -335,8 +335,8 @@ SHAPES = {
     "#3583 allowedDomains__2": (
         "gcp/prod/public-cloud/na1-a/cl-prod-b/constellation/customer.yaml",
         AUTH, AUTH + "          appspace__login__allowedDomains__2:\n            value: \"alrayan.com\"\n",
-        [("dup", "appspace.microservices.definitions.authentication.env."
-                 "appspace__login__allowedDomains__2")]),
+        [("dup", ("appspace.microservices.definitions.authentication.env."
+                 "appspace__login__allowedDomains__2"))]),
     "#4322 bnym--aec1 env": (
         "gcp/aec/private-cloud/na2-a/pv-bnym--aec1-a/customer.yaml",
         RESV, RESV + "        env:\n          B:\n            value: dev\n",

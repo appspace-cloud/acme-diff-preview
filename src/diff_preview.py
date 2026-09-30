@@ -5001,15 +5001,15 @@ def _dup_identity_lines(gates, unchecked=False) -> list:
             lines.append(f"{head}, like " + ", ".join(f"`{e}`" for e in g["also"])
                          + " in this PR.")
     if dups:
-        lines += ["", ("Two environments cannot share one namespace. To move an environment, "
+        lines += ["", (("Two environments cannot share one namespace. To move an environment, "
                   "use `git mv`, so the old folder goes in the same PR. Otherwise choose "
-                  "another `customerName` or `suffix`."), ""]
+                  "another `customerName` or `suffix`.")), ""]
     if any(g["apps"] for g in dups):
-        lines += [("If the old environment is being removed, wait until its apps are gone "
-                  "in ArgoCD, then push again (an empty commit is enough)."), ""]
+        lines += [(("If the old environment is being removed, wait until its apps are gone "
+                  "in ArgoCD, then push again (an empty commit is enough).")), ""]
     if unchecked:
-        lines += [("\u2139\ufe0f Name check not run: the ArgoCD app list is not loaded, so "
-                  "the new environment names are not compared with the live apps."), ""]
+        lines += [(("\u2139\ufe0f Name check not run: the ArgoCD app list is not loaded, so "
+                  "the new environment names are not compared with the live apps.")), ""]
     return lines
 
 
@@ -5485,8 +5485,8 @@ def _detect_inert_generator_keys(changed, renames, path_map, sha, base_sha, repo
 
 
 _INERT_WHERE = ("the environment `customer.yaml`, or the cohort `config.yaml` one folder up",
-                "`cl-*/config.yaml` (the whole environment) or `cl-*/appN/customer.yaml` "
-                "(one app type)")
+                ("`cl-*/config.yaml` (the whole environment) or `cl-*/appN/customer.yaml` "
+                "(one app type)"))
 _INERT_WHY = {
     "inert": "In any other file, `version` and `autosync` do nothing: no new chart, no "
              "pause. The diff stays quiet, and the PR looks done (COPS-2684).",
@@ -7370,18 +7370,18 @@ def _clone_wake_lines(gates) -> list:
             to = f"`{g['to']}`" if g["to"] else "unset"
             lines.append(f"- `{g['env']}` starts running with this PR (`zeroPods` goes "
                          f"from `true` to {to}).")
-    lines += ["", ("A clone starts with a copy of the production data, so it can call the "
+    lines += ["", (("A clone starts with a copy of the production data, so it can call the "
               "customer live integrations: SSO, webhooks, mail and connected apps "
-              "(AE-15507). `zeroPods` does not stop the Core VM."), "",
-              ("Before you merge, check on the clone Mongo that these are empty, and write "
-              "the counts in the PR:"), "",
+              "(AE-15507). `zeroPods` does not stop the Core VM.")), "",
+              (("Before you merge, check on the clone Mongo that these are empty, and write "
+              "the counts in the PR:")), "",
               "- `passport.passports`", "- `mail.smtpConfigurations`",
               "- `integrationwebhook.webhookSubscriptions`",
               "- `authorization.authorizationregistrations`",
               "- the `applicationintegration` database",
               "- `cacsJwts` in `feedconnector`, `contentconversion`, `userinbox` and `mention`",
-              "", ("Runbook: https://appspace.atlassian.net/wiki/spaces/cops/pages/66093626 "
-              "step 2.")]
+              "", (("Runbook: https://appspace.atlassian.net/wiki/spaces/cops/pages/66093626 "
+              "step 2."))]
     todo = [gate_trailer(g) for g in open_gates(wakes)]
     if todo:
         lines += ["", "Then confirm with an empty commit:", "", "```",
@@ -7498,11 +7498,11 @@ def _ashn_copy_lines(gates, notes=()) -> list:
         lines.append(f"- `{g['env']}` has `ashn: {g['ashn']}`, the ashn of "
                      + ", ".join(f"`{p.split('/')[-2]}` (`{p}`)" for p in g["others"]) + ".")
     if hits:
-        lines += ["", ("The ashn names the environment in Customers and PDNS, so the clone "
+        lines += ["", (("The ashn names the environment in Customers and PDNS, so the clone "
                   "and the other environment look like one environment there. Give the "
                   "clone its own ashn (runbook "
                   "https://appspace.atlassian.net/wiki/spaces/cops/pages/66093626 step 2: "
-                  "change ashn, suffix, customerName and instanceName)."), ""]
+                  "change ashn, suffix, customerName and instanceName).")), ""]
     return lines + [x for n in notes for x in (n, "")]
 
 
@@ -7814,9 +7814,9 @@ def _appset_miss_lines(gates, notes=()) -> list:
     lines += [f"- `{p}` matches no ApplicationSet, so ArgoCD makes no apps for it and "
               "nothing deploys on merge." for g in hits for p in g["paths"]]
     if hits:
-        lines += ["", ("Check the cloud, tier and spoke folders. If the ApplicationSet is being "
+        lines += ["", (("Check the cloud, tier and spoke folders. If the ApplicationSet is being "
                   "added in acme-infrastructure, apply it first, then push again here (an "
-                  "empty commit is enough)."), ""]
+                  "empty commit is enough).")), ""]
     return lines + [x for n in notes for x in (n, "")]
 
 
@@ -10259,8 +10259,8 @@ def _inert_edit_lines(changed, sha, base_sha, path_map, app_results, redundant,
         lines += [h for h in (_inert_edit_hint(k, is_paused) for k in keys[:5]) if h]
     if len(found) > 10:
         lines.append(f"- ... and {len(found) - 10} more environment(s)")
-    return lines + ["", ("*Check the key path and the service name. Helm ignores a key "
-                    "that no chart reads, with no error.*"), ""]
+    return lines + ["", (("*Check the key path and the service name. Helm ignores a key "
+                    "that no chart reads, with no error.*")), ""]
 
 
 def _clean_status_description(has_redundancy: bool,

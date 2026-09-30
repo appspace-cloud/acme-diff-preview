@@ -207,11 +207,11 @@ def test_a_failed_read_retries_and_is_never_a_gate(monkeypatch, error, new):
 # ── the panel ────────────────────────────────────────────────────────────
 
 MONGO = [
-    "A clone starts with a copy of the production data, so it can call the customer "
+    ("A clone starts with a copy of the production data, so it can call the customer "
     "live integrations: SSO, webhooks, mail and connected apps (AE-15507). `zeroPods` "
-    "does not stop the Core VM.", "",
-    "Before you merge, check on the clone Mongo that these are empty, and write the "
-    "counts in the PR:", "",
+    "does not stop the Core VM."), "",
+    ("Before you merge, check on the clone Mongo that these are empty, and write the "
+    "counts in the PR:"), "",
     "- `passport.passports`", "- `mail.smtpConfigurations`",
     "- `integrationwebhook.webhookSubscriptions`",
     "- `authorization.authorizationregistrations`",
@@ -231,12 +231,12 @@ def test_the_panel_names_each_env_and_the_open_trailers():
         f"- `{ENV}` is a new clone and it starts running on merge. Add `zeroPods: true` "
         "under `appspace:` to create it asleep, restore and clean the data, and wake "
         "it in a later PR.",
-        "- `pv-y--aec1-a` starts running with this PR (`zeroPods` goes from `true` to "
-        "`false`).",
-        "- `pv-z--aec1-a` starts running with this PR (`zeroPods` goes from `true` to "
-        "unset).",
-        "- `pv-w--aec1-a` can start running with this PR: its values cannot be parsed, "
-        "so `zeroPods` is unknown.",
+        ("- `pv-y--aec1-a` starts running with this PR (`zeroPods` goes from `true` to "
+        "`false`)."),
+        ("- `pv-z--aec1-a` starts running with this PR (`zeroPods` goes from `true` to "
+        "unset)."),
+        ("- `pv-w--aec1-a` can start running with this PR: its values cannot be parsed, "
+        "so `zeroPods` is unknown."),
         "", *MONGO, "", "Then confirm with an empty commit:", "", "```",
         f'git commit --allow-empty -m "{TRAILER}"',
         'git commit --allow-empty -m "Confirm-Clone-Sanitized: pv-z--aec1-a"',

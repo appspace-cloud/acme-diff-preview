@@ -346,15 +346,15 @@ def test_the_panel_names_each_path_and_the_way_out():
              _gate("pv-x", FAKE), {"kind": "shrink", "env": ""}]
     assert m._appset_miss_lines(gates, ["note"]) == [
         "## ⛔ NO APPLICATIONSET READS THIS FOLDER", "",
-        "- `a/app41/customer.yaml` matches no ApplicationSet, so ArgoCD makes no apps for it "
-        "and nothing deploys on merge.",
-        "- `a/app42/customer.yaml` matches no ApplicationSet, so ArgoCD makes no apps for it "
-        "and nothing deploys on merge.",
+        ("- `a/app41/customer.yaml` matches no ApplicationSet, so ArgoCD makes no apps for it "
+        "and nothing deploys on merge."),
+        ("- `a/app42/customer.yaml` matches no ApplicationSet, so ArgoCD makes no apps for it "
+        "and nothing deploys on merge."),
         f"- `{FAKE}` matches no ApplicationSet, so ArgoCD makes no apps for it and nothing "
         "deploys on merge.", "",
-        "Check the cloud, tier and spoke folders. If the ApplicationSet is being added in "
+        ("Check the cloud, tier and spoke folders. If the ApplicationSet is being added in "
         "acme-infrastructure, apply it first, then push again here (an empty commit is "
-        "enough).", "",
+        "enough)."), "",
         "note", ""]
     assert m._appset_miss_lines([{"kind": "shrink", "env": ""}]) == []
     assert m._appset_miss_lines(None, ["note"]) == ["note", ""]
