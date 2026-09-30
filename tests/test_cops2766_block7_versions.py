@@ -278,8 +278,8 @@ def test_a_rev_counts_only_on_release_tags(current, new, down):
 
 def test_a_rev_revert_is_a_downgrade_not_a_bump():
     b = _bullets({"pv-x-a-ms": _r(("2602.1.14-rev1", "2602.1.14"))})
-    assert b == ["⬇️ **Chart version downgrade** `2602.1.14-rev1` "
-                 "→ `2602.1.14` in pv-x-a"], b
+    assert b == [("⬇️ **Chart version downgrade** `2602.1.14-rev1` "
+                 "→ `2602.1.14` in pv-x-a")], b
 
 
 def test_a_new_rev_counts_up_for_the_note():
@@ -645,8 +645,8 @@ def test_pins_behind_is_skipped_on_a_broken_versions_yaml(tmp_path, warnings):
     main = _chart(tmp_path, "main", versions={"signschannel": "1.90.14"})
     pr = _chart(tmp_path, "pr", versions="appspace: [unclosed\n")
     assert m._pins_behind(main, pr, _pin_vals({"signschannel": SC_PIN}), APP) == "skipped"
-    assert warnings == [("WARNING", "pin check skipped for pv-pin-a-ms "
-                                    "(non-fatal): ParserError")]
+    assert warnings == [("WARNING", ("pin check skipped for pv-pin-a-ms "
+                                    "(non-fatal): ParserError"))]
 
 
 def test_pins_behind_is_skipped_on_a_broken_value_file(tmp_path, warnings):
@@ -760,8 +760,8 @@ def test_argocd_diff_carries_the_pins_on_a_diff(monkeypatch):
 
 @pytest.mark.parametrize("diff_text,reason", [
     ("", "clean"),
-    ("===== apps/Deployment webx =====\n"
-     "-   checksum/config: aaa\n+   checksum/config: bbb\n", "noise_only"),
+    (("===== apps/Deployment webx =====\n"
+     "-   checksum/config: aaa\n+   checksum/config: bbb\n"), "noise_only"),
 ])
 def test_argocd_diff_carries_the_pins_with_no_manifest_change(
         monkeypatch, diff_text, reason):
@@ -907,9 +907,9 @@ def test_the_jfrog_webhook_never_hard_refreshes_a_prod_app(jfrog):
     assert msgs[-1].endswith(" 1 refreshed, 0 failed"), msgs
     warned = [msg for sev, msg in logs if sev == "WARNING"]
     assert warned == [
-        "JFrog webhook: skipped 1 appspace-prod app(s) on "
+        ("JFrog webhook: skipped 1 appspace-prod app(s) on "
         "appspace-micro-services:2603.3.7-dev, prod is never hard-refreshed: "
-        "pv-fake-a-ms"]
+        "pv-fake-a-ms")]
     assert not any("pv-fake-a-ms" in msg for msg in msgs if msg not in warned)
 
 
@@ -918,9 +918,9 @@ def test_a_webhook_that_only_matches_prod_refreshes_nothing(jfrog):
                         for i in range(6)])
     assert gets == []
     assert logs[-1] == ("WARNING",
-        "JFrog webhook: skipped 6 appspace-prod app(s) on "
+        ("JFrog webhook: skipped 6 appspace-prod app(s) on "
         "appspace-micro-services:2603.3.7-dev, prod is never hard-refreshed: "
-        "pv-p0-a-ms, pv-p1-a-ms, pv-p2-a-ms, pv-p3-a-ms, pv-p4-a-ms...")
+        "pv-p0-a-ms, pv-p1-a-ms, pv-p2-a-ms, pv-p3-a-ms, pv-p4-a-ms..."))
     assert not any("no apps found" in msg or "hard-refresh:" in msg
                    for _, msg in logs)
 

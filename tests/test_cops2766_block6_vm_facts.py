@@ -546,9 +546,9 @@ def test_the_boot_disk_warning_reaches_the_panel_and_stays_clean(monkeypatch):
 
 def test_a_bigquery_move_is_never_folded_as_version_noise():
     bump = [(f"/apps/Deployment svc-{i}",
-             "--- \n+++ \n@@ -1,4 +1,4 @@\n   labels:\n"
+             ("--- \n+++ \n@@ -1,4 +1,4 @@\n   labels:\n"
              "-    helm.sh/chart: supporting-services-2603.0.1\n"
-             "+    helm.sh/chart: supporting-services-2604.0.1\n")
+             "+    helm.sh/chart: supporting-services-2604.0.1\n"))
             for i in range(3)]
     bq_hdr = "/bigquery.cnrm.cloud.google.com/BigQueryDataset pv-acme-analytics-a"
     secs = bump + [(bq_hdr, bump[0][1])]

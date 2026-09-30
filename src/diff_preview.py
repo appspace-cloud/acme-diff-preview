@@ -12489,13 +12489,13 @@ def format_comment(pr_sha, app_results, skipped_apps=None, base_sha="",
             f"### \U0001f39a\ufe0f acme-ping-scaler takes over replica "
             f"control in {_fmt_env_list(ps_apps_p)}",
             "",
-            "This PR enables `acme-ping-scaler` here. From now on it owns "
+            ("This PR enables `acme-ping-scaler` here. From now on it owns "
             "the replica counts: it pings its target host every minute, "
             "scales every Deployment in the namespace to **0** while the "
             "host is down. When the host answers, it sets the default "
             "replica count (2 on AEC) or the value in "
             "`acmePingScaler.customReplicas`. It never reads "
-            "`definitions.<service>.replicas`.",
+            "`definitions.<service>.replicas`."),
             "",
             f"The {n_ps} HorizontalPodAutoscaler(s) this PR deletes go "
             "**by design**: the chart never renders HPA while a "

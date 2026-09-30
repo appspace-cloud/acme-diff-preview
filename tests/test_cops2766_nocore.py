@@ -484,8 +484,8 @@ def test_the_summary_names_up_to_three_envs():
                     "(+11 more): on in 13, off in 1 (read the noCore note, COPS-2758)")
     _verdict, b = _bullets(m._nocore_flip_lines([moved]))
     assert b[0].startswith("\U0001f50c **noCore changes** in `pv-m-a`: on in 0"), b
-    _verdict, b = _bullets(["### \U0001f50c noCore changes in 2 environment(s): "
-                            "on in 2, off in 0"])
+    _verdict, b = _bullets([("### \U0001f50c noCore changes in 2 environment(s): "
+                            "on in 2, off in 0")])
     assert b[0].startswith("\U0001f50c **noCore changes** in 2 environment(s): on in 2"), b
 
 
@@ -516,8 +516,8 @@ def test_the_gate_table_has_the_kind():
     """No trailer lifts it, so the red status and the summary line give the
     fix. On main's 4-tuple GATES, _gate_way_out prints the same text."""
     assert cr.GATES["nocore_lost"] == ("A move turns noCore off", None, "blocked",
-                                       "Set appspace.infra.noCore in the moved "
-                                       "customer.yaml")
+                                       ("Set appspace.infra.noCore in the moved "
+                                       "customer.yaml"))
     assert cr.gate_status_description(m._nocore_gates([_change(
         env="pv-m-a", moved_from=OLD, old=True, new=False)])) == (
         "Blocked - A move turns noCore off in pv-m-a. Set appspace.infra.noCore "

@@ -156,8 +156,8 @@ def test_the_green_status_keeps_the_action_at_the_3888_size():
     lead cut at 255 bytes still says what to do. #3888 had 22 envs."""
     tail = "44 resource(s) will change - review comment"
     for n, action in ((1, "delete the BackendService, never the finalizer."),
-                      (22, "check kubectl get svcneg -n <namespace>, and if one is "
-                           "stuck, delete")):
+                      (22, ("check kubectl get svcneg -n <namespace>, and if one is "
+                           "stuck, delete"))):
         results = {}
         for i in range(n):
             results[f"pv-cust{i:02}--aec1-a-ms"] = _r(neg=[SVC])
@@ -263,8 +263,8 @@ def test_the_summary_finding_names_the_envs():
     lines = m._legacy_backends_lines([base, dict(base, env="pv-qa89-a")])
     verdict, b = _bullets({}, state=lines)
     assert verdict.startswith("⚠️ **Review before merging** (1 item(s))"), verdict
-    assert b == ["\U0001f517 **Legacy backends come back** in `pv-qa88-a`, `pv-qa89-a`: "
-                 "sync `-ms` and `-glb`, then check `kubectl get svcneg`"]
+    assert b == [("\U0001f517 **Legacy backends come back** in `pv-qa88-a`, `pv-qa89-a`: "
+                 "sync `-ms` and `-glb`, then check `kubectl get svcneg`")]
     lines = m._legacy_backends_lines([dict(base, env=f"pv-e{i:02}-a") for i in range(12)])
     _verdict, b = _bullets({}, state=lines)
     assert b[0].startswith("\U0001f517 **Legacy backends come back** in `pv-e00-a`, "

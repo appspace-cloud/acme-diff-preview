@@ -261,8 +261,8 @@ def test_a_requoted_size_is_not_a_changed_field():
     assert not any(k == "size" for k, _, _ in f["fields"]), (
         "200 did not become 200: %r" % (f["fields"],))
     # COPS-2766: the location move is a danger now, the re-quote still is not.
-    assert f["dangerous"] == ["disk location is immutable: KCC rejects the "
-                              "change and the sync fails"]
+    assert f["dangerous"] == [("disk location is immutable: KCC rejects the "
+                              "change and the sync fails")]
 
 
 # ══ Part 3 ── _detect_vm_changes: two unreached verdicts ═════════════════

@@ -266,9 +266,9 @@ def test_tenant_wide_lines():
     assert m._tenant_wide_lines([]) == []
     line = m._tenant_wide_lines(["cl-prod-b"])
     assert line == [
-        "\U0001f310 **Reaches every public-cloud tenant.** This PR changes the shared ms "
+        ("\U0001f310 **Reaches every public-cloud tenant.** This PR changes the shared ms "
         "or ss app of `cl-prod-b`. It serves every customer of its constellation, so the "
-        "change reaches every tenant there, not one environment.", ""]
+        "change reaches every tenant there, not one environment."), ""]
     assert "`cl-a`, `cl-b`" in m._tenant_wide_lines(["cl-a", "cl-b"])[0]
     assert not any(d in line[0] for d in DASHES)
 
@@ -331,8 +331,8 @@ def _cl_world(world, monkeypatch, vf=PROD_VF, others=None):
 def test_a_prod_constellation_change_says_so_in_the_status(world, monkeypatch):
     body, (state, desc) = _cl_world(world, monkeypatch)
     assert m._extract_status_token(body) == "clean"
-    assert (state, desc) == ("SUCCESSFUL", "1 resource(s) will change | \U0001f310 every "
-                                           "tenant of cl-prod-b - review comment")
+    assert (state, desc) == ("SUCCESSFUL", ("1 resource(s) will change | \U0001f310 every "
+                                           "tenant of cl-prod-b - review comment"))
     assert "- \U0001f310 **Reaches every public-cloud tenant** of `cl-prod-b`" in body
     assert "\U0001f310 **Reaches every public-cloud tenant.** This PR changes" in body
     assert "✅ **Routine**" in body
@@ -358,9 +358,9 @@ def test_a_failed_status_keeps_its_old_text(world, monkeypatch):
     body, (state, desc) = _cl_world(world, monkeypatch, others={
         "cl-prod-b-ss": m.DiffResult("", [], 0, False, "", m.OUT_INDETERMINATE,
                                      m.REASON_TIMEOUT)})
-    assert (state, desc) == ("FAILED", "Diff unavailable for 1 app(s) | 1 resource(s) "
+    assert (state, desc) == ("FAILED", ("Diff unavailable for 1 app(s) | 1 resource(s) "
                                        "confirmed changed - review comment (will retry "
-                                       "automatically if transient)")
+                                       "automatically if transient)"))
     assert "- \U0001f310 **Reaches every public-cloud tenant** of `cl-prod-b`" in body
 
 

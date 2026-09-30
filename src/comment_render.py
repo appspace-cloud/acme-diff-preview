@@ -1039,13 +1039,13 @@ def _build_merge_summary(results, rollup_by_sig, vm_change_lines,
            if getattr(r, "capacity", None)}
     for part, text, action, tail in (
             ("cuts", "\U0001f4c9 **Capacity cut**", "check that it is planned",
-             "Keep 2 replicas or more, keep the floor of the connection "
-             "services, and a CPU request of 30m or more (COPR-32597)."),
+             ("Keep 2 replicas or more, keep the floor of the connection "
+             "services, and a CPU request of 30m or more (COPR-32597).")),
             ("released", "\U0001f501 **Fixed replicas released**",
              "merge in a quiet window",
-             "On sync the field goes away, and Kubernetes runs 1 replica until "
+             ("On sync the field goes away, and Kubernetes runs 1 replica until "
              "the HPA or acme-ping-scaler scales it back (acme-config-prod "
-             "#4523).")):
+             "#4523)."))):
         apps = [a for a in cap if cap[a].get(part)]
         envs = sorted(set(_envs_from_apps(apps)))
         items = [f"`{w}` " + (f"({what})" if part == "released" else what)
