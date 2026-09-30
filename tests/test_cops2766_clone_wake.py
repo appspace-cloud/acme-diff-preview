@@ -423,6 +423,32 @@ def test_the_pr_4660_status_fits_and_keeps_the_trailer(env, why):
                     "(see PR comment)")
 
 
+def _six_gates(env):
+    """A wake on env first, then the other 5 gates of blocks 3 and 4 on it."""
+    return [_gate(env, "zeroPods true to false")] + [
+        {"kind": k, "env": env, "arg": env} for k in
+        ("dup_identity", "ashn_copy", "vm_disk", "appset_miss", "legacy_helm")]
+
+
+def test_a_63_character_env_fits_the_status_with_the_whole_trailer():
+    """The namespace maximum: the trailer then comes alone, as it names the env."""
+    env = "pv-" + "u" * 54 + "--aec1"
+    assert len(env) == 63
+    desc = cr.gate_status_description(_six_gates(env))
+    assert len(desc.encode()) <= 255
+    assert desc == (f"Blocked - {TEXT} (zeroPods true to false). To merge anyway, add "
+                    f"'Confirm-Clone-Sanitized: {env}' (+5 more) (see PR comment)")
+    footer = cr.gate_footer(_six_gates(env))
+    assert m._GATE_FOOTER_RE.findall(f"**Status:** x{footer}\n") == [desc]
+
+
+def test_a_status_never_goes_over_255_bytes():
+    """A name no namespace allows: the rest is cut, and the end stays."""
+    desc = cr.gate_status_description(_six_gates("pv-" + "\u00e9" * 150))
+    assert len(desc.encode()) <= 255 and desc.startswith(f"Blocked - {TEXT}. To merge")
+    assert desc.endswith("... (+5 more) (see PR comment)")
+
+
 # ── golden ───────────────────────────────────────────────────────────────
 
 GOLDEN_DIR = os.path.join(os.path.dirname(__file__), "golden")

@@ -498,19 +498,25 @@ def _gate_way_out(g, trailer_fmt) -> str:
 def gate_status_description(gates, limit=255) -> str:
     """The FAILED build status. It names the line to add or the fix, so a
     reviewer who reads only the checks list can act. A transient gate waits.
-    Over `limit` UTF-8 bytes, only the reason is cut: the panel has it in full."""
+    It fits `limit` UTF-8 bytes and ends in '(see PR comment)', which
+    fix_stuck_inprogress reads back. Over the limit the reason is cut, then a
+    trailer comes alone (it names the env), and last the rest is cut. The
+    panel has all of it in full."""
     todo = open_gates(gates)
     g = todo[0]
     head = "Waiting - " if GATES[g["kind"]][2] == "transient" else "Blocked - "
-    tail = ((f" in {g['env']}" if g["env"] else "")
-            + _gate_way_out(g, ". To merge anyway, add '{}' to a commit message")
-            + (f" (+{len(todo) - 1} more)" if len(todo) > 1 else "") + " (see PR comment)")
-    why, over = g.get("why") or "", _utf8_len(f"{head}{gate_text(g)}{tail}") - limit
-    if over > 0:                         # 3 for the "..."
-        why = why.encode("utf-8", "surrogatepass")[:max(_utf8_len(why) - over - 3, 0)]
-        why = why.decode("utf-8", "ignore").rstrip()
-        why = why and why + "..."
-    return f"{head}{gate_text(dict(g, why=why))}{tail}"
+    end = (f" (+{len(todo) - 1} more)" if len(todo) > 1 else "") + " (see PR comment)"
+    tails = [(f" in {g['env']}" if g["env"] else "")
+             + _gate_way_out(g, ". To merge anyway, add '{}' to a commit message")]
+    if gate_trailer(g):
+        tails.append(_gate_way_out(g, ". To merge anyway, add '{}'"))
+    for tail in tails:
+        why = g.get("why") or ""
+        why = _cut_utf8(why, limit + _utf8_len(why) - _utf8_len(f"{head}{gate_text(g)}{tail}{end}"))
+        desc = f"{head}{gate_text(dict(g, why=why))}{tail}"
+        if _utf8_len(desc + end) <= limit:
+            return desc + end
+    return _cut_utf8(desc, limit - _utf8_len(end)) + end
 
 
 def gate_footer(gates) -> str:
@@ -1154,6 +1160,15 @@ def status_lead(comment_md) -> str:
 
 def _utf8_len(s) -> int:
     return len(s.encode("utf-8", "surrogatepass"))
+
+
+def _cut_utf8(s, room) -> str:
+    """s in `room` UTF-8 bytes: whole, or cut and ending in '...', or ''."""
+    if _utf8_len(s) <= room:
+        return s
+    s = s.encode("utf-8", "surrogatepass")[:max(room - 3, 0)]     # 3 for the "..."
+    s = s.decode("utf-8", "ignore").rstrip()
+    return s and s + "..."
 
 
 def join_status_lead(lead, description, limit=255) -> str:
