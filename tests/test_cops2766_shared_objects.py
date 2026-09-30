@@ -47,13 +47,14 @@ TAIL = ("Two KCC resources on one object fail or fight (acme-config-prod #4333).
         "`appspace.bigQuery.suffix` to a new value.")
 
 
-def _region(key="na1", suffix="a", domain="appspacestorage.com"):
+def _region(key="na1", suffix="a", domain="appspacestorage.com",
+            project="appspace-cloud-private-bq"):
     """A spoke config.yaml: the user content bucket, its zone and BigQuery."""
     return ("appspace:\n  buckets:\n    userContent:\n"
             f"      suffix: \"{suffix}\"\n" + (f"      domain: {domain}\n" if domain else "")
             + f"      regionMapping:\n        {key}:\n          region: us-central1\n"
             "      managedZone:\n        domain: appspacestorage.com\n"
-            "  bigQuery:\n    project: appspace-cloud-private-bq\n")
+            + (f"  bigQuery:\n    project: {project}\n" if project else ""))
 
 
 def _cust(name, suffix, extra=""):
@@ -187,6 +188,22 @@ def test_only_the_shared_objects_are_named(monkeypatch, new_extra, region, objs)
            {GSK_B: _cust("gsk--aec1", "b")})
     _fleet(monkeypatch, [GSK_B])
     assert _lines(GSK_C) == ([_line(GSK_C, GSK_B, objs)] if objs else [])
+
+
+@pytest.mark.parametrize("project,warns", [
+    ("appspace-cloud-private-bq", True),   # the project of the live env
+    ("appspace-cloud-stage-bq", False),    # the same name in another project
+    (None, True),                          # unknown: read as the same project
+])
+def test_a_dataset_is_one_name_in_one_project(monkeypatch, project, warns):
+    """COPS-2772: stage envs use appspace-cloud-stage-bq. Another user content
+    suffix, so only the dataset can be shared."""
+    _serve(monkeypatch, {GSK_C: _cust("gsk--aec1", "c"),
+                         f"{AEC}/na2-a/config.yaml": _region(suffix="b", project=project)},
+           {GSK_B: _cust("gsk--aec1", "b")})
+    _fleet(monkeypatch, [GSK_B])
+    objs = "BigQuery dataset `pv_gsk__aec1_analytics_a`"
+    assert _lines(GSK_C) == ([_line(GSK_C, GSK_B, objs)] if warns else [])
 
 
 def test_one_line_per_live_sibling(monkeypatch):

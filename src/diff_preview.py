@@ -7773,7 +7773,7 @@ def _new_env_shared_lines(env_info, sha, base_sha, repo=None, changed=(), rename
                          f"values cannot be read or are incomplete, so `{env}` may share GCP "
                          "objects with it.")
             continue
-        objs = ([f"BigQuery dataset `{ds}`"] if ds and ds == user_content.bq_dataset(other)
+        objs = ([f"BigQuery dataset `{ds}`"] if user_content.same_bq_dataset(flat, other)
                 else []) + [f"bucket `{b}`" for b in uc.get("buckets", ())] \
             + [f"DNS `{f}`" for f in uc.get("fqdns", ())]
         if objs:
