@@ -2895,7 +2895,8 @@ DiffResult = namedtuple("DiffResult",
 # diff touches, extracted by _detect_vm_changes on the FULL pre-cap section
 # list (same design as deleted_resources: safety facts never depend on
 # display caps), plus the _render_immutable_facts of _run_one_diff (COPS-2766:
-# bootDisk, BigQueryDataset and StorageBucket changes KCC rejects on sync).
+# bootDisk, BigQueryDataset, StorageBucket and IAMPolicyMember changes KCC
+# rejects on sync).
 # None on non-OUT_DIFF outcomes and legacy/coerced results.
 # fingerprint (COPS-2579): stable hash of this app's FULL (pre-cap) section
 # list, set only on the OUT_DIFF success path. Two apps whose changes are
@@ -9224,8 +9225,9 @@ def _run_one_diff(app, pr_sha, main_sha, chart_revision=None, changed_paths=None
     # workload totals, scaling two services to 0 looked like a whole-env
     # shutdown (acme-config-prod #4321).
     # COPS-2766: element 6 is the capacity facts, element 7 what KCC rejects
-    # on sync (bootDisk, a dataset or bucket location or project), both read
-    # from both renders, element 8 the pins a chart upgrade leaves behind.
+    # on sync (bootDisk, a dataset or bucket location or project, an IAM
+    # binding), both read from both renders, element 8 the pins a chart
+    # upgrade leaves behind.
     # Index: 0 diff, 1 reason, 2 detail, 3 version_change, 4 hpas_remaining,
     # 5 replica_stats, 6 capacity, 7 render facts, 8 pins_behind. A new
     # element goes at the end, with its own index.
