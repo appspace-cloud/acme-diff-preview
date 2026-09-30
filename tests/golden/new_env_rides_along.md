@@ -6,7 +6,7 @@
 
 ## ℹ️ Merge summary
 
-⚠️ **Review before merging** (1 item(s))
+⛔ **DO NOT MERGE** without checking the item(s) below (1 item(s))
 
 - 🆕 **New environment** in this PR — its configuration did not validate
 

@@ -1019,7 +1019,8 @@ def _build_merge_summary(results, rollup_by_sig, vm_change_lines,
         findings.append((_SEV_REVIEW, f"\U0001f195 **New environment: {len(checks)} "
                                       f"check(s) to review** - {first}"))
     if new_env_lines and (new_env_structural or not checks):
-        findings.append((_SEV_REVIEW if new_env_structural else _SEV_ROUTINE,
+        # A structural problem makes the build red, so it is a stop sign too.
+        findings.append((_SEV_BLOCK if new_env_structural else _SEV_ROUTINE,
                          "\U0001f195 **New environment** in this PR"
                          + (" \u2014 its configuration did not validate"
                             if new_env_structural else "")))
