@@ -15,6 +15,7 @@ that might be shrinking is a disk that gets flagged.
 import re
 
 from comment_render import (
+    _NEW_ENV_CHECK_PREFIX,
     _VM_PANEL_DANGER_HDR,
     _VM_PANEL_ROUTINE_HDR,
     _section_name,
@@ -733,6 +734,137 @@ def _kcc_move_disk_shrink(old_flat: dict, new_flat: dict, roles: list) -> str:
             except (TypeError, ValueError):
                 continue
     return ""
+
+
+# COPS-2766 (C21): these machine families take only Hyperdisk, so GCP rejects
+# the VM on a pd- disk and KCC never creates it (acme-config-prod #4482, #4331).
+_VM_DISK_FAMILY_RE = re.compile(r"^(n4|n4a|n4d|c4|c4a|c4d)-")
+_VM_DISK_FAMILY_REASON = "this machine family takes only Hyperdisk, and GCP rejects a pd- disk"
+# The supporting-services chart defaults (values.yaml, defaults.gcp).
+_KCC_CHART_MACHINE_TYPES = {"svc": "n2d-highmem-2", "rabbit": "n2d-highmem-2",
+                            "mongo": "n2d-highmem-4"}
+_KCC_CHART_DISK_TYPE = "pd-ssd"
+# The leaves the rule reads. A change to no other leaf can add an error.
+_VM_DISK_FAMILY_LEAVES = ("enabled", "machineType", "svcMachineType", "rabbitMachineType",
+                          "mongoMachineType", "dataDiskType", "bootDiskType",
+                          "createNewBootDisk", "instanceName", "instances")
+
+
+def _kcc_true(v) -> bool:
+    return str(v).strip().lower() == "true"
+
+
+def _kcc_rendered_roles(flat: dict) -> list:
+    """The roles the chart renders a VM for: KCC on and the role enabled."""
+    return _kcc_enabled_roles(flat) if _kcc_true(flat.get(_KCC_PREFIX + "enabled")) else []
+
+
+def _kcc_machine_type(flat: dict, role: str) -> str:
+    """Like the chart helper: the role, the legacy deployLinuxServices key,
+    defaults.gcp.<role>MachineType, then the chart default."""
+    legacy = _LEGACY_PREFIX + ("" if role == "svc" else role + ".") + "machineType"
+    return _norm_machine_type(flat.get(f"{_KCC_PREFIX}{role}.machineType") or flat.get(legacy)
+                              or flat.get(f"{_KCC_PREFIX}defaults.gcp.{role}MachineType")
+                              or _KCC_CHART_MACHINE_TYPES[role])
+
+
+def _kcc_instance_names(flat: dict, role: str) -> set:
+    """The VM names of a role: svc.instanceName or its chart default, else
+    the instances list."""
+    if role == "svc":
+        return {str(flat.get(_KCC_PREFIX + "svc.instanceName") or "%s-%s-svc-%s" % tuple(
+            flat.get("appspace." + k) for k in ("prefix", "customerName", "suffix")))}
+    return {str(i.get("name") if isinstance(i, dict) else i)
+            for i in flat.get(f"{_KCC_PREFIX}{role}.instances") or ()}
+
+
+def _kcc_disk_type(flat: dict, role: str, disk: str) -> str:
+    """The 'data' or 'boot' disk type: the role, defaults.gcp, then pd-ssd."""
+    return _norm_machine_type(flat.get(f"{_KCC_PREFIX}{role}.{disk}DiskType")
+                              or flat.get(f"{_KCC_PREFIX}defaults.gcp.{disk}DiskType")
+                              or _KCC_CHART_DISK_TYPE)
+
+
+def _vm_disk_family_errors(flat) -> list:
+    """[(role, machineType, 'data' or 'boot', disk type)]: each rendered role on
+    an n4 or c4 family with a pd- disk. The boot disk counts only when KCC
+    creates it (createNewBootDisk true); else it is adopted as it is."""
+    out = []
+    for role in _kcc_rendered_roles(flat or {}):
+        mt = _kcc_machine_type(flat, role)
+        if not _VM_DISK_FAMILY_RE.match(mt):
+            continue
+        new_boot = _kcc_true(_kcc_role_value(flat, role, "createNewBootDisk"))
+        for disk in ("data", "boot") if new_boot else ("data",):
+            t = _kcc_disk_type(flat, role, disk)
+            if t.startswith("pd-"):
+                out.append((role, mt, disk, t))
+    return out
+
+
+def _vm_disk_family_text(errors) -> str:
+    """The error and its fix, for the errors of one role on a new VM."""
+    return (f"`{errors[0][1]}` with " + " and ".join(f"{d} disk `{t}`" for _r, _m, d, t in errors)
+            + f": {_VM_DISK_FAMILY_REASON}. Set `dataDiskType` (and `bootDiskType` when "
+            "`createNewBootDisk` is true) to `hyperdisk-balanced`.")
+
+
+def _vm_disk_family_changes(old_flat, new_flat) -> list:
+    """[(role, text)]: the n4 or c4 disk errors a change adds to a live env.
+
+    A VM that runs at base keeps its disks: GCP cannot change a disk type in
+    place. So moving it into the family is the error, unless its data disk
+    and a boot disk KCC created are Hyperdisk at base. A new VM (a new role
+    or a new name) is checked on its values. An error that is already on
+    main does not count."""
+    if old_flat is None or new_flat is None:
+        return []
+    ran = _kcc_rendered_roles(old_flat)
+    before = {(r, d) for r, _m, d, _t in _vm_disk_family_errors(old_flat)}
+    errors = _vm_disk_family_errors(new_flat)
+    out = []
+    for role in _kcc_rendered_roles(new_flat):
+        old_mt, new_mt = _kcc_machine_type(old_flat, role), _kcc_machine_type(new_flat, role)
+        if (role in ran and _kcc_instance_names(old_flat, role) & _kcc_instance_names(new_flat, role)
+                and _VM_DISK_FAMILY_RE.match(new_mt) and not _VM_DISK_FAMILY_RE.match(old_mt)
+                and not (_kcc_true(_kcc_role_value(old_flat, role, "createNewBootDisk"))
+                         and all(_kcc_disk_type(old_flat, role, d).startswith("hyperdisk-")
+                                 for d in ("data", "boot")))):
+            out.append((role, f"`machineType` `{old_mt}` \u2192 `{new_mt}`: "
+                              f"{_VM_DISK_FAMILY_REASON}. The running VM keeps its disks, "
+                              "because a disk type cannot change in place. Keep the current "
+                              "family, or plan a disk migration to Hyperdisk (snapshot and "
+                              "restore)."))
+            continue
+        mine = [e for e in errors if e[0] == role and (role, e[2]) not in before]
+        if mine:
+            out.append((role, _vm_disk_family_text(mine)))
+    return out
+
+
+def _new_env_prereq_findings(flat: dict, env: str) -> tuple:
+    """COPS-2766 (C21): (errors, lines) for a new GCP env from its value chain.
+
+    The errors are the n4 or c4 disk errors, one line per role. The checks
+    are warnings: a new VM that adopts a boot disk, and no VM at all. There
+    is no deployWindows check: that Terraform path is going away."""
+    errors = _vm_disk_family_errors(flat)
+    roles = _kcc_rendered_roles(flat)
+    lines = [f"- \u26d4 `{env}` \u00b7 **linux VM (KCC) \u00b7 {role}**: "
+             + _vm_disk_family_text([e for e in errors if e[0] == role])
+             for role in roles if any(e[0] == role for e in errors)]
+    adopt = [r for r in roles if not _kcc_true(_kcc_role_value(flat, r, "createNewBootDisk"))]
+    if adopt:
+        lines.append(f"{_NEW_ENV_CHECK_PREFIX}`{env}` adopts a boot disk for "
+                     + ", ".join(f"`{r}`" for r in adopt) + " that a new VM does not have yet "
+                     "(`createNewBootDisk` is not true). Set `createNewBootDisk: true`, unless "
+                     "the VM or its boot disk already exists (a move, or a disk restored by "
+                     "hand).")
+    if not roles:
+        lines.append(f"{_NEW_ENV_CHECK_PREFIX}`{env}` renders no Linux VM (`svc`, `mongo` or "
+                     "`rabbit`) from `deployLinuxServicesK8s`, so KCC creates no VM for it. "
+                     "Enable the roles it needs, unless it runs with no VM on purpose.")
+    return errors, lines
 
 
 def _kcc_adoption_card(env_name: str, info: dict) -> list:

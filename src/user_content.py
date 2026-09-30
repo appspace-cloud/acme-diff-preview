@@ -173,6 +173,26 @@ def identity(flat) -> dict:
     return {"proven": True, "buckets": buckets, "fqdns": fqdns, "reason": ""}
 
 
+def bq_dataset(flat):
+    """COPS-2766: the analytics BigQuery dataset of an env, or None when
+    `bigQuery.enabled` is false or the name cannot be built.
+
+    supporting-services `appspace.bigQueryDatasetName`, where `bigQuery` is
+    {enabled: true, suffix: a} in the chart values:
+      {prefix}_{customerName}_analytics_{bigQuery.suffix}, "-" to "_", lower
+    Every env uses the one project appspace-cloud-private-bq, so one name is
+    one dataset.
+    """
+    flat = flat or {}
+    if not _truthy(flat.get("appspace.bigQuery.enabled"), default=True):
+        return None
+    prefix, customer = flat.get("appspace.prefix"), flat.get("appspace.customerName")
+    if not prefix or not customer:
+        return None
+    suffix = flat.get("appspace.bigQuery.suffix") or "a"
+    return f"{prefix}_{customer}_analytics_{suffix}".replace("-", "_").lower()
+
+
 def shared_owners(target: dict, siblings: dict) -> dict:
     """Which surviving environments share the target's bucket names or FQDNs.
 

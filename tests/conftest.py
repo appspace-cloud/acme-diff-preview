@@ -81,10 +81,13 @@ def _clear_sha_fetch_cache():
     # _yaml_cache (COPS-2562) shares the (sha, path) keying of _vf_cache and
     # therefore the same cross-test poisoning risk: two tests faking the same
     # sha with different content must never see each other's parse.
-    for d in (_m._vf_cache, _m._vf_inflight, _m._retry_backoff, _m._yaml_cache):
+    # _fleet_own_cache (COPS-2766) is keyed by base sha, the same risk.
+    caches = (_m._vf_cache, _m._vf_inflight, _m._retry_backoff, _m._yaml_cache,
+              _m._fleet_own_cache, _m._appset_globs_cache)
+    for d in caches:
         d.clear()
     yield
-    for d in (_m._vf_cache, _m._vf_inflight, _m._retry_backoff, _m._yaml_cache):
+    for d in caches:
         d.clear()
 
 
@@ -163,4 +166,60 @@ def _no_background_selfcheck_thread(request, monkeypatch):
         return
     import diff_preview as _m
     monkeypatch.setattr(_m, "_start_oci_selfcheck_loop", lambda: None)
+    yield
+
+
+# ── COPS-2766: no fleet read unless a test asks for it ──────────────────────
+#
+# Block 3 reads the own customer.yaml of every live env (_fleet_own_identities)
+# for each new env, and for each clone with a new ashn. An old process_pr
+# fixture never stubbed that read, so it would compare against whatever app
+# list an earlier test left behind, and its output could change while it
+# asserts only part of the body. The default here is an empty fleet, which is
+# what those fixtures saw before. A test of these checks opts back in with
+# @pytest.mark.fleet_reads.
+@pytest.fixture(autouse=True)
+def _no_fleet_reads(request, monkeypatch):
+    if request.node.get_closest_marker("fleet_reads"):
+        yield          # this test reads the fleet on purpose
+        return
+    import diff_preview as _m
+    monkeypatch.setattr(_m, "_fleet_own_identities", lambda repo, base_sha: ({}, []))
+    yield
+
+
+# ── COPS-2766: no new-env VM check unless a test asks for it ────────────────
+#
+# Block 3 checks the value chain of each new GCP env for its VMs, and warns
+# when no VM renders. Most old new-env fixtures are minimal customer.yaml
+# files with no VM role, so the real check would turn their verdict to Review
+# while they assert only part of the body. The default here is no finding,
+# which is what those fixtures saw before. A test of these checks opts back
+# in with @pytest.mark.prereq_reads.
+@pytest.fixture(autouse=True)
+def _no_prereq_reads(request, monkeypatch):
+    if request.node.get_closest_marker("prereq_reads"):
+        yield          # this test runs the VM checks on purpose
+        return
+    import diff_preview as _m
+    monkeypatch.setattr(_m, "_new_env_prereqs", lambda *a, **k: ([], {}))
+    yield
+
+
+# ── COPS-2766: no ApplicationSet list unless a test asks for it ─────────────
+#
+# Block 3 lists the ApplicationSets (`argocd appset list`) for each new env and
+# each moved identity file. An old process_pr fixture never stubbed that
+# command, so the real one would run, fail and add the "ApplicationSet check
+# unavailable" line, which changes its verdict while it asserts only part of
+# the body. The default here is one glob that reads every file, so there is no
+# finding, which is what those fixtures saw before. A test of the list itself
+# opts back in with @pytest.mark.appset_reads.
+@pytest.fixture(autouse=True)
+def _no_appset_reads(request, monkeypatch):
+    if request.node.get_closest_marker("appset_reads"):
+        yield          # this test lists the ApplicationSets on purpose
+        return
+    import diff_preview as _m
+    monkeypatch.setattr(_m, "_appset_file_globs", lambda repo, fresh=False: ["**"])
     yield

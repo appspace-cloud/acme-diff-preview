@@ -226,6 +226,8 @@ def test_newenv_only_path_saves_artifact_before_final_status(monkeypatch):
     assert "kind: Deployment" in art_body
     assert "hunter2plaintext" not in art_body
     assert art_body == com_body
+    # COPS-2766: the happy path, not the transient catch-all.
+    assert m._extract_status_token(com_body) == "clean"
     # the artifact is saved BEFORE the final (non-INPROGRESS) build status,
     # so the status icon can deep-link to the full page
     final_status_idx = max(i for i, e in enumerate(events) if e[0] == "status")

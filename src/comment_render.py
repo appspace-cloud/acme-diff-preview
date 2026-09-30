@@ -241,6 +241,8 @@ _VALUES_REDUNDANCY_HDR = "**Higher-layer values.**"
 # no manifest are no reason for a warning sign on a green status.
 _HIGHER_LAYER_FINDING = ("\U0001f4da **Higher-layer values already cover "
                          "part of this PR**")
+# COPS-2766: written by the inert-edit panel in diff_preview, matched here.
+_INERT_EDIT_HDR = "**Edits with no effect.**"
 # Written by the identity-change guard in diff_preview for a confirmed rename of
 # a live environment, matched here for the REVIEW verdict line.
 _IDENTITY_MIGRATION_HDR = "**Planned rename.**"
@@ -291,6 +293,8 @@ _DECOM_CASCADE_NOT_LIVE_HDR = ("**The cascade is armed in config but NOT live "
 # COPS-2766: a paused env still cascades on delete, but what main changed
 # during the pause may not be live. A warning, not a gate.
 _DECOM_PAUSED_HDR = "Auto-sync is paused on main"
+# COPS-2766: a warning about a new env. The summary counts these lines.
+_NEW_ENV_CHECK_PREFIX = "- ⚠️ **Check:** "
 
 
 def _pingscaler_reclass(results) -> dict:
@@ -364,6 +368,7 @@ _REVIEW_RANK = {
     "\U0001f5a5": 8,               # KCC resources unmanaged
     "\U0001f9ec": 9,               # unresolved chart value
     "\U0001f4da": 99,              # higher-layer values
+    "\U0001f4a4": 98,              # an edit changes nothing rendered
     "\u2611": 0,                   # merge gate confirmed in a commit
 }
 
@@ -417,7 +422,8 @@ def build_marks(lines, green):
 # COPS-2766: merge gates. A gate fails the build until a Confirm-* line in a
 # commit message of the PR lifts it. A kind with no trailer cannot be lifted:
 # its fix says what to do. A transient kind is checked again by itself.
-# kind: (summary text, trailer, token, fix). A gate is {kind, env, arg, lifted}.
+# kind: (summary text, trailer, token, fix). A gate is {kind, env, arg, lifted},
+# and `why` when its text needs a reason.
 GATES = {
     "orphan": ("Teardown with no cascade, the workloads keep running",
                "Confirm-Teardown", "blocked", ""),
@@ -440,12 +446,24 @@ GATES = {
                "GCP cannot shrink a disk in place, so keep the old size or grow it"),
     "not_live": ("The cascade finalizer is not live in ArgoCD yet", None, "transient",
                  "Re-checked automatically after ArgoCD syncs"),
+    "clone_wake": ("An AEC clone starts running with a copy of production data",
+                   "Confirm-Clone-Sanitized", "blocked", ""),
+    "dup_identity": ("A new environment uses the name of another environment", None,
+                     "blocked", "Use git mv, or choose another customerName or suffix"),
+    "ashn_copy": ("A clone reuses the ashn of another environment", None, "blocked",
+                  "Give the clone its own ashn"),
+    "vm_disk": ("An n4 or c4 machine with a pd- disk, GCP rejects it", None, "blocked",
+                "Use hyperdisk-balanced on a new VM, or keep the machine family"),
+    "appset_miss": ("No ApplicationSet reads this folder, nothing deploys", None,
+                    "blocked", "Check the cloud, tier and spoke folders"),
+    "legacy_helm": ("The legacy Helm writer is switched back on", "Confirm-LegacyHelm",
+                    "blocked", ""),
 }
 
 
 def gate_text(g) -> str:
-    """The summary text of gate g."""
-    return GATES[g["kind"]][0]
+    """The summary text of gate g, with its reason when it has one."""
+    return GATES[g["kind"]][0] + (f" ({g['why']})" if g.get("why") else "")
 
 
 def gate_trailer(g) -> str:
@@ -477,15 +495,28 @@ def _gate_way_out(g, trailer_fmt) -> str:
     return trailer_fmt.format(tr) if tr else ". " + GATES[g["kind"]][3]
 
 
-def gate_status_description(gates) -> str:
+def gate_status_description(gates, limit=255) -> str:
     """The FAILED build status. It names the line to add or the fix, so a
-    reviewer who reads only the checks list can act. A transient gate waits."""
+    reviewer who reads only the checks list can act. A transient gate waits.
+    It fits `limit` UTF-8 bytes and ends in '(see PR comment)', which
+    fix_stuck_inprogress reads back. Over the limit the reason is cut, then a
+    trailer comes alone (it names the env), and last the rest is cut. The
+    panel has all of it in full."""
     todo = open_gates(gates)
     g = todo[0]
-    return (("Waiting - " if GATES[g["kind"]][2] == "transient" else "Blocked - ")
-            + gate_text(g) + (f" in {g['env']}" if g["env"] else "")
-            + _gate_way_out(g, ". To merge anyway, add '{}' to a commit message")
-            + (f" (+{len(todo) - 1} more)" if len(todo) > 1 else "") + " (see PR comment)")
+    head = "Waiting - " if GATES[g["kind"]][2] == "transient" else "Blocked - "
+    end = (f" (+{len(todo) - 1} more)" if len(todo) > 1 else "") + " (see PR comment)"
+    tails = [(f" in {g['env']}" if g["env"] else "")
+             + _gate_way_out(g, ". To merge anyway, add '{}' to a commit message")]
+    if gate_trailer(g):
+        tails.append(_gate_way_out(g, ". To merge anyway, add '{}'"))
+    for tail in tails:
+        why = g.get("why") or ""
+        why = _cut_utf8(why, limit + _utf8_len(why) - _utf8_len(f"{head}{gate_text(g)}{tail}{end}"))
+        desc = f"{head}{gate_text(dict(g, why=why))}{tail}"
+        if _utf8_len(desc + end) <= limit:
+            return desc + end
+    return _cut_utf8(desc, limit - _utf8_len(end)) + end
 
 
 def gate_footer(gates) -> str:
@@ -973,8 +1004,23 @@ def _build_merge_summary(results, rollup_by_sig, vm_change_lines,
                              _HIGHER_LAYER_FINDING + " \u2014 some keys match an "
                              "ancestor config.yaml, so they do not change "
                              "rendered manifests (see the higher-layer note)"))
-    if new_env_lines:
-        findings.append((_SEV_REVIEW if new_env_structural else _SEV_ROUTINE,
+        # COPS-2766: keys a live env changed while all its apps render the same.
+        m = re.search(re.escape(_INERT_EDIT_HDR) + r" (\d+) keys? changed.*?\n- `([^`]+)`: "
+                      r"`([^`]+)`", txt, re.S)
+        if m:
+            more = int(m[1]) - 1
+            findings.append((_SEV_REVIEW,
+                             f"\U0001f4a4 **An edit changes nothing rendered**: `{m[3]}` "
+                             f"in `{m[2]}`" + (f" (+{more} more)" if more else "")))
+    # COPS-2766: the checks of a new env are one REVIEW finding, led by the first.
+    checks = [l for l in new_env_lines or () if l.startswith(_NEW_ENV_CHECK_PREFIX)]
+    if checks:
+        first = checks[0][len(_NEW_ENV_CHECK_PREFIX):].split(". ", 1)[0].rstrip(".")
+        findings.append((_SEV_REVIEW, f"\U0001f195 **New environment: {len(checks)} "
+                                      f"check(s) to review** - {first}"))
+    if new_env_lines and (new_env_structural or not checks):
+        # A structural problem makes the build red, so it is a stop sign too.
+        findings.append((_SEV_BLOCK if new_env_structural else _SEV_ROUTINE,
                          "\U0001f195 **New environment** in this PR"
                          + (" \u2014 its configuration did not validate"
                             if new_env_structural else "")))
@@ -1115,6 +1161,15 @@ def status_lead(comment_md) -> str:
 
 def _utf8_len(s) -> int:
     return len(s.encode("utf-8", "surrogatepass"))
+
+
+def _cut_utf8(s, room) -> str:
+    """s in `room` UTF-8 bytes: whole, or cut and ending in '...', or ''."""
+    if _utf8_len(s) <= room:
+        return s
+    s = s.encode("utf-8", "surrogatepass")[:max(room - 3, 0)]     # 3 for the "..."
+    s = s.decode("utf-8", "ignore").rstrip()
+    return s and s + "..."
 
 
 def join_status_lead(lead, description, limit=255) -> str:

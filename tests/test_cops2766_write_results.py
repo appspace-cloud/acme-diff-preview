@@ -138,9 +138,11 @@ def test_comment_skipped_when_not_leader(monkeypatch, failures):
     assert calls == [] and m._diff_stats["bb_write_failures"] == 0
 
 
-# ── process_pr: the 8 early exits ────────────────────────────────────────
+# ── process_pr: the early exits ────────────────────────────────────────
 
 COHORT = "gcp/dev/private-cloud/ap1/custom/config.yaml"
+SLIP = {"path": IDENTITY, "kind": "wipe", "key": "appspace.microservices.definitions",
+        "line": 3, "first_line": None}
 _ENV_ONLY = ["gcp/dev/private-cloud/ap1/custom/pv-new-a/customer.yaml"]
 
 
@@ -158,6 +160,12 @@ def _identity(monkeypatch):
     monkeypatch.setattr(m, "_pr_commit_messages", lambda *a, **k: [])
 
 
+def _legacy(monkeypatch):
+    _force(monkeypatch, "_detect_legacy_writer_rearm", [
+        {"path": IDENTITY, "key": "deployGLB", "env": "pv-orch-a"}])
+    monkeypatch.setattr(m, "_pr_commit_messages", lambda *a, **k: [])
+
+
 def _new_env(monkeypatch):
     monkeypatch.setattr(m, "get_pr_changed_files", lambda pr_id, repo=None: (_ENV_ONLY, {}))
     _force(monkeypatch, "_detect_new_env_candidates", [{"name": "pv-new-a"}])
@@ -171,8 +179,7 @@ EXITS = {
     "conflict": (lambda mp: mp.setattr(m, "_merge_preview", lambda repo, base, sha:
                                        (None, ["gcp/x/values.yaml"])),
                  "", "CONFLICTS with `main`"),
-    "wiped": (lambda mp: _force(mp, "_detect_wiped_definitions", [IDENTITY]),
-              "blocked", "microservices.definitions"),
+    "slip": (lambda mp: _force(mp, "_detect_yaml_slips", [SLIP]), "blocked", "YAML slip"),
     "token": (lambda mp: _force(mp, "_detect_partition_token_misses", [
         (IDENTITY, "--aec1", [("customerName", "orch", "orch--aec1")])]),
               "blocked", "orch--aec1"),
@@ -183,6 +190,10 @@ EXITS = {
     "frozen": (lambda mp: _force(mp, "_detect_frozen_versions", [
         {"path": IDENTITY, "cohort": COHORT, "why": "missing"}]),
                "blocked", "watch-only"),
+    "inert_key": (lambda mp: _force(mp, "_detect_inert_generator_keys", [
+        {"path": IDENTITY, "key": "autosync", "value": False, "why": "inert"}]),
+                  "blocked", "does not read it"),
+    "legacy": (_legacy, "blocked", "Confirm-LegacyHelm: pv-orch-a"),
     "new_env": (_new_env, "clean", "New Environment(s) Detected"),
     "no_apps": (lambda mp: mp.setattr(m, "get_pr_changed_files", lambda pr_id, repo=None:
                                       (["docs/README.md"], {})),
@@ -448,7 +459,7 @@ def test_a_block_whose_status_write_fails_turns_an_old_green_red(world, monkeypa
     """The early exits post no INPROGRESS. When their FAILED did not land,
     the commit kept the SUCCESSFUL of a render against an older main, and
     the recovery left it: a green gate under a [blocked] comment."""
-    monkeypatch.setattr(m, "_detect_wiped_definitions", lambda *a, **k: [IDENTITY])
+    monkeypatch.setattr(m, "_detect_yaml_slips", lambda *a, **k: [SLIP])
     bb = _bitbucket(world, monkeypatch, "SUCCESSFUL", ["FAILED"])
     body = _render_then_recover(world, monkeypatch)
     assert m._extract_status_token(body) == "blocked"

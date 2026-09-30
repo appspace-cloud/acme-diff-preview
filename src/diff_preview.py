@@ -65,6 +65,7 @@ import fleet_health  # COPS-2694 fleet health gauges (same-dir module, stdlib on
 import user_content  # COPS-2697 shared user-content identity (same-dir module, stdlib only)
 import blast_radius  # COPS-2693 Plan B blast-radius assessment (same-dir module, stdlib only)
 import values_redundancy  # COPS-2721 higher-layer redundant value callout
+import yaml_hygiene  # COPS-2766 YAML slips in a value file (same-dir module, pure)
 import render_cache  # three-tier main-render cache (same-dir module)
 from render_cache import (  # re-exported: the suite reaches these on the hub
     MAIN_RENDER_CACHE_DIR,
@@ -166,8 +167,11 @@ from comment_render import (  # comment rendering (same-dir module, stdlib only)
     build_marks,
     status_lead,
     join_status_lead,
+    _utf8_len,
+    _cut_utf8,
     gate_trailer,
     gate_token,
+    open_gates,
     gate_status_description,
     gate_footer,
     _DECOM_ORPHAN_HDR,
@@ -178,6 +182,7 @@ from comment_render import (  # comment rendering (same-dir module, stdlib only)
     _DECOM_PUBLIC_CLOUD_WHY,
     _BLAST_RADIUS_HDR,
     _VALUES_REDUNDANCY_HDR,
+    _INERT_EDIT_HDR,
     _IDENTITY_MIGRATION_HDR,
     _AUTOSYNC_PAUSED_HDR,
     _AUTOSYNC_RESUMED_HDR,
@@ -187,6 +192,7 @@ from comment_render import (  # comment rendering (same-dir module, stdlib only)
     _DECOM_PAUSED_HDR,
     _SHUTDOWN_MIN_WORKLOADS,
     _is_env_shutdown,
+    _NEW_ENV_CHECK_PREFIX,
 )
 from redact import (  # display-time redaction (same-dir module, stdlib only)
     _unquote,
@@ -259,6 +265,10 @@ from vm_analysis import (  # VM/KCC infrastructure analysis (same-dir module)
     _kcc_role_value,
     _detect_kcc_adoption,
     _kcc_move_disk_shrink,
+    _VM_DISK_FAMILY_REASON,
+    _VM_DISK_FAMILY_LEAVES,
+    _vm_disk_family_changes,
+    _new_env_prereq_findings,
     _kcc_adoption_card,
     _VM_PANEL_CLEAN_HDR,
     _VM_REPEAT_RE,
@@ -4588,53 +4598,150 @@ def _helm_template(chart_path: str, release: str, namespace: str,
 # that has never held an image -> ImagePullBackOff across the whole
 # environment. Root cause: acme-config-dev commit 1015bc622 "remove CICD"
 # deleted the children but left the key. This guard blocks any PR that
-# reintroduces the pattern before it can be merged.
+# reintroduces the pattern before it can be merged. COPS-2766: it is now one of
+# the three YAML slips (yaml_hygiene), with a duplicate key and a bare key.
 _VALUE_FILE_SUFFIXES = (".yaml", ".yml")
 
 
 def _values_wipes_definitions(body: str) -> bool:
-    """True iff this value-file body sets appspace.microservices.definitions to
-    an empty/null map (the dangerous pattern). A missing key, a populated map,
-    or unparseable YAML all return False: only an explicitly present-but-empty
-    definitions map is a wipe, and we never block on a mere parse error."""
-    if not body or not body.strip():
-        return False
-    try:
-        doc = _yaml_safe_load(body)
-    except Exception:
-        return False  # malformed YAML fails elsewhere; never block on it here
-    if not isinstance(doc, dict):
-        return False
-    ms = (doc.get("appspace") or {})
-    ms = ms.get("microservices") if isinstance(ms, dict) else None
-    if not isinstance(ms, dict):
-        return False
-    if "definitions" not in ms:
-        return False  # absent key: merge leaves the chart's map intact — safe
-    defs = ms["definitions"]
-    # Present key with null (None) or an empty mapping is the wipe.
-    return defs is None or defs == {}
+    """True iff the first document of this value file sets
+    appspace.microservices.definitions to anything but a non-empty map (null,
+    {}, [], "" or a scalar). A missing key, or YAML that does not parse, is
+    False: a parse error fails in the render, never here."""
+    s = yaml_hygiene.slips(body)
+    return bool(s and s["wipe"])
 
 
 def _detect_wiped_definitions(changed_files: list, sha: str, repo=None) -> list:
-    """Return the changed value files whose content at `sha` wipes the
-    microservices.definitions map. Only *.yaml/*.yml files are fetched; an
-    absent file is skipped. A failed read raises, so the PR is retried
-    (COPS-2766: skipping it let the wipe through green)."""
+    """The changed value files whose first document at `sha` wipes
+    microservices.definitions. A failed read raises, so the PR is retried."""
+    return [h["path"] for h in _detect_yaml_slips(changed_files, {}, sha, None, repo=repo)]
+
+
+def _value_body(path, sha, repo=None):
+    """The text of `path` at `sha`, or None when it is absent. A failed read
+    raises, so the PR is retried (COPS-2766: skipping it let a wipe through)."""
+    body, status = _bb_fetch_cached(path, sha, repo=repo)
+    if status == BB_ERROR:
+        raise ValueFileUnreadable(
+            f"value file unreadable at sha {sha[:8]} "
+            f"(Bitbucket transport, not absence): {path}")
+    return body if status == BB_OK else None
+
+
+def _detect_yaml_slips(changed, renames, sha, base_sha, repo=None) -> list:
+    """COPS-2766: the YAML slips in the changed files at `sha`, as hits
+    {path, kind, key, line, first_line}, kind "dup", "null" or "wipe".
+
+    A wipe counts at head alone, as in 2.121.0, so that guard never gets weaker.
+    A duplicate or bare key counts only in a value file under gcp/, azure/ or
+    aws/, and only when this PR adds it: the multiset delta against `base_sha`.
+    So an old slip stays green, and a third copy of an old duplicate is new.
+    With no `base_sha`, or a base that does not parse, they are not checked. A
+    head that is absent or does not parse is skipped (the render reports bad
+    YAML); a base that is absent counts every head slip.
+    """
+    renames = renames or {}
+    old_of = {new: old for old, new in renames.items()}
+    heads, gone = {}, []
+    for f in changed:
+        if f.endswith(_VALUE_FILE_SUFFIXES):
+            body = _value_body(f, sha, repo)
+            if body is None:
+                gone.append(f)
+            else:
+                heads[f] = yaml_hygiene.slips(body)
+
+    def base_body(f):
+        body = _value_body(old_of.get(f, f), base_sha, repo)
+        if body is None and f not in old_of:
+            # A move Bitbucket did not pair: the same env folder and file, deleted here.
+            twin = next((g for g in gone if g not in renames
+                         and g.split("/")[-2:] == f.split("/")[-2:]), None)
+            body = twin and _value_body(twin, base_sha, repo)
+        return body
+
     hits = []
-    for f in changed_files:
-        if not f.endswith(_VALUE_FILE_SUFFIXES):
+    for f, s in heads.items():
+        if not s:
             continue
-        body, status = _bb_fetch_cached(f, sha, repo=repo)
-        if status == BB_ERROR:
-            raise ValueFileUnreadable(
-                f"value file unreadable at sha {sha[:8]} "
-                f"(Bitbucket transport, not absence): {f}")
-        if status != BB_OK or body is None:
-            continue
-        if _values_wipes_definitions(body):
-            hits.append(f)
+        found = [("wipe", yaml_hygiene.DEFINITIONS, 1)] if s["wipe"] else []
+        if (s["dup"] or s["null"]) and f.split("/")[0] in ("gcp", "azure", "aws"):
+            base = yaml_hygiene.slips(base_body(f) or "") if base_sha else None
+            if base is None:
+                why = "the base does not parse" if base_sha else "no base to compare with"
+                logsink.log(f"[yaml-slips] {f}: duplicate or bare keys not checked, {why}")
+            else:
+                found += [(kind, key, n) for kind in ("dup", "null")
+                          for key, n in (s[kind] - base[kind]).items()]
+        # The delta gives how many copies are new; the last ones are shown.
+        hits += sorted(({"path": f, "kind": kind, "key": key, "line": line, "first_line": first}
+                        for kind, key, n in found for line, first in s["lines"][(kind, key)][-n:]),
+                       key=lambda h: h["line"])
     return hits
+
+
+_SLIP_DESC = {"dup": "duplicate key {key}", "null": "bare key {key}",
+              "wipe": "empty microservices.definitions (wipes image names)"}
+_SLIP_WHAT = {
+    "dup": "duplicate key `{key}` (first copy at line {first_line})",
+    "null": "bare key `{key}` (it reads as null)",
+    "wipe": "`appspace.microservices.definitions` is empty or not a map",
+}
+_SLIP_WHY = {
+    "dup": "A duplicate key keeps only its last copy. The first copy is dropped with no "
+           "error (COPR-31148: a login whitelist was lost for 53 h).",
+    "null": "A bare key (`key:` with no value) is null. Helm then deletes that key from "
+            "the chart defaults, for example the probes or the HPA policies.",
+    "wipe": "An empty or non-map `definitions` deletes every image name the chart ships, "
+            "so the whole environment fails with ImagePullBackOff (COPR-31637).",
+}
+_SLIP_FIX = {
+    "dup": "Keep one copy of a duplicate key and delete the other.",
+    "null": "Give a bare key a value, or delete the line. To remove a chart default on "
+            "purpose, write `null`.",
+    "wipe": "Delete the `definitions:` line, so the chart's map stays, or give it real "
+            "children.",
+}
+
+
+def _status_path(path):
+    """The file as a build status names it: its folder and name, and under a
+    cl-* env also the env, so cl-x/app3/customer.yaml says which one."""
+    parts = path.split("/")
+    return "/".join(parts[-3:] if len(parts) > 2 and parts[-3].startswith("cl-") else parts[-2:])
+
+
+def _yaml_slip_block(hits: list, pr_sha: str, base_sha: str):
+    """(build status description, comment body) for _detect_yaml_slips hits."""
+    h = hits[0]
+    tail = (f" (+{len(hits) - 1} more)" if len(hits) > 1 else "") + " - see PR comment"
+    desc = _cut_utf8(f"BLOCKED: YAML slip in {_status_path(h['path'])} line {h['line']}: "
+                     + _SLIP_DESC[h["kind"]].format(**h), 255 - _utf8_len(tail)) + tail
+    kinds = [k for k in _SLIP_WHY if any(x["kind"] == k for x in hits)]
+    if kinds == ["wipe"]:   # the 2.12.0 text, so an existing red status reads the same
+        desc = (f"BLOCKED: {len(hits)} file(s) empty out "
+                "microservices.definitions (wipes image overrides)")
+    paths = list(dict.fromkeys(x["path"] for x in hits))
+    old = (" Old duplicate or bare keys in these files do not block, only the ones "
+           "this PR adds." if kinds != ["wipe"] else "")
+    body = (
+        f"## \U0001f52d {STATUS_NAME}\n\n"
+        f"{_comment_header(pr_sha)}\n\n"
+        "\u26d4 **Blocked: this PR adds a YAML slip. It changes config, and no diff "
+        "line shows it clearly.**\n\n"
+        + "\n".join(f"- `{x['path']}` line {x['line']}: " + _SLIP_WHAT[x["kind"]].format(**x)
+                    for x in hits) + "\n\n"
+        "**Why:** Helm and ArgoCD read only the first YAML document of a file.\n\n"
+        + "".join(f"- {_SLIP_WHY[k]}\n" for k in kinds) + "\n"
+        "**Fix:** " + " ".join(_SLIP_FIX[k] for k in kinds) + old + "\n\n"
+        "This check runs again by itself on a new commit, or when `main` changes.\n\n"
+        f"---\n**Status:** \u26d4 Blocked: YAML slip in `{paths[0]}`"
+        + (f" (+{len(paths) - 1} more)" if len(paths) > 1 else "") + "\n"
+        f"*{_ts()} - {COMMENT_MARKER} [blocked]"
+        + (f" [base:{base_sha[:8]}]" if base_sha else "") + "*"
+    )
+    return desc, body
 
 
 def _read_first_doc(path, sha, repo=None, lenient=False):
@@ -4752,6 +4859,12 @@ def _is_pv_env_file(path):
     return _is_pv_file(path, "customer.yaml")
 
 
+def _live_apps_in_namespace(ns, exclude=()):
+    """Live apps `<ns>-*` in namespace `ns`, on any spoke: names are global on the hub."""
+    return sorted(a for a, n in (_app_namespace_map or {}).items()
+                  if n == ns and a not in exclude and a.split("/")[-1].startswith(ns + "-"))
+
+
 def _detect_live_identity_changes(changed, renames, path_map, sha, base_sha, repo=None):
     """Private-cloud envs on main whose ArgoCD apps and namespace this PR renames.
 
@@ -4819,11 +4932,85 @@ def _detect_live_identity_changes(changed, renames, path_map, sha, base_sha, rep
             "paused_base": eff(old_doc, old_cohort, "autosync") == "false",
             "paused_head": eff(new_doc, new_cohort, "autosync") == "false",
             # Names are global on the hub: another env may already own the new ones.
-            "taken": sorted(a for a, ns in (_app_namespace_map or {}).items()
-                            if ns == new_ns and a not in apps
-                            and a.split("/")[-1].startswith(new_ns + "-")),
+            "taken": _live_apps_in_namespace(new_ns, apps),
         })
     return hits
+
+
+def _app_identity_file(app):
+    """The customer.yaml an app renders from, from its value files, or ""."""
+    return next((vf.split("$config/", 1)[-1].lstrip("/")
+                 for vf in _app_value_files_map.get(app) or () if vf.endswith("customer.yaml")), "")
+
+
+def _detect_duplicate_identities(changed, renames, new_env_candidates, sha, repo=None):
+    """COPS-2766 (C03): (dup_identity gates, unchecked) for the new private-cloud envs.
+
+    A gate when a new env names its apps `pv-<customerName>-<suffix>-*` like a
+    live app on the hub (the `taken` rule), or like another new env in this
+    PR. Nothing lifts it. The apps of an env this PR deletes do not count: a
+    rebuild. `unchecked` is True when the app list is empty, so the live
+    names were not compared. A failed read raises, so the PR is retried.
+    """
+    renames = renames or {}
+    new_sides = set(renames.values())
+    files = sorted({f for c in new_env_candidates or () for f in c.get("all_yaml_files", ())
+                    if _is_pv_env_file(f) and f not in new_sides})
+    by_ns = {}
+    for f in files:
+        doc, state = _read_first_doc(f, sha, repo, True)
+        if state != "ok":
+            continue                       # the render reports it
+        cohort, cohort_state = _read_first_doc(_cohort_of(f), sha, repo, True)
+        ident = _appset_identity(doc, cohort)
+        if cohort_state != "absent" and ident[0] not in ("", "<no value>"):
+            by_ns.setdefault("pv-%s-%s" % ident, []).append(f)
+
+    def kept(app):
+        f = _app_identity_file(app)
+        return f not in changed or f in renames or _read_first_doc(f, sha, repo)[1] != "absent"
+    gates = []
+    for ns, paths in sorted(by_ns.items()):
+        apps = [a for a in _live_apps_in_namespace(ns) if kept(a)]
+        names = [a.split("/")[-1] for a in apps]
+        srcs = sorted({_app_identity_file(a) for a in apps} - {""})
+        for p in paths:
+            also = [q.split("/")[-2] for q in paths if q != p]
+            if not (apps or also):
+                continue
+            why = (f"live apps {', '.join(names)}" + (f" from {', '.join(srcs)}" if srcs else "")
+                   if apps else f"same name as {', '.join(also)} in this PR")
+            gates.append({"kind": "dup_identity", "env": p.split("/")[-2], "why": why,
+                          "path": p, "ns": ns, "apps": names, "files": srcs, "also": also})
+    return gates, bool(files) and not _app_namespace_map
+
+
+def _dup_identity_lines(gates, unchecked=False) -> list:
+    """COPS-2766: the panel of the dup_identity gates, and a note when the live
+    names were not checked. Plain lines, like _clone_wake_lines."""
+    dups = [g for g in gates or () if g["kind"] == "dup_identity"]
+    lines = ["## \u26d4 NEW ENVIRONMENT NAME ALREADY IN USE", ""] if dups else []
+    for g in dups:
+        head = f"- `{g['path']}` names its apps `{g['ns']}-*`"
+        if g["apps"]:
+            lines.append(f"{head}, but live apps already use these names: "
+                         + ", ".join(f"`{a}`" for a in g["apps"])
+                         + (" (from " + ", ".join(f"`{f}`" for f in g["files"]) + ")"
+                            if g["files"] else "") + ".")
+        else:
+            lines.append(f"{head}, like " + ", ".join(f"`{e}`" for e in g["also"])
+                         + " in this PR.")
+    if dups:
+        lines += ["", (("Two environments cannot share one namespace. To move an environment, "
+                  "use `git mv`, so the old folder goes in the same PR. Otherwise choose "
+                  "another `customerName` or `suffix`.")), ""]
+    if any(g["apps"] for g in dups):
+        lines += [(("If the old environment is being removed, wait until its apps are gone "
+                  "in ArgoCD, then push again (an empty commit is enough).")), ""]
+    if unchecked:
+        lines += [(("\u2139\ufe0f Name check not run: the ArgoCD app list is not loaded, so "
+                  "the new environment names are not compared with the live apps.")), ""]
+    return lines
 
 
 def _identity_block_reason(hit, confirmed):
@@ -5129,7 +5316,9 @@ def _cohort_removal_block(hits: list, pr_sha: str, base_sha: str):
     return desc, body
 
 _CL_ENV_RE = re.compile(r"^gcp/[^/]+/public-cloud/[^/]+/(cl-[^/]+)/config\.yaml$")
-_CL_APP_RE = re.compile(r"^gcp/[^/]+/public-cloud/[^/]+/(cl-[^/]+)/([^/]+)/customer\.yaml$")
+# COPS-2766: only the glb-appN sets read an app folder; the fixed api, cloud and
+# user-content sets and the constellation read cl-*/config.yaml alone.
+_CL_APP_RE = re.compile(r"^gcp/[^/]+/public-cloud/[^/]+/(cl-[^/]+)/(app\d+)/customer\.yaml$")
 
 
 def _generator_file(path, path_map):
@@ -5223,6 +5412,215 @@ def _frozen_version_block(hits: list, pr_sha: str, base_sha: str):
         + (f" [base:{base_sha[:8]}]" if base_sha else "") + "*"
     )
     return desc, body
+
+
+_GENERATOR_KEYS = ("version", "autosync", "decommission")
+
+
+def _generator_reads(path, sha, path_map, changed, repo=None):
+    """True when an ApplicationSet generator reads appspace.version, autosync and
+    decommission from `path`, False when none does, None out of scope (aws/ has
+    no ApplicationSet, and nothing outside gcp/ and azure/ is env config).
+
+    Private cloud reads <spoke>/**/customer.yaml and the config.yaml one folder
+    up; public cloud reads cl-*/config.yaml and cl-*/appN/customer.yaml.
+    """
+    if path.split("/")[0] not in ("gcp", "azure"):
+        return None
+    if _is_pv_env_file(path):
+        return True
+    if _is_pv_file(path, "config.yaml"):
+        # The cohort of an env is read. Next to a customer.yaml it is an env folder
+        # file, and no generator reads it. A cohort with no env below yet counts
+        # as read, so a fleet bump stays green.
+        if any(_is_pv_env_file(p) and _cohort_of(p) == path for p in (*path_map, *changed)):
+            return True
+        sib = posixpath.dirname(path) + "/customer.yaml"
+        return not (sib in path_map or sib in changed or _value_body(sib, sha, repo) is not None)
+    return bool(_CL_ENV_RE.match(path) or _CL_APP_RE.match(path))
+
+
+def _detect_inert_generator_keys(changed, renames, path_map, sha, base_sha, repo=None) -> list:
+    """COPS-2766: appspace.version, autosync or decommission that this PR sets in
+    a file the ApplicationSet does not read (why "inert"), or a version that is
+    not a string (why "type", in any file), as hits {path, key, value, why,
+    text}, `text` the value as written when it is not a string, else None.
+
+    A removed key, or one with the same value at `base_sha` (under the old name
+    of a move), is not a hit. With no base every key counts. A public-cloud
+    decommission stays block 2's warning, and a falsy version in a generator
+    file is the frozen check's.
+    """
+    old_of = {new: old for old, new in (renames or {}).items()}
+
+    def appspace(path, at):
+        doc = _read_first_doc(path, at, repo, True)[0]
+        a = doc.get("appspace") if isinstance(doc, dict) else None
+        return a if isinstance(a, dict) else {}
+
+    hits = []
+    for f in changed:
+        if not f.endswith(_VALUE_FILE_SUFFIXES):
+            continue
+        own = appspace(f, sha)
+        keys = [k for k in _GENERATOR_KEYS if k in own]
+        reads = _generator_reads(f, sha, path_map, changed, repo) if keys else None
+        if reads is None:
+            continue
+        found = []
+        for k in keys:
+            if not reads and not (k == "decommission" and "/public-cloud/" in f):
+                found.append((k, "inert"))
+            elif k == "version" and own[k] and not isinstance(own[k], str):
+                found.append((k, "type"))
+        if found and base_sha:
+            old = appspace(old_of.get(f, f), base_sha)
+            found = [(k, why) for k, why in found if not (k in old and old[k] == own[k])]
+        # The text as written: 2604.10 loads as 2604.1, so the value cannot say it.
+        text = {k: yaml_hygiene.scalar_text(_value_body(f, sha, repo), "appspace", k)
+                for k, _ in found if not isinstance(own[k], str)}
+        hits += [{"path": f, "key": k, "value": own[k], "why": why, "text": text.get(k)}
+                 for k, why in found]
+    return hits
+
+
+_INERT_WHERE = ("the environment `customer.yaml`, or the cohort `config.yaml` one folder up",
+                ("`cl-*/config.yaml` (the whole environment) or `cl-*/appN/customer.yaml` "
+                "(one app type)"))
+_INERT_WHY = {
+    "inert": "In any other file, `version` and `autosync` do nothing: no new chart, no "
+             "pause. The diff stays quiet, and the PR looks done (COPS-2684).",
+    "decommission": "In any other file, `decommission` adds no cascade finalizer, but the "
+                    "chart still reads it: the static IP deletion policy, and the data purge "
+                    "with `decommissionPurgeData`. The teardown is only half armed.",
+    "type": "A YAML number is printed as a number, not as the text you wrote (`2604.0` "
+            "becomes `2604`), so ArgoCD can ask for a chart that does not exist.",
+}
+_INERT_FIX = {
+    "inert": "Move the key to the file named above, or delete it.",
+    "decommission": "Move `decommission` to the environment `customer.yaml`, or delete it.",
+    "type": "Quote the version.",
+}
+
+
+def _inert_key_block(hits: list, pr_sha: str, base_sha: str):
+    """(build status description, comment body) for _detect_inert_generator_keys hits."""
+    def kind(x):
+        return "decommission" if x["key"] == "decommission" else x["why"]
+
+    def line(x):
+        v = x.get("text") or json.dumps(x["value"], default=str)
+        # acme-config-dev #6845 wrote version.AppVersion for versions.AppVersion.
+        tip = (" For the chart's app versions, the key is `appspace.versions`."
+               if x["key"] == "version" and isinstance(x["value"], dict) else "")
+        if x["why"] == "type":
+            return (f"- `{x['path']}`: `appspace.version: {v}` is not a string in YAML."
+                    + (tip or f" Quote it: `version: \"{v}\"`."))
+        return (f"- `{x['path']}`: `appspace.{x['key']}: {v}`. The ApplicationSet reads it "
+                f"only from {_INERT_WHERE['/public-cloud/' in x['path']]}." + tip)
+
+    h = hits[0]
+    more = f" (+{len(hits) - 1} more)" if len(hits) > 1 else ""
+    what = "is not a string" if h["why"] == "type" else "is never read by the ApplicationSet"
+    tail = more + " - see PR comment"
+    desc = _cut_utf8(f"BLOCKED: appspace.{h['key']} in {_status_path(h['path'])} {what}",
+                     255 - _utf8_len(tail)) + tail
+    kinds = [k for k in _INERT_WHY if any(kind(x) == k for x in hits)]
+    head = ("sets `appspace.version` to a value that is not a string" if kinds == ["type"]
+            else "sets a key where ArgoCD does not read it")
+    body = (
+        f"## \U0001f52d {STATUS_NAME}\n\n"
+        f"{_comment_header(pr_sha)}\n\n"
+        f"⛔ **Blocked: this PR {head}.**\n\n"
+        + "\n".join(line(x) for x in hits) + "\n\n"
+        "**Why:** the ApplicationSet takes `appspace.version`, `autosync` and "
+        "`decommission` only from the files its generator lists, not from every value "
+        "file, and it prints each value as text.\n\n"
+        + "".join(f"- {_INERT_WHY[k]}\n" for k in kinds) + "\n"
+        "**Fix:** " + " ".join(_INERT_FIX[k] for k in kinds) + "\n\n"
+        "This check runs again by itself on a new commit, or when `main` changes.\n\n"
+        f"---\n**Status:** ⛔ Blocked: `appspace.{h['key']}` in `{h['path']}`{more}\n"
+        f"*{_ts()} - {COMMENT_MARKER} [blocked]"
+        + (f" [base:{base_sha[:8]}]" if base_sha else "") + "*"
+    )
+    return desc, body
+
+
+# COPS-2766: under appspace.infra. helm_deploy.sh (acme-components) runs helm
+# upgrade on the ArgoCD releases when one is the literal true; no chart reads them.
+_LEGACY_WRITER_KEYS = ("deployGLB", "deployMicroservices", "deploySupportingServices")
+
+
+def _legacy_env(path):
+    """What a Confirm-LegacyHelm line names: the cl-* folder in public cloud, the
+    env folder of a customer.yaml or cicd-versions.yaml, else the file's folder."""
+    parts = path.split("/")
+    cl = [p for p in parts[:-1] if p.startswith("cl-")]
+    if "public-cloud" in parts and cl:
+        return cl[0]
+    if parts[-1] in ("customer.yaml", "cicd-versions.yaml"):
+        return parts[-2]
+    return posixpath.dirname(path)
+
+
+def _detect_legacy_writer_rearm(changed, renames, sha, base_sha, repo=None) -> list:
+    """COPS-2766: a _LEGACY_WRITER_KEYS key this PR sets to true in a value file
+    under gcp/, azure/ or aws/, as hits {path, key, env}. True at `base_sha`
+    (under the old name of a move) is not a hit; with no base every true counts.
+    A failed read raises, so the PR is retried."""
+    old_of = {new: old for old, new in (renames or {}).items()}
+
+    def on(path, at):
+        doc = _read_first_doc(path, at, repo, True)[0]
+        for k in ("appspace", "infra"):
+            doc = doc.get(k) if isinstance(doc, dict) else None
+        doc = doc if isinstance(doc, dict) else {}
+        return {k for k in _LEGACY_WRITER_KEYS if str(doc.get(k)).lower() == "true"}
+
+    hits = []
+    for f in changed:
+        if f.split("/")[0] not in ("gcp", "azure", "aws") or not f.endswith(_VALUE_FILE_SUFFIXES):
+            continue
+        keys = on(f, sha)
+        if keys and base_sha:
+            keys -= on(old_of.get(f, f), base_sha)
+        hits += [{"path": f, "key": k, "env": _legacy_env(f)}
+                 for k in _LEGACY_WRITER_KEYS if k in keys]
+    return hits
+
+
+def _legacy_writer_block(hits: list, pr_sha: str, base_sha: str):
+    """(build status description, comment body) for _detect_legacy_writer_rearm hits."""
+    trailers = list(dict.fromkeys(gate_trailer({"kind": "legacy_helm", "env": h["env"]})
+                                  for h in hits))
+    h = hits[0]
+    more = f" (+{len(hits) - 1} more)" if len(hits) > 1 else ""
+    ask = f"{more}. To merge anyway, add {trailers[0]} to a commit"
+    desc = _cut_utf8(f"BLOCKED: {h['key']}: true in {h['env']} turns the legacy Helm writer "
+                     "back on", 255 - _utf8_len(ask)) + ask
+    body = (
+        f"## \U0001f52d {STATUS_NAME}\n\n"
+        f"{_comment_header(pr_sha)}\n\n"
+        "⛔ **Blocked: this PR turns the legacy Helm writer back on.**\n\n"
+        + "\n".join(f"- `{x['path']}`: `appspace.infra.{x['key']}: true`" for x in hits)
+        + "\n\n"
+        "**Why:** ArgoCD owns these releases. No chart reads `deployGLB`, "
+        "`deployMicroservices` or `deploySupportingServices`, so the diff shows nothing. "
+        "The ADO pipeline (`helm_deploy.sh`) reads them, and with `true` it runs "
+        "`helm upgrade` on the same releases again. Two writers on one release fail with "
+        "invalid ownership metadata, or undo each other. COPS-2560 turned it off, and the "
+        "root `config.yaml` says to keep it off.\n\n"
+        "**Fix:** set the key back to `false`, or delete the line. If an environment "
+        "really needs the old writer, add its line to a commit message of this PR and "
+        "push:\n\n" + "".join(f"- `{t}`\n" for t in trailers) + "\n"
+        "This check runs again by itself on a new commit, or when `main` changes.\n\n"
+        f"---\n**Status:** ⛔ Blocked: the legacy Helm writer is back on in "
+        f"`{h['env']}`{more}\n"
+        f"*{_ts()} - {COMMENT_MARKER} [blocked]"
+        + (f" [base:{base_sha[:8]}]" if base_sha else "") + "*"
+    )
+    return desc, body
+
 
 def _detect_new_env_candidates(changed_files: list, path_map: dict, renames: dict = None, pr_sha: str = None, repo: str = None) -> list:
     """Scan changed files for patterns that indicate a brand-new environment.
@@ -5350,7 +5748,8 @@ def _detect_new_env_candidates(changed_files: list, path_map: dict, renames: dic
 
 
 def _evaluate_new_envs(new_env_candidates: list, pr_sha: str,
-                       with_full_output: bool = False) -> tuple:
+                       with_full_output: bool = False, base_sha: str = "",
+                       repo: str = None, changed=(), renames=None, prereqs=None) -> tuple:
     """Render and classify a list of new-environment candidates.
 
     v2.5.4 (Finding 4): extracted from process_pr's inline logic so the same
@@ -5371,6 +5770,10 @@ def _evaluate_new_envs(new_env_candidates: list, pr_sha: str,
                           (FIX E) that must block the PR, not go green.
       total_new_resources — sum of resources that would be created across
                           all successfully-rendered new environments.
+
+    COPS-2766: with `base_sha`, each env section also lists the GCP objects
+    it shares with a live env (_new_env_shared_lines), as check lines. The
+    `prereqs` lines of _new_env_prereqs go first.
     """
     new_env_sections = []
     full_sections = []      # (name, version, n_res, redacted manifest)
@@ -5475,6 +5878,9 @@ def _evaluate_new_envs(new_env_candidates: list, pr_sha: str,
                                      "GCP"),
             })
             continue
+        # COPS-2766: the GCP objects it shares with a live env, a warning.
+        checks = (prereqs or {}).get(env_info["config_file"], []) + _new_env_shared_lines(
+            env_info, pr_sha, base_sha, repo, changed, renames)
         render_result = _render_new_env_diff(env_info, pr_sha)
         # Returns (rendered_manifest, error [, n_res [, version]])
         rendered   = render_result[0]
@@ -5506,6 +5912,7 @@ def _evaluate_new_envs(new_env_candidates: list, pr_sha: str,
                 "files": env_info["all_yaml_files"], "n_res": 0,
                 "kind_counts": None, "workloads": None, "error": render_err,
             })
+        new_env_sections[-1]["checks"] = checks
 
     lines = [
         f"### \U0001f195 New Environment(s) Detected", "",
@@ -5517,7 +5924,7 @@ def _evaluate_new_envs(new_env_candidates: list, pr_sha: str,
         lines.append(f"#### `{sec['name']}` (chart `{sec['version']}`)")
         lines.append("")
         if sec["files"]:
-            lines.append("**Files added:**")
+            lines += ["**Files added:**", ""]  # COPS-2605: or the list renders inline
             for f in sorted(sec["files"])[:15]:
                 lines.append(f"- `{f}`")
             if len(sec["files"]) > 15:
@@ -5590,6 +5997,8 @@ def _evaluate_new_envs(new_env_candidates: list, pr_sha: str,
                             "Every definitions key needs one.*")
                 elif "helm template failed" not in sec["error"]:
                     lines.append(f"  \n*Technical detail: {sec['error'][:120]}*")
+        if sec.get("checks"):
+            lines += [""] + sec["checks"]
         lines.append("")
 
     total_new = sum(s["n_res"] for s in new_env_sections)
@@ -6820,7 +7229,7 @@ def _decommission_purges_data(identity_file: str, main_sha: str) -> bool:
 
 
 def _merged_kcc_flat_for_env(identity_file: str, sha: str,
-                             repo: str = None):
+                             repo: str = None, strict: bool = False):
     """Flattened appspace values for an env: ancestor config.yaml chain +
     identity file, last-wins (same order live Helm uses).
 
@@ -6835,6 +7244,9 @@ def _merged_kcc_flat_for_env(identity_file: str, sha: str,
     YAML that returned BB_OK). A missing file (BB_NOT_FOUND) is normal for
     intermediate path segments and is skipped. Returns None when the merge
     is not proven; callers must treat that as "not fully phased".
+
+    COPS-2766: `strict` raises ValueFileUnreadable on BB_ERROR, so the PR is
+    retried. None then means only YAML that cannot be parsed.
     """
     env_dir = identity_file.rsplit("/", 1)[0]
     ancestors = []
@@ -6847,6 +7259,10 @@ def _merged_kcc_flat_for_env(identity_file: str, sha: str,
     for path in ancestors + [identity_file]:
         content, status = _bb_fetch_cached(path, sha, repo=repo)
         if status == BB_ERROR:
+            if strict:
+                raise ValueFileUnreadable(
+                    f"value file unreadable at sha {sha[:8]} "
+                    f"(Bitbucket transport, not absence): {path}")
             return None
         if status != BB_OK or not content:
             continue
@@ -6856,6 +7272,121 @@ def _merged_kcc_flat_for_env(identity_file: str, sha: str,
             return None
         merged.update(flat)
     return merged
+
+
+# COPS-2766 (AE-15507): an AEC clone runs on a copy of production data, so it
+# is created asleep and wakes only after its data is cleaned.
+_CLONE_DIR_RE = re.compile(r"--aec\d+(?=-|$)")
+_CLONE_NEW_WHY, _CLONE_BAD_WHY = "new clone", "values cannot be parsed"
+
+
+def _is_clone_env_file(path):
+    return _is_pv_env_file(path) and bool(_CLONE_DIR_RE.search(path.split("/")[-2]))
+
+
+def _own_zero_pods(path, sha, repo=None):
+    """(appspace.zeroPods as the file itself writes it, in lower case, or None
+    when it does not set it; the read state). A failed read raises."""
+    doc, state = _read_first_doc(path, sha, repo)
+    own = doc.get("appspace") if isinstance(doc, dict) else None
+    own = own if isinstance(own, dict) else {}
+    return (str(own["zeroPods"]).lower() if "zeroPods" in own else None), state
+
+
+def _zero_pods_on(flat):
+    return str(flat.get("appspace.zeroPods", "")).lower() == "true"
+
+
+def _detect_clone_wakes(changed, renames, path_map, new_env_candidates, sha, base_sha,
+                        repo=None) -> list:
+    """COPS-2766: the clone_wake gates, one per clone that starts running.
+
+    A new clone that is not asleep at `sha`. A live clone whose value chain
+    has zeroPods true at base and not at `sha`: its own customer.yaml changed
+    (a move reads the old path at base), or a config.yaml above it changed
+    its own zeroPods. Only clone files, and a config.yaml with a live clone
+    below, are read; the chain only in those cases. A failed read raises, so
+    the PR is retried; values that cannot be parsed are a gate.
+    """
+    renames = renames or {}
+    inv = {n: o for o, n in renames.items()}
+    pairs = {f: None for c in new_env_candidates or () for f in c.get("all_yaml_files", ())
+             if _is_clone_env_file(f)}     # head path -> base path, None when new
+    gone = set()
+    for f in changed if base_sha else ():
+        old = inv.get(f, f)
+        if not _is_clone_env_file(f) or f in renames or f in pairs or old not in path_map:
+            continue
+        now = _own_zero_pods(f, sha, repo)
+        if now[1] == "absent":
+            gone.add(f)                    # a teardown, not a wake
+        elif old != f or now[1] != "ok" or now != _own_zero_pods(old, base_sha, repo):
+            pairs[f] = old
+    for cfg in changed if base_sha else ():
+        if posixpath.basename(cfg) != "config.yaml":
+            continue
+        below = posixpath.dirname(cfg) + "/"
+        kids = [p for p in path_map if p.startswith(below) and _is_clone_env_file(p)
+                and p not in pairs and p not in renames and p not in gone]
+        if kids and _own_zero_pods(cfg, sha, repo) != _own_zero_pods(inv.get(cfg, cfg),
+                                                                     base_sha, repo):
+            pairs.update({p: p for p in kids})
+    gates = []
+    for head, base in sorted(pairs.items()):
+        now = _merged_kcc_flat_for_env(head, sha, repo, strict=True)
+        was = _merged_kcc_flat_for_env(base, base_sha, repo, strict=True) if base else {}
+        if now is not None and _zero_pods_on(now):
+            continue                       # asleep at the head
+        v = (now or {}).get("appspace.zeroPods")
+        to = None if v is None else str(v).lower()
+        if now is None or was is None:
+            why = _CLONE_BAD_WHY
+        elif not base:
+            why = _CLONE_NEW_WHY
+        elif _zero_pods_on(was):
+            why = f"zeroPods true to {to or 'unset'}"
+        else:
+            continue                       # awake on main already
+        gates.append({"kind": "clone_wake", "env": head.split("/")[-2], "why": why, "to": to})
+    return gates
+
+
+def _clone_wake_lines(gates) -> list:
+    """COPS-2766: the panel of the clone_wake gates. Plain lines: the caller's
+    icon rule turns its \U0001f6a8 into \u26a0\ufe0f on a green build."""
+    wakes = [g for g in gates or () if g["kind"] == "clone_wake"]
+    if not wakes:
+        return []
+    lines = ["## \U0001f6a8 AEC CLONE STARTS RUNNING", ""]
+    for g in wakes:
+        if g["why"] == _CLONE_NEW_WHY:
+            lines.append(f"- `{g['env']}` is a new clone and it starts running on merge. "
+                         "Add `zeroPods: true` under `appspace:` to create it asleep, "
+                         "restore and clean the data, and wake it in a later PR.")
+        elif g["why"] == _CLONE_BAD_WHY:
+            lines.append(f"- `{g['env']}` can start running with this PR: its values "
+                         "cannot be parsed, so `zeroPods` is unknown.")
+        else:
+            to = f"`{g['to']}`" if g["to"] else "unset"
+            lines.append(f"- `{g['env']}` starts running with this PR (`zeroPods` goes "
+                         f"from `true` to {to}).")
+    lines += ["", (("A clone starts with a copy of the production data, so it can call the "
+              "customer live integrations: SSO, webhooks, mail and connected apps "
+              "(AE-15507). `zeroPods` does not stop the Core VM.")), "",
+              (("Before you merge, check on the clone Mongo that these are empty, and write "
+              "the counts in the PR:")), "",
+              "- `passport.passports`", "- `mail.smtpConfigurations`",
+              "- `integrationwebhook.webhookSubscriptions`",
+              "- `authorization.authorizationregistrations`",
+              "- the `applicationintegration` database",
+              "- `cacsJwts` in `feedconnector`, `contentconversion`, `userinbox` and `mention`",
+              "", (("Runbook: https://appspace.atlassian.net/wiki/spaces/cops/pages/66093626 "
+              "step 2."))]
+    todo = [gate_trailer(g) for g in open_gates(wakes)]
+    if todo:
+        lines += ["", "Then confirm with an empty commit:", "", "```",
+                  *[f'git commit --allow-empty -m "{t}"' for t in todo], "git push", "```"]
+    return lines + [""]
 
 
 def _fleet_identity_files(repo: str = None) -> list:
@@ -6879,6 +7410,100 @@ def _fleet_identity_files(repo: str = None) -> list:
             if vf.endswith("customer.yaml"):
                 out.add(vf.split("$config/", 1)[-1].lstrip("/"))
     return sorted(out)
+
+
+def _own_identity(doc):
+    """(customerName, suffix, ashn) as the file itself writes them, "" when unset."""
+    own = doc.get("appspace") if isinstance(doc, dict) else None
+    own = own if isinstance(own, dict) else {}
+    return tuple(str(own.get(k) or "") for k in ("customerName", "suffix", "ashn"))
+
+
+_fleet_own_cache = {}      # repo -> (base_sha, result), only the last base
+
+
+def _fleet_own_identities(repo, base_sha):
+    """COPS-2766: ({path: (customerName, suffix, ashn)} from the own customer.yaml
+    of each live env at base_sha, [paths not read]). A failed read or YAML that
+    cannot be parsed is not checked; only a complete read is kept."""
+    hit = _fleet_own_cache.get(repo)
+    if hit and hit[0] == base_sha:
+        return hit[1]
+    own, unread = {}, []
+    files = _fleet_identity_files(repo=repo)
+    for f in files:
+        try:
+            doc, state = _read_first_doc(f, base_sha, repo, True)
+        except ValueFileUnreadable:
+            state = "error"
+        if state == "ok":
+            own[f] = _own_identity(doc)
+        elif state != "absent":
+            unread.append(f)
+    if files and not unread:
+        _fleet_own_cache[repo] = (base_sha, (own, unread))
+    return own, unread
+
+
+def _detect_copied_clone_ashn(changed, renames, sha, base_sha, repo=None):
+    """COPS-2766 (C03): (ashn_copy gates, notes) for the changed clone
+    customer.yaml files whose own `appspace.ashn` is new or changed.
+
+    A gate when an env with another customerName has that ashn: a live env
+    at base, or a file of this PR at `sha`, so a move or a delete is not a
+    copy. Nothing lifts it. The fleet is read only for these clones. A failed
+    read of a PR file raises, so the PR is retried; a fleet file that cannot
+    be read is not checked, and a note says so.
+    """
+    if not base_sha:
+        return [], []
+    renames = renames or {}
+    inv = {n: o for o, n in renames.items()}
+    todo = {}
+    for f in changed:
+        if not _is_clone_env_file(f) or f in renames:
+            continue
+        ident = _own_identity(_read_first_doc(f, sha, repo)[0])
+        if ident[2] and ident[2] != _own_identity(
+                _read_first_doc(inv.get(f, f), base_sha, repo)[0])[2]:
+            todo[f] = ident
+    if not todo:
+        return [], []
+    fleet, unread = _fleet_own_identities(repo, base_sha)
+    others = {g: v for g, v in fleet.items() if g not in changed and g not in renames}
+    others.update({p: _own_identity(_read_first_doc(p, sha, repo)[0]) for p in changed
+                   if posixpath.basename(p) == "customer.yaml" and p not in todo})
+    others.update(todo)
+    gates = []
+    for f, (cn, _sfx, ashn) in sorted(todo.items()):
+        hits = sorted(g for g, (c, _s, a) in others.items() if a == ashn and c != cn)
+        if hits:
+            gates.append({"kind": "ashn_copy", "env": f.split("/")[-2],
+                          "why": "the ashn of " + ", ".join(g.split("/")[-2] for g in hits),
+                          "ashn": ashn, "path": f, "others": hits})
+    notes = [f"\u26a0\ufe0f ashn check skipped {len(unread)} environment(s) that could not "
+             "be read, so a copied ashn there is not ruled out."] if unread else []
+    if not fleet and not unread:
+        notes.append("\u26a0\ufe0f ashn check unavailable: the ArgoCD app list is not "
+                     "loaded, so the clone ashn is not compared with the live environments.")
+    return gates, notes
+
+
+def _ashn_copy_lines(gates, notes=()) -> list:
+    """COPS-2766: the panel of the ashn_copy gates, then the notes of the check.
+    Plain lines, like _dup_identity_lines."""
+    hits = [g for g in gates or () if g["kind"] == "ashn_copy"]
+    lines = ["## \u26d4 CLONE ASHN ALREADY IN USE", ""] if hits else []
+    for g in hits:
+        lines.append(f"- `{g['env']}` has `ashn: {g['ashn']}`, the ashn of "
+                     + ", ".join(f"`{p.split('/')[-2]}` (`{p}`)" for p in g["others"]) + ".")
+    if hits:
+        lines += ["", (("The ashn names the environment in Customers and PDNS, so the clone "
+                  "and the other environment look like one environment there. Give the "
+                  "clone its own ashn (runbook "
+                  "https://appspace.atlassian.net/wiki/spaces/cops/pages/66093626 step 2: "
+                  "change ashn, suffix, customerName and instanceName).")), ""]
+    return lines + [x for n in notes for x in (n, "")]
 
 
 def _uc_prefilter_token(identity_file: str) -> str:
@@ -6991,6 +7616,208 @@ def _shared_user_content_lines(identity_file: str, main_sha: str,
             + " — treated as a possible sharer rather than assumed safe.")
     lines.append("")
     return lines
+
+
+def _new_env_shared_lines(env_info, sha, base_sha, repo=None, changed=(), renames=None):
+    """COPS-2766 (C03): check lines for the GCP objects a new env manages with
+    a live env: the BigQuery dataset, the user content bucket and its DNS
+    record. A warning, never a gate: a planned migration shares them on
+    purpose, and a shared customerName is never blocked.
+
+    The siblings are the live envs at base whose own customer.yaml has the
+    same customerName, or whose folder is `<prefix>-<customerName>-*`. The
+    folder is not enough: #4671 was pv-nbc--aec1-a with customerName nbc. An
+    env this PR deletes is left out, a moved one stays. Nothing here raises:
+    a sibling that cannot be read is a check line, and the new env's own
+    values are the render's job.
+    """
+    flat = _merged_kcc_flat_for_env(env_info["config_file"], sha, repo) if base_sha else None
+    cn = str((flat or {}).get("appspace.customerName") or "")
+    if not cn:
+        return []
+    token, renames = f"{flat.get('appspace.prefix')}-{cn}", renames or {}
+    fleet, unread = _fleet_own_identities(repo, base_sha)
+
+    def gone(p):
+        return (p in changed and p not in renames
+                and _bb_fetch_cached(p, sha, repo=repo)[1] == BB_NOT_FOUND)
+    sibs = sorted(p for p in list(fleet) + unread
+                  if (fleet.get(p, ("",))[0] == cn or _uc_prefilter_token(p) == token)
+                  and not gone(p))
+    env, target, ds = env_info["name"], user_content.identity(flat), user_content.bq_dataset(flat)
+    lines = []
+    for p in sibs:
+        label = p.split("/")[-2]
+        other = _merged_kcc_flat_for_env(p, base_sha, repo)
+        uc = user_content.shared_owners(target, {label: user_content.identity(other)})
+        uc = uc.get(label, {})
+        if other is None or uc.get("unproven"):
+            lines.append(f"{_NEW_ENV_CHECK_PREFIX}could not check live `{label}` (`{p}`): its "
+                         f"values cannot be read or are incomplete, so `{env}` may share GCP "
+                         "objects with it.")
+            continue
+        objs = ([f"BigQuery dataset `{ds}`"] if ds and ds == user_content.bq_dataset(other)
+                else []) + [f"bucket `{b}`" for b in uc.get("buckets", ())] \
+            + [f"DNS `{f}`" for f in uc.get("fqdns", ())]
+        if objs:
+            lines.append(
+                f"{_NEW_ENV_CHECK_PREFIX}`{env}` uses the same customerName as live `{label}`, "
+                f"so both manage the same GCP objects: {', '.join(objs)}. The live environment "
+                f"is `{p}`. Two KCC resources on one object fail or fight (acme-config-prod "
+                "#4333). If this is not a planned migration, change `customerName`, or set "
+                "`appspace.bigQuery.suffix` to a new value.")
+    return lines
+
+
+def _new_env_prereqs(new_env_candidates, sha, repo=None) -> tuple:
+    """COPS-2766 (C21): (vm_disk gates, {config_file: lines}) for the new GCP
+    private-cloud envs, where KCC renders the VMs, from the value chain at the
+    head. A failed read raises, so the PR is retried."""
+    gates, lines = [], {}
+    for c in new_env_candidates or ():
+        path = c.get("config_file", "")
+        if not (path.startswith("gcp/") and _is_pv_env_file(path)):
+            continue
+        flat = _merged_kcc_flat_for_env(path, sha, repo, strict=True)
+        if flat is None:
+            lines[path] = [f"{_NEW_ENV_CHECK_PREFIX}`{c['name']}`: the VM checks did not run, "
+                           "because its values cannot be parsed."]
+            continue
+        errors, lines[path] = _new_env_prereq_findings(flat, c["name"])
+        if errors:
+            role, mt, disk, t = errors[0]
+            gates.append({"kind": "vm_disk", "env": c["name"], "why": f"{role} {mt}, {disk} {t}"})
+    return gates, lines
+
+
+# COPS-2766 (C24): the git files globs of the ApplicationSets, by repo slug.
+_appset_globs_cache = {}   # repo -> (monotonic time, globs), a proven list only
+_APPSET_NONE = "ApplicationSet check unavailable (could not list ApplicationSets)"
+
+
+def _glob_re(glob):
+    """A git files glob as a regex: `**/` is zero or more folders, `*` and `?`
+    do not match `/`. The hub runs the old globbing (git ls-files), where `*`
+    also matches `/`. For today's globs and the checked shapes both agree, and
+    the self-check of _appset_file_globs catches a glob where they do not."""
+    return re.compile(re.escape(glob).replace(r"\*\*/", "(?:.*/)?").replace(r"\*\*", ".*")
+                      .replace(r"\*", "[^/]*").replace(r"\?", "[^/]"))
+
+
+def _appset_reads(path, globs):
+    return any(_glob_re(g).fullmatch(path) for g in globs)
+
+
+def _appset_checked(path):
+    """An identity file that an ApplicationSet must read: a private-cloud
+    customer.yaml, a cl-*/config.yaml or a cl-*/app<N>/customer.yaml. The other
+    cl-* folders are rendered by the cl-*/config.yaml ApplicationSets."""
+    app = _CL_APP_RE.match(path)
+    return _is_pv_env_file(path) or bool(_CL_ENV_RE.match(path)) \
+        or bool(app and re.fullmatch(r"app\d+", app[2]))
+
+
+def _git_file_globs(node, repo):
+    """The git files paths in a generator tree whose repoURL is `repo`. A path
+    with `{{` is a template, and an exclude path deploys nothing."""
+    if isinstance(node, list):
+        return [g for x in node for g in _git_file_globs(x, repo)]
+    if not isinstance(node, dict):
+        return []
+    # The repoURL rule of the apps: an ssh or https URL, with or without .git.
+    own = node.get("files") if _extract_app_git_repo({"spec": {"source": node}}) == repo else ()
+    return [f["path"] for f in own or () if isinstance(f, dict) and not f.get("exclude")
+            and isinstance(f.get("path"), str) and "{{" not in f["path"]] \
+        + [g for v in node.values() for g in _git_file_globs(v, repo)]
+
+
+def _appset_file_globs(repo, fresh=False):
+    """COPS-2766 (C24): the git files globs of the ApplicationSets that read
+    `repo`, or None when they are not proven: `argocd appset list` failed, it
+    gave no glob (an RBAC filter lists nothing), or a live identity file of a
+    checked shape matches none, so this matcher does not agree with ArgoCD. A
+    proven list is cached for PATH_MAP_TTL; `fresh` lists again."""
+    hit = _appset_globs_cache.get(repo)
+    if hit and not fresh and time.monotonic() - hit[0] < PATH_MAP_TTL:
+        return hit[1]
+    try:
+        r = subprocess.run([ARGOCD_BIN, "appset", "list", "-o", "json"] + _auth_flags(),
+                           capture_output=True, text=True, timeout=90,
+                           env=_argocd_subprocess_env())
+        if r.returncode != 0:
+            raise RuntimeError(f"rc {r.returncode}: {r.stderr[:200]}")
+        raw = json.loads(r.stdout)
+    except (OSError, RuntimeError, ValueError, subprocess.SubprocessError) as exc:
+        logsink.log(f"{_APPSET_NONE}: {exc}", "WARNING")
+        return None
+    items = raw.get("items") if isinstance(raw, dict) else raw
+    globs = sorted({g for a in (items if isinstance(items, list) else ()) if isinstance(a, dict)
+                    for g in _git_file_globs((a.get("spec") or {}).get("generators"), repo)})
+    live = {vf.split("$config/", 1)[-1].lstrip("/")
+            for app, vfs in (_app_value_files_map or {}).items()
+            if (_app_repo_map or {}).get(app) in (None, repo) for vf in vfs or ()}
+    bad = sorted(f for f in live if _appset_checked(f) and not _appset_reads(f, globs))
+    if not globs or bad:
+        logsink.log(f"{_APPSET_NONE}: " + (f"live {bad[0]} matches no glob" if globs
+                                            else f"no git files glob reads {repo}"), "WARNING")
+        return None
+    _appset_globs_cache[repo] = (time.monotonic(), globs)
+    return globs
+
+
+def _appset_misses(new_env_candidates, renames, repo=None) -> tuple:
+    """COPS-2766 (C24, row 34): (appset_miss gates, {config_file: check lines},
+    notes). An identity file of a new env, or the new side of a move out of an
+    ApplicationSet, that no git files glob reads makes no apps, so nothing
+    deploys on merge. A miss lists the ApplicationSets again without the cache,
+    so one applied a minute ago counts. aws/, and globs that are not proven,
+    give a warning and never a gate."""
+    todo = [(c["name"], c["config_file"], f, None) for c in new_env_candidates or ()
+            for f in c.get("all_yaml_files", ())
+            if _appset_checked(f) or (f.startswith("aws/") and f.endswith("/customer.yaml"))]
+    for old, new in sorted((renames or {}).items()):
+        if _appset_checked(new):
+            cl = _CL_ENV_RE.match(new) or _CL_APP_RE.match(new)
+            todo.append((cl[1] if cl else new.split("/")[-2], None, new, old))
+    lines = {k: [f"{_NEW_ENV_CHECK_PREFIX}`{e}`: `aws/` is deployed by the legacy pipeline, "
+                 "not by ArgoCD, so no ApplicationSet check ran."]
+             for e, k, f, _old in todo if f.startswith("aws/")}
+    rest = [t for t in todo if not t[2].startswith("aws/")]
+
+    def missed(globs):
+        return [t for t in rest if not _appset_reads(t[2], globs)
+                and (t[3] is None or _appset_reads(t[3], globs))]
+    globs = _appset_file_globs(repo or BB_REPO) if rest else []
+    if globs and missed(globs):
+        globs = _appset_file_globs(repo or BB_REPO, fresh=True)   # it may be applied just now
+    if globs is None:
+        for e, k, _f, _old in rest:
+            if k:
+                lines.setdefault(k, [f"{_NEW_ENV_CHECK_PREFIX}`{e}`: {_APPSET_NONE}, so it is "
+                                     "not proven that ArgoCD makes apps for it."])
+        moved = [f"`{f}`" for _e, k, f, _old in rest if not k]
+        notes = [f"\u26a0\ufe0f {_APPSET_NONE}, so it is not proven that ArgoCD makes apps "
+                 f"for the moved {', '.join(moved)}."] if moved else []
+        return [], lines, notes
+    by_env = {}
+    for e, _k, f, _old in missed(globs):
+        by_env.setdefault(e, []).append(f)
+    return [{"kind": "appset_miss", "env": e, "paths": ps}
+            for e, ps in sorted(by_env.items())], lines, []
+
+
+def _appset_miss_lines(gates, notes=()) -> list:
+    """COPS-2766: the panel of the appset_miss gates, then the notes of the
+    check. Plain lines, like _dup_identity_lines."""
+    hits = [g for g in gates or () if g["kind"] == "appset_miss"]
+    lines = ["## \u26d4 NO APPLICATIONSET READS THIS FOLDER", ""] if hits else []
+    lines += [f"- `{p}` matches no ApplicationSet, so ArgoCD makes no apps for it and "
+              "nothing deploys on merge." for g in hits for p in g["paths"]]
+    if hits:
+        lines += ["", (("Check the cloud, tier and spoke folders. If the ApplicationSet is being "
+                  "added in acme-infrastructure, apply it first, then push again here (an "
+                  "empty commit is enough).")), ""]
+    return lines + [x for n in notes for x in (n, "")]
 
 
 def _env_declares_live_kcc_vms(identity_file: str, sha: str,
@@ -7480,8 +8307,13 @@ def _evaluate_env_decommissions(candidates: list, pr_sha: str, main_sha: str,
     return lines, envs_reported, full_lines
 
 
+# The VM panel line of a vm_disk error, built in _summarize_vm_changes.
+_VM_DISK_LINE_RE = re.compile(r"`([^`]+)` \u00b7 \*\*linux VM \(KCC\) \u00b7 (\w+)\*\*: "
+                              r"`(?:machineType` `([^`]+)` \u2192 `)?([^`]+)`")
+
+
 def _merge_gates(decommission_candidates, renames=None, path_map=None,
-                 vm_change_lines=None, app_results=None) -> list:
+                 vm_change_lines=None, app_results=None, extra=()) -> list:
     """COPS-2766: the merge gates of this PR, one per kind and env, none lifted.
 
     From the teardowns _evaluate_env_decommissions confirmed. Arming the flag
@@ -7492,6 +8324,9 @@ def _merge_gates(decommission_candidates, renames=None, path_map=None,
     is `shrink`, one per env (the first name in backticks of its line), and
     nothing lifts it. An app that releases a static IP or a DNS record is
     `ip`, lifted by `Confirm-IP-Release: <env>`.
+    `extra` holds gates the caller built itself. An n4 or c4 machine with a
+    pd- disk in the VM panel is `vm_disk`, one per env with the role and the
+    machine type as its reason, and nothing lifts it either.
     """
     found = [g for c in decommission_candidates or () for g in c.get("gates", ())]
     found += [{"kind": "cl_rename", "env": _CL_ENV_RE.match(old)[1],
@@ -7500,12 +8335,28 @@ def _merge_gates(decommission_candidates, renames=None, path_map=None,
               if _CL_ENV_RE.match(old) and (path_map or {}).get(old)]
     found += [{"kind": "shrink", "env": (re.findall(r"`([^`]+)`", line) or [""])[0]}
               for line in vm_change_lines or () if _VM_SHRINK_REASON in line]
+    for hit in (_VM_DISK_LINE_RE.search(line) for line in vm_change_lines or ()
+                if _VM_DISK_FAMILY_REASON in line):
+        why = hit and f"{hit[2]} " + " to ".join(filter(None, hit.groups()[2:]))
+        found.append({"kind": "vm_disk", "env": hit[1] if hit else "", "why": why or ""})
     found += [{"kind": "ip", "env": _envs_from_apps([app])[0]}
               for app, r in (app_results or {}).items() if getattr(r, "ip_released", None)]
+    found += extra
     gates = {}
     for g in found:
         gates.setdefault((g["kind"], g["env"]), {"arg": g["env"], **g, "lifted": False})
     return list(gates.values())
+
+
+def _lift_gates(gates, repo, pr_id, base_sha, pr_sha) -> list:
+    """COPS-2766: lift the gates a Confirm-* line in a commit message names.
+    The commits are read only when a gate has a trailer, so a PR with none
+    never pays for it. PrCommitsUnreadable propagates: a retry, never a lift."""
+    if any(gate_trailer(g) for g in gates):
+        confirmed = _confirmations(_pr_commit_messages(repo, pr_id, base_sha, pr_sha))
+        for g in gates:
+            g["lifted"] = gate_trailer(g).lower() in confirmed
+    return gates
 
 
 def _rebuild_hint_lines(candidates) -> list:
@@ -9284,6 +10135,14 @@ def _value_file_parent_chain(changed_path: str, apps, sha: str,
 
 def _values_redundancy_lines(changed_files, pr_sha, base_sha, path_map,
                              repo=None) -> list:
+    """COPS-2721: the higher-layer panel for _values_redundancy_findings."""
+    return values_redundancy.render_lines(
+        _values_redundancy_findings(changed_files, pr_sha, base_sha, path_map, repo=repo),
+        _VALUES_REDUNDANCY_HDR)
+
+
+def _values_redundancy_findings(changed_files, pr_sha, base_sha, path_map,
+                                repo=None) -> list:
     """COPS-2721: call out value-file edits already identical in a parent.
 
     Only identity / yaml value files that exist on BOTH sides are candidates
@@ -9329,18 +10188,90 @@ def _values_redundancy_lines(changed_files, pr_sha, base_sha, path_map,
         finding = values_redundancy.assess(clean, old_flat, new_flat, chain)
         if finding:
             findings.append(finding)
-    return values_redundancy.render_lines(findings, _VALUES_REDUNDANCY_HDR)
+    return findings
+
+
+# COPS-2766: keys the ApplicationSet, the pause panel or the teardown panels own.
+_INERT_EDIT_SKIP = ("appspace.decommission", "appspace.decommissionPurgeData",
+                    "appspace.customerName", "appspace.suffix")
+_INERT_REPLICAS_RE = re.compile(r"^appspace\.microservices\.(?:definitions\.)?([^.]+)\.replicas$")
+
+
+def _inert_edit_hint(key, paused) -> str:
+    """Why `key` can change nothing, or '' when the closing line says it."""
+    svc = _INERT_REPLICAS_RE.match(key)
+    if key == "appspace.autosync" and not paused:
+        return ("  - Only `autosync: false` pauses auto-sync. `true` is the default, so "
+                "this line changes nothing.")
+    if svc:
+        return (f"  - `replicas` does nothing while an HPA or the ping-scaler runs "
+                f"`{svc[1]}`. For a fixed count, use "
+                f"`microservices.acmePingScaler.customReplicas.{svc[1]}` with the "
+                "ping-scaler, or the service's `hpa.minReplicas` with an HPA.")
+    if key.startswith("appspace.helm"):
+        return f"  - `{key}` only acts in the legacy Helm pipeline, which ArgoCD replaced."
+    return ""
+
+
+def _inert_edit_lines(changed, sha, base_sha, path_map, app_results, redundant,
+                      repo=None) -> list:
+    """COPS-2766: the keys a live env's customer.yaml changes while every app of
+    that file renders the same (REVIEW). Helm ignores a key no chart reads, with
+    no error. Versions, appspace.infra.*, _INERT_EDIT_SKIP, a pause or resume
+    and the keys the higher-layer findings `redundant` list stay out. A failed
+    read raises, so the PR is retried."""
+    listed = {f["path"]: {r["key"] for r in f["redundant"]} for f in redundant}
+
+    def paused(path, doc, at):
+        # The ApplicationSet merges customer.yaml over the cohort config.yaml.
+        cohort = _read_first_doc(_cohort_of(path), at, repo, True)[0]
+        return _autosync_paused({"appspace.autosync": _appset_param(doc, cohort, "autosync")})
+
+    found = []
+    for f in sorted(set(changed)):
+        apps = path_map.get(f)
+        if posixpath.basename(f) != "customer.yaml" or not apps or any(
+                getattr(app_results.get(a), "outcome", None) != OUT_NO_DIFF for a in apps):
+            continue
+        (old, st_old), (new, st_new) = _read_first_doc(f, base_sha, repo), _read_first_doc(f, sha, repo)
+        if (st_old, st_new) != ("ok", "ok"):
+            continue
+        old_flat, new_flat = _flatten_yaml(old), _flatten_yaml(new)
+        keys = [k for k in sorted(values_redundancy.changed_keys(old_flat, new_flat))
+                if k in new_flat and k.rsplit(".", 1)[-1] != "version"
+                and not k.startswith("appspace.infra.") and k not in _INERT_EDIT_SKIP
+                and k not in listed.get(f, ())]
+        if "appspace.autosync" in keys and paused(f, old, base_sha) != paused(f, new, sha):
+            keys.remove("appspace.autosync")    # the auto-sync panel's
+        if keys:
+            env = ("/".join(f.split("/")[4:-1]) if "/public-cloud/" in f
+                   else posixpath.basename(posixpath.dirname(f)))
+            found.append((env, keys, _autosync_paused(new_flat)))
+    if not found:
+        return []
+    n = sum(len(keys) for _e, keys, _p in found)
+    lines = ["### \U0001f4a4 Edits with no effect", "",
+             f"{_INERT_EDIT_HDR} {n} key{'s' if n > 1 else ''} changed, but no rendered "
+             "manifest changed:", ""]
+    for env, keys, is_paused in found[:10]:
+        more = f" (+{len(keys) - 5} more)" if len(keys) > 5 else ""
+        lines.append(f"- `{env}`: " + ", ".join(f"`{k}`" for k in keys[:5]) + more)
+        lines += [h for h in (_inert_edit_hint(k, is_paused) for k in keys[:5]) if h]
+    if len(found) > 10:
+        lines.append(f"- ... and {len(found) - 10} more environment(s)")
+    return lines + ["", (("*Check the key path and the service name. Helm ignores a key "
+                    "that no chart reads, with no error.*")), ""]
 
 
 def _clean_status_description(has_redundancy: bool,
-                              has_input_changes: bool) -> str:
+                              has_input_changes: bool, has_inert: bool = False) -> str:
     """SUCCESSFUL build-status text when every evaluated app is unchanged.
 
     COPS-2721: keep SUCCESSFUL (nothing failed) but stop the status reading
     like a silent miss when the PR clearly edited YAML that a higher layer
     already set, or that the chart did not consume.
     """
-    return values_redundancy.noop_status_hint(has_redundancy, has_input_changes)
+    return values_redundancy.noop_status_hint(has_redundancy, has_input_changes, has_inert)
 
 
 def _flag_typo_status_description(lines, removal=False) -> str:
@@ -9997,6 +10928,16 @@ def _summarize_vm_changes(changed_files, pr_sha, base_sha, path_map,
         if not keys:
             continue
         env_name = posixpath.basename(posixpath.dirname(clean))
+        # COPS-2766 (C21): an n4 or c4 machine with a pd- disk that this change
+        # adds. Only a GCP private-cloud env: KCC renders its VMs.
+        if clean.startswith("gcp/") and _is_pv_env_file(clean) and any(
+                k.startswith((_KCC_PREFIX, _LEGACY_PREFIX))
+                and k.rsplit(".", 1)[-1] in _VM_DISK_FAMILY_LEAVES for k in keys):
+            dangerous_lines += [
+                f"- \U0001f6a8 `{env_name}` \u00b7 **linux VM (KCC) \u00b7 {role}**: {text}"
+                for role, text in _vm_disk_family_changes(
+                    _merged_kcc_flat_for_env(clean, base_sha, repo, strict=True),
+                    _merged_kcc_flat_for_env(clean, pr_sha, repo, strict=True))]
         # COPS-2608: classify the whole file before scoring individual keys.
         # A Terraform -> KCC ownership transfer moves the same machineType
         # from one key tree to the other; scoring the removal and the
@@ -11602,7 +12543,7 @@ def format_comment(pr_sha, app_results, skipped_apps=None, base_sha="",
     # change) get their own section here, using the exact same rendering
     # and classification path as a new-env-only PR (_evaluate_new_envs).
     if new_env_lines:
-        lines += ["---"] + new_env_lines
+        lines += ["---"] + build_marks(new_env_lines, _green)
 
     # ── Appendix (v2.25.0): full rendered output of new environments ──
     # Always the LAST content before the footer: the middle-cut truncation
@@ -11663,7 +12604,8 @@ def format_comment(pr_sha, app_results, skipped_apps=None, base_sha="",
         _joined_state = "\n".join(appspace_state_lines or [])
         status = "\u2705 " + _clean_status_description(
             has_redundancy=_VALUES_REDUNDANCY_HDR in _joined_state,
-            has_input_changes=bool(input_change_lines))
+            has_input_changes=bool(input_change_lines),
+            has_inert=_INERT_EDIT_HDR in _joined_state)
 
     # v2.5.8: the downgrade must also be visible in the one-line status —
     # including the case where manifests are identical but the chart
@@ -11709,6 +12651,47 @@ def format_comment(pr_sha, app_results, skipped_apps=None, base_sha="",
                 continue
         deduped.append(ln)
     return "\n".join(deduped)
+
+
+def format_new_env_comment(pr_sha, new_env_lines, new_env_full_lines,
+                           structural_envs, gates, n_envs, total_new,
+                           base_sha=""):
+    """COPS-2766: (body, state, desc) for a PR that only adds environments.
+
+    The merge summary and the gates of a diff comment, with the same token
+    and status rules. A structural problem stays [blocked] with its old
+    description; an open gate comes next. Pure, like format_comment."""
+    token = "blocked" if structural_envs else (gate_token(gates) or "clean")
+    lines = [f"## \U0001f52d {STATUS_NAME}", "", _comment_header(pr_sha), ""]
+    green = token == "clean"
+    lines += _build_merge_summary({}, {}, None, None, None, new_env_lines,
+                                  bool(structural_envs), gates=gates, green=green)
+    lines += ["---", ""] + build_marks(new_env_lines, green)
+    # v2.25.0: complete rendered output after the summary. The comment
+    # inlines what fits (footer-preserving truncation in upsert_comment);
+    # the full-diff artifact keeps it all.
+    if new_env_full_lines:
+        lines += ["---"] + new_env_full_lines
+    if structural_envs:
+        desc = (f"{len(structural_envs)} new environment(s) have a structural "
+                f"config problem: {', '.join(structural_envs)}")
+        status = ("\u274c New environment(s) with a structural problem that "
+                  "must be fixed before merge: "
+                  + ", ".join(f"`{e}`" for e in structural_envs))
+    else:
+        desc = f"{n_envs} new environment(s), ~{total_new} resource(s) to create"
+        status = "\u2705 New environment(s) - all resources will be created on merge"
+    status += gate_footer(gates)
+    lines += [
+        "---",
+        f"**Status:** {status}",
+        f"*{_ts()} \u2014 {COMMENT_MARKER} [{token}]"
+        + (f" [base:{base_sha[:8]}]" if base_sha else "") + "*",
+    ]
+    body = "\n".join(lines)
+    if green:
+        return body, "SUCCESSFUL", join_status_lead(status_lead(body), desc)
+    return body, "FAILED", (desc if structural_envs else gate_status_description(gates))
 
 # ── Per-PR processing (isolated) ──────────────────────────────────────
 def process_pr(pr, path_map, base_sha="", repo=None):
@@ -11976,45 +12959,16 @@ def process_pr(pr, path_map, base_sha="", repo=None):
                     "DEBUG", pr=pr_id, repo=repo,
                     changed_files=len(changed), affected_apps=len(affected))
 
-        # v2.12.0 (COPR-31637): hard guard. A value file that sets
-        # appspace.microservices.definitions to null/empty wipes every
-        # per-service image.name override on merge (helm `merge` collapses the
-        # map), silently breaking image names -> ImagePullBackOff across the
-        # whole environment. This is checked BEFORE any diff/app logic and, if
-        # found, blocks the merge outright with a red status: no rendered diff
-        # would make the danger obvious, so we refuse instead of commenting a
-        # green diff. Runs on every PR regardless of affected apps.
-        wiped = _detect_wiped_definitions(changed, render_sha, repo=repo)
-        if wiped:
-            _files_md = "\n".join(f"- `{w}`" for w in wiped)
-            desc = (f"BLOCKED: {len(wiped)} file(s) empty out "
-                    f"microservices.definitions (wipes image overrides)")
+        # COPR-31637, COPS-2766: a YAML slip (a duplicate key, a bare key, or an
+        # empty or non-map microservices.definitions) changes config, and no diff
+        # line shows it clearly, so it blocks before any render. Only the slips
+        # this PR adds count. Without a merge preview the base is main, not the
+        # merge base, so only the wipe is checked.
+        slips = _detect_yaml_slips(changed, renames, render_sha,
+                                   base_sha if render_sha != pr_sha else None, repo=repo)
+        if slips:
+            desc, body = _yaml_slip_block(slips, pr_sha, base_sha)
             st = post_build_status(pr_sha, "FAILED", desc, pr_id=pr_id, repo=repo)
-            body = (
-                f"## \U0001f52d {STATUS_NAME}\n\n"
-                f"{_comment_header(pr_sha)}\n\n"
-                f"\u26d4 **This PR is blocked from merging — dangerous change "
-                f"detected.**\n\n"
-                f"The following value file(s) set "
-                f"`appspace.microservices.definitions` to an **empty/null "
-                f"map**:\n\n{_files_md}\n\n"
-                f"On merge, Helm merges this map **last**, so a null/empty "
-                f"`definitions` **wipes every per-service `image.name` "
-                f"override** the chart ships (e.g. `appspace-platformservice`, "
-                f"`appspace-webhookservice`, `appspace-screenshot`). Each "
-                f"affected microservice then falls back to the derived "
-                f"`appspace-<key>` name, which for these services points at a "
-                f"registry path that has never held an image \u2014 causing "
-                f"**ImagePullBackOff across the whole environment** (this is "
-                f"exactly what happened in COPR-31637).\n\n"
-                f"**How to fix:** either remove the `definitions:` key entirely "
-                f"(so the chart's own map is kept), or give it real children. "
-                f"Never leave `definitions:` present but empty.\n\n"
-                f"---\n**Status:** \u26d4 Blocked \u2014 empty "
-                f"`microservices.definitions` would break image names on merge\n"
-                f"*{_ts()} \u2014 {COMMENT_MARKER} [blocked]"
-                + (f" [base:{base_sha[:8]}]" if base_sha else "") + "*"
-            )
             cm = upsert_comment(pr_id, body, existing_id, repo=repo)
             _seen_after_writes(sk, pr_sha, base_sha, st, cm)
             return
@@ -12081,10 +13035,51 @@ def process_pr(pr, path_map, base_sha="", repo=None):
             cm = upsert_comment(pr_id, body, existing_id, repo=repo)
             _seen_after_writes(sk, pr_sha, base_sha, st, cm)
             return
+        # COPS-2766: a generator key where the ApplicationSet does not read it, or a
+        # version that is not a string. The fix is always to move, quote or delete it.
+        inert_hits = _detect_inert_generator_keys(changed, renames, path_map, render_sha,
+                                                  base_sha, repo=repo)
+        if inert_hits:
+            desc, body = _inert_key_block(inert_hits, pr_sha, base_sha)
+            st = post_build_status(pr_sha, "FAILED", desc, pr_id=pr_id, repo=repo)
+            cm = upsert_comment(pr_id, body, existing_id, repo=repo)
+            _seen_after_writes(sk, pr_sha, base_sha, st, cm)
+            return
+        # COPS-2766: a deploy* key set to true turns the legacy Helm writer back on.
+        # Confirm-LegacyHelm: <env> lifts it; the commits are read only on a hit.
+        legacy_hits = _detect_legacy_writer_rearm(changed, renames, render_sha, base_sha,
+                                                  repo=repo)
+        legacy_gates = [{"kind": "legacy_helm", "env": h["env"]} for h in legacy_hits]
+        if legacy_gates:
+            confirmed = _confirmations(_pr_commit_messages(repo, pr_id, base_sha, pr_sha))
+            todo = [h for h, g in zip(legacy_hits, legacy_gates)
+                    if gate_trailer(g).lower() not in confirmed]
+            if todo:
+                desc, body = _legacy_writer_block(todo, pr_sha, base_sha)
+                st = post_build_status(pr_sha, "FAILED", desc, pr_id=pr_id, repo=repo)
+                cm = upsert_comment(pr_id, body, existing_id, repo=repo)
+                _seen_after_writes(sk, pr_sha, base_sha, st, cm)
+                return
         new_env_candidates = _detect_new_env_candidates(changed, path_map, renames, pr_sha=render_sha, repo=repo)
         if new_env_candidates:
             logsink.log(f"PR #{pr_id}: {len(new_env_candidates)} new env candidate(s): "
                         f"{[e['name'] for e in new_env_candidates]}", pr=pr_id)
+        # COPS-2766: an AEC clone that starts running is a gate on both paths below.
+        clone_gates = _detect_clone_wakes(changed, renames, path_map, new_env_candidates,
+                                          render_sha, base_sha, repo=repo)
+        # A new env with the app names of another env: nothing lifts it.
+        dup_gates, dup_unchecked = _detect_duplicate_identities(
+            changed, renames, new_env_candidates, render_sha, repo=repo)
+        # A clone with the ashn of another env: nothing lifts it either.
+        ashn_gates, ashn_notes = _detect_copied_clone_ashn(changed, renames, render_sha,
+                                                           base_sha, repo=repo)
+        # A new GCP env on an n4 or c4 machine with a pd- disk: GCP rejects it.
+        disk_gates, prereqs = _new_env_prereqs(new_env_candidates, render_sha, repo=repo)
+        # A new or moved env that no ApplicationSet reads: nothing deploys.
+        appset_gates, appset_lines, appset_notes = _appset_misses(new_env_candidates, renames,
+                                                                  repo=repo)
+        for f, ls in appset_lines.items():
+            prereqs[f] = prereqs.get(f, []) + ls
 
         # v2.5.10 (explicit request): detect FULL environment decommissions
         # (identity file deleted, no successor anywhere — distinct from a
@@ -12117,41 +13112,17 @@ def process_pr(pr, path_map, base_sha="", repo=None):
                                   pr_id=pr_id, repo=repo)
                 new_env_lines, structural_envs, total_new, new_env_full_lines = \
                     _evaluate_new_envs(new_env_candidates, render_sha,
-                                       with_full_output=True)
-
-                lines = [
-                    f"## \U0001f52d {STATUS_NAME}", "",
-                    _comment_header(pr_sha), "",
-                ] + new_env_lines
-
-                # v2.25.0: complete rendered output after the summary. The
-                # comment inlines what fits (footer-preserving truncation in
-                # upsert_comment); the full-diff artifact below keeps it all.
-                if new_env_full_lines:
-                    lines += ["---"] + new_env_full_lines
-
-                if structural_envs:
-                    state = "FAILED"
-                    desc = (f"{len(structural_envs)} new environment(s) have a "
-                            f"structural config problem: {', '.join(structural_envs)}")
-                    status_line = (
-                        f"**Status:** \u274c New environment(s) with a structural "
-                        f"problem that must be fixed before merge: "
-                        f"{', '.join(f'`{e}`' for e in structural_envs)}")
-                    clean_tag = "[blocked]"
-                else:
-                    state = "SUCCESSFUL"
-                    desc = f"{len(new_env_candidates)} new environment(s), ~{total_new} resource(s) to create"
-                    status_line = (
-                        f"**Status:** \u2705 New environment(s) - all resources "
-                        f"will be created on merge")
-                    clean_tag = "[clean]"
-                lines += [
-                    "---",
-                    status_line,
-                    f"*{_ts()} \u2014 {COMMENT_MARKER} {clean_tag}" + (f" [base:{base_sha[:8]}]" if base_sha else "") + "*",
-                ]
-                body = "\n".join(lines)
+                                       with_full_output=True, base_sha=base_sha, repo=repo,
+                                       changed=changed, renames=renames, prereqs=prereqs)
+                gates = _lift_gates(_merge_gates((), extra=clone_gates + dup_gates + ashn_gates
+                                                 + disk_gates + appset_gates + legacy_gates),
+                                    repo, pr_id, base_sha, pr_sha)
+                body, state, desc = format_new_env_comment(
+                    pr_sha, _clone_wake_lines(gates) + _dup_identity_lines(gates, dup_unchecked)
+                    + _ashn_copy_lines(gates, ashn_notes)
+                    + _appset_miss_lines(gates, appset_notes) + new_env_lines,
+                    new_env_full_lines, structural_envs,
+                    gates, len(new_env_candidates), total_new, base_sha)
                 # v2.25.0: this path never persisted a full-diff artifact, so
                 # new-env-only PRs had no full-output page at all. Save it
                 # BEFORE the final build status so the status icon deep-links
@@ -12160,7 +13131,10 @@ def process_pr(pr, path_map, base_sha="", repo=None):
                                        base_sha=base_sha)
                 st = post_build_status(pr_sha, state, desc, pr_id=pr_id, repo=repo)
                 cm = upsert_comment(pr_id, body, existing_id, repo=repo)
-                _seen_after_writes(sk, pr_sha, base_sha, st, cm)
+                if _extract_status_token(body) == "transient":
+                    _backoff_register_transient(sk, pr_sha)
+                else:
+                    _seen_after_writes(sk, pr_sha, base_sha, st, cm)
                 return
 
             # No apps affected and no new env pattern found.
@@ -12563,7 +13537,8 @@ def process_pr(pr, path_map, base_sha="", repo=None):
         if new_env_candidates:
             new_env_lines, structural_envs, total_new, new_env_full_lines = \
                 _evaluate_new_envs(new_env_candidates, render_sha,
-                                   with_full_output=True)
+                                   with_full_output=True, base_sha=base_sha, repo=repo,
+                                   changed=changed, renames=renames, prereqs=prereqs)
         new_env_desc = (
             f"{len(structural_envs)} new environment(s) have a structural "
             f"config problem: {', '.join(structural_envs)}"
@@ -12603,14 +13578,25 @@ def process_pr(pr, path_map, base_sha="", repo=None):
                 changed, render_sha, base_sha, path_map, repo=repo)
         except Exception as e:  # informational panel must never break the comment
             logsink.log(f"    [comment] blast-radius panel failed: {e}", "WARNING")
+        redundant = []
         try:
             # COPS-2721: same channel — REVIEW verdict when customer.yaml
             # re-states values a parent config.yaml already sets.
-            appspace_state_lines += _values_redundancy_lines(
+            redundant = _values_redundancy_findings(
                 changed, pr_sha, base_sha, path_map, repo=repo)
+            appspace_state_lines += values_redundancy.render_lines(
+                redundant, _VALUES_REDUNDANCY_HDR)
         except Exception as e:
             logsink.log(f"    [comment] values-redundancy panel failed: {e}",
                         "WARNING")
+        try:
+            # COPS-2766: same channel, a REVIEW line for keys that change nothing.
+            appspace_state_lines += _inert_edit_lines(
+                changed, render_sha, base_sha, path_map, app_results, redundant, repo=repo)
+        except Exception as e:
+            if _is_transient_exception(e):
+                raise  # a failed read retries the PR
+            logsink.log(f"    [comment] inert-edits panel failed: {e}", "WARNING")
         try:
             vm_change_lines = _summarize_vm_changes(
                 changed, render_sha, base_sha, path_map, app_results, repo=repo)
@@ -12619,15 +13605,16 @@ def process_pr(pr, path_map, base_sha="", repo=None):
                 raise  # COPS-2766: but a failed read retries the PR
             logsink.log(f"    [comment] vm-changes panel failed: {e}", "WARNING")
             vm_change_lines = []
-        # COPS-2766: merge gates. The commits are read only when a gate can be
-        # lifted, so a PR with none never pays for it. PrCommitsUnreadable goes
-        # to the catch-all below: a retry, never a lift.
+        # COPS-2766: merge gates. PrCommitsUnreadable goes to the catch-all
+        # below: a retry, never a lift.
         gates = _merge_gates(decommission_candidates, renames, path_map,
-                             vm_change_lines, app_results)
-        if any(gate_trailer(g) for g in gates):
-            confirmed = _confirmations(_pr_commit_messages(repo, pr_id, base_sha, pr_sha))
-            for g in gates:
-                g["lifted"] = gate_trailer(g).lower() in confirmed
+                             vm_change_lines, app_results,
+                             clone_gates + dup_gates + ashn_gates + disk_gates + appset_gates
+                             + legacy_gates)
+        _lift_gates(gates, repo, pr_id, base_sha, pr_sha)
+        appspace_state_lines = (_clone_wake_lines(gates) + _dup_identity_lines(gates, dup_unchecked)
+                                + _ashn_copy_lines(gates, ashn_notes)
+                                + _appset_miss_lines(gates, appset_notes) + appspace_state_lines)
         # Direct permalink into the full-diff view for this exact commit.
         # Only built when the view is reachable from outside the cluster
         # (base URL set), so the comment never links to something a
@@ -12916,7 +13903,8 @@ def process_pr(pr, path_map, base_sha="", repo=None):
                 _joined = "\n".join(appspace_state_lines or [])
                 _clean = _clean_status_description(
                     has_redundancy=_VALUES_REDUNDANCY_HDR in _joined,
-                    has_input_changes=bool(input_change_lines))
+                    has_input_changes=bool(input_change_lines),
+                    has_inert=_INERT_EDIT_HDR in _joined)
                 state, desc = "SUCCESSFUL", f"{_clean}{status_extra}"
         if state == "SUCCESSFUL":
             # COPS-2766: lead with the top finding of the comment just

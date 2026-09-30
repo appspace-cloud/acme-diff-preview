@@ -27,6 +27,8 @@ Each golden below maps to a real incident:
 | `decommission_phase1.md` | COPS-2707. acme-config-prod #4378 armed `allowDeletion` and showed no phase table, leaving the first PR of a three-PR teardown as the one with no positional context. |
 | `teardown_flag_misspelled.md` | COPS-2707. acme-config-prod #4376 merged `appspace.decomission: true` — one `m`, read by nothing — under a green "Routine, nothing dangerous detected". |
 | `env_decommission_orphan.md` | COPS-2766. A folder removal with no cascade armed said DO NOT MERGE in the comment, but the build was green. Now it is `[blocked]` and FAILED until a commit message has `Confirm-Teardown: <env>`. The build is red, so the verdict keeps ⛔. |
+| `new_env_only.md` | COPS-2766. A PR that only adds environments had its own comment, with no merge summary, no gates and no status lead. Now it gets the summary and the gates of a diff comment. A clean one stays green and routine. |
+| `clone_wake.md` | COPS-2766. An AEC clone woke on a copy of production data with only a replica diff to show it (acme-config-prod #4660 woke 13, AE-15507). Now the build is FAILED with `[blocked]` until a commit message has `Confirm-Clone-Sanitized: <env>`, and the panel lists the Mongo collections to check. |
 
 ## Updating them
 

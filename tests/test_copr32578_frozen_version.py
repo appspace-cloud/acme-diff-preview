@@ -131,6 +131,14 @@ def test_only_real_generator_files_count_in_public_cloud(repo):
     assert _frozen([CL_CONST, f"{CL}/app9/customer.yaml"], path_map=CL_MAP) == [] and calls == []
 
 
+def test_a_fixed_cl_glb_customer_yaml_is_not_a_version_source(repo):
+    # COPS-2766: the api, cloud and user-content GLB sets read only cl-*/config.yaml.
+    _, head, calls = repo
+    api = f"{CL}/api/customer.yaml"
+    head[api] = 'appspace:\n  version: ""\n'
+    assert _frozen([api], path_map={**CL_MAP, api: ["cl-prod-b-api-glb"]}) == [] and calls == []
+
+
 def test_an_empty_version_in_a_live_cl_app(repo):
     _, head, _ = repo
     head[CL_ENV] = "appspace:\n  version: 2603.2.19\n"

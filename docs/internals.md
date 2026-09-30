@@ -5,12 +5,17 @@ here is required to use the tool; it is for people changing it or debugging it.
 
 ## Contents
 
-- [Why an empty `microservices.definitions` is blocked](#why-an-empty-microservicesdefinitions-is-blocked)
+- [Why a YAML slip is blocked](#why-a-yaml-slip-is-blocked)
 - [Why a clone without its `--aec1` token is blocked](#why-a-clone-without-its---aec1-token-is-blocked)
 - [Why renaming a live environment is blocked](#why-renaming-a-live-environment-is-blocked)
 - [Why a teardown is blocked](#why-a-teardown-is-blocked)
 - [Why removing a cohort `config.yaml` is blocked](#why-removing-a-cohort-configyaml-is-blocked)
 - [Why an environment without a chart version is blocked](#why-an-environment-without-a-chart-version-is-blocked)
+- [Why waking an AEC clone is blocked](#why-waking-an-aec-clone-is-blocked)
+- [Why a copied clone ashn is blocked](#why-a-copied-clone-ashn-is-blocked)
+- [Why a new env needs an ApplicationSet glob](#why-a-new-env-needs-an-applicationset-glob)
+- [Why a key in a file the ApplicationSet does not read is blocked](#why-a-key-in-a-file-the-applicationset-does-not-read-is-blocked)
+- [Why turning the legacy Helm writer back on is blocked](#why-turning-the-legacy-helm-writer-back-on-is-blocked)
 - [Handling mass version bumps](#handling-mass-version-bumps-hundreds-of-apps-in-one-pr)
 - [The two surfaces: comment and page](#the-two-surfaces-comment-and-page)
 - [Which resources make it into the comment body](#which-resources-make-it-into-the-comment-body)
@@ -21,10 +26,45 @@ here is required to use the tool; it is for people changing it or debugging it.
 
 ---
 
-### Why an empty `microservices.definitions` is blocked
+### Why a YAML slip is blocked
 
-ArgoCD merges an environment's Helm value files in order, with the per-env
-`cicd-versions.yaml` **last**. A file shaped like
+<a id="why-an-empty-microservicesdefinitions-is-blocked"></a>
+
+A YAML slip changes config, and no diff line shows it clearly. So a PR to
+`main` is blocked (COPS-2766) when it adds one of these to a changed `*.yaml`
+or `*.yml` file:
+
+- **A duplicate key**: the same key twice in one map. YAML keeps only the last
+  copy and drops the first one with no error. acme-config-prod #3583 lost a
+  login whitelist for 53 h this way (COPR-31148).
+- **A bare key**: `key:` with no value. It is null, and Helm then deletes that
+  key from the chart defaults, for example the probes or the HPA policies. An
+  explicit `null` or `~` is not a slip: it removes a chart default on purpose.
+- **An empty `microservices.definitions`**: the key is present, but it is not
+  a map with children (null, `{}`, `[]`, `""`, a number). It deletes every
+  image name the chart ships (see below).
+
+Helm and ArgoCD read only the first YAML document of a file, so the check reads
+only that one. A `definitions:` before a second `---` document is a wipe too.
+2.121.0 missed it, and it also missed `definitions: []` and `definitions: ""`.
+
+**Only the slips the PR adds.** A duplicate or bare key counts only in a value
+file under `gcp/`, `azure/` or `aws/` (not the pipeline YAML under `.ci/`), and
+only when the PR adds it. The check counts each key path in the file at the
+merge preview and in the same file on `main` (the old name for a move), and
+blocks only on the difference. So a file with an old slip stays green, and a
+third copy of an old duplicate is new. A key path is dotted and a list item is
+`[]`, so moving list items does not make an old slip look new. `<<` merge keys
+are skipped here, but the wipe follows them, as Helm does. A new file counts
+every slip. A move that Bitbucket did not pair is compared with the deleted
+file of the same env folder and name. Over 6 months of acme-config-prod this
+would have blocked 6 PRs, all real slips (#3245, #3289, #3299, #3411, #3583
+and #4322). Without the compare with `main` it would have blocked 52.
+
+**The wipe counts at head alone**, in every changed YAML file, as in 2.121.0,
+so that guard never gets weaker. ArgoCD merges an environment's Helm value
+files in order, with the per-env `cicd-versions.yaml` **last**. A file shaped
+like
 
 ```yaml
 appspace:
@@ -36,16 +76,36 @@ collapses the **entire** `microservices.definitions` map to null in Helm's
 `merge`, wiping every per-service `image.name` override the chart ships
 (`appspace-platformservice`, `appspace-webhookservice`, `appspace-screenshot`,
 …). Each affected service then falls back to the chart helper's derived
-`appspace-<key>` name — a registry path that for these services has never
-held an image — so the whole environment goes `ImagePullBackOff` on the next
-sync. This is the COPR-31637 incident.
-
-The guard flags a `definitions` key that is present but null/empty. A
-**missing** `definitions` key is safe (the chart's own map is kept intact) and
-is deliberately **not** blocked. To remove per-env overrides, delete the
-`definitions:` key entirely — never leave it present but empty. See
+`appspace-<key>` name, a registry path that for these services has never held
+an image, so the whole environment goes `ImagePullBackOff` on the next sync.
+This is the COPR-31637 incident. A **missing** `definitions` key is safe (the
+chart's own map is kept intact) and is not blocked. To remove per-env
+overrides, delete the `definitions:` key entirely. See
 [`docs/microservices-definitions-guard.md`](microservices-definitions-guard.md)
-for the full incident write-up and the exact detection rule.
+for the full incident write-up.
+
+Limits:
+
+- Without a merge preview the base is the tip of `main`, not the merge base.
+  An old slip that `main` fixed later would then look new, so only the wipe is
+  checked, and the skip is logged.
+- A file that does not parse on `main` has no old slips to compare with, so
+  only the wipe is checked, and the skip is logged. A PR that fixes the YAML
+  is not blocked for the slips that were already there.
+- A file that is absent at the PR side is skipped, and so is one that does not
+  parse: the render reports bad YAML.
+- A failed read is red and retried, never a pass.
+- There is no override. The fix is always in the YAML: keep one copy of a
+  duplicate key, give a bare key a value (or write `null`), or delete the
+  `definitions:` line.
+
+The red status names the file, the line and the key. When every slip is a
+wipe, it keeps the text of the 2.12.0 guard:
+
+```
+BLOCKED: YAML slip in pv-orch-a/customer.yaml line 5: duplicate key appspace.zeroPods - see PR comment
+BLOCKED: 1 file(s) empty out microservices.definitions (wipes image overrides)
+```
 
 ### Why a clone without its `--aec1` token is blocked
 
@@ -302,7 +362,8 @@ Limits:
 The ApplicationSets set the chart `targetRevision` to `appspace.version`, taken
 from the generator file: `customer.yaml` over the `config.yaml` one folder up.
 For public cloud, the constellation apps (ms, ss) read `cl-*/config.yaml`
-alone, and each GLB app reads `cl-*/<app>/customer.yaml` over it. When there is
+alone, and each numbered GLB app reads `cl-*/appN/customer.yaml` over it (the
+fixed GLB apps read `cl-*/config.yaml` alone). When there is
 no version, the template writes `watch-only`, a value that never resolves. The
 apps go Sync Unknown and stop: no sync, no self-heal, and no later change
 reaches them. Nothing is deleted. This happened on acme-config-prod #4042 (15
@@ -320,9 +381,219 @@ It checks the changed or moved `customer.yaml` files, new private-cloud
 environments, and, when a cohort `config.yaml` has no version after the PR, the
 live environments below it. In public cloud it checks only files the generator
 really reads and that have live apps: `cl-*/config.yaml`, and
-`cl-*/<app>/customer.yaml` of a live `<cl-*>-<app>-glb` app (not
+`cl-*/appN/customer.yaml` of a live `<cl-*>-appN-glb` app (not
 `constellation/customer.yaml`, which is only a Helm values file). A removed
 environment is not checked: that is a decommission.
+
+### Why waking an AEC clone is blocked
+
+An AEC clone (a folder with an `--aec<n>` token) starts with a copy of the
+production data of the tenant it copies. When its pods run, it can call the
+customer live integrations: SSO, webhooks, mail and connected apps
+(AE-15507). So the runbook
+(https://appspace.atlassian.net/wiki/spaces/cops/pages/66093626) creates a
+clone asleep with `zeroPods: true`, restores and cleans the data, and wakes it
+in a later PR. A replay of 6 months of acme-config-prod found 18 PRs that woke
+47 clones, about 3 a month (#4660 woke 13 at once).
+
+The `clone_wake` merge gate (COPS-2766) fails the build when a PR:
+
+- adds a clone `customer.yaml` whose values do not set `zeroPods: true`,
+- or takes a live clone from `zeroPods: true` to `false` or unset. The change
+  can be in its own `customer.yaml` (a move reads the old path on `main`) or
+  in a `config.yaml` above it.
+
+The value is the one the chart sees: the `config.yaml` files above the
+environment, then its `customer.yaml`, and the last one wins. It is read at
+the head and on `main`. A version bump on a clone reads only the own
+`zeroPods` of the file, on both sides. The whole chain is read only when that
+key changes, when the file moves, or when a `config.yaml` with live clones
+below it changes its own `zeroPods`.
+
+The comment lists the Mongo collections that must be empty on the clone.
+Write their counts in the PR, then push an empty commit with
+`Confirm-Clone-Sanitized: <env>`, one line per clone. The line is read like
+the other confirmation lines: in any case, with or without backticks.
+
+It fails closed. Values that cannot be parsed are a gate too, and the same
+line lifts it. A failed Bitbucket read is not a gate: the build is red with
+`[transient]` and the PR is checked again after the backoff.
+
+Limits:
+
+- `zeroPods` stops the pods, not the Core VM, so this gate does not cover the
+  Core VM.
+- A wake written in `cicd-versions.yaml` is not seen, because the chain does
+  not read that file. The pipeline writes only versions there.
+- Only `--aec<n>` folders count as clones here, not `--sbx<n>` sandboxes.
+- Direct pushes to `main` are not checked.
+
+### Why a copied clone ashn is blocked
+
+`appspace.ashn` names an environment in Customers and PDNS. acme-config-prod
+#4042 made four AEC clones with the ashn of the production environment each
+one copies (heb, universal with the ashn of universalhollywood, blackrock and
+pfizer). So each clone and its original look like one environment there.
+`main` has no duplicate ashn today (294 environments set one).
+
+The `ashn_copy` merge gate (COPS-2766) looks at each changed clone
+`customer.yaml` (a folder with `--aec<n>`) whose own `appspace.ashn` is new or
+changed against `main`. A move reads the old path on `main`. It fails the
+build when an environment with another `customerName` has the same ashn: the
+own `customer.yaml` of a live environment on `main`, or another file of this
+PR. The b and c clones of one customer share a `customerName`, so they are no
+hit. A move or a delete is not a copy, because the old path is left out.
+
+Nothing lifts it. Give the clone its own ashn (runbook step 2: change ashn,
+suffix, customerName and instanceName). The tier token guard runs first, so a
+clone that misses `--aec1` gets that block before this one.
+
+The live environments are read only when a clone ashn changes: the own
+`customer.yaml` of each one on `main`, from the git mirror first. Only a
+complete read is kept, and only for the last `main` of each repo. A file that
+cannot be read or parsed is not checked, and a ⚠️ line says how many. When
+the ArgoCD app list is not loaded, a ⚠️ line says that the check is
+unavailable. Neither one is a gate. A failed read of a file of the PR retries
+the PR.
+
+### Why a new env needs an ApplicationSet glob
+
+ArgoCD makes the apps of an environment from the ApplicationSets on the hub.
+Their git files generators list the identity files they read as globs, for
+example `gcp/dev/private-cloud/ap1/**/customer.yaml`. A new environment, or a
+live one that moves, in a folder that no glob reads gets no apps. Nothing
+deploys on merge, and nothing says so. A replay against today's 135
+ApplicationSets found one case in 6 months, acme-config-prod #3423 (the
+nachaos spoke).
+
+The `appset_miss` merge gate (COPS-2766) runs `argocd appset list -o json`
+with the ArgoCD token of the service. It keeps the git files paths of every
+generator, nested ones too, whose `repoURL` is this repo (ssh or https, with
+or without `.git`). A path with `{{` is a template, and an exclude path
+deploys nothing, so both are left out. The list is cached for
+`PATH_MAP_TTL`. On a miss it is listed again without the cache, so an
+ApplicationSet applied a minute ago counts.
+
+It checks the identity files of each new environment, and the new side of
+each move: a private-cloud `customer.yaml`, a `cl-*/config.yaml` and a
+`cl-*/app<N>/customer.yaml`. The other `cl-*` folders (`api`, `cloud`,
+`constellation`, `user-content`) are rendered by the `cl-*/config.yaml` sets,
+so they are not checked. A move whose old side no glob reads is no miss: it
+deployed nothing on `main` either. The legacy pipeline deploys `aws/`, not
+ArgoCD, so a new `aws/` environment gets a ⚠️ check line instead.
+
+The matcher reads `**/` as zero or more folders, and `*` and `?` do not match
+`/`. The hub does not set
+`applicationsetcontroller.enable.new.git.file.globbing`, so ArgoCD uses the
+old globbing, where `*` also matches `/`. For today's globs and the checked
+shapes, both give the same result. As a self-check, every live identity file
+of a checked shape must match a glob. When one does not, or the list fails,
+is not JSON or has no glob (a token that may not list them gets an empty
+list), the check is not proven. Then a new environment gets a ⚠️ check line
+and a move gets a note, there is no gate, and the leader log says
+`ApplicationSet check unavailable`.
+
+Nothing lifts the gate. Check the cloud, tier and spoke folders. If the
+ApplicationSet is being added in acme-infrastructure, apply it first, then
+push again here (an empty commit is enough). A move to another cloud, tier or
+spoke is a rename of a live environment, so that guard stops it first. This
+gate shows for a move after the rename is confirmed.
+
+### Why a key in a file the ApplicationSet does not read is blocked
+
+The ApplicationSets take `appspace.version` (the chart `targetRevision`),
+`autosync` and `decommission` only from the files their generators list, not
+from every Helm value file. Written anywhere else, `version` and `autosync` do
+nothing: no new chart, no pause. The diff stays quiet, and the PR looks done.
+COPS-2684 was `autosync: false` in a constellation `customer.yaml`.
+`decommission` in such a file adds no cascade finalizer, but the chart still
+reads it (the static IP deletion policy, and the data purge with
+`decommissionPurgeData`), so the teardown is only half armed.
+
+So a PR to `main` is blocked (COPS-2766) when it sets one of these keys in a
+file that no generator reads:
+
+| Tree | Read by the generator | Not read |
+|---|---|---|
+| Private cloud, `<gcp or azure>/<tier>/private-cloud/<spoke>/` | every `customer.yaml` below the spoke, and the cohort `config.yaml` one folder up (the spoke `config.yaml` for an env right under the spoke) | `cicd-versions.yaml` and the other value files, a `config.yaml` next to a `customer.yaml`, and every `config.yaml` above the spoke (`gcp/config.yaml`, the tier file) |
+| Public cloud, `gcp/<tier>/public-cloud/<spoke>/` | `cl-*/config.yaml` (the whole environment) and `cl-*/appN/customer.yaml` (one numbered GLB app) | `cl-*/constellation/customer.yaml`, the fixed GLB folders (`api`, `cloud`, `user-content`) and `cicd-versions.yaml` |
+| `aws/` | not checked: it has no ApplicationSet | |
+
+A private-cloud `config.yaml` with no `customer.yaml` next to it counts as
+read even when no env uses it yet, so a fleet bump stays green.
+
+It is also blocked when `appspace.version` is not a string, in any file under
+`gcp/` or `azure/`. The ApplicationSet prints a YAML number as a number, so
+`2604.0` becomes `2604`, and ArgoCD can ask for a chart that does not exist.
+The fix is to quote it. A `version` that is a map gets a tip: the chart's app
+versions are `appspace.versions` (acme-config-dev #6845 wrote
+`version.AppVersion`, so the upgrade did nothing).
+
+Rules:
+
+- Only a key the PR adds or changes counts, compared with `main` (the old name
+  for a move). A removed key, or one with the same value on `main`, is not a
+  hit.
+- `decommission` in a public-cloud file is left out. It arms nothing there, and
+  the decommission panel keeps its warning.
+- An empty version in a generator file (`version: ""`, `~`, `false`, `0`) is
+  the chart version check's (previous section).
+- A failed read is red and retried, never a pass.
+- There is no override. The fix is always to move, quote or delete the key.
+
+The replay found no hit in 1023 acme-config-prod PRs (6 months) and 525
+acme-config-stage PRs, and one in 525 acme-config-dev PRs (#6845).
+
+```
+BLOCKED: appspace.autosync in cl-prod-b/constellation/customer.yaml is never read by the ApplicationSet - see PR comment
+BLOCKED: appspace.version in pv-x-a/customer.yaml is not a string - see PR comment
+```
+
+### Why turning the legacy Helm writer back on is blocked
+
+ArgoCD owns the `ms`, `ss` and `glb` releases. The old ADO pipeline is still
+there: `helm_deploy.sh` in `acme-components` reads
+`appspace.infra.deployGLB`, `deployMicroservices` and
+`deploySupportingServices`, and on the literal `true` it runs `helm upgrade` on
+the same releases again. Two writers on one release fail with invalid
+ownership metadata, or undo each other. COPS-2560 turned the old writer off,
+and the root `config.yaml` says to keep it off. No chart reads these keys, so
+the diff shows nothing.
+
+So a PR to `main` is blocked (COPS-2766) when it sets one of the three keys to
+`true` in a value file under `gcp/`, `azure/` or `aws/`, and the key was not
+`true` on `main` (the old name for a move). A new file counts every `true`.
+`helmForceUpgrade` is not a hit, because the stage and dev roots set it to
+`true`. When a live env's `customer.yaml` changes it and nothing renders
+differently, the 💤 Edits with no effect panel says that only the legacy
+pipeline reads it.
+
+An environment that really needs the old writer adds
+`Confirm-LegacyHelm: <env>` to a commit message of the PR, and pushes. `<env>`
+is:
+
+- the `cl-*` folder, in public cloud,
+- the env folder, for a `customer.yaml` or a `cicd-versions.yaml`,
+- else the folder of the file, for example
+  `gcp/prod/private-cloud/na1-a/monthly` for a cohort `config.yaml`, or `gcp`
+  for `gcp/config.yaml`.
+
+The comment and the red status give the exact line:
+
+```
+BLOCKED: deployGLB: true in pv-x-a turns the legacy Helm writer back on. To merge anyway, add Confirm-LegacyHelm: pv-x-a to a commit
+```
+
+The line is read by the same parser as `Confirm-Rename`: on its own line in any
+commit message, and case does not matter. Then the check lets the PR through.
+When the PR has a diff or only adds environments, the merge summary keeps a
+☑️ `Confirmed in a commit` review line, so the override is visible. The commits are read only when there
+is a hit. A commit list that
+cannot be read is red and retried, never a lift, as for `Confirm-Rename`.
+
+The replay found no hit in 1023 acme-config-prod PRs (6 months). Stage had 3
+PRs and dev 1 (#6509), all from before the legacy retirement in July 2026.
+Direct pushes to `main` are not checked, as for every guard.
 
 ### Handling mass version bumps (hundreds of apps in one PR)
 

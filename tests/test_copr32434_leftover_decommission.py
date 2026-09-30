@@ -176,3 +176,5 @@ def test_process_pr_skips_leftover_apps_before_normal_diff(world, monkeypatch):
     state, desc = sinks.statuses[-1]
     assert state == "SUCCESSFUL", (
         f"leftover alone must not block the PR; got {state}: {desc}")
+    # COPS-2766: the clone wake check reads the aec cohort here too.
+    assert m._extract_status_token(body) == "clean"
