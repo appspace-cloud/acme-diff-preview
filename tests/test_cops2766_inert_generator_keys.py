@@ -80,7 +80,7 @@ def _hits(monkeypatch, head, base=None, changed=None, renames=None, path_map=MAP
     (ENV, True),
     (COHORT, True),                                  # pv-x-a lives below it
     (EMPTY_COHORT, True),                            # no env below: a fleet bump stays green
-    ("gcp/prod/private-cloud/na1-a/config.yaml", True),   # the cohort of an env under the spoke
+    ("gcp/prod/private-cloud/na1-a/config.yaml", False),  # the spoke, above the cohort of pv-x-a
     (ENV_CFG, False),                                # next to a customer.yaml: an env folder
     (CICD, False),
     ("gcp/config.yaml", False),
@@ -103,7 +103,13 @@ def test_the_files_a_generator_reads(monkeypatch, path, want):
     assert m._generator_reads(path, "head1", MAP, [path]) is want
     # Only a config.yaml with no env known next to it or below it is read.
     assert calls == ([(posixpath.dirname(path) + "/customer.yaml", "head1")]
-                     if path in (EMPTY_COHORT, "gcp/prod/private-cloud/na1-a/config.yaml") else [])
+                     if path == EMPTY_COHORT else [])
+
+
+def test_the_spoke_config_yaml_is_read_as_the_cohort_of_an_env_right_under_it(monkeypatch):
+    _serve(monkeypatch, {})
+    spoke, env = "gcp/prod/private-cloud/na1-a/config.yaml", "gcp/prod/private-cloud/na1-a/pv-y-a"
+    assert m._generator_reads(spoke, "head1", {**MAP, f"{env}/customer.yaml": []}, [spoke]) is True
 
 
 def test_an_env_folder_config_yaml_found_in_the_changed_files(monkeypatch):

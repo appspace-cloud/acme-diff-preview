@@ -5543,13 +5543,13 @@ def _generator_reads(path, sha, path_map, changed, repo=None):
     if _is_pv_env_file(path):
         return True
     if _is_pv_file(path, "config.yaml"):
-        # The cohort of an env is read. Next to a customer.yaml it is an env folder
-        # file, and no generator reads it. A cohort with no env below yet counts
-        # as read, so a fleet bump stays green.
-        if any(_is_pv_env_file(p) and _cohort_of(p) == path for p in (*path_map, *changed)):
-            return True
-        sib = posixpath.dirname(path) + "/customer.yaml"
-        return not (sib in path_map or sib in changed or _value_body(sib, sha, repo) is not None)
+        # Read only as the cohort of an env below it, never as its spoke or grandparent.
+        # A cohort with no env below yet counts as read, so a fleet bump stays green.
+        d = posixpath.dirname(path)
+        envs = [p for p in (*path_map, *changed) if _is_pv_env_file(p) and p.startswith(d + "/")]
+        if envs:
+            return any(_cohort_of(p) == path for p in envs)
+        return _value_body(d + "/customer.yaml", sha, repo) is None
     return bool(_CL_ENV_RE.match(path) or _CL_APP_RE.match(path))
 
 
@@ -10789,6 +10789,10 @@ def _summarize_appspace_state_changes(changed_files, pr_sha, base_sha, path_map,
 
         # -- autosync (COPS-2583) --
         was_paused, is_paused = _autosync_paused(old_flat), _autosync_paused(new_flat)
+        # In a file the generator does not read (a spoke config.yaml), autosync pauses nothing.
+        if (was_paused or is_paused) and _generator_reads(
+                clean, pr_sha, path_map, changed_files, repo) is False:
+            was_paused = is_paused = False
         if not was_paused and is_paused:
             lines += [
                 f"### \u23f8\ufe0f {_AUTOSYNC_PAUSED_HDR} `{env_name}`",
