@@ -14278,12 +14278,13 @@ def process_pr(pr, path_map, base_sha="", repo=None):
             if getattr(_result(v), "image_downgrades", None))
         image_extra = (f" | IMAGE DOWNGRADE in {len(_img_envs)} environment(s)"
                        if _img_envs else "")
-        status_extra = decom_extra + leftover_extra + downgrade_extra + image_extra
-        # COPS-2766: the tenant reach goes only on a green status, so no
-        # FAILED text changes. Two names at most, so it never pushes out the lead.
+        status_extra = decom_extra + leftover_extra
+        # COPS-2766: the downgrade notes and the tenant reach go only on a green
+        # status, so no FAILED text changes. Two names at most, so it never
+        # pushes out the lead.
         tenant_extra = (f" | \U0001f310 every tenant of {_fmt_service_list(tenant_cls, 2)}"
                         if tenant_cls else "")
-        green_extra = status_extra + tenant_extra
+        green_extra = status_extra + downgrade_extra + image_extra + tenant_extra
 
         # v2.5.4 (Finding 1): traffic-light rule agreed with Marcos — green ONLY
         # when the diff was actually computed (with or without changes); ANY

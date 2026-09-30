@@ -195,7 +195,9 @@ def test_a_plain_bump_has_no_suffix(world):
     assert state == "SUCCESSFUL" and "DOWNGRADE" not in desc, desc
 
 
-def test_the_red_unavailable_status_keeps_it(world):
+def test_the_red_unavailable_status_has_no_downgrade_note(world):
+    """No FAILED text changes: the red 'Diff unavailable' text stays as it
+    was on 2.121.0, and the downgrade notes go only on a green status."""
     sinks, plan = world
     _downgrade_plan(plan)
     plan["pv-orch-a-ss"] = m.DiffResult("", [], 0, False, "", m.OUT_INDETERMINATE,
@@ -203,8 +205,7 @@ def test_the_red_unavailable_status_keeps_it(world):
     m.process_pr(_mk_pr(), PATH_MAP, base_sha=BASE_SHA)
     assert sinks.statuses[-1] == (
         "FAILED", "Diff unavailable for 1 app(s) | 1 resource(s) confirmed "
-        "changed" + SUFFIX + " - review comment (will retry automatically "
-        "if transient)")
+        "changed - review comment (will retry automatically if transient)")
 
 
 def test_other_failed_descriptions_do_not_change(world):
