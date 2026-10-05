@@ -5740,9 +5740,14 @@ def _detect_new_env_candidates(changed_files: list, path_map: dict, renames: dic
     """Scan changed files for patterns that indicate a brand-new environment.
 
     A 'new env' is a customer.yaml or config.yaml at env-directory depth that is
-    NOT covered by any existing ArgoCD app in path_map. Since v2.5.4 (Finding 4)
-    this is called unconditionally, whether or not other apps are also affected
-    in the same PR — it no longer requires get_affected_apps() to be empty.
+    NOT covered by any existing ArgoCD app in path_map, AND that still exists at
+    pr_sha. Since v2.5.4 (Finding 4) this is called unconditionally, whether or
+    not other apps are also affected in the same PR — it no longer requires
+    get_affected_apps() to be empty.
+
+    COPR-32729: the existence check is what keeps a DELETED identity file out.
+    changed_files has no add/remove status, so without it an environment being
+    removed that has no live ArgoCD app is indistinguishable from a new one.
 
     renames (v2.5.4, Finding 4/6 interaction fix): a customer folder rename
     produces a NEW path that is, by definition, not yet in path_map — without
@@ -5823,12 +5828,23 @@ def _detect_new_env_candidates(changed_files: list, path_map: dict, renames: dic
     # it DOES declare customerName (verified live on cl-prod-b). A fetch
     # failure keeps the candidate: a conservative red finding a human looks
     # at beats a silent skip.
+    # COPR-32729 (live acme-config-prod PR #4733): changed_files carries no
+    # add/remove status -- get_pr_changed_files flattens both sides of the
+    # Bitbucket diffstat into one list -- so an identity file DELETED by the
+    # PR looked exactly like one added by it. An environment being removed is
+    # normally owned by _detect_env_decommission_candidates, but that function
+    # bails on `if not apps: continue`, so it only sees environments that have
+    # live ArgoCD Applications. One with none (the aws/ tree, deployed by the
+    # legacy pipeline) fell between the two and landed here as a brand-new
+    # environment. _evaluate_new_envs then looked for the cohort config.yaml
+    # the same PR deletes, found a 404, and blocked the PR with "a required
+    # cohort config.yaml is missing" -- telling the author to re-add the exact
+    # file they meant to delete. The existence check below is not limited to
+    # config.yaml because the file that reached it was a customer.yaml.
     if pr_sha:
         for env_dir in list(candidates.keys()):
             info = candidates[env_dir]
             cf = info["config_file"]
-            if not cf.endswith("config.yaml"):
-                continue
             try:
                 content, _st = _bb_fetch_cached(cf, pr_sha, repo=repo)
             except Exception as e:
@@ -5839,6 +5855,19 @@ def _detect_new_env_candidates(changed_files: list, path_map: dict, renames: dic
                 raise ValueFileUnreadable(
                     f"value file unreadable at sha {pr_sha[:8]} "
                     f"(Bitbucket transport, not absence): {cf}")
+            # BB_NOT_FOUND is the cacheable 404: the file is genuinely gone at
+            # the PR head, so whatever its basename it cannot be an
+            # environment being added. BB_ERROR above keeps the COPS-2668
+            # contract -- absence is a fact about the config, unreadability is
+            # a fact about Bitbucket, and the two must never be conflated.
+            if _st == BB_NOT_FOUND:
+                logsink.log(f"new-env candidate '{info['name']}' skipped: {cf} "
+                            f"does not exist at the PR head (deleted by this "
+                            f"PR, not added)")
+                del candidates[env_dir]
+                continue
+            if not cf.endswith("config.yaml"):
+                continue
             cname, _suffix = _extract_appspace_identity(content or "")
             if cname is None:
                 logsink.log(f"new-env candidate '{info['name']}' skipped: {cf} "
