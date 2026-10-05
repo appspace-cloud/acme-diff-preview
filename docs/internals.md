@@ -14,6 +14,7 @@ here is required to use the tool; it is for people changing it or debugging it.
 - [Why waking an AEC clone is blocked](#why-waking-an-aec-clone-is-blocked)
 - [Why a copied clone ashn is blocked](#why-a-copied-clone-ashn-is-blocked)
 - [Why a new env needs an ApplicationSet glob](#why-a-new-env-needs-an-applicationset-glob)
+- [Why a KCC linux VM needs hostingID](#why-a-kcc-linux-vm-needs-hostingid)
 - [Why a key in a file the ApplicationSet does not read is blocked](#why-a-key-in-a-file-the-applicationset-does-not-read-is-blocked)
 - [Why turning the legacy Helm writer back on is blocked](#why-turning-the-legacy-helm-writer-back-on-is-blocked)
 - [Why a move that turns noCore off is blocked](#why-a-move-that-turns-nocore-off-is-blocked)
@@ -500,6 +501,34 @@ ApplicationSet is being added in acme-infrastructure, apply it first, then
 push again here (an empty commit is enough). A move to another cloud, tier or
 spoke is a rename of a live environment, so that guard stops it first. This
 gate shows for a move after the rename is confirmed.
+
+### Why a KCC linux VM needs hostingID
+
+The supporting-services chart names the linux VM from `appspace.hostingID`
+(COPS-2634). With a KCC role enabled (`svc`, `mongo` or `rabbit`) and that
+value missing, helm fails:
+
+`appspace.hostingID is required when deployLinuxServicesK8s.enabled is true`
+
+The new-env preview only renders `appspace-micro-services`, on purpose: SS
+and GLB still need values that exist after the first deploy. So that
+`required()` never ran for a brand-new environment. COPS-2789
+`pv-qa-perf-01-a` (acme-config-dev #7450) merged green. Argo SS went
+Unknown / ComparisonError. Mongo and Rabbit secrets never appeared, and
+the microservices sat in `CreateContainerConfigError`.
+
+The `kcc_hosting_id` merge gate (COPS-2790) reads the same merged value
+chain as the other new-env VM checks. It fails the build when a rendered
+KCC role has no `appspace.hostingID` (empty or whitespace counts as
+missing). A parent `config.yaml` that already sets it is enough. Top-level
+`deployLinuxServicesK8s.enabled` with no role is not this gate: the chart
+`required` sits inside each role template, and that shape is already the
+"renders no Linux VM" check.
+
+Nothing lifts it. Set `appspace.hostingID` in `customer.yaml` (QA usually
+`"00000000"`). A live environment that changes supporting-services already
+fails helm as a missing required value; this gate is for the new-env path
+that never rendered that chart.
 
 ### Why a key in a file the ApplicationSet does not read is blocked
 

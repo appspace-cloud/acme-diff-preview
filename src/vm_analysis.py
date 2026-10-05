@@ -1113,6 +1113,43 @@ def _kcc_rendered_roles(flat: dict) -> list:
     return _kcc_enabled_roles(flat) if _kcc_true(flat.get(_KCC_PREFIX + "enabled")) else []
 
 
+def _kcc_hosting_id(flat) -> str:
+    """The merged appspace.hostingID, quotes and padding stripped.
+
+    Helm `required` treats empty and missing the same. A dummy like
+    `00000000` is a real value and counts as set."""
+    v = (flat or {}).get("appspace.hostingID")
+    if v is None:
+        return ""
+    return str(v).strip().strip("'\"").strip()
+
+
+def _kcc_missing_hosting_id(flat) -> bool:
+    """True when a KCC linux VM would render and hostingID is unset.
+
+    Matches the chart: `required` sits inside each role template (svc /
+    mongo / rabbit), so top-level `deployLinuxServicesK8s.enabled` with no
+    role does not fail helm and must not fail the preview (COPS-2790)."""
+    return bool(_kcc_rendered_roles(flat or {})) and not _kcc_hosting_id(flat)
+
+
+_KCC_HOSTING_ID_CHART_MSG = (
+    "appspace.hostingID is required when deployLinuxServicesK8s.enabled is true")
+
+
+def _kcc_hosting_id_line(env: str, roles: list) -> str:
+    """The blocking new-env line for a missing hostingID (COPS-2790)."""
+    listed = ", ".join(f"`{r}`" for r in roles)
+    return (
+        f"- \u26d4 `{env}` \u00b7 **linux VM (KCC)**: `appspace.hostingID` is missing "
+        f"while `deployLinuxServicesK8s` has {listed} enabled. The supporting-services "
+        f"chart fails helm with `{_KCC_HOSTING_ID_CHART_MSG}`. Argo sync goes Unknown "
+        "(ComparisonError); Mongo/Rabbit secrets never appear and microservices stay "
+        "CreateContainerConfigError. Set `appspace.hostingID` in `customer.yaml` "
+        '(QA usually `"00000000"`).'
+    )
+
+
 def _kcc_machine_type(flat: dict, role: str) -> str:
     """Like the chart helper: the role, the legacy deployLinuxServices key,
     defaults.gcp.<role>MachineType, then the chart default."""
@@ -1197,14 +1234,20 @@ def _vm_disk_family_changes(old_flat, new_flat) -> list:
 
 
 def _new_env_prereq_findings(flat: dict, env: str) -> tuple:
-    """COPS-2766 (C21): (errors, lines) for a new GCP env from its value chain.
+    """COPS-2766 (C21) + COPS-2790: (errors, lines) for a new GCP env.
 
-    The errors are the n4 or c4 disk errors, one line per role. The checks
-    are warnings: a new VM that adopts a boot disk, and no VM at all. There
-    is no deployWindows check: that Terraform path is going away."""
+    The errors are the n4 or c4 disk errors, one line per role. A missing
+    hostingID is a blocking line (not a disk error): the new-env helm path
+    only renders micro-services, so SS `required()` never runs there.
+    The checks are warnings: a new VM that adopts a boot disk, and no VM
+    at all. There is no deployWindows check: that Terraform path is going
+    away."""
     errors = _vm_disk_family_errors(flat)
     roles = _kcc_rendered_roles(flat)
-    lines = [f"- \u26d4 `{env}` \u00b7 **linux VM (KCC) \u00b7 {role}**: "
+    lines = []
+    if _kcc_missing_hosting_id(flat):
+        lines.append(_kcc_hosting_id_line(env, roles))
+    lines += [f"- \u26d4 `{env}` \u00b7 **linux VM (KCC) \u00b7 {role}**: "
              + _vm_disk_family_text([e for e in errors if e[0] == role])
              for role in roles if any(e[0] == role for e in errors)]
     adopt = [r for r in roles if not _kcc_true(_kcc_role_value(flat, r, "createNewBootDisk"))]

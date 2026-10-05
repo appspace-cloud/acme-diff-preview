@@ -26,10 +26,12 @@ GUARDS = {
     "dup_identity": "New environment name already in use",
     "ashn_copy": "Clone ashn already in use",
     "vm_disk": "n4 or c4 machine with a pd- disk",
+    "kcc_hosting_id": "KCC linux VM missing hostingID",
     "appset_miss": "No ApplicationSet reads the folder",
 }
 SECTIONS = ("why-waking-an-aec-clone-is-blocked", "why-a-copied-clone-ashn-is-blocked",
-            "why-a-new-env-needs-an-applicationset-glob")
+            "why-a-new-env-needs-an-applicationset-glob",
+            "why-a-kcc-linux-vm-needs-hostingid")
 
 
 def _read(rel):

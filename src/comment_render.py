@@ -512,6 +512,8 @@ GATES = {
                   "Give the clone its own ashn"),
     "vm_disk": ("An n4 or c4 machine with a pd- disk, GCP rejects it", None, "blocked",
                 "Use hyperdisk-balanced on a new VM, or keep the machine family"),
+    "kcc_hosting_id": ("KCC linux VM enabled with no appspace.hostingID", None, "blocked",
+                       "Set appspace.hostingID in customer.yaml"),
     "appset_miss": ("No ApplicationSet reads this folder, nothing deploys", None,
                     "blocked", "Check the cloud, tier and spoke folders"),
     "legacy_helm": ("The legacy Helm writer is switched back on", "Confirm-LegacyHelm",

@@ -281,6 +281,8 @@ from vm_analysis import (  # VM/KCC infrastructure analysis (same-dir module)
     _VM_DISK_FAMILY_LEAVES,
     _vm_disk_family_changes,
     _new_env_prereq_findings,
+    _kcc_missing_hosting_id,
+    _kcc_rendered_roles,
     _kcc_adoption_card,
     _VM_PANEL_CLEAN_HDR,
     _VM_REPEAT_RE,
@@ -7816,9 +7818,10 @@ def _new_env_shared_lines(env_info, sha, base_sha, repo=None, changed=(), rename
 
 
 def _new_env_prereqs(new_env_candidates, sha, repo=None) -> tuple:
-    """COPS-2766 (C21): (vm_disk gates, {config_file: lines}) for the new GCP
-    private-cloud envs, where KCC renders the VMs, from the value chain at the
-    head. A failed read raises, so the PR is retried."""
+    """COPS-2766 (C21) + COPS-2790: (gates, {config_file: lines}) for new GCP
+    private-cloud envs, from the value chain at the head. vm_disk for n4/c4
+    with a pd- disk, kcc_hosting_id when a KCC role renders with no
+    hostingID. A failed read raises, so the PR is retried."""
     gates, lines = [], {}
     for c in new_env_candidates or ():
         path = c.get("config_file", "")
@@ -7830,6 +7833,10 @@ def _new_env_prereqs(new_env_candidates, sha, repo=None) -> tuple:
                            "because its values cannot be parsed."]
             continue
         errors, lines[path] = _new_env_prereq_findings(flat, c["name"])
+        if _kcc_missing_hosting_id(flat):
+            roles = _kcc_rendered_roles(flat)
+            gates.append({"kind": "kcc_hosting_id", "env": c["name"],
+                          "why": "no appspace.hostingID, " + ", ".join(roles) + " enabled"})
         if errors:
             role, mt, disk, t = errors[0]
             gates.append({"kind": "vm_disk", "env": c["name"], "why": f"{role} {mt}, {disk} {t}"})
