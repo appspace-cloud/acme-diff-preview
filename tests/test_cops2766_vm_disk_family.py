@@ -44,9 +44,15 @@ def no_vertex(monkeypatch):
     monkeypatch.setattr(m, "generate_ai_summary", lambda app_results: None)
 
 
-def _flat(roles, on=True, extra=None):
-    """A value chain: KCC `on`, and role -> {leaf: value}, each role enabled."""
-    flat = {K + "enabled": on, **(extra or {})}
+def _flat(roles, on=True, extra=None, hosting_id="00000000"):
+    """A value chain: KCC `on`, and role -> {leaf: value}, each role enabled.
+
+    COPS-2790: hosting_id defaults to a QA dummy so the disk-family tests stay
+    about disks. Pass hosting_id=None to omit the key."""
+    flat = {K + "enabled": on}
+    if hosting_id is not None:
+        flat["appspace.hostingID"] = hosting_id
+    flat.update(extra or {})
     for role, leaves in roles.items():
         flat[f"{K}{role}.enabled"] = True
         flat.update({f"{K}{role}.{k}": v for k, v in leaves.items()})
@@ -274,9 +280,10 @@ COHORT_DOC = "appspace:\n  version: 2603.0.1-dev\n"
 NEW = f"{CUSTOM}/{ENV}/customer.yaml"
 
 
-def _doc(svc=None, name="use1-test"):
+def _doc(svc=None, name="use1-test", hosting_id="00000000"):
     """A customer.yaml; `svc` is the YAML of its svc role, or no VM."""
-    return (f"appspace:\n  customerName: {name}\n  suffix: a\n  version: 2603.0.1-dev\n"
+    hid = f'  hostingID: "{hosting_id}"\n' if hosting_id is not None else ""
+    return (f"appspace:\n{hid}  customerName: {name}\n  suffix: a\n  version: 2603.0.1-dev\n"
             + ("  infra:\n    deployLinuxServicesK8s:\n      svc:\n        enabled: true\n"
                + "".join(f"        {line}\n" for line in svc) if svc is not None else ""))
 
