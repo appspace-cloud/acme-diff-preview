@@ -312,10 +312,14 @@ def _detect_neg_removed(sections: list) -> list:
 # Go's own output for a nil or missing template/printf argument. Matched
 # tightly on purpose: a bare "%!" or the word "value" appears in legitimate
 # ConfigMap data (log format strings, embedded templates), and a block that
-# fires on real config is a block people learn to override. These three
-# shapes are only ever produced by a value the chart read and did not get.
+# fires on real config is a block people learn to override. These
+# shapes are only ever produced by a value the chart read and did not get,
+# or got with the wrong type (COPS-2790: unquoted `hostingID: 00000000`
+# renders `hst-%!s(float64=0)`).
 _TEMPLATE_ARTIFACT_RE = re.compile(
-    r"%![a-zA-Z]?\((?:<nil>|MISSING)\)|<no value>")
+    r"%![a-zA-Z]?\((?:<nil>|MISSING"
+    r"|(?:bool|string|u?int(?:8|16|32|64)?|float(?:32|64))=[^)]*)\)"
+    r"|<no value>")
 
 
 def _detect_template_artifacts(sections: list) -> list:

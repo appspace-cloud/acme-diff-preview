@@ -1113,33 +1113,40 @@ def _kcc_rendered_roles(flat: dict) -> list:
     return _kcc_enabled_roles(flat) if _kcc_true(flat.get(_KCC_PREFIX + "enabled")) else []
 
 
-def _kcc_hosting_id(flat) -> str:
-    """The merged appspace.hostingID, quotes and padding stripped.
+_HOSTING_ID_RE = re.compile(r"[0-9]{8}")
 
-    Helm `required` treats empty and missing the same. A dummy like
-    `00000000` is a real value and counts as set."""
+
+def _kcc_hosting_id_ok(flat) -> bool:
+    """The merged appspace.hostingID is what the charts take: a string of
+    exactly 8 digits. A dummy like `"00000000"` counts. Unquoted, YAML gives
+    a number, and the KCC labels render `hst-%!s(float64=0)`."""
     v = (flat or {}).get("appspace.hostingID")
-    if v is None:
-        return ""
-    return str(v).strip().strip("'\"").strip()
+    return isinstance(v, str) and bool(_HOSTING_ID_RE.fullmatch(v))
 
 
 def _kcc_missing_hosting_id(flat) -> bool:
-    """True when a KCC linux VM would render and hostingID is unset.
+    """True when a KCC linux VM would render and hostingID is not valid.
 
     Matches the chart: `required` sits inside each role template (svc /
     mongo / rabbit), so top-level `deployLinuxServicesK8s.enabled` with no
     role does not fail helm and must not fail the preview (COPS-2790)."""
-    return bool(_kcc_rendered_roles(flat or {})) and not _kcc_hosting_id(flat)
+    return bool(_kcc_rendered_roles(flat or {})) and not _kcc_hosting_id_ok(flat)
 
 
 _KCC_HOSTING_ID_CHART_MSG = (
     "appspace.hostingID is required when deployLinuxServicesK8s.enabled is true")
 
 
-def _kcc_hosting_id_line(env: str, roles: list) -> str:
-    """The blocking new-env line for a missing hostingID (COPS-2790)."""
+def _kcc_hosting_id_line(env: str, roles: list, value=None) -> str:
+    """The blocking new-env line for a missing or invalid hostingID (COPS-2790)."""
     listed = ", ".join(f"`{r}`" for r in roles)
+    if value is not None and str(value).strip():
+        return (
+            f"- \u26d4 `{env}` \u00b7 **linux VM (KCC)**: `appspace.hostingID` is "
+            f"`{value}`, and `deployLinuxServicesK8s` has {listed} enabled. The charts "
+            "only take exactly 8 digits in quotes, so helm fails or the VM labels "
+            'render `hst-%!s(float64=0)`. Set it like `hostingID: "00000000"`.'
+        )
     return (
         f"- \u26d4 `{env}` \u00b7 **linux VM (KCC)**: `appspace.hostingID` is missing "
         f"while `deployLinuxServicesK8s` has {listed} enabled. The supporting-services "
@@ -1246,7 +1253,7 @@ def _new_env_prereq_findings(flat: dict, env: str) -> tuple:
     roles = _kcc_rendered_roles(flat)
     lines = []
     if _kcc_missing_hosting_id(flat):
-        lines.append(_kcc_hosting_id_line(env, roles))
+        lines.append(_kcc_hosting_id_line(env, roles, flat.get("appspace.hostingID")))
     lines += [f"- \u26d4 `{env}` \u00b7 **linux VM (KCC) \u00b7 {role}**: "
              + _vm_disk_family_text([e for e in errors if e[0] == role])
              for role in roles if any(e[0] == role for e in errors)]

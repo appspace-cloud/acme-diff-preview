@@ -1297,6 +1297,20 @@ def _build_merge_summary(results, rollup_by_sig, vm_change_lines,
                          f"\u2754 **{len(errored) + len(soft)} app(s) "
                          f"could not be diffed** \u2014 the comment below "
                          f"cannot prove they are safe"))
+    # COPS-2790: main cannot render these and the PR fixes it. Not a block,
+    # but the diff is against nothing, not against what is live.
+    broken = {}
+    for a, r in results.items():
+        if getattr(r, "main_broken", None):
+            broken.setdefault(r.main_broken, []).append(a)
+    for why, apps in sorted(broken.items()):
+        findings.append((_SEV_REVIEW,
+                         f"\U0001fa79 **{len(set(_envs_from_apps(apps)))} "
+                         f"environment(s) do not render on main** ({why}), "
+                         f"this PR makes them render: {_fmt_env_list(apps)}. "
+                         f"Their diff is against an empty main, so deletions "
+                         f"and immutable fields against the live state are "
+                         f"not checked"))
     if not findings:
         findings.append((
             _SEV_ROUTINE,
