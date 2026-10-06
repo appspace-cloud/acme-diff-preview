@@ -727,7 +727,7 @@ def test_run_one_diff_returns_the_pins_a_bump_leaves(pin_world):
 def test_run_one_diff_checks_no_pin_unless_the_chart_goes_up(pin_world, rev):
     out = m._run_one_diff(PIN_APP, "pinpr0000001", "pinmain00001",
                           chart_revision=rev)
-    assert out[1] is None and len(out) == 9 and out[8] is None
+    assert out[1] is None and len(out) == 10 and out[8] is None
 
 
 def test_a_raising_pin_check_keeps_the_diff(pin_world, monkeypatch, warnings):

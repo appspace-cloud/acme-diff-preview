@@ -297,7 +297,13 @@ def _quote_helm_error(err: str) -> list:
     return out
 
 
-def _missing_value_remedies() -> list:
+# COPS-2790: the charts take a hostingID only as a quoted string of 8 digits.
+_HOSTING_ID_FIX = ("> **Fix:** set `appspace.hostingID` to exactly 8 digits in "
+                   'quotes, for example `hostingID: "00000000"`. Without quotes '
+                   "YAML reads it as a number.")
+
+
+def _missing_value_remedies(err: str = "") -> list:
     """The remedies for a MISSING REQUIRED VALUE block, one per line.
 
     COPS-2548: these used to be a single long sentence that crammed two
@@ -305,7 +311,10 @@ def _missing_value_remedies() -> list:
     parent config.yaml" and "if the chart version changed..."), which the
     renderer showed as one wall of text. An operator had to untangle it to
     work out what to actually do. Separate lines, most likely cause first.
+    A hostingID error has one fix (COPS-2790).
     """
+    if "hostingid" in (err or "").lower():
+        return [_HOSTING_ID_FIX]
     return [
         "> **Fix:** add the missing value to this environment's "
         "`customer.yaml`, or to the `config.yaml` of its cohort or ring if "

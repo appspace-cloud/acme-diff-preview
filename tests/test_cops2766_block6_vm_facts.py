@@ -538,7 +538,7 @@ def _world(monkeypatch, pr_doc, main_doc):
 def test_run_one_diff_carries_the_render_facts(monkeypatch):
     _world(monkeypatch, _ci(boot_id="hst-00000478"), _ci())
     step = m._run_one_diff(APP, PR_SHA, MAIN_SHA)
-    assert step[1] is None and len(step) == 9
+    assert step[1] is None and len(step) == 10
     assert [f["fields"] for f in step[7]] == [
         [(HOSTING, "hst-00000000", "hst-00000478")]]
 

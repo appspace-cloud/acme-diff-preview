@@ -282,6 +282,7 @@ from vm_analysis import (  # VM/KCC infrastructure analysis (same-dir module)
     _vm_disk_family_changes,
     _new_env_prereq_findings,
     _kcc_missing_hosting_id,
+    _kcc_hosting_id_ok,
     _kcc_rendered_roles,
     _kcc_adoption_card,
     _VM_PANEL_CLEAN_HDR,
@@ -380,6 +381,7 @@ from schema_errors import (  # render-failure explanation
     _NULL_VIOLATION_RE,
     _schema_fix_hints,
     _missing_value_remedies,
+    _HOSTING_ID_FIX,
     _toleration_errors,
 )
 from chart_identity import (  # chart tree digest and its memo
@@ -2856,9 +2858,11 @@ DiffResult = namedtuple("DiffResult",
                          "fingerprint", "renamed_resources", "vm_changes",
                          "version_fold", "shutdown_stats",
                          "template_artifacts", "pingscaler_created", "ip_released",
-                         "neg_removed", "capacity", "image_downgrades", "pins_behind"],
+                         "neg_removed", "capacity", "image_downgrades", "pins_behind",
+                         "main_broken"],
                         defaults=[None, None, None, None, None, None, None,
-                                  None, None, None, None, None, None, None, None])
+                                  None, None, None, None, None, None, None, None,
+                                  None])
 # ip_released (COPS-2766): the deleted ComputeAddress and DNSRecordSet headers
 # GCP releases (no explicit abandon), from the full pre-cap list. The `ip`
 # merge gate reads it. Only OUT_DIFF sets it, so a teardown never has it.
@@ -2877,6 +2881,8 @@ DiffResult = namedtuple("DiffResult",
 # every image tag that goes down (_detect_image_downgrades), counted on the
 # full pre-cap list (#4679). None when there is none, and when the chart
 # moves and does not go up (_images_may_go_down).
+# main_broken (COPS-2790): the short main-side error when main cannot render
+# this app and the PR can. The diff is then against an empty main.
 # pingscaler_created (COPS-2714): True when this app's diff CREATES the
 # acme-ping-scaler Deployment. The chart skips all HPA rendering while a
 # ping-scaler is on, so the HPAs it displaces -- deleted in the SIBLING
@@ -3260,6 +3266,11 @@ def _git_read_file(repo: str, sha: str, filepath: str):
 # CAN answer for a sha it minted itself.
 
 _merge_preview_cache = {}   # (repo, base_sha, pr_sha) -> (render_sha, conflicts)
+# COPS-2790: render_sha -> base_sha of every clean merge preview, oldest out
+# first. The cache above is cleared whole, so it cannot prove a merge.
+_merge_preview_bases = {}
+_MERGE_PREVIEW_BASES_MAX = 4096
+_merge_preview_bases_lock = threading.Lock()
 _MERGE_PREVIEW_ENV = {
     "GIT_AUTHOR_NAME": "acme-diff-preview", "GIT_AUTHOR_EMAIL": "preview@local",
     "GIT_COMMITTER_NAME": "acme-diff-preview", "GIT_COMMITTER_EMAIL": "preview@local",
@@ -3322,6 +3333,10 @@ def _merge_preview(repo, base_sha, pr_sha):
         return None, None
     out = (c.stdout.strip(), [])
     _merge_preview_cache[key] = out
+    with _merge_preview_bases_lock:
+        _merge_preview_bases[out[0]] = base_sha
+        while len(_merge_preview_bases) > _MERGE_PREVIEW_BASES_MAX:
+            del _merge_preview_bases[next(iter(_merge_preview_bases))]
     if len(_merge_preview_cache) > 512:
         _merge_preview_cache.clear()
     return out
@@ -7835,8 +7850,11 @@ def _new_env_prereqs(new_env_candidates, sha, repo=None) -> tuple:
         errors, lines[path] = _new_env_prereq_findings(flat, c["name"])
         if _kcc_missing_hosting_id(flat):
             roles = _kcc_rendered_roles(flat)
+            hid = flat.get("appspace.hostingID")
+            what = (f"appspace.hostingID {hid} is not 8 quoted digits"
+                    if hid is not None and str(hid).strip() else "no appspace.hostingID")
             gates.append({"kind": "kcc_hosting_id", "env": c["name"],
-                          "why": "no appspace.hostingID, " + ", ".join(roles) + " enabled"})
+                          "why": what + ", " + ", ".join(roles) + " enabled"})
         if errors:
             role, mt, disk, t = errors[0]
             gates.append({"kind": "vm_disk", "env": c["name"], "why": f"{role} {mt}, {disk} {t}"})
@@ -8671,6 +8689,28 @@ def _rebase_value_files(value_files: list, old_env_dir: str, new_env_dir: str) -
     return rebased
 
 
+def _pr_fixes_main_hosting_id(main_err, ordered_vals, render_sha, main_sha) -> bool:
+    """COPS-2790: main fails on appspace.hostingID, and the merge of this PR
+    sets one the charts take (a quoted string of 8 digits, last file wins).
+    Only then is the PR not blocked with main's error. The branch tip is not
+    the merge, so it may not fix main: that keeps the block."""
+    if (_render_reason(main_err) not in (REASON_MISSING_REQUIRED, REASON_TEMPLATE)
+            or "hostingid" not in main_err.lower()):
+        return False
+    if _merge_preview_bases.get(render_sha) != main_sha:
+        return False
+    hid = None
+    for content in ordered_vals:
+        try:
+            doc = _yaml_safe_load(content or "")
+        except Exception:
+            return False
+        a = doc.get("appspace") if isinstance(doc, dict) else None
+        if isinstance(a, dict) and "hostingID" in a:
+            hid = a["hostingID"]
+    return _kcc_hosting_id_ok({"appspace.hostingID": hid})
+
+
 def _effective_chart_version(ordered_value_files: list, vals: dict):
     """Effective appspace.version across ordered value files (last wins).
 
@@ -9167,6 +9207,7 @@ def _run_one_diff(app, pr_sha, main_sha, chart_revision=None, changed_paths=None
 
         pool     = concurrency._get_subtask_pool()
         _t_render0 = time.perf_counter()
+        main_broken = None
         pr_fut   = pool.submit(_helm_template, pr_chart, release, namespace, pr_vals)
         _diff_futs.append(pr_fut)
         main_fut = pool.submit(_helm_template, main_chart, release, namespace, main_vals) \
@@ -9181,12 +9222,20 @@ def _run_one_diff(app, pr_sha, main_sha, chart_revision=None, changed_paths=None
 
         if needs_main_render:
             main_yaml, main_err = main_fut.result(timeout=DIFF_TIMEOUT)
-            if main_err:
+            if main_err and not _pr_fixes_main_hosting_id(
+                    main_err, [pr_vals[vf] for vf in pr_value_files if vf in pr_vals],
+                    pr_sha, main_sha):
                 return None, _render_reason(main_err), main_err
             _record_stage("render", time.perf_counter() - _t_render0)
             _t_parse0 = time.perf_counter()
-            main_resources = _parse_manifest_resources(main_yaml)
-            _main_render_cache_put(content_key, main_yaml, main_resources)
+            if main_err:
+                # COPS-2790: the merge sets the hostingID main is missing and
+                # renders. Diff it against an empty main, never cached.
+                main_broken = (_render_reason(main_err), main_err)
+                main_resources = {}
+            else:
+                main_resources = _parse_manifest_resources(main_yaml)
+                _main_render_cache_put(content_key, main_yaml, main_resources)
             _parse_main_s = time.perf_counter() - _t_parse0
         else:
             # Cache hit: only the PR side rendered. Optional shadow audit
@@ -9265,12 +9314,13 @@ def _run_one_diff(app, pr_sha, main_sha, chart_revision=None, changed_paths=None
     # binding), both read from both renders, element 8 the pins a chart
     # upgrade leaves behind.
     # Index: 0 diff, 1 reason, 2 detail, 3 version_change, 4 hpas_remaining,
-    # 5 replica_stats, 6 capacity, 7 render facts, 8 pins_behind. A new
-    # element goes at the end, with its own index.
+    # 5 replica_stats, 6 capacity, 7 render facts, 8 pins_behind,
+    # 9 main_broken. A new element goes at the end, with its own index.
     return (diff_text, None, None, version_change,
             _count_hpas_remaining(pr_resources),
             _count_workload_replicas(pr_resources), capacity,
-            _render_immutable_facts(main_resources, pr_resources), pins)
+            _render_immutable_facts(main_resources, pr_resources), pins,
+            main_broken)
 
 
 def _indeterminate(reason, detail):
@@ -9336,6 +9386,7 @@ def argocd_diff(app, pr_sha, main_sha, chart_revision=None, changed_paths=None, 
         capacity = step[6] if len(step) > 6 else None  # COPS-2766
         render_facts = step[7] if len(step) > 7 else None
         pins_behind = step[8] if len(step) > 8 else None
+        main_broken = step[9] if len(step) > 9 else None
 
         if reason is not None:
             last_detail, last_reason = detail or reason, reason
@@ -9364,16 +9415,26 @@ def argocd_diff(app, pr_sha, main_sha, chart_revision=None, changed_paths=None, 
             # Non-retryable soft failure (e.g. render_failed) or retries spent.
             return _indeterminate(reason, detail or reason)
 
+        if main_broken:
+            # COPS-2790: the comment names the main error, redacted and short.
+            main_broken = (_short_permanent_error(_indeterminate(*main_broken))
+                           or main_broken[0])
+            logsink.log(f"[{app}] main does not render ({main_broken[:120]}), "
+                        "the PR does: diffing against an empty main", "WARNING",
+                        app=app, event="main_broken")
+
         # diff_text == "" means manifests are identical
         if not diff_text:
             return DiffResult("", [], 0, False, None, OUT_NO_DIFF, "clean",
-                              version_change, pins_behind=pins_behind)
+                              version_change, pins_behind=pins_behind,
+                              main_broken=main_broken)
 
         # Filter noise sections (checksums, version annotations that always drift)
         filtered_sections = _filter_diff_sections(parse_diff_sections(diff_text))
         if not filtered_sections:
             return DiffResult("", [], 0, False, None, OUT_NO_DIFF, "noise_only",
-                              version_change, pins_behind=pins_behind)
+                              version_change, pins_behind=pins_behind,
+                              main_broken=main_broken)
 
         n_res = len(filtered_sections)
         # Truncate to display budget NOW so we never hold the full YAML in
@@ -9392,7 +9453,7 @@ def argocd_diff(app, pr_sha, main_sha, chart_revision=None, changed_paths=None, 
         artifacts = _detect_template_artifacts(filtered_sections)
         # COPS-2714: like shutdown_stats and artifacts above, computed on the
         # full pre-cap list.
-        pingscaler_res = _detect_pingscaler_created(
+        pingscaler_res = None if main_broken else _detect_pingscaler_created(
             _detect_created_resources(filtered_sections))
         ip_released = _released_addresses(filtered_sections, deleted_res)
         neg_res = _detect_neg_removed(filtered_sections)  # COPS-2766, pre-cap too
@@ -9404,7 +9465,8 @@ def argocd_diff(app, pr_sha, main_sha, chart_revision=None, changed_paths=None, 
                           vm_changes_res, version_fold, shutdown_stats,
                           artifacts, pingscaler_res, ip_released=ip_released,
                           neg_removed=neg_res, capacity=capacity,
-                          image_downgrades=image_downgrades, pins_behind=pins_behind)
+                          image_downgrades=image_downgrades, pins_behind=pins_behind,
+                          main_broken=main_broken)
     # Exhausted retries
     return _indeterminate(last_reason, last_detail or "unknown error")
 
@@ -11351,6 +11413,8 @@ def _render_covers(apps, app_results) -> bool:
         r = results.get(app) or results.get(str(app).rsplit("/", 1)[-1])
         if getattr(r, "outcome", None) not in (OUT_DIFF, OUT_NO_DIFF):
             return False
+        if getattr(r, "main_broken", None):
+            return False   # COPS-2790: an empty main confirms nothing
     return True
 
 
@@ -11916,7 +11980,7 @@ def _permanent_failure_top_panel(results, failure_group_for_app, quiet: bool) ->
                 f"**{_reason_panel_label(r.reason)}**")
         if r.reason == REASON_MISSING_REQUIRED:
             out += _explain_required_error(r.error)
-            remedies = _missing_value_remedies()
+            remedies = _missing_value_remedies(r.error)
             out += remedies[:1] if quiet else remedies
         elif r.reason == REASON_SCHEMA_INVALID:
             out += _explain_schema_error(r.error)
@@ -11931,6 +11995,7 @@ def _permanent_failure_top_panel(results, failure_group_for_app, quiet: bool) ->
         elif r.reason == REASON_TEMPLATE:
             out += _quote_helm_error(r.error)
             out.append(
+                _HOSTING_ID_FIX if "hostingid" in (r.error or "").lower() else
                 "> **Fix:** correct the value the error names in this "
                 "environment's `customer.yaml` (or cohort/ring "
                 "`config.yaml`).")
@@ -12803,7 +12868,7 @@ def format_comment(pr_sha, app_results, skipped_apps=None, base_sha="",
                         f"VALUE**",
                     ]
                     lines += _explain_required_error(r.error)
-                    lines += _missing_value_remedies()
+                    lines += _missing_value_remedies(r.error)
                     lines += ["", f"> {_fmt_service_list(_members)}", ""]
                 else:
                     lines += [
@@ -12812,7 +12877,7 @@ def format_comment(pr_sha, app_results, skipped_apps=None, base_sha="",
                         f"environment**",
                     ]
                     lines += _explain_required_error(r.error)
-                    lines += _missing_value_remedies()
+                    lines += _missing_value_remedies(r.error)
                     lines += [""]
             elif r.reason == REASON_SCHEMA_INVALID:
                 # COPS-2554: same clarity principle, adapted to Helm's own
@@ -12852,6 +12917,7 @@ def format_comment(pr_sha, app_results, skipped_apps=None, base_sha="",
                 ]
                 lines += _quote_helm_error(r.error)
                 lines += [
+                    _HOSTING_ID_FIX if "hostingid" in (r.error or "").lower() else
                     "> **Fix:** correct the value the error names in this "
                     "environment's `customer.yaml` (or the `config.yaml` of "
                     "its cohort or ring). The template path above says which "

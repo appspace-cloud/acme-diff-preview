@@ -526,9 +526,22 @@ missing). A parent `config.yaml` that already sets it is enough. Top-level
 "renders no Linux VM" check.
 
 Nothing lifts it. Set `appspace.hostingID` in `customer.yaml` (QA usually
-`"00000000"`). A live environment that changes supporting-services already
-fails helm as a missing required value; this gate is for the new-env path
-that never rendered that chart.
+`"00000000"`). The gate wants a string of exactly 8 digits, as the charts do.
+Unquoted, YAML reads `00000000` as the number 0: `required()` passes and the
+VM labels render `hst-%!s(float64=0)`, so a number fails the gate, and that
+render is a template artifact on a live env. A live environment that changes
+supporting-services already fails helm as a missing required value; this
+gate is for the new-env path that never rendered that chart.
+
+When main does not render an app because of `appspace.hostingID` and the PR
+fixes it, the PR is not blocked (COPS-2790, acme-config-dev #7462). Three
+conditions, or main's error blocks as before: the main error names
+hostingID, the PR side is the merge preview (the branch tip may not fix
+main), and the last value file that sets hostingID sets 8 digits in quotes.
+The app is diffed against an empty main, so every resource shows as added,
+and the summary has a review line that names the main error. Deletions and
+immutable fields against the live state cannot be checked that way, which is
+why any other main error still blocks.
 
 ### Why a key in a file the ApplicationSet does not read is blocked
 

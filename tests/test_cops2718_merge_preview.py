@@ -111,6 +111,16 @@ def test_the_synthetic_sha_is_deterministic_across_pods(repo):
     assert a == b
 
 
+def test_a_clean_preview_remembers_its_base_past_a_cache_clear(repo, monkeypatch):
+    """COPS-2790: the hostingID bypass needs proof that render_sha is a merge
+    of this main. _merge_preview_cache is cleared whole at 513 entries."""
+    monkeypatch.setattr(m, "_merge_preview_bases", {"old": "x"})
+    monkeypatch.setattr(m, "_MERGE_PREVIEW_BASES_MAX", 1)
+    sha, _ = m._merge_preview("acme-config-dev", repo["base"], repo["pr"])
+    m._merge_preview_cache.clear()
+    assert m._merge_preview_bases == {sha: repo["base"]}
+
+
 def test_a_real_conflict_names_its_files_and_yields_no_sha(repo):
     work = repo["work"]
     _git("checkout", "-q", "pr", cwd=work)
