@@ -512,8 +512,8 @@ GATES = {
                   "Give the clone its own ashn"),
     "vm_disk": ("An n4 or c4 machine with a pd- disk, GCP rejects it", None, "blocked",
                 "Use hyperdisk-balanced on a new VM, or keep the machine family"),
-    "kcc_hosting_id": ("KCC linux VM enabled with no appspace.hostingID", None, "blocked",
-                       "Set appspace.hostingID in customer.yaml"),
+    "kcc_hosting_id": ("KCC linux VM enabled with no valid appspace.hostingID", None,
+                       "blocked", 'Set appspace.hostingID to 8 digits in quotes ("00000000")'),
     "appset_miss": ("No ApplicationSet reads this folder, nothing deploys", None,
                     "blocked", "Check the cloud, tier and spoke folders"),
     "legacy_helm": ("The legacy Helm writer is switched back on", "Confirm-LegacyHelm",
@@ -1305,12 +1305,12 @@ def _build_merge_summary(results, rollup_by_sig, vm_change_lines,
             broken.setdefault(r.main_broken, []).append(a)
     for why, apps in sorted(broken.items()):
         findings.append((_SEV_REVIEW,
-                         f"\U0001fa79 **{len(set(_envs_from_apps(apps)))} "
-                         f"environment(s) do not render on main** ({why}), "
-                         f"this PR makes them render: {_fmt_env_list(apps)}. "
-                         f"Their diff is against an empty main, so deletions "
-                         f"and immutable fields against the live state are "
-                         f"not checked"))
+                         (f"\U0001fa79 **{len(set(_envs_from_apps(apps)))} "
+                          f"environment(s) do not render on main** ({why}), "
+                          f"this PR makes them render: {_fmt_env_list(apps)}. "
+                          "Their diff is against an empty main, so deletions "
+                          "and immutable fields against the live state are "
+                          "not checked")))
     if not findings:
         findings.append((
             _SEV_ROUTINE,

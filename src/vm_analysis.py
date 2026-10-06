@@ -1141,11 +1141,14 @@ def _kcc_hosting_id_line(env: str, roles: list, value=None) -> str:
     """The blocking new-env line for a missing or invalid hostingID (COPS-2790)."""
     listed = ", ".join(f"`{r}`" for r in roles)
     if value is not None and str(value).strip():
+        number = (", a number because it has no quotes"
+                  if isinstance(value, (int, float)) and not isinstance(value, bool)
+                  else "" if isinstance(value, str) else ", not a string")
         return (
             f"- \u26d4 `{env}` \u00b7 **linux VM (KCC)**: `appspace.hostingID` is "
-            f"`{value}`, and `deployLinuxServicesK8s` has {listed} enabled. The charts "
-            "only take exactly 8 digits in quotes, so helm fails or the VM labels "
-            'render `hst-%!s(float64=0)`. Set it like `hostingID: "00000000"`.'
+            f"`{value}`{number}, and `deployLinuxServicesK8s` has {listed} enabled. The "
+            "charts only take a string of exactly 8 digits, so helm fails or the VM "
+            'labels render `hst-%!s(float64=0)`. Set it like `hostingID: "00000000"`.'
         )
     return (
         f"- \u26d4 `{env}` \u00b7 **linux VM (KCC)**: `appspace.hostingID` is missing "

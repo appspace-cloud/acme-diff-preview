@@ -61,23 +61,29 @@ def _instance(hosting_id):
     )
 
 
-def _world(monkeypatch, pr, main):
-    """pr and main are (doc, err) as `_helm_template` returns them."""
+GOOD = 'appspace:\n  hostingID: "12345678"\n'
+
+
+def _world(monkeypatch, pr, main, pr_values=GOOD, merged=True):
+    """pr and main are (doc, err) as `_helm_template` returns them. merged:
+    the PR side is a real merge preview, not the branch tip."""
     monkeypatch.setitem(m._app_chart_map, APP, "appspace-supporting-services")
     monkeypatch.setitem(m._app_chart_revision_map, APP, "2604.0.0-dev")
     monkeypatch.setitem(m._app_chart_registry_map, APP, "registry.example.com")
     monkeypatch.setitem(m._app_value_files_map, APP,
                         [f"$config/gcp/qa/private-cloud/ap1/custom/{ENV}/customer.yaml"])
     monkeypatch.setitem(m._app_namespace_map, APP, ENV)
+    monkeypatch.setattr(m, "_merge_preview_bases", {PR_SHA: MAIN_SHA} if merged else {})
     monkeypatch.setattr(m, "_ensure_chart", lambda reg, chart, ver: "/fake/chart")
     monkeypatch.setattr(m, "_fetch_value_files", lambda vfs, sha: {
-        vf: f"side: {'pr' if sha == PR_SHA else 'main'}\n" for vf in vfs})
+        vf: ("# side: pr\n" + pr_values if sha == PR_SHA else "# side: main\n")
+        for vf in vfs})
     monkeypatch.setattr(m, "_main_render_content_key", lambda *a: "k-2790")
     monkeypatch.setattr(m, "_main_render_cache_get", lambda k: (None, None, "miss"))
     puts = []
     monkeypatch.setattr(m, "_main_render_cache_put", lambda *a: puts.append(a))
     monkeypatch.setattr(m, "_helm_template", lambda chart, release, ns, vals: (
-        pr if "side: pr" in "".join(vals.values()) else main))
+        pr if "# side: pr" in "".join(vals.values()) else main))
     return puts
 
 
@@ -112,10 +118,54 @@ def test_a_generic_main_failure_keeps_the_retry_path(monkeypatch):
     assert step[:3] == (None, m.REASON_RENDER, "exit status 1")
 
 
+def test_a_main_error_that_is_not_hosting_id_keeps_the_block(monkeypatch):
+    """A live env can have a broken main for other reasons. Against an empty
+    main its deletions and the ip gate would vanish, so it stays blocked."""
+    err = ("Error: execution error at (appspace-ms/templates/x.yaml:4:5): "
+           "Missing Image Tag on => platform")
+    _world(monkeypatch, (_instance('"hst-12345678"'), None), (None, err))
+    assert m._run_one_diff(APP, PR_SHA, MAIN_SHA)[:3] == (
+        None, m.REASON_MISSING_REQUIRED, err)
+
+
+def test_the_branch_tip_is_not_the_merge_so_it_keeps_the_block(monkeypatch):
+    """No merge preview: a branch cut before main broke renders, and still
+    leaves main broken after the merge."""
+    _world(monkeypatch, (_instance('"hst-12345678"'), None), (None, MAIN_ERR),
+           merged=False)
+    assert m._run_one_diff(APP, PR_SHA, MAIN_SHA)[:3] == (
+        None, m.REASON_MISSING_REQUIRED, MAIN_ERR)
+
+
+def test_a_hosting_id_the_charts_refuse_keeps_the_block(monkeypatch):
+    """`required()` lets 0, {} and [] through, and the labels helper skips
+    them, so the PR side renders. Only 8 digits in quotes lifts it."""
+    for bad in ("00000000", "{}", "[]", '"1234568"', "12345678"):
+        _world(monkeypatch, (_instance('"hst-12345678"'), None), (None, MAIN_ERR),
+               pr_values=f"appspace:\n  hostingID: {bad}\n")
+        assert m._run_one_diff(APP, PR_SHA, MAIN_SHA)[1] == m.REASON_MISSING_REQUIRED, bad
+
+
+def test_the_last_file_that_sets_hosting_id_wins(monkeypatch):
+    monkeypatch.setattr(m, "_merge_preview_bases", {PR_SHA: MAIN_SHA})
+    assert m._pr_fixes_main_hosting_id(
+        MAIN_ERR, ['appspace:\n  hostingID: 0\n', 'appspace:\n  hostingID: "00000000"\n'],
+        PR_SHA, MAIN_SHA)
+    assert not m._pr_fixes_main_hosting_id(
+        MAIN_ERR, ['appspace:\n  hostingID: "00000000"\n', 'appspace:\n  hostingID: 0\n'],
+        PR_SHA, MAIN_SHA)
+    assert not m._pr_fixes_main_hosting_id(MAIN_ERR, [": not yaml: ["], PR_SHA, MAIN_SHA)
+
+
+def test_a_merge_preview_of_another_main_does_not_count(monkeypatch):
+    monkeypatch.setattr(m, "_merge_preview_bases", {PR_SHA: "othermain001"})
+    assert not m._pr_fixes_main_hosting_id(MAIN_ERR, [GOOD], PR_SHA, MAIN_SHA)
+
+
 # ── argocd_diff, comment and status ───────────────────────────────────────
 
-def _diff(monkeypatch, pr, main):
-    _world(monkeypatch, pr, main)
+def _diff(monkeypatch, pr, main, **kw):
+    _world(monkeypatch, pr, main, **kw)
     return m.argocd_diff(APP, PR_SHA, MAIN_SHA)
 
 
@@ -123,13 +173,19 @@ def test_argocd_diff_is_a_diff_that_names_the_main_error(monkeypatch):
     r = _diff(monkeypatch, (_instance('"hst-12345678"'), None), (None, MAIN_ERR))
     assert r.outcome == m.OUT_DIFF
     assert r.main_broken == REQUIRED
+    assert not m._render_covers([APP], {APP: r}), "an empty main confirms nothing"
+
+
+def test_a_pr_that_renders_nothing_still_carries_main_broken(monkeypatch):
+    r = _diff(monkeypatch, ("", None), (None, MAIN_ERR))
+    assert r.outcome == m.OUT_NO_DIFF and r.main_broken == REQUIRED
 
 
 def test_the_comment_is_green_with_a_review_line(monkeypatch):
     r = _diff(monkeypatch, (_instance('"hst-12345678"'), None), (None, MAIN_ERR))
     body = m.format_comment(PR_SHA, {APP: r}, base_sha=MAIN_SHA)
     assert m._extract_status_token(body) == "clean"
-    assert "RENDER BLOCKED" not in body and "⛔" not in body
+    assert "RENDER BLOCKED" not in body
     line = next(l for l in body.splitlines() if "render on main" in l)
     assert ENV in line and f"({REQUIRED})" in line
     assert "empty main" in line
@@ -153,24 +209,32 @@ def test_an_unquoted_hosting_id_is_blocked_and_says_quote_it(monkeypatch):
     assert schema_errors._HOSTING_ID_FIX in body.split("RENDER BLOCKED", 1)[1]
 
 
-def test_an_unquoted_zero_on_a_kcc_vm_still_fails(monkeypatch):
-    """`hostingID: 00000000` loads as 0: `required` passes and printf renders
-    hst-%!s(float64=0). Against an empty main every line is new, so the
-    artifact check sees it."""
-    r = _diff(monkeypatch, (_instance('"hst-%!s(float64=0)"'), None), (None, MAIN_ERR))
+def test_the_full_page_gives_the_same_hosting_id_fix(monkeypatch):
+    page = m.RenderProfile("page", is_complete_record=True, inline_diffs=True)
+    for err in (INVALID_ERR, TYPE_ERR):
+        r = _diff(monkeypatch, (None, err), (None, MAIN_ERR))
+        body = m.format_comment(PR_SHA, {APP: r}, base_sha=MAIN_SHA, profile=page)
+        block = body.split("helm cannot render this environment", 1)[1]
+        assert schema_errors._HOSTING_ID_FIX in block, err
+
+
+def test_an_unquoted_zero_on_a_live_kcc_vm_still_fails(monkeypatch):
+    """Main renders, the PR writes `hostingID: 00000000`: it loads as 0,
+    `required` passes and printf renders hst-%!s(float64=0)."""
+    r = _diff(monkeypatch, (_instance('"hst-%!s(float64=0)"'), None),
+              (_instance('"hst-none"'), None))
     assert r.outcome == m.OUT_DIFF and r.template_artifacts
     body = m.format_comment(PR_SHA, {APP: r}, base_sha=MAIN_SHA)
     assert m._extract_status_token(body) == "permanent"
 
 
-def test_the_summary_line_has_no_red_mark():
+def test_the_summary_line_is_review_not_block():
     r = m.DiffResult("x", [], 1, True, None, m.OUT_DIFF, "changes",
                      main_broken=REQUIRED)
-    lines = cr._build_merge_summary({APP: r}, {}, None, None, None, None, None,
-                                    green=True)
-    text = "\n".join(lines)
-    assert "render on main" in text
-    assert "⛔" not in text and "❌" not in text
+    text = "\n".join(cr._build_merge_summary({APP: r}, {}, None, None, None, None,
+                                             None, green=False))
+    assert "render on main" in text and "Review before merging" in text
+    assert "DO NOT MERGE" not in text and "\u26d4" not in text
 
 
 # ── the artifact regex ────────────────────────────────────────────────────
@@ -183,8 +247,8 @@ def test_a_go_bad_verb_with_a_typed_value_is_an_artifact():
 
 def test_a_typed_bad_verb_on_main_only_is_not_this_prs():
     assert manifest._detect_template_artifacts(
-        [("/h", "-    hosting-id: hst-%!s(float64=0)\n"
-                "+    hosting-id: hst-00000000\n")]) == []
+        [("/h", ("-    hosting-id: hst-%!s(float64=0)\n"
+                 "+    hosting-id: hst-00000000\n"))]) == []
 
 
 # ── the new-env gate takes only what the chart takes ─────────────────────
@@ -203,15 +267,18 @@ def test_the_gate_takes_a_quoted_eight_digit_string():
 
 
 def test_the_gate_refuses_what_the_chart_refuses():
-    for bad in (0, 12345678, "1234568", "123456789", "0000000a", " 00000000"):
+    for bad in (0, 12345678, "1234568", "123456789", "0000000a", (" 00000000")):
         assert va._kcc_missing_hosting_id(_flat(bad)), bad
 
 
 def test_an_invalid_hosting_id_line_names_the_value():
     line = va._new_env_prereq_findings(_flat(0), ENV)[1][0]
     assert line.startswith(f"- ⛔ `{ENV}`")
-    assert "`0`" in line and "8 digits" in line and '"00000000"' in line
+    assert "`0`, a number because it has no quotes" in line
+    assert "8 digits" in line and '"00000000"' in line
     assert "is missing" not in line
+    assert "`True`, not a string" in va._new_env_prereq_findings(_flat(True), ENV)[1][0]
+    assert "`1234568`, and" in va._new_env_prereq_findings(_flat("1234568"), ENV)[1][0]
 
 
 @pytest.mark.prereq_reads
@@ -225,3 +292,4 @@ def test_an_unquoted_zero_in_customer_yaml_fails_the_new_env_gate(monkeypatch):
     gates, _ = m._new_env_prereqs([fam._cand(fam.NEW)], fam.PR_SHA)
     assert gates == [{"kind": "kcc_hosting_id", "env": fam.ENV,
                       "why": "appspace.hostingID 0 is not 8 quoted digits, svc enabled"}]
+

@@ -282,6 +282,7 @@ from vm_analysis import (  # VM/KCC infrastructure analysis (same-dir module)
     _vm_disk_family_changes,
     _new_env_prereq_findings,
     _kcc_missing_hosting_id,
+    _kcc_hosting_id_ok,
     _kcc_rendered_roles,
     _kcc_adoption_card,
     _VM_PANEL_CLEAN_HDR,
@@ -3265,6 +3266,11 @@ def _git_read_file(repo: str, sha: str, filepath: str):
 # CAN answer for a sha it minted itself.
 
 _merge_preview_cache = {}   # (repo, base_sha, pr_sha) -> (render_sha, conflicts)
+# COPS-2790: render_sha -> base_sha of every clean merge preview, oldest out
+# first. The cache above is cleared whole, so it cannot prove a merge.
+_merge_preview_bases = {}
+_MERGE_PREVIEW_BASES_MAX = 4096
+_merge_preview_bases_lock = threading.Lock()
 _MERGE_PREVIEW_ENV = {
     "GIT_AUTHOR_NAME": "acme-diff-preview", "GIT_AUTHOR_EMAIL": "preview@local",
     "GIT_COMMITTER_NAME": "acme-diff-preview", "GIT_COMMITTER_EMAIL": "preview@local",
@@ -3327,6 +3333,10 @@ def _merge_preview(repo, base_sha, pr_sha):
         return None, None
     out = (c.stdout.strip(), [])
     _merge_preview_cache[key] = out
+    with _merge_preview_bases_lock:
+        _merge_preview_bases[out[0]] = base_sha
+        while len(_merge_preview_bases) > _MERGE_PREVIEW_BASES_MAX:
+            del _merge_preview_bases[next(iter(_merge_preview_bases))]
     if len(_merge_preview_cache) > 512:
         _merge_preview_cache.clear()
     return out
@@ -8679,6 +8689,28 @@ def _rebase_value_files(value_files: list, old_env_dir: str, new_env_dir: str) -
     return rebased
 
 
+def _pr_fixes_main_hosting_id(main_err, ordered_vals, render_sha, main_sha) -> bool:
+    """COPS-2790: main fails on appspace.hostingID, and the merge of this PR
+    sets one the charts take (a quoted string of 8 digits, last file wins).
+    Only then is the PR not blocked with main's error. The branch tip is not
+    the merge, so it may not fix main: that keeps the block."""
+    if (_render_reason(main_err) not in (REASON_MISSING_REQUIRED, REASON_TEMPLATE)
+            or "hostingid" not in main_err.lower()):
+        return False
+    if _merge_preview_bases.get(render_sha) != main_sha:
+        return False
+    hid = None
+    for content in ordered_vals:
+        try:
+            doc = _yaml_safe_load(content or "")
+        except Exception:
+            return False
+        a = doc.get("appspace") if isinstance(doc, dict) else None
+        if isinstance(a, dict) and "hostingID" in a:
+            hid = a["hostingID"]
+    return _kcc_hosting_id_ok({"appspace.hostingID": hid})
+
+
 def _effective_chart_version(ordered_value_files: list, vals: dict):
     """Effective appspace.version across ordered value files (last wins).
 
@@ -9190,15 +9222,16 @@ def _run_one_diff(app, pr_sha, main_sha, chart_revision=None, changed_paths=None
 
         if needs_main_render:
             main_yaml, main_err = main_fut.result(timeout=DIFF_TIMEOUT)
-            main_reason = _render_reason(main_err) if main_err else None
-            if main_err and main_reason not in PERMANENT_REASONS:
-                return None, main_reason, main_err
+            if main_err and not _pr_fixes_main_hosting_id(
+                    main_err, [pr_vals[vf] for vf in pr_value_files if vf in pr_vals],
+                    pr_sha, main_sha):
+                return None, _render_reason(main_err), main_err
             _record_stage("render", time.perf_counter() - _t_render0)
             _t_parse0 = time.perf_counter()
             if main_err:
-                # COPS-2790: main can never render and the PR does, so the PR
-                # fixes main. Diff it against an empty main, never cached.
-                main_broken = (main_reason, main_err)
+                # COPS-2790: the merge sets the hostingID main is missing and
+                # renders. Diff it against an empty main, never cached.
+                main_broken = (_render_reason(main_err), main_err)
                 main_resources = {}
             else:
                 main_resources = _parse_manifest_resources(main_yaml)
@@ -9420,7 +9453,7 @@ def argocd_diff(app, pr_sha, main_sha, chart_revision=None, changed_paths=None, 
         artifacts = _detect_template_artifacts(filtered_sections)
         # COPS-2714: like shutdown_stats and artifacts above, computed on the
         # full pre-cap list.
-        pingscaler_res = _detect_pingscaler_created(
+        pingscaler_res = None if main_broken else _detect_pingscaler_created(
             _detect_created_resources(filtered_sections))
         ip_released = _released_addresses(filtered_sections, deleted_res)
         neg_res = _detect_neg_removed(filtered_sections)  # COPS-2766, pre-cap too
@@ -11380,6 +11413,8 @@ def _render_covers(apps, app_results) -> bool:
         r = results.get(app) or results.get(str(app).rsplit("/", 1)[-1])
         if getattr(r, "outcome", None) not in (OUT_DIFF, OUT_NO_DIFF):
             return False
+        if getattr(r, "main_broken", None):
+            return False   # COPS-2790: an empty main confirms nothing
     return True
 
 
