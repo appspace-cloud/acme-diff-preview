@@ -471,6 +471,7 @@ def test_sigterm_without_elector_still_shuts_down(monkeypatch):
 def test_main_standby_waits_short_then_takes_over(monkeypatch):
     """A non-leader main() pass must skip the iteration, log standby once,
     wait on the short 5s timeout, and run the iteration after takeover."""
+    monkeypatch.setattr(m, "_leader", None)  # main() rebinds it; undo on teardown
     monkeypatch.setattr(m, "_start_health_server",
                         lambda *a, **k: type("S", (), {"shutdown": lambda self: None})())
     monkeypatch.setattr(m, "_start_heartbeat", lambda: None)
