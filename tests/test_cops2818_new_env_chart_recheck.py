@@ -27,7 +27,7 @@ import comment_render as cr  # noqa: E402
 import diff_preview as m  # noqa: E402
 
 from test_coverage_orchestration import (  # noqa: E402,F401
-    world, _mk_pr, PATH_MAP, BASE_SHA, PR_SHA, ANCILLARY, IDENTITY, IDENTITY_YAML)
+    world, _mk_pr, PATH_MAP, BASE_SHA, PR_SHA, ANCILLARY)
 from test_cops2766_new_env_gates import (  # noqa: E402,F401
     newenv, ENV, ENV_DIR, IDENT, FILES, CAND, RENDERED, IP, SK, REAL_FIX_STUCK)
 
@@ -126,7 +126,7 @@ def test_a_fresh_pod_reruns_a_transient_comment(newenv, comments, world):
     newenv(render=NOT_FOUND)
     m._seen.clear()
     m._retry_backoff.clear()     # a restart or leader flip: no memory at all
-    body, (state, _desc) = newenv(render=GREEN)
+    _, (state, _) = newenv(render=GREEN)
     assert len(sinks.upserts) == 2 and state == "SUCCESSFUL"
     assert len(comments["ids"]) == 1
 
@@ -136,7 +136,7 @@ def test_a_forced_recompute_skips_the_backoff(newenv, comments, world):
     newenv(render=NOT_FOUND)
     assert SK in m._retry_backoff
     m._force_recompute.add(SK)
-    body, (state, _desc) = newenv(render=GREEN)
+    _, (state, _) = newenv(render=GREEN)
     assert len(sinks.upserts) == 2 and state == "SUCCESSFUL"
 
 
@@ -176,7 +176,7 @@ def test_a_transient_gate_with_an_awaiting_env_stays_transient(newenv):
 
 
 def test_status_recovery_of_an_awaiting_comment_is_failed(newenv, monkeypatch):
-    body, (state, _desc) = newenv(render=NOT_FOUND)
+    body, _ = newenv(render=NOT_FOUND)
     posted = []
     monkeypatch.setattr(m, "http", lambda *a, **k: {"state": "INPROGRESS"})
     monkeypatch.setattr(m, "post_build_status",
