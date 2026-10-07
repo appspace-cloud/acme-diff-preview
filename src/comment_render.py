@@ -592,7 +592,8 @@ def _build_merge_summary(results, rollup_by_sig, vm_change_lines,
                          decommission_lines, appspace_state_lines,
                          new_env_lines, new_env_structural,
                          paused_changing=None, paused_envs=None,
-                         block_headline=None, gates=None, green=False) -> list:
+                         block_headline=None, gates=None, green=False,
+                         new_env_awaiting=False) -> list:
     """The verdict block that opens every comment.
 
     Reads the same deterministic facts the panels below use, so the
@@ -611,6 +612,9 @@ def _build_merge_summary(results, rollup_by_sig, vm_change_lines,
 
     green (COPS-2766): the build is green. The verdict is then at most a
     review and no line has a red mark. The findings are the same.
+
+    new_env_awaiting (COPS-2818): every failing new env only waits for its
+    chart. Still a stop sign, with the right reason.
     """
     findings = []          # (severity, line)
     sev = _SEV_ROUTINE
@@ -1213,7 +1217,9 @@ def _build_merge_summary(results, rollup_by_sig, vm_change_lines,
         # A structural problem makes the build red, so it is a stop sign too.
         findings.append((_SEV_BLOCK if new_env_structural else _SEV_ROUTINE,
                          "\U0001f195 **New environment** in this PR"
-                         + (" \u2014 its configuration did not validate"
+                         + ((" \u2014 its chart is not in the registry yet"
+                             if new_env_awaiting else
+                             " \u2014 its configuration did not validate")
                             if new_env_structural else "")))
 
     # The 50% case: fleets jumping from one version to another. Named the

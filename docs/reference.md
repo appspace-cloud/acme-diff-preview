@@ -35,6 +35,8 @@ Two things to know up front:
 It also runs a second, unrelated job: a **JFrog webhook** that hard-refreshes the
 dev, QA and stage apps (never prod) that track the chart CI just published, so
 they pick it up past the OCI cache.
+A standby replica also relays each push to the leader, which checks again the
+open PRs that render with that chart (COPS-2818).
 
 ---
 
@@ -404,6 +406,11 @@ it is self-resolving, the poll loop keeps retrying it (COPS-2696), and telling
 the author to fix and push would send them to change a version that is
 probably correct. Apps failing the same way are grouped, so a fleet PR reads
 as one problem with an environment count rather than fifty lines.
+
+A new environment whose chart is not in the registry yet gets the same rule
+(COPS-2818): the build stays red, and the preview checks the PR again until the
+chart is published. Any other pull or render error of a new environment still
+blocks until a push.
 
 An open merge gate (COPS-2766) names the gate, the environment and the line
 that lifts it, or the fix when no line can, so a reviewer who reads only the
