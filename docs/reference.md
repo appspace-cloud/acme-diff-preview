@@ -726,8 +726,10 @@ rolling deploys with no availability gap:
   in `iters_standby_wait`. The safety-net-to-webhook ratio (the
   webhook-health signal) is therefore meaningful on any pod, with no
   `is_leader` filter needed.
-- The chart ships the rest of the disruption armor: `RollingUpdate` with
-  `maxUnavailable: 0`, a PodDisruptionBudget (rendered only above one
+- The chart ships the rest of the disruption armor: `RollingUpdate` that
+  replaces pods in place above one replica (`maxSurge: 0`,
+  `maxUnavailable: 1`, so a rollout never waits for a new node; one replica
+  keeps `maxSurge: 1`), a PodDisruptionBudget (rendered only above one
   replica), node and zone topology spread, a `preStop` sleep for clean
   endpoint drain, and the Lease RBAC for the pod's ServiceAccount.
 
