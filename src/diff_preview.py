@@ -711,7 +711,8 @@ def _still_leader() -> bool:
         return True
 
 
-def _forward_webhook_to_leader(body: bytes, headers) -> bool:
+def _forward_webhook_to_leader(body: bytes, headers,
+                               path: str = "/diff-preview/webhook") -> bool:
     """Relay a verified Bitbucket webhook from a standby to the leader pod.
 
     The load balancer delivers each webhook to ONE replica; when that
@@ -722,6 +723,9 @@ def _forward_webhook_to_leader(body: bytes, headers) -> bool:
     IP, with a marker header so a relay is never relayed again even if
     leadership flips mid-flight. Best-effort by design: any failure here
     just means falling back to the safety net, never a failed webhook.
+
+    COPS-2818: JFrog pushes take the same relay (path="/jfrog-webhook"),
+    because the PR chart targets live only in the leader's memory.
     """
     holder = ""
     try:
@@ -733,11 +737,12 @@ def _forward_webhook_to_leader(body: bytes, headers) -> bool:
             return False
         ip = _leader.pod_ip(holder)
         req = urllib.request.Request(
-            f"http://{ip}:8080/diff-preview/webhook", data=body,
+            f"http://{ip}:8080{path}", data=body,
             method="POST",
             headers={
                 "X-Hub-Signature": headers.get("X-Hub-Signature", ""),
                 "X-Event-Key": headers.get("X-Event-Key", ""),
+                "X-JFrog-Event-Auth": headers.get("X-JFrog-Event-Auth", ""),
                 "X-ADP-Forwarded": "1",
                 "Content-Type": "application/json",
             })
@@ -1717,7 +1722,16 @@ class _HealthHandler(BaseHTTPRequestHandler):
                 _invalidate_for_republish(chart_name, chart_ver)
             except Exception as exc:
                 logsink.log(f"JFrog webhook: local invalidation failed: {exc}", "ERROR")
-            _jfrog_refresh_pool.submit(_jfrog_refresh_guarded, chart_name, chart_ver)
+            # COPS-2818: a relayed push was already refreshed by the standby,
+            # which also relays it: only the leader knows which PRs it forces.
+            relayed_in = self.headers.get("X-ADP-Forwarded", "") == "1"
+            if not relayed_in:
+                _jfrog_refresh_pool.submit(_jfrog_refresh_guarded, chart_name, chart_ver)
+                if not _should_run_iteration(_leader):
+                    _jfrog_refresh_pool.submit(
+                        _forward_webhook_to_leader, body,
+                        {"X-JFrog-Event-Auth": self.headers.get("X-JFrog-Event-Auth", ""),
+                         "X-ADP-Forwarded": "1"}, "/jfrog-webhook")
 
         else:
             self.send_response(404)
@@ -5909,7 +5923,8 @@ def _detect_new_env_candidates(changed_files: list, path_map: dict, renames: dic
 
 def _evaluate_new_envs(new_env_candidates: list, pr_sha: str,
                        with_full_output: bool = False, base_sha: str = "",
-                       repo: str = None, changed=(), renames=None, prereqs=None) -> tuple:
+                       repo: str = None, changed=(), renames=None, prereqs=None,
+                       awaiting=None, chart_targets=None) -> tuple:
     """Render and classify a list of new-environment candidates.
 
     v2.5.4 (Finding 4): extracted from process_pr's inline logic so the same
@@ -5934,6 +5949,10 @@ def _evaluate_new_envs(new_env_candidates: list, pr_sha: str,
     COPS-2766: with `base_sha`, each env section also lists the GCP objects
     it shares with a live env (_new_env_shared_lines), as check lines. The
     `prereqs` lines of _new_env_prereqs go first.
+
+    COPS-2818: out-params, so the return shapes stay. `awaiting` (a set) gets
+    the structural envs whose chart is not pullable yet, and `chart_targets`
+    (a set) gets (chart, version) of every env whose version resolved.
     """
     new_env_sections = []
     full_sections = []      # (name, version, n_res, redacted manifest)
@@ -6049,6 +6068,8 @@ def _evaluate_new_envs(new_env_candidates: list, pr_sha: str,
         detected_version = render_result[3] if len(render_result) > 3 else None
         env_name = env_info["name"]
         display_version = detected_version or env_info.get("version", "unknown")
+        if detected_version and chart_targets is not None:
+            chart_targets.add((_NEW_ENV_CHART, detected_version))
         if rendered:
             logsink.log(f"  new env {env_name}: rendered {n_res} resource(s)")
             # v2.5.6 (Finding B): summarize instead of dumping the manifest.
@@ -6071,6 +6092,9 @@ def _evaluate_new_envs(new_env_candidates: list, pr_sha: str,
                 "name": env_name, "version": display_version,
                 "files": env_info["all_yaml_files"], "n_res": 0,
                 "kind_counts": None, "workloads": None, "error": render_err,
+                # COPS-2818: still FAILED, but it resolves by itself once the
+                # chart lands, like oci_not_found for a live app (COPS-2696).
+                "awaiting": (render_err or "").startswith(_AWAITING_CHART_ERRORS),
             })
         new_env_sections[-1]["checks"] = checks
 
@@ -6130,6 +6154,19 @@ def _evaluate_new_envs(new_env_candidates: list, pr_sha: str,
                         if len(sec["workloads"]) > 12 else "")
                 lines.append(
                     f"- **Applications ({len(sec['workloads'])}):** {apps}{more}")
+        elif sec.get("awaiting"):
+            chart = f"`{_NEW_ENV_CHART}:{sec['version']}`"
+            if sec["error"].startswith("chart not found in OCI"):
+                lines.append(
+                    f"\u23f3 **The chart {chart} is not in the registry yet.**  \n"
+                    f"If it is still being published, this preview checks again by "
+                    f"itself and updates this comment. If the version is wrong, "
+                    f"fix it and push.")
+            else:
+                lines.append(
+                    f"\u23f3 **The chart {chart} could not be pulled:** "
+                    f"{sec['error'][:160]}  \n"
+                    f"This preview checks again by itself and updates this comment.")
         else:
             lines.append(
                 "\U0001f4cb **Resource preview not available for new environments.**  \n"
@@ -6170,6 +6207,8 @@ def _evaluate_new_envs(new_env_candidates: list, pr_sha: str,
         s["name"] for s in new_env_sections
         if s["error"] and _new_env_status(s["error"])[1] is False
     ]
+    if awaiting is not None:
+        awaiting.update(s["name"] for s in new_env_sections if s.get("awaiting"))
     if not with_full_output:
         return lines, structural_envs, total_new
     # v2.25.0: the complete rendered output as a separate appendix block.
@@ -6229,6 +6268,21 @@ def _new_env_value_chain(env_info: dict, pr_sha: str, repo: str = None) -> tuple
     ordered = list(dict.fromkeys(ancestor_levels + env_own))
     vals = _fetch_value_files(ordered, pr_sha)
     return ordered, vals
+
+
+# The chart every new-env preview renders with (see _render_new_env_diff).
+_NEW_ENV_CHART = "appspace-micro-services"
+# COPS-2818: render errors of a chart that is not pullable YET. Transport
+# errors are retryable for live apps too (REASON_OCI_PULL).
+_AWAITING_CHART_ERRORS = ("chart not found in OCI", "chart pull failed",
+                          "chart pull returned None")
+
+
+def _awaiting_chart_desc(envs) -> str:
+    """COPS-2818: the status of new envs that only wait for their chart."""
+    return (f"{len(envs)} new environment(s) wait for their chart in the "
+            f"registry: {', '.join(envs)} - check the version or wait for "
+            f"the registry")
 
 
 def _render_new_env_diff(env_info: dict, pr_sha: str) -> tuple:
@@ -6307,7 +6361,7 @@ def _render_new_env_diff(env_info: dict, pr_sha: str) -> tuple:
     # values that a brand-new environment customer.yaml will not have yet, and
     # their templates would fail with missing-value errors. The ms chart gives
     # the most useful resource preview for a reviewer.
-    chart_name = "appspace-micro-services"
+    chart_name = _NEW_ENV_CHART
 
     # 3. Pull chart
     try:
@@ -12038,7 +12092,8 @@ def _app_sort_key(app: str, r) -> tuple:
 
 
 def _comment_status_token(results, new_env_structural, skipped_apps,
-                          arming_broken, flag_typo, kcc_nil, gates) -> str:
+                          arming_broken, flag_typo, kcc_nil, gates,
+                          new_env_awaiting=False) -> str:
     """Machine-readable token embedded in the footer. Used by process_pr to
     decide whether to re-run without parsing the human-readable status string.
 
@@ -12048,14 +12103,17 @@ def _comment_status_token(results, new_env_structural, skipped_apps,
       Apps over the cap are here too: the cut is the same on every retry.
     - blocked   : COPS-2766, an open merge gate (no retry, mark seen)
     - transient : diff unavailable on transient blip (retry next loop)
+
+    COPS-2818: new_env_awaiting means every structural new env only waits
+    for its chart. That resolves by itself, like oci_not_found below.
     """
     outcomes = {r.outcome for r in results.values()}
-    if (OUT_ERROR in outcomes or new_env_structural or arming_broken
-            or flag_typo or kcc_nil):
+    if (OUT_ERROR in outcomes or (new_env_structural and not new_env_awaiting)
+            or arming_broken or flag_typo or kcc_nil):
         return "permanent"
     if gate_token(gates) == "blocked":
         return "blocked"
-    if OUT_INDETERMINATE in outcomes:
+    if OUT_INDETERMINATE in outcomes or new_env_awaiting:
         # Permanent if ANY app has a permanent reason that cannot resolve by
         # itself (e.g. invalid_version mixed with transient ones). A mixed PR
         # is still "permanent" for dedup purposes because the FAILED build
@@ -12082,7 +12140,7 @@ def format_comment(pr_sha, app_results, skipped_apps=None, base_sha="",
                     appspace_state_lines=None, appendix_lines=None,
                     vm_change_lines=None, artifact_url="",
                     readable_budget=None, profile=None, paused_apps=None,
-                    gates=None, authors_line=""):
+                    gates=None, authors_line="", new_env_awaiting=False):
     """Format the full PR comment. Never uses <details>/<summary> — Bitbucket
     does not render them. Large changesets get a compact summary table at the
     top (all apps, one row each) and, for the diff sections below, apps
@@ -12100,6 +12158,8 @@ def format_comment(pr_sha, app_results, skipped_apps=None, base_sha="",
     a broken new environment as blocking even if every existing app's own
     diff is perfectly clean — a reviewer must never see a plain green check
     while an unvalidated new environment rode along in the same PR.
+    new_env_awaiting (COPS-2818): those envs only wait for their chart, so
+    the token is transient and the PR is checked again.
 
     appspace_state_lines (COPS-2584): the markdown block from
     _summarize_appspace_state_changes calling out an autosync pause/resume
@@ -12414,7 +12474,7 @@ def format_comment(pr_sha, app_results, skipped_apps=None, base_sha="",
             break
     _status_token = _comment_status_token(
         results, new_env_structural, skipped_apps, _arming_broken,
-        _flag_typo_block, _kcc_nil_block, gates)
+        _flag_typo_block, _kcc_nil_block, gates, new_env_awaiting=new_env_awaiting)
     # COPS-2766: the icons follow the build colour. The panels are built
     # and read raw, only what this comment shows changes.
     _green = _status_token == "clean"
@@ -12426,7 +12486,7 @@ def format_comment(pr_sha, app_results, skipped_apps=None, base_sha="",
         results, rollup_by_sig, vm_change_lines, decommission_lines,
         appspace_state_lines, new_env_lines, new_env_structural,
         _paused_changing, _paused_envs, block_headline=block_headline or None,
-        gates=gates, green=_green)
+        gates=gates, green=_green, new_env_awaiting=new_env_awaiting)
     lines += ["---", ""]
     if authors_line:  # COPS-2766: right under the verdict
         at = lines.index(MERGE_SUMMARY_HDR) + 3
@@ -13248,18 +13308,29 @@ def format_comment(pr_sha, app_results, skipped_apps=None, base_sha="",
 
 def format_new_env_comment(pr_sha, new_env_lines, new_env_full_lines,
                            structural_envs, gates, n_envs, total_new,
-                           base_sha="", authors_line=""):
+                           base_sha="", authors_line="", awaiting_envs=()):
     """COPS-2766: (body, state, desc) for a PR that only adds environments.
 
     The merge summary and the gates of a diff comment, with the same token
     and status rules. A structural problem stays [blocked] with its old
     description; an open gate comes next. The authors line goes right under
-    the verdict, as in format_comment. Pure, like format_comment."""
-    token = "blocked" if structural_envs else (gate_token(gates) or "clean")
+    the verdict, as in format_comment. Pure, like format_comment.
+
+    COPS-2818: structural envs that only wait for their chart (awaiting_envs)
+    stay FAILED but get [transient], so the PR is checked again."""
+    hard = [e for e in structural_envs if e not in set(awaiting_envs)]
+    gate_tok = gate_token(gates)
+    if hard or gate_tok == "blocked":
+        token = "blocked"
+    elif structural_envs:
+        token = "transient"
+    else:
+        token = gate_tok or "clean"
     lines = [f"## \U0001f52d {STATUS_NAME}", "", _comment_header(pr_sha), ""]
     green = token == "clean"
     lines += _build_merge_summary({}, {}, None, None, None, new_env_lines,
-                                  bool(structural_envs), gates=gates, green=green)
+                                  bool(structural_envs), gates=gates, green=green,
+                                  new_env_awaiting=bool(structural_envs) and not hard)
     if authors_line:  # COPS-2766: right under the verdict
         at = lines.index(MERGE_SUMMARY_HDR) + 3
         lines[at:at] = ["", authors_line]
@@ -13269,12 +13340,17 @@ def format_new_env_comment(pr_sha, new_env_lines, new_env_full_lines,
     # the full-diff artifact keeps it all.
     if new_env_full_lines:
         lines += ["---"] + new_env_full_lines
-    if structural_envs:
+    if hard:
         desc = (f"{len(structural_envs)} new environment(s) have a structural "
                 f"config problem: {', '.join(structural_envs)}")
         status = ("\u274c New environment(s) with a structural problem that "
                   "must be fixed before merge: "
                   + ", ".join(f"`{e}`" for e in structural_envs))
+    elif structural_envs:
+        desc = _awaiting_chart_desc(structural_envs)
+        status = ("\u23f3 New environment(s) waiting for their chart in the "
+                  "registry: " + ", ".join(f"`{e}`" for e in structural_envs)
+                  + " - this preview checks again automatically")
     else:
         desc = f"{n_envs} new environment(s), ~{total_new} resource(s) to create"
         status = "\u2705 New environment(s) - all resources will be created on merge"
@@ -13707,10 +13783,16 @@ def process_pr(pr, path_map, base_sha="", repo=None):
             if new_env_candidates:
                 post_build_status(pr_sha, "INPROGRESS", "Rendering new environment(s)...",
                                   pr_id=pr_id, repo=repo)
+                awaiting_envs, chart_targets = set(), set()
                 new_env_lines, structural_envs, total_new, new_env_full_lines = \
                     _evaluate_new_envs(new_env_candidates, render_sha,
                                        with_full_output=True, base_sha=base_sha, repo=repo,
-                                       changed=changed, renames=renames, prereqs=prereqs)
+                                       changed=changed, renames=renames, prereqs=prereqs,
+                                       awaiting=awaiting_envs, chart_targets=chart_targets)
+                # COPS-2818: a push of the new env's chart forces this PR
+                # (_invalidate_for_republish). Assigned: no stale app targets.
+                with _seen_lock:
+                    _pr_chart_targets[sk] = set(chart_targets)
                 gates = _lift_gates(_merge_gates((), extra=clone_gates + dup_gates + ashn_gates
                                                  + disk_gates + appset_gates + legacy_gates),
                                     repo, pr_id, base_sha, pr_sha)
@@ -13720,7 +13802,8 @@ def process_pr(pr, path_map, base_sha="", repo=None):
                     + _appset_miss_lines(gates, appset_notes) + new_env_lines,
                     new_env_full_lines, structural_envs,
                     gates, len(new_env_candidates), total_new, base_sha,
-                    authors_line=_pr_authors_line(repo, pr, pr_sha))
+                    authors_line=_pr_authors_line(repo, pr, pr_sha),
+                    awaiting_envs=awaiting_envs)
                 # v2.25.0: this path never persisted a full-diff artifact, so
                 # new-env-only PRs had no full-output page at all. Save it
                 # BEFORE the final build status so the status icon deep-links
@@ -14134,15 +14217,22 @@ def process_pr(pr, path_map, base_sha="", repo=None):
         # environment must never hide behind an unrelated app's clean diff.
         new_env_lines, structural_envs, total_new = ([], [], 0)
         new_env_full_lines = []
+        awaiting_envs, chart_targets = set(), set()
         if new_env_candidates:
             new_env_lines, structural_envs, total_new, new_env_full_lines = \
                 _evaluate_new_envs(new_env_candidates, render_sha,
                                    with_full_output=True, base_sha=base_sha, repo=repo,
-                                   changed=changed, renames=renames, prereqs=prereqs)
+                                   changed=changed, renames=renames, prereqs=prereqs,
+                                   awaiting=awaiting_envs, chart_targets=chart_targets)
+            with _seen_lock:  # COPS-2818: a push of the new env's chart forces this PR
+                _pr_chart_targets.setdefault(sk, set()).update(chart_targets)
+        # COPS-2818: envs that only wait for their chart retry; the rest block.
+        hard_envs = [e for e in structural_envs if e not in awaiting_envs]
         new_env_desc = (
             f"{len(structural_envs)} new environment(s) have a structural "
             f"config problem: {', '.join(structural_envs)}"
-        ) if structural_envs else ""
+        ) if hard_envs else (
+            _awaiting_chart_desc(structural_envs) if structural_envs else "")
 
         # COPS-2552: a paired move is excluded from the new-env candidates, so
         # the cohort guard above never sees it. Check the destinations here.
@@ -14251,6 +14341,8 @@ def process_pr(pr, path_map, base_sha="", repo=None):
             skipped_apps=skipped_apps, base_sha=base_sha,
             new_env_lines=new_env_lines or None,
             new_env_structural=bool(structural_envs or moves_missing_cohort),
+            new_env_awaiting=bool(structural_envs) and not hard_envs
+            and not moves_missing_cohort,
             new_env_desc=new_env_desc,
             decommission_lines=decommission_lines or None,
             leftover_lines=leftover_lines or None,
@@ -14471,7 +14563,8 @@ def process_pr(pr, path_map, base_sha="", repo=None):
                 base_desc = (f"{len(structural_envs)} new environment(s) "
                              f"cannot render"
                              + (f" ({_se_why})" if _se_why else "")
-                             + f": {', '.join(structural_envs)}")
+                             + f": {', '.join(structural_envs)}"
+                             ) if hard_envs else _awaiting_chart_desc(structural_envs)
                 if oci_not_found_count:
                     desc = f"{base_desc} | {oci_not_found_count} existing app(s): chart version not found in OCI registry"
                 elif any_hard_error:
@@ -14581,13 +14674,17 @@ def process_pr(pr, path_map, base_sha="", repo=None):
             if r.outcome == OUT_INDETERMINATE
             and r.reason in PERMANENT_REASONS
             and r.reason not in SELF_RESOLVING_REASONS)
+        # COPS-2818: the same rules as _comment_status_token. A new env that
+        # only waits for its chart retries; flag_typo is permanent there too.
         is_permanent_failure = (any_hard_error or unresolvable_indet > 0
-                                or bool(structural_envs)
+                                or bool(hard_envs)
                                 or bool(moves_missing_cohort)
                                 or broken_arming
+                                or flag_typo_block
                                 or kcc_nil_block
                                 or gate_tok == "blocked")
-        is_transient_failure = ((any_unknown or gate_tok == "transient")
+        is_transient_failure = ((any_unknown or gate_tok == "transient"
+                                 or bool(structural_envs))
                                 and not is_permanent_failure)
         if not is_transient_failure:
             # Mark seen for both clean runs AND permanent failures so we don't
