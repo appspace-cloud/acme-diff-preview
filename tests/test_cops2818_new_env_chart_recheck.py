@@ -35,6 +35,7 @@ CHART = "appspace-micro-services"
 VER = "2603.2.22-rev1-copr-32580-dev"
 NOT_FOUND = (None, f"chart not found in OCI: {CHART}:{VER}", 0, VER)
 PULL_FAILED = (None, "chart pull failed: read tcp: i/o timeout", 0, VER)
+PULL_NONE = (None, "chart pull returned None (registry login may have failed)", 0, VER)
 GREEN = (RENDERED, None, 3, VER)
 HARD = (None, "template: boom at line 3", 0, VER)
 
@@ -89,18 +90,23 @@ def test_a_missing_chart_is_failed_but_transient(newenv):
     assert "wait for their chart in the registry" in desc and ENV in desc
     assert SK not in m._seen and SK in m._retry_backoff
     assert f"`{CHART}:{VER}` is not in the registry yet" in body
-    assert "checks again by itself" in body
+    assert "this comment is updated once the chart is published" in body
+    assert "this preview checks again automatically" in body
     assert "its configuration did not validate" not in body
     assert "structural problem" not in body
     assert "missing required value" not in body.lower()
 
 
-def test_a_failed_chart_pull_is_transient_and_shows_the_error(newenv):
-    body, (state, desc) = newenv(render=PULL_FAILED)
-    assert m._extract_status_token(body) == "transient"
-    assert state == "FAILED"
-    assert "i/o timeout" in body and "checks again by itself" in body
-    assert SK in m._retry_backoff and SK not in m._seen
+@pytest.mark.parametrize("render", [PULL_FAILED, PULL_NONE])
+def test_a_failed_chart_pull_stays_blocked(newenv, render):
+    """Only "not found" resolves by itself. helm answers a bad version such
+    as 1.2.3.4 with "improper constraint", and _ensure_chart returns None."""
+    body, (state, desc) = newenv(render=render)
+    assert m._extract_status_token(body) == "blocked"
+    assert state == "FAILED" and "structural config problem" in desc
+    assert "not in the registry yet" not in body
+    assert "its configuration did not validate" in body
+    assert m._seen.get(SK) == (PR_SHA, BASE_SHA) and SK not in m._retry_backoff
 
 
 def test_the_next_pass_turns_the_same_comment_green(newenv, comments, world):
@@ -154,10 +160,13 @@ def test_a_hard_env_next_to_an_awaiting_one_stays_blocked(newenv, monkeypatch):
 
 
 def test_a_blocked_gate_keeps_blocked(newenv):
-    body, (state, _desc) = newenv(extra=[IP], messages=[], render=NOT_FOUND)
+    body, (state, desc) = newenv(extra=[IP], messages=[], render=NOT_FOUND)
     assert m._extract_status_token(body) == "blocked"
     assert state == "FAILED"
     assert m._seen.get(SK) == (PR_SHA, BASE_SHA)
+    # The gate blocks, so no promise of a re-check, and the gate is named.
+    assert "checks again automatically" not in body
+    assert desc and "wait for their chart" not in desc
 
 
 def test_a_transient_gate_with_an_awaiting_env_stays_transient(newenv):
@@ -319,9 +328,9 @@ def test_the_standby_processes_locally_and_relays(jfrog):
     post, calls = jfrog
     body, sig = post("1.0.0-dev", leading=False)
     assert calls["invalidate"] == [(CHART, "1.0.0-dev")]
-    assert _fns(calls) == [m._jfrog_refresh_guarded, m._forward_webhook_to_leader]
-    fwd_body, fwd_headers, path = calls["submit"][1][1]
-    assert fwd_body == body and path == "/jfrog-webhook"
+    assert _fns(calls) == [m._jfrog_refresh_guarded, m._relay_jfrog_push]
+    fwd_body, fwd_headers, label = calls["submit"][1][1]
+    assert fwd_body == body and label == f"{CHART}:1.0.0-dev"
     assert fwd_headers == {"X-JFrog-Event-Auth": sig, "X-ADP-Forwarded": "1"}
 
 
@@ -360,6 +369,30 @@ def test_the_relay_posts_to_the_leader_jfrog_path(monkeypatch):
     assert req.full_url == "http://10.0.0.9:8080/jfrog-webhook"
     assert req.get_header("X-jfrog-event-auth") == "sig"
     assert req.get_header("X-adp-forwarded") == "1"
+
+
+@pytest.mark.parametrize("ok", [True, False])
+def test_the_jfrog_relay_logs_its_result(monkeypatch, ok):
+    sent, logged = [], []
+    monkeypatch.setattr(m, "_forward_webhook_to_leader",
+                        lambda body, headers, path: sent.append(path) or ok)
+    monkeypatch.setattr(m.logsink, "log", lambda msg, sev="INFO", **k: logged.append(msg))
+    assert m._relay_jfrog_push(b"{}", {}, f"{CHART}:{VER}") is ok
+    assert sent == ["/jfrog-webhook"]
+    assert logged == [f"JFrog webhook {CHART}:{VER} (standby): "
+                      + ("relayed to the leader" if ok else
+                         "relay unavailable, the leader does not force its PRs")]
+
+
+def test_a_failed_jfrog_relay_does_not_claim_a_safety_net(monkeypatch):
+    logged = []
+    monkeypatch.setattr(m, "_leader", _Elector(False), raising=False)
+    monkeypatch.setattr(urllib.request, "urlopen",
+                        lambda req, timeout=None: (_ for _ in ()).throw(OSError("down")))
+    monkeypatch.setattr(m.logsink, "log", lambda msg, sev="INFO", **k: logged.append(msg))
+    assert m._forward_webhook_to_leader(b"{}", {}, "/jfrog-webhook") is False
+    assert m._forward_webhook_to_leader(b"{}", {}) is False
+    assert "safety net" not in logged[0] and "safety net covers it" in logged[1]
 
 
 def test_a_real_push_payload_forces_the_new_env_pr(newenv, monkeypatch):

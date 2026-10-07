@@ -751,8 +751,20 @@ def _forward_webhook_to_leader(body: bytes, headers,
         return True
     except Exception as e:
         logsink.log(f"[leader] webhook relay to {holder or 'unknown leader'} failed "
-                    f"(non-fatal, safety net covers it): {e}", "WARNING")
+                    f"(non-fatal"
+                    + (", safety net covers it" if path == "/diff-preview/webhook" else "")
+                    + f"): {e}", "WARNING")
         return False
+
+
+def _relay_jfrog_push(body: bytes, headers, label: str) -> bool:
+    """COPS-2818: relay a JFrog push to the leader and log the result."""
+    ok = _forward_webhook_to_leader(body, headers, "/jfrog-webhook")
+    logsink.log(f"JFrog webhook {label} (standby): "
+                + ("relayed to the leader" if ok
+                   else "relay unavailable, the leader does not force its PRs"),
+                "INFO" if ok else "WARNING")
+    return ok
 
 # JFrog webhook dedup state: {chart:version -> last_processed_timestamp}
 _jfrog_recent:     dict          = {}
@@ -1729,9 +1741,9 @@ class _HealthHandler(BaseHTTPRequestHandler):
                 _jfrog_refresh_pool.submit(_jfrog_refresh_guarded, chart_name, chart_ver)
                 if not _should_run_iteration(_leader):
                     _jfrog_refresh_pool.submit(
-                        _forward_webhook_to_leader, body,
+                        _relay_jfrog_push, body,
                         {"X-JFrog-Event-Auth": self.headers.get("X-JFrog-Event-Auth", ""),
-                         "X-ADP-Forwarded": "1"}, "/jfrog-webhook")
+                         "X-ADP-Forwarded": "1"}, dedup_key)
 
         else:
             self.send_response(404)
@@ -6156,17 +6168,10 @@ def _evaluate_new_envs(new_env_candidates: list, pr_sha: str,
                     f"- **Applications ({len(sec['workloads'])}):** {apps}{more}")
         elif sec.get("awaiting"):
             chart = f"`{_NEW_ENV_CHART}:{sec['version']}`"
-            if sec["error"].startswith("chart not found in OCI"):
-                lines.append(
-                    f"\u23f3 **The chart {chart} is not in the registry yet.**  \n"
-                    f"If it is still being published, this preview checks again by "
-                    f"itself and updates this comment. If the version is wrong, "
-                    f"fix it and push.")
-            else:
-                lines.append(
-                    f"\u23f3 **The chart {chart} could not be pulled:** "
-                    f"{sec['error'][:160]}  \n"
-                    f"This preview checks again by itself and updates this comment.")
+            lines.append(
+                f"\u23f3 **The chart {chart} is not in the registry yet.**  \n"
+                f"If it is still being published, this comment is updated once "
+                f"the chart is published. If the version is wrong, fix it and push.")
         else:
             lines.append(
                 "\U0001f4cb **Resource preview not available for new environments.**  \n"
@@ -6272,10 +6277,10 @@ def _new_env_value_chain(env_info: dict, pr_sha: str, repo: str = None) -> tuple
 
 # The chart every new-env preview renders with (see _render_new_env_diff).
 _NEW_ENV_CHART = "appspace-micro-services"
-# COPS-2818: render errors of a chart that is not pullable YET. Transport
-# errors are retryable for live apps too (REASON_OCI_PULL).
-_AWAITING_CHART_ERRORS = ("chart not found in OCI", "chart pull failed",
-                          "chart pull returned None")
+# COPS-2818: the render error of a chart that is not in the registry YET.
+# Any other pull failure (a bad version such as 1.2.3.4, a login failure)
+# stays a structural problem.
+_AWAITING_CHART_ERRORS = ("chart not found in OCI",)
 
 
 def _awaiting_chart_desc(envs) -> str:
@@ -13347,10 +13352,14 @@ def format_new_env_comment(pr_sha, new_env_lines, new_env_full_lines,
                   "must be fixed before merge: "
                   + ", ".join(f"`{e}`" for e in structural_envs))
     elif structural_envs:
-        desc = _awaiting_chart_desc(structural_envs)
+        # COPS-2818: only a transient token is checked again. A blocked gate
+        # is what blocks the PR, so the description names the gate.
+        desc = (gate_status_description(gates) if token == "blocked"
+                else _awaiting_chart_desc(structural_envs))
         status = ("\u23f3 New environment(s) waiting for their chart in the "
                   "registry: " + ", ".join(f"`{e}`" for e in structural_envs)
-                  + " - this preview checks again automatically")
+                  + (" - this preview checks again automatically"
+                     if token == "transient" else ""))
     else:
         desc = f"{n_envs} new environment(s), ~{total_new} resource(s) to create"
         status = "\u2705 New environment(s) - all resources will be created on merge"
