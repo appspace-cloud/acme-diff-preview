@@ -274,6 +274,7 @@ def test_credential_probe_tries_both_shapes_and_keeps_the_one_that_works(monkeyp
         tried.append(user)
         return R(0 if user == m.BB_USER else 1)   # only the app-password shape works
     monkeypatch.setattr(m.subprocess, "run", fake_run)
+    monkeypatch.setattr(m, "_GIT_AUTH_HEADER", m._GIT_AUTH_HEADER)  # the probe rebinds it
     m._mirror_state_reset()
     m._resolve_git_credential("https://bitbucket.org/w/r.git")
     assert tried == ["x-bitbucket-api-token-auth", m.BB_USER]

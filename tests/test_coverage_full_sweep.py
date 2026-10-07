@@ -68,6 +68,7 @@ def test_hint_rejects_full_name_without_slash(monkeypatch):
 
 def test_git_credential_skips_falsy_candidates(monkeypatch):
     monkeypatch.setattr(m, "_git_credential_resolved", False)
+    monkeypatch.setattr(m, "_GIT_AUTH_HEADER", m._GIT_AUTH_HEADER)  # the probe rebinds it
     monkeypatch.setattr(m, "_GIT_USER_CANDIDATES", ["", "real-user"])
     calls = []
     class R:  # ls-remote succeeds for the real user

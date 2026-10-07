@@ -138,6 +138,7 @@ class TestWebhookUsesTheCache:
         Skipping silently there would drop a real refresh, so the original
         full-list path is kept for exactly that case."""
         monkeypatch.setattr(diff_preview, "_app_chart_map", {})
+        monkeypatch.setattr(diff_preview, "_path_map_cache", {})
         called = []
 
         def _fake_run(cmd, **kw):
