@@ -65,6 +65,7 @@ import fleet_health  # COPS-2694 fleet health gauges (same-dir module, stdlib on
 import user_content  # COPS-2697 shared user-content identity (same-dir module, stdlib only)
 import blast_radius  # COPS-2693 Plan B blast-radius assessment (same-dir module, stdlib only)
 import values_redundancy  # COPS-2721 higher-layer redundant value callout
+import immutable_guard  # COPS-2833 fields that cannot change on a live resource
 import yaml_hygiene  # COPS-2766 YAML slips in a value file (same-dir module, pure)
 import render_cache  # three-tier main-render cache (same-dir module)
 from render_cache import (  # re-exported: the suite reaches these on the hub
@@ -2885,10 +2886,14 @@ DiffResult = namedtuple("DiffResult",
                          "version_fold", "shutdown_stats",
                          "template_artifacts", "pingscaler_created", "ip_released",
                          "neg_removed", "capacity", "image_downgrades", "pins_behind",
-                         "main_broken"],
+                         "main_broken", "immutable_changes"],
                         defaults=[None, None, None, None, None, None, None,
                                   None, None, None, None, None, None, None, None,
-                                  None])
+                                  None, None])
+# immutable_changes (COPS-2833): immutable_guard.find_changes on the full main
+# and PR renders, [{level, family, kind, name, ns, path, old, new, why}]. A
+# `block` change opens the `immutable` gate of its env; `review` is a warning.
+# Only OUT_DIFF sets it.
 # ip_released (COPS-2766): the deleted ComputeAddress and DNSRecordSet headers
 # GCP releases (no explicit abandon), from the full pre-cap list. The `ip`
 # merge gate reads it. Only OUT_DIFF sets it, so a teardown never has it.
@@ -7728,6 +7733,81 @@ def _ashn_copy_lines(gates, notes=()) -> list:
     return lines + [x for n in notes for x in (n, "")]
 
 
+# COPS-2833: what to do about a change the API rejects, by who rejects it.
+_IMMUTABLE_FIX = {
+    "kcc": ("Config Connector rejects these changes, so the sync fails and nothing is "
+            "recreated. Keep the old value. To change it on purpose, recreate the resource: "
+            "annotate it `cnrm.cloud.google.com/deletion-policy: abandon`, delete the CR, "
+            "replace the GCP resource, then let Argo CD sync"),
+    "kubernetes": ("The Kubernetes API rejects these changes, so the sync fails and nothing "
+                   "is recreated. Keep the old value, or delete the object so Argo CD creates "
+                   "it again"),
+    "aso": ("Azure Service Operator or Azure rejects these changes, so the resource stays "
+            "failed and nothing is recreated. Keep the old value, or recreate the Azure "
+            "resource on purpose"),
+}
+
+
+def _immutable_changes_by_env(app_results):
+    """[(env, change)] of every app, in app order."""
+    return [(_envs_from_apps([app])[0], c) for app, r in sorted((app_results or {}).items())
+            for c in getattr(r, "immutable_changes", None) or ()]
+
+
+def _immutable_gates(app_results) -> list:
+    """COPS-2833: one `immutable` gate per env with a change the API rejects
+    for sure. The reason names the first one, so the red status names it."""
+    by_env = {}
+    for env, c in _immutable_changes_by_env(app_results):
+        if c["level"] == immutable_guard.BLOCK:
+            by_env.setdefault(env, []).append(c)
+    gates = []
+    for env, changes in by_env.items():
+        first = changes[0]
+        more = f", +{len(changes) - 1} more" if len(changes) > 1 else ""
+        gates.append({"kind": "immutable", "env": env,
+                      "why": f"{first['kind']} {first['name']} {first['path']}{more}"})
+    return gates
+
+
+def _immutable_item(env, c) -> str:
+    def val(v):
+        return f"`{v}`" if v else "unset"
+    return (f"`{env}` \u00b7 **{c['kind']}** `{c['name']}` \u00b7 `{c['path']}`: "
+            f"{val(c['old'])} \u2192 {val(c['new'])}")
+
+
+def _immutable_lines(gates, app_results) -> list:
+    """COPS-2833: the panel. Changes the API rejects for sure first, marked
+    \u26d4 while the gate of their env is open and \u2611\ufe0f once a commit
+    lifts it, then the changes that may be rejected, \u26a0\ufe0f, with why."""
+    confirmed = "\u2611\ufe0f"
+    lifted = {g["env"] for g in gates or () if g["kind"] == "immutable" and g.get("lifted")}
+    found = _immutable_changes_by_env(app_results)
+    blocks = [(e, c) for e, c in found if c["level"] == immutable_guard.BLOCK]
+    reviews = [(e, c) for e, c in found if c["level"] != immutable_guard.BLOCK]
+    lines = []
+    if blocks:
+        envs = sorted({e for e, _ in blocks})
+        mark = confirmed if set(envs) <= lifted else "\u26d4"
+        lines += [f"## {mark} FIELD THAT CANNOT CHANGE ON A LIVE RESOURCE", ""]
+        lines += [f"- {confirmed + ' ' if e in lifted else ''}{_immutable_item(e, c)}"
+                  for e, c in blocks]
+        trailer = f"Confirm-Recreate: {envs[0] if len(envs) == 1 else '<env>'}"
+        for family in sorted({c["family"] for _e, c in blocks}):
+            lines += ["", f"{_IMMUTABLE_FIX[family]}, and add `{trailer}` to a commit message."]
+        for e in envs:
+            if e in lifted:
+                lines += ["", f"\u2611\ufe0f `Confirm-Recreate: {e}` is in a commit: plan the "
+                          "recreation before this syncs."]
+        lines.append("")
+    if reviews:
+        lines += ["## \u26a0\ufe0f FIELD THAT MAY NOT CHANGE, CHECK BEFORE MERGING", ""]
+        lines += [f"- {_immutable_item(e, c)}: {c['why']}." for e, c in reviews]
+        lines.append("")
+    return lines
+
+
 def _uc_prefilter_token(identity_file: str) -> str:
     """`.../pv-gsk--aec1-c/customer.yaml` -> `pv-gsk--aec1`.
 
@@ -9374,12 +9454,13 @@ def _run_one_diff(app, pr_sha, main_sha, chart_revision=None, changed_paths=None
     # upgrade leaves behind.
     # Index: 0 diff, 1 reason, 2 detail, 3 version_change, 4 hpas_remaining,
     # 5 replica_stats, 6 capacity, 7 render facts, 8 pins_behind,
-    # 9 main_broken. A new element goes at the end, with its own index.
+    # 9 main_broken, 10 immutable changes (COPS-2833). A new element goes at
+    # the end, with its own index.
     return (diff_text, None, None, version_change,
             _count_hpas_remaining(pr_resources),
             _count_workload_replicas(pr_resources), capacity,
             _render_immutable_facts(main_resources, pr_resources), pins,
-            main_broken)
+            main_broken, immutable_guard.find_changes(main_resources, pr_resources))
 
 
 def _indeterminate(reason, detail):
@@ -9446,6 +9527,7 @@ def argocd_diff(app, pr_sha, main_sha, chart_revision=None, changed_paths=None, 
         render_facts = step[7] if len(step) > 7 else None
         pins_behind = step[8] if len(step) > 8 else None
         main_broken = step[9] if len(step) > 9 else None
+        immutable_changes = step[10] if len(step) > 10 else None  # COPS-2833
 
         if reason is not None:
             last_detail, last_reason = detail or reason, reason
@@ -9525,7 +9607,8 @@ def argocd_diff(app, pr_sha, main_sha, chart_revision=None, changed_paths=None, 
                           artifacts, pingscaler_res, ip_released=ip_released,
                           neg_removed=neg_res, capacity=capacity,
                           image_downgrades=image_downgrades, pins_behind=pins_behind,
-                          main_broken=main_broken)
+                          main_broken=main_broken,
+                          immutable_changes=immutable_changes or None)
     # Exhausted retries
     return _indeterminate(last_reason, last_detail or "unknown error")
 
@@ -11694,7 +11777,8 @@ def _summarize_vm_changes(changed_files, pr_sha, base_sha, path_map,
                 # is destroyed or recreated (COPS-2635).
                 if not domain_new:
                     danger = True
-                    reason = "zone is immutable \u2014 destroy-and-recreate"
+                    reason = ("zone cannot change: KCC rejects it, the sync "
+                              "fails and nothing is recreated")
             elif leaf in _VM_DISK_SIZE_KEYS:
                 try:
                     if float(new_s) < float(old_s):
@@ -11709,8 +11793,8 @@ def _summarize_vm_changes(changed_files, pr_sha, base_sha, path_map,
             elif leaf in _VM_DISK_TYPE_KEYS:
                 if not domain_new:
                     danger = True
-                    reason = ("disk type is immutable \u2014 "
-                              "destroy-and-recreate")
+                    reason = ("disk type cannot change in place: KCC rejects "
+                              "it, the sync fails and nothing is recreated")
             mark = "\U0001f6a8 " if danger else ""
             tail = f" \u2014 {reason}" if reason else ""
             line = f"- {mark}{scope} \u00b7 **{role_label}**: {change}{tail}"
@@ -14333,11 +14417,13 @@ def process_pr(pr, path_map, base_sha="", repo=None):
         gates = _merge_gates(decommission_candidates, renames, path_map,
                              vm_change_lines, app_results,
                              clone_gates + dup_gates + ashn_gates + disk_gates + appset_gates
-                             + legacy_gates + _nocore_gates(nocore_changes))
+                             + legacy_gates + _nocore_gates(nocore_changes)
+                             + _immutable_gates(app_results))
         _lift_gates(gates, repo, pr_id, base_sha, pr_sha)
         appspace_state_lines = (_clone_wake_lines(gates) + _dup_identity_lines(gates, dup_unchecked)
                                 + _ashn_copy_lines(gates, ashn_notes)
-                                + _appset_miss_lines(gates, appset_notes) + appspace_state_lines)
+                                + _appset_miss_lines(gates, appset_notes)
+                                + _immutable_lines(gates, app_results) + appspace_state_lines)
         # Direct permalink into the full-diff view for this exact commit.
         # Only built when the view is reachable from outside the cluster
         # (base URL set), so the comment never links to something a

@@ -520,6 +520,9 @@ GATES = {
                     "blocked", ""),
     "nocore_lost": ("A move turns noCore off", None, "blocked",
                     "Set appspace.infra.noCore in the moved customer.yaml"),
+    # COPS-2833: KCC, the Kubernetes API or ASO rejects the change on sync.
+    "immutable": ("A field that cannot change, on a resource that already exists",
+                  "Confirm-Recreate", "blocked", ""),
 }
 
 
@@ -1061,6 +1064,19 @@ def _build_merge_summary(results, rollup_by_sig, vm_change_lines,
             findings.append((_SEV_REVIEW,
                              f"{text} in {_fmt_service_list([f'`{e}`' for e in envs], 3)}"
                              f", {action}: {_fmt_service_list(items, 4)}. {tail}"))
+
+    # COPS-2833: an immutable change we are not sure the API rejects. The sure
+    # ones are the `immutable` merge gate, already a line of its own.
+    maybe = [(a, c) for a, r in sorted(results.items())
+             for c in getattr(r, "immutable_changes", None) or () if c["level"] != "block"]
+    if maybe:
+        envs = sorted(set(_envs_from_apps(a for a, _c in maybe)))
+        items = [f"`{c['kind']} {c['name']}` `{c['path']}`" for _a, c in maybe]
+        findings.append((_SEV_REVIEW,
+                         f"\u26a0\ufe0f **Field that may not change** in "
+                         f"{_fmt_service_list([f'`{e}`' for e in envs], 3)}: "
+                         f"{_fmt_service_list(items, 3)}. Check before merging, "
+                         f"the API may reject it on sync."))
 
     if appspace_state_lines:
         txt = "\n".join(appspace_state_lines)

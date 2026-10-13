@@ -1360,3 +1360,56 @@ red status names the resource and the value, and it is not retried. There is
 no trailer, because the fix is a change of the value: in `customer.yaml`, or
 in the cohort `config.yaml`. When the bad value comes from the chart itself,
 for example in a chart bump, the fix goes in the chart.
+
+### Why a field that cannot change is blocked
+
+Some fields cannot change on a resource that already exists. The API rejects
+the update, so ArgoCD cannot sync, and the app stays failed until someone
+reverts the value. Nothing is deleted or recreated by itself. On
+acme-config-dev #7492 the data disk `type` of `pv-dev-07-a` went from `pd-ssd`
+to `hyperdisk-balanced`, and Config Connector refused it.
+
+The check (COPS-2833) compares each resource that is both on `main` and in the
+PR render, with the same kind, namespace and name. A new, removed or renamed
+resource is not read. Helm and ArgoCD hooks are not read either, because they
+are created again on each run.
+
+| Family | Fields | Where the list lives |
+|---|---|---|
+| KCC | every field the CRD marks `Immutable.` or guards with the CEL rule `self == oldSelf`, plus `location`, `zone`, `region` and `resourceID`, which the CRDs do not mark | `src/kcc_immutable_fields.json`, made from the KCC 1.157.0 CRDs of the clusters |
+| Kubernetes | the `selector` of a workload; StatefulSet `serviceName`, `volumeClaimTemplates` and `podManagementPolicy`; Job `template` and `completionMode`; Service `clusterIP`; PVC `accessModes`, `storageClassName`, `volumeMode`, `selector`, `dataSource`, `volumeName` and a smaller size; Secret `type`; RoleBinding `roleRef`; StorageClass `provisioner`, `parameters`, `reclaimPolicy`, `volumeBindingMode`; the data of a ConfigMap or Secret with `immutable: true` | `src/immutable_guard.py` |
+| ASO | `owner`, `azureName`, `location`, and a Disk `creationData` | `src/immutable_guard.py` |
+
+It blocks only when it is sure: the field had a value on `main` and the PR
+gives it another one. When it is not sure it writes a review line (⚠️) and
+the build stays green:
+
+- the field is set for the first time, or removed: fine when the live resource
+  already has that value;
+- the KCC project, folder or organization changes (`projectRef`, or the
+  `cnrm.cloud.google.com/project-id` annotation): KCC may already read that
+  project from the namespace;
+- a reference is written another way (`name` to `external`) but still names
+  the same object, unless the CRD guards it with a CEL rule;
+- ArgoCD replaces the object (sync option `Replace=true` or `Force=true`);
+- a Job has `ttlSecondsAfterFinished`, so it may already be gone;
+- a PVC grows: fine when its StorageClass allows expansion.
+
+The values are compared after a light clean, so `1` and `"1"` are the same, a
+list in another order is the same, a location in another case is the same, and
+a `resourceID` that is not set means `metadata.name`. An error inside the
+check never blocks: the check is skipped and the log says
+`[immutable] guard skipped`.
+
+The override is `Confirm-Recreate: <env>` in a commit message, once the
+recreation is planned. It only turns the build green; it does not recreate
+anything. For KCC the recreation is: annotate the resource
+`cnrm.cloud.google.com/deletion-policy: abandon`, delete the CR, replace the
+GCP resource, then let ArgoCD sync.
+
+After a KCC upgrade, make the list again from the CRDs of a cluster:
+
+```bash
+kubectl --context=gcp-prod-pv-na2-a get crd -o json > /tmp/crds.json
+python3 tools/kcc_immutable_fields.py /tmp/crds.json src/kcc_immutable_fields.json
+```
