@@ -131,15 +131,15 @@ UNPARSEABLE_SIZE_WITH_REAL_CHANGE = """     location: europe-west1-d
 def test_unparseable_size_does_not_discard_the_section():
     """One size the shrink check cannot compare must not silence the section.
 
-    `type: pd-ssd -> pd-balanced` is an immutable-field change the panel calls
-    destroy-and-recreate. Pre-fix, the ValueError on `100Gi` skipped straight
-    to the next section and this never reached the operator.
+    `type: pd-ssd -> pd-balanced` is a disk type change, which KCC rejects in
+    place. Pre-fix, the ValueError on `100Gi` skipped straight to the next
+    section and this never reached the operator.
     """
     facts = vm_analysis._detect_vm_changes([(DISK, UNPARSEABLE_SIZE_WITH_REAL_CHANGE)])
     assert facts, "the section must still produce a fact"
     f = facts[0]
     blob = " ".join(f["dangerous"]) + " ".join(str(x) for x in f["fields"])
-    assert "immutable" in blob or "type" in blob, (
+    assert "cannot change" in blob or "type" in blob, (
         "the disk type change must survive an unparseable size")
 
 

@@ -219,9 +219,9 @@ def test_a_colonless_changed_line_is_not_reported_as_a_field():
 
 
 # -- 2c. `type:` that is not a disk type ----------------------------------
-# `type` is tracked because a disk type is immutable, and the panel calls
-# that destroy-and-recreate. A ComputeInstance body also carries
-# `accessConfig.type`, which is a NAT mode and changes freely.
+# `type` is tracked because a disk type cannot change in place, and the panel
+# flags it. A ComputeInstance body also carries `accessConfig.type`, which is
+# a NAT mode and changes freely.
 
 NAT_TYPE_AND_STATUS = (
     "   networkInterface:\n"
@@ -239,7 +239,7 @@ def test_a_network_access_config_type_is_not_a_disk_type():
         "the rest of the section must still be read: %r" % (f["fields"],))
     assert not any(k == "type" for k, _, _ in f["fields"]), (
         "a NAT mode must not be reported as a disk type: %r" % (f["fields"],))
-    assert not any("immutable" in d for d in f["dangerous"]), f["dangerous"]
+    assert not any("cannot change" in d for d in f["dangerous"]), f["dangerous"]
 
 
 # -- 2d. a value that is only re-quoted -----------------------------------
@@ -328,11 +328,12 @@ ZONE_MOVE = (
 )
 
 
-def test_a_zone_move_is_destroy_and_recreate():
+def test_a_zone_move_is_rejected_not_recreated():
     f = _fact(CI_HDR, ZONE_MOVE)
     assert ("zone", "europe-west1-d", "europe-west4-a") in f["fields"]
     joined = " ".join(f["dangerous"])
-    assert "immutable" in joined and "destroy-and-recreate" in joined, joined
+    assert "cannot change" in joined and "nothing is recreated" in joined, joined
+    assert "destroy-and-recreate" not in joined, joined
 
 
 # ══ Part 4 ── the Terraform -> KCC move ══════════════════════════════════

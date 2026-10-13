@@ -528,8 +528,9 @@ def _detect_vm_changes(sections: list) -> list:
       - any machineType change: KCC stops, resizes and starts the VM, so
         it needs a window. Parked or not, it is dangerous (COPS-2766). A
         move to TERMINATED and a TERMINATED to RUNNING are notes.
-      - zone and disk `type` are immutable in GCP: changing them means
-        destroy-and-recreate — dangerous. A ComputeDisk `location` too.
+      - zone and disk `type` cannot change in place: KCC rejects the change,
+        the sync fails and nothing is recreated (COPS-2833), so they are
+        dangerous. A ComputeDisk `location` too.
       - a disk size DECREASE is impossible in place (GCP only grows disks),
         so it implies recreation and data loss — dangerous. Growth is the
         routine case.
@@ -675,14 +676,15 @@ def _detect_vm_changes(sections: list) -> list:
                         "operation follows from this alone"
                         % ("removed" if o else "added", o or n))
             if "zone" in byk:
-                dangerous.append("zone is immutable — changing it means "
-                                 "destroy-and-recreate")
+                dangerous.append("zone cannot change: KCC rejects it, the sync "
+                                 "fails and nothing is recreated")
             if kind == "ComputeDisk" and "location" in byk:
                 dangerous.append("disk location is immutable: KCC rejects "
                                  "the change and the sync fails")
             if "type" in byk:
-                dangerous.append("disk type is immutable — changing it "
-                                 "means destroy-and-recreate")
+                dangerous.append("disk type cannot change in place: KCC "
+                                 "rejects it, the sync fails and nothing is "
+                                 "recreated")
             if "size" in byk:
                 o, n = byk["size"]
                 try:

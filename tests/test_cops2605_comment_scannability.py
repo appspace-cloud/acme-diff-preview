@@ -571,7 +571,7 @@ def test_vm_instance_type_and_disk_type_are_highlighted(monkeypatch):
     assert "dataDiskType" in body and "pd-balanced" in body
     assert body.count("\U0001f6a8") >= 2, \
         "instance-type and disk-type changes must both be flagged"
-    assert "immutable" in body
+    assert "cannot change in place" in body and "nothing is recreated" in body
 
 
 def _merge_summary_of(body):
