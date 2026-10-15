@@ -1245,6 +1245,141 @@ def _vm_disk_family_changes(old_flat, new_flat) -> list:
     return out
 
 
+# COPS-2865 (B1): a VM migration that a PR plans with the acme-components
+# vmMigration block (COPS-2835). With it set, the supporting-services chart
+# stops rendering that VM's ComputeInstance, data ComputeDisk and snapshot
+# attachments and renders a Job, vmm-<vm>-<attempt>, that copies the disks to
+# the target names and types and swaps them onto the same VM (or only verifies
+# a VM already on target). So the target values in the same PR are not a plain
+# in-place change, and the rules for one (vm_disk, disk type) do not apply.
+_VMM_TYPES = ("disk-replace",)
+_VMM_PLANNED_LEAVES = ("machineType", "bootDiskType", "dataDiskType",
+                       "diskNameSuffix", "createNewBootDisk")
+_VMM_PLANNED_NOTE = ("planned: the `vmMigration` Job moves the VM to this value, "
+                     "so it is not an in-place change")
+
+
+def _kcc_vm_migrations(flat: dict) -> dict:
+    """{role: (type, instance, attempt)} for each KCC role whose values carry
+    a vmMigration block. attempt defaults to 1, as in the chart."""
+    out = {}
+    for role in ("svc", "mongo", "rabbit"):
+        p = f"{_KCC_PREFIX}{role}.vmMigration."
+        kind, inst, att = (flat or {}).get(p + "type"), (flat or {}).get(p + "instance"), \
+            (flat or {}).get(p + "attempt")
+        if kind is None and inst is None:
+            continue
+        out[role] = ("" if kind is None else str(kind), "" if inst is None else str(inst),
+                     "1" if att in (None, "") else str(att))
+    return out
+
+
+def _vmm_job_created(sections, job: str) -> bool:
+    """Whether a rendered diff creates the migration Job `job` (any namespace).
+
+    Created only: a modified Job of the same attempt cannot run a new plan
+    (the chart's Job is immutable and migrate.py refuses a reused attempt)."""
+    for h, body in sections or ():
+        if _section_kind(h) != "Job" or h.rsplit("/", 1)[-1] != job:
+            continue
+        lines = [ln for ln in (body or "").splitlines() if not ln.startswith(("+++", "---"))]
+        if any(ln.startswith("+") for ln in lines) and not any(ln.startswith("-") for ln in lines):
+            return True
+    return False
+
+
+def _vmm_deletion_armed(flat: dict, role: str) -> bool:
+    """allowDeletion for a role, with the chart's fallback to defaults."""
+    return _kcc_true(_kcc_role_value(flat or {}, role, "allowDeletion"))
+
+
+def _planned_vm_migrations(flat: dict, sections, base_flat: dict = None,
+                           rendered: bool = True) -> tuple:
+    """(planned, unrendered, armed): {role: (type, instance, attempt)} each.
+
+    Only a block this change sets or changes counts (one equal to main's has
+    its Job on main already). It must name a known type and the role's only
+    VM. planned: the chart created its Job, so it honours the block. armed:
+    allowDeletion is on for the role on main or in the change, so Argo would
+    prune the VM and its data disk with deletion-policy delete; the runbook
+    wants allowDeletion: false synced in its own PR first. unrendered: the
+    env rendered completely but there is no new Job (a chart without the
+    feature): the target values then apply as a plain change. A render that
+    did not complete is in none of them (its error already blocks). A role
+    with other VMs (mongo or rabbit instances) is in none either, because a
+    role-level value would change those VMs in place."""
+    planned, unrendered, armed = {}, {}, {}
+    before = _kcc_vm_migrations(base_flat)
+    for role, (kind, inst, att) in _kcc_vm_migrations(flat).items():
+        if (kind not in _VMM_TYPES or not inst or before.get(role) == (kind, inst, att)
+                or _kcc_instance_names(flat, role) != {inst}):
+            continue
+        if _vmm_deletion_armed(base_flat, role) or _vmm_deletion_armed(flat, role):
+            armed[role] = (kind, inst, att)
+        elif _vmm_job_created(sections, f"vmm-{inst}-{att}"):
+            planned[role] = (kind, inst, att)
+        elif rendered:
+            unrendered[role] = (kind, inst, att)
+    return planned, unrendered, armed
+
+
+# COPS-2865 (B2): the change that removes a vmMigration block (PR2) hands the
+# VM back to KCC on the target values. Merged before the Job is Complete, those
+# values apply in place to a VM still on its old disks. A revert of PR1 puts
+# the old values back as well and always passes.
+_VMM_REMOVED_REASON = "merge only once its Job is Complete"
+
+
+def _vm_migrations_removed(old_flat: dict, new_flat: dict) -> dict:
+    """{role: (type, instance, attempt)}: a block on main that this change
+    removes while it keeps that role's target values (a PR2, not a revert)."""
+    out = {}
+    after = _kcc_vm_migrations(new_flat)
+    for role, block in _kcc_vm_migrations(old_flat).items():
+        if block[0] not in _VMM_TYPES or role in after:
+            continue
+        if all(_kcc_role_value(old_flat or {}, role, leaf) == _kcc_role_value(new_flat or {}, role, leaf)
+               for leaf in _VMM_PLANNED_LEAVES):
+            out[role] = block
+    return out
+
+
+def _removed_vm_migration_line(env: str, role: str, inst: str, att: str) -> str:
+    """The dangerous VM panel line of a PR2, which opens the vmm_pr2 gate."""
+    return (f"- \U0001f6a8 `{env}` \u00b7 **linux VM (KCC) \u00b7 {role}**: removes the "
+            f"`vmMigration` block of `{inst}`, so KCC takes the VM back on its target values: "
+            f"{_VMM_REMOVED_REASON} (Job `vmm-{inst}-{att}`, journal ConfigMap "
+            f"`vmm-{inst}-journal` with outcome `done`). Then add `Confirm-VM-Migrated: {env}` "
+            "to a commit message of this PR.")
+
+
+def _armed_vm_migration_line(env: str, role: str, inst: str) -> str:
+    """The dangerous VM panel line of a block on a VM whose deletion is armed."""
+    return (f"- \U0001f6a8 `{env}` \u00b7 **linux VM (KCC) \u00b7 {role}**: `vmMigration` selects "
+            f"`{inst}`, but `allowDeletion` is on for it on main or in this change: Argo would "
+            "prune the VM and its data disk with `deletion-policy: delete`. Sync "
+            "`allowDeletion: false` in its own PR first.")
+
+
+def _planned_vm_migration_line(env: str, role: str, kind: str, inst: str, att: str) -> str:
+    """The routine VM panel line of a planned migration."""
+    return (f"- \U0001f9f3 `{env}` · **linux VM (KCC) · {role}**: planned migration "
+            f"`vmMigration` `{kind}` of `{inst}` (attempt {att}). Job `vmm-{inst}-{att}` copies "
+            "the disks to the target names and types and swaps them onto the same VM, or only "
+            "verifies a VM already on target. Its ComputeInstance and data ComputeDisk leave "
+            "Argo under `deletion-policy: abandon`. Merge the PR that removes `vmMigration` "
+            "only once the Job is Complete (acme-components "
+            "documentation/linux-vm-migration.md).")
+
+
+def _unrendered_vm_migration_line(env: str, role: str, inst: str, att: str) -> str:
+    """The dangerous VM panel line of a vmMigration block the chart ignored."""
+    return (f"- \U0001f6a8 `{env}` \u00b7 **linux VM (KCC) \u00b7 {role}**: `vmMigration` selects "
+            f"`{inst}`, but the render has no Job `vmm-{inst}-{att}`: this chart version does "
+            "not know the key, so the target values apply in place. Move the env to a chart "
+            "with the VM migration feature (COPS-2835) first.")
+
+
 def _new_env_prereq_findings(flat: dict, env: str) -> tuple:
     """COPS-2766 (C21) + COPS-2790: (errors, lines) for a new GCP env.
 
