@@ -281,6 +281,11 @@ from vm_analysis import (  # VM/KCC infrastructure analysis (same-dir module)
     _VM_DISK_FAMILY_REASON,
     _VM_DISK_FAMILY_LEAVES,
     _vm_disk_family_changes,
+    _planned_vm_migrations,
+    _planned_vm_migration_line,
+    _unrendered_vm_migration_line,
+    _VMM_PLANNED_LEAVES,
+    _VMM_PLANNED_NOTE,
     _new_env_prereq_findings,
     _kcc_missing_hosting_id,
     _kcc_hosting_id_ok,
@@ -11626,6 +11631,22 @@ def _summarize_vm_changes(changed_files, pr_sha, base_sha, path_map,
         if not keys:
             continue
         env_name = posixpath.basename(posixpath.dirname(clean))
+        # COPS-2865 (B1): a VM migration this change plans with the COPS-2835
+        # vmMigration block. When the chart renders its Job, the target values
+        # of that role are what the Job moves the VM to, not an in-place
+        # change: no vm_disk error and no disk type danger for them. A block
+        # the chart ignored is a danger of its own, and every rule stays.
+        planned_vmm = {}
+        if clean.startswith("gcp/") and _is_pv_env_file(clean) and any(
+                k.startswith(_KCC_PREFIX) and ".vmMigration." in k for k in keys):
+            planned_vmm, unrendered_vmm = _planned_vm_migrations(
+                _merged_kcc_flat_for_env(clean, pr_sha, repo, strict=True),
+                [sec for app in (path_map.get(clean) or ())
+                 for sec in (getattr((app_results or {}).get(app), "sections", None) or ())])
+            dangerous_lines += [_unrendered_vm_migration_line(env_name, role, inst, att)
+                                for role, (_kind, inst, att) in sorted(unrendered_vmm.items())]
+            routine_lines += [(env_name, _planned_vm_migration_line(env_name, role, *planned))
+                              for role, planned in sorted(planned_vmm.items())]
         # COPS-2766 (C21): an n4 or c4 machine with a pd- disk that this change
         # adds. Only a GCP private-cloud env: KCC renders its VMs.
         if clean.startswith("gcp/") and _is_pv_env_file(clean) and any(
@@ -11635,7 +11656,8 @@ def _summarize_vm_changes(changed_files, pr_sha, base_sha, path_map,
                 f"- \U0001f6a8 `{env_name}` \u00b7 **linux VM (KCC) \u00b7 {role}**: {text}"
                 for role, text in _vm_disk_family_changes(
                     _merged_kcc_flat_for_env(clean, base_sha, repo, strict=True),
-                    _merged_kcc_flat_for_env(clean, pr_sha, repo, strict=True))]
+                    _merged_kcc_flat_for_env(clean, pr_sha, repo, strict=True))
+                if role not in planned_vmm]
         # COPS-2608: classify the whole file before scoring individual keys.
         # A Terraform -> KCC ownership transfer moves the same machineType
         # from one key tree to the other; scoring the removal and the
@@ -11795,6 +11817,12 @@ def _summarize_vm_changes(changed_files, pr_sha, base_sha, path_map,
                     danger = True
                     reason = ("disk type cannot change in place: KCC rejects "
                               "it, the sync fails and nothing is recreated")
+            if (prefix == _KCC_PREFIX and role in planned_vmm
+                    and (leaf in _VMM_PLANNED_LEAVES or rest.startswith(role + ".vmMigration."))):
+                # COPS-2865 (B1): the target of a planned migration.
+                danger = False
+                reason = (_VMM_PLANNED_NOTE
+                          if leaf in ("machineType", "bootDiskType", "dataDiskType") else "")
             mark = "\U0001f6a8 " if danger else ""
             tail = f" \u2014 {reason}" if reason else ""
             line = f"- {mark}{scope} \u00b7 **{role_label}**: {change}{tail}"

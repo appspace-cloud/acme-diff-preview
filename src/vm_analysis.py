@@ -1245,6 +1245,78 @@ def _vm_disk_family_changes(old_flat, new_flat) -> list:
     return out
 
 
+# COPS-2865 (B1): a VM migration that a PR plans with the acme-components
+# vmMigration block (COPS-2835). With it set, the supporting-services chart
+# stops rendering that VM's ComputeInstance, data ComputeDisk and snapshot
+# attachments and renders a Job, vmm-<vm>-<attempt>, that copies the disks to
+# the target names and types and swaps them onto the same VM (or only verifies
+# a VM already on target). So the target values in the same PR are not a plain
+# in-place change, and the rules for one (vm_disk, disk type) do not apply.
+_VMM_TYPES = ("disk-replace",)
+_VMM_PLANNED_LEAVES = ("machineType", "bootDiskType", "dataDiskType",
+                       "diskNameSuffix", "createNewBootDisk")
+_VMM_PLANNED_NOTE = ("planned: the `vmMigration` Job moves the VM to this value, "
+                     "so it is not an in-place change")
+
+
+def _kcc_vm_migrations(flat: dict) -> dict:
+    """{role: (type, instance, attempt)} for each KCC role whose values carry
+    a vmMigration block. attempt defaults to 1, as in the chart."""
+    out = {}
+    for role in ("svc", "mongo", "rabbit"):
+        p = f"{_KCC_PREFIX}{role}.vmMigration."
+        kind, inst, att = (flat or {}).get(p + "type"), (flat or {}).get(p + "instance"), \
+            (flat or {}).get(p + "attempt")
+        if kind is None and inst is None:
+            continue
+        out[role] = ("" if kind is None else str(kind), "" if inst is None else str(inst),
+                     "1" if att in (None, "") else str(att))
+    return out
+
+
+def _vmm_job_rendered(sections, job: str) -> bool:
+    """Whether a rendered diff holds the migration Job `job` (any namespace)."""
+    return any(_section_kind(h) == "Job" and h.rsplit("/", 1)[-1] == job
+               for h, _body in sections or ())
+
+
+def _planned_vm_migrations(flat: dict, sections) -> tuple:
+    """(planned, unrendered): {role: (type, instance, attempt)} each.
+
+    planned: the block names a known type and the role's only VM, and the
+    chart rendered its Job, so the chart honours the block. unrendered: the
+    same, but no Job in the render (a chart without the feature, or a render
+    that did not run): the target values then apply as a plain change, and
+    every rule stays. A role with other VMs (mongo or rabbit instances) is in
+    neither, because a role-level value would change those VMs in place."""
+    planned, unrendered = {}, {}
+    for role, (kind, inst, att) in _kcc_vm_migrations(flat).items():
+        if kind not in _VMM_TYPES or not inst or _kcc_instance_names(flat, role) != {inst}:
+            continue
+        (planned if _vmm_job_rendered(sections, f"vmm-{inst}-{att}")
+         else unrendered)[role] = (kind, inst, att)
+    return planned, unrendered
+
+
+def _planned_vm_migration_line(env: str, role: str, kind: str, inst: str, att: str) -> str:
+    """The routine VM panel line of a planned migration."""
+    return (f"- \U0001f9f3 `{env}` · **linux VM (KCC) · {role}**: planned migration "
+            f"`vmMigration` `{kind}` of `{inst}` (attempt {att}). Job `vmm-{inst}-{att}` copies "
+            "the disks to the target names and types and swaps them onto the same VM, or only "
+            "verifies a VM already on target. Its ComputeInstance and data ComputeDisk leave "
+            "Argo under `deletion-policy: abandon`. Merge the PR that removes `vmMigration` "
+            "only once the Job is Complete (acme-components "
+            "documentation/linux-vm-migration.md).")
+
+
+def _unrendered_vm_migration_line(env: str, role: str, inst: str, att: str) -> str:
+    """The dangerous VM panel line of a vmMigration block the chart ignored."""
+    return (f"- \U0001f6a8 `{env}` · **linux VM (KCC) · {role}**: `vmMigration` selects "
+            f"`{inst}`, but the render has no Job `vmm-{inst}-{att}`: this chart version does "
+            "not know the key, so the target values apply in place. Move the env to a chart "
+            "with the VM migration feature (COPS-2835) first.")
+
+
 def _new_env_prereq_findings(flat: dict, env: str) -> tuple:
     """COPS-2766 (C21) + COPS-2790: (errors, lines) for a new GCP env.
 
