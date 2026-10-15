@@ -284,6 +284,10 @@ from vm_analysis import (  # VM/KCC infrastructure analysis (same-dir module)
     _planned_vm_migrations,
     _planned_vm_migration_line,
     _unrendered_vm_migration_line,
+    _armed_vm_migration_line,
+    _removed_vm_migration_line,
+    _vm_migrations_removed,
+    _VMM_REMOVED_REASON,
     _VMM_PLANNED_LEAVES,
     _VMM_PLANNED_NOTE,
     _new_env_prereq_findings,
@@ -8650,6 +8654,10 @@ def _merge_gates(decommission_candidates, renames=None, path_map=None,
               if _CL_ENV_RE.match(old) and (path_map or {}).get(old)]
     found += [{"kind": "shrink", "env": (re.findall(r"`([^`]+)`", line) or [""])[0]}
               for line in vm_change_lines or () if _VM_SHRINK_REASON in line]
+    # COPS-2865 (B2): a PR2 that removes a vmMigration block before its Job is
+    # Complete. Lifted by `Confirm-VM-Migrated: <env>`.
+    found += [{"kind": "vmm_pr2", "env": (re.findall(r"`([^`]+)`", line) or [""])[0]}
+              for line in vm_change_lines or () if _VMM_REMOVED_REASON in line]
     for hit in (_VM_DISK_LINE_RE.search(line) for line in vm_change_lines or ()
                 if _VM_DISK_FAMILY_REASON in line):
         why = hit and f"{hit[2]} " + " to ".join(filter(None, hit.groups()[2:]))
@@ -11639,12 +11647,28 @@ def _summarize_vm_changes(changed_files, pr_sha, base_sha, path_map,
         planned_vmm = {}
         if clean.startswith("gcp/") and _is_pv_env_file(clean) and any(
                 k.startswith(_KCC_PREFIX) and ".vmMigration." in k for k in keys):
-            planned_vmm, unrendered_vmm = _planned_vm_migrations(
-                _merged_kcc_flat_for_env(clean, pr_sha, repo, strict=True),
-                [sec for app in (path_map.get(clean) or ())
-                 for sec in (getattr((app_results or {}).get(app), "sections", None) or ())])
+            env_apps = [a for a in (path_map.get(clean) or ()) if isinstance(a, str)]
+            env_results = [(app_results or {}).get(a) for a in env_apps]
+            base_vmm = _merged_kcc_flat_for_env(clean, base_sha, repo, strict=True)
+            head_vmm = _merged_kcc_flat_for_env(clean, pr_sha, repo, strict=True)
+            planned_vmm, unrendered_vmm, armed_vmm = _planned_vm_migrations(
+                head_vmm, [sec for r in env_results for sec in (getattr(r, "sections", None) or ())],
+                base_vmm, rendered=_render_covers(path_map.get(clean), app_results))
+            # The render decides too: a CR of that VM leaving Argo without
+            # abandon is pruned in GCP, whatever the values say.
+            for role, (kind, inst, att) in list(planned_vmm.items()):
+                if any(f.get("deleted") and not f.get("orphaned")
+                       and f.get("kind") in ("ComputeInstance", "ComputeDisk")
+                       and str(f.get("name", "")).startswith(inst)
+                       for r in env_results for f in (getattr(r, "vm_changes", None) or ())):
+                    armed_vmm[role] = planned_vmm.pop(role)
             dangerous_lines += [_unrendered_vm_migration_line(env_name, role, inst, att)
                                 for role, (_kind, inst, att) in sorted(unrendered_vmm.items())]
+            dangerous_lines += [_armed_vm_migration_line(env_name, role, inst)
+                                for role, (_kind, inst, _att) in sorted(armed_vmm.items())]
+            dangerous_lines += [_removed_vm_migration_line(env_name, role, inst, att)
+                                for role, (_kind, inst, att) in sorted(
+                                    _vm_migrations_removed(base_vmm, head_vmm).items())]
             routine_lines += [(env_name, _planned_vm_migration_line(env_name, role, *planned))
                               for role, planned in sorted(planned_vmm.items())]
         # COPS-2766 (C21): an n4 or c4 machine with a pd- disk that this change

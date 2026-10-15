@@ -61,10 +61,14 @@ def _serve(monkeypatch, head, base):
     monkeypatch.setattr(m, "_bb_fetch_status", fetch)
 
 
-def _result(*jobs):
-    secs = [(f"/batch/Job pv-orch-a/{j}", "+apiVersion: batch/v1\n+kind: Job\n") for j in jobs]
+def _result(*jobs, outcome=None, facts=None, body="+apiVersion: batch/v1\n+kind: Job\n"):
+    """The env's two apps: -ss with the given Job sections, -ms without a diff."""
+    secs = [(f"/batch/Job pv-orch-a/{j}", body) for j in jobs]
     return {SS: m.DiffResult(text="", sections=secs, n_res=len(secs), has_diff=bool(secs),
-                             error=None, outcome=m.OUT_DIFF, reason=None)}
+                             error=None, outcome=outcome or m.OUT_DIFF, reason=None,
+                             vm_changes=facts),
+            "pv-orch-a-ms": m.DiffResult(text="", sections=[], n_res=0, has_diff=False,
+                                         error=None, outcome=m.OUT_NO_DIFF, reason=None)}
 
 
 def _lines(monkeypatch, head, base=BASE, results=None):
@@ -138,11 +142,65 @@ def test_a_role_with_other_vms_keeps_the_rules(monkeypatch):
     assert _gates(lines) == ["vm_disk"]
 
 
-def test_pr2_that_removes_the_block_is_routine(monkeypatch):
+# ── B2: the PR that removes the block (PR2) waits for the Job ────────────
+
+def test_pr2_that_removes_the_block_opens_the_vmm_pr2_gate(monkeypatch):
     lines = _lines(monkeypatch, PR2, base=PR1, results=_result())
-    assert _gates(lines) == []
-    assert _danger(lines) == []
+    assert _gates(lines) == ["vmm_pr2"]
+    assert va._removed_vm_migration_line("pv-orch-a", "svc", VM, "1") in lines
+    assert m._merge_gates((), vm_change_lines=lines)[0]["arg"] == "pv-orch-a"
+    assert "Confirm-VM-Migrated: pv-orch-a" in lines[lines.index(
+        va._removed_vm_migration_line("pv-orch-a", "svc", VM, "1"))]
+
+
+def test_a_revert_of_pr1_always_passes(monkeypatch):
+    lines = _lines(monkeypatch, BASE, base=PR1, results=_result())
+    assert "vmm_pr2" not in _gates(lines)
+
+
+# ── what keeps every rule (review of 2.126.0) ────────────────────────────
+
+@pytest.mark.parametrize("where", ["svc", "defaults"])
+def test_deletion_armed_on_main_keeps_the_gate(monkeypatch, where):
+    """An allowDeletion: false not synced yet comes too late (runbook)."""
+    if where == "svc":
+        base = BASE + "        allowDeletion: true\n"
+    else:
+        base = BASE.replace("      svc:\n", "      defaults:\n        allowDeletion: true\n      svc:\n")
+    head = PR1 + "        allowDeletion: false\n"
+    lines = _lines(monkeypatch, head, base=base, results=_result(f"vmm-{VM}-1"))
+    assert "vm_disk" in _gates(lines)
+    assert va._armed_vm_migration_line("pv-orch-a", "svc", VM) in lines
     assert not any("planned migration" in line for line in lines)
+
+
+def test_a_vm_cr_pruned_with_delete_keeps_the_gate(monkeypatch):
+    fact = {"header": f"/compute.cnrm.cloud.google.com/ComputeInstance pv-orch-a/{VM}",
+            "kind": "ComputeInstance", "name": VM, "fields": [], "created": False,
+            "deleted": True, "orphaned": False, "notes": [], "untracked": [],
+            "dangerous": ["resource DELETED from the render with `deletion-policy: delete`"]}
+    lines = _lines(monkeypatch, PR1, results=_result(f"vmm-{VM}-1", facts=[fact]))
+    assert "vm_disk" in _gates(lines)
+    assert va._armed_vm_migration_line("pv-orch-a", "svc", VM) in lines
+
+
+def test_an_incomplete_render_does_not_blame_the_chart(monkeypatch):
+    lines = _lines(monkeypatch, PR1, results=_result(outcome=m.OUT_INDETERMINATE))
+    assert not any("this chart version does not know the key" in line for line in lines)
+    assert "vm_disk" in _gates(lines)
+
+
+def test_a_modified_job_of_the_same_attempt_is_not_a_plan(monkeypatch):
+    lines = _lines(monkeypatch, PR1, results=_result(
+        f"vmm-{VM}-1", body="-  backoffLimit: 0\n+  backoffLimit: 1\n"))
+    assert "vm_disk" in _gates(lines)
+
+
+def test_a_block_equal_to_main_adds_no_line(monkeypatch):
+    head = PR1.replace("  attempt: 1\n", "")          # the same block: attempt defaults to 1
+    base = PR1.replace("instanceName: pv-orch-svc-a", "instanceName: pv-orch-svc-a\n        dataDiskSizeGb: 128")
+    lines = _lines(monkeypatch, head, base=base, results=_result())
+    assert not any("vmMigration` selects" in line or "planned migration" in line for line in lines)
 
 
 # ── vm_analysis helpers ──────────────────────────────────────────────────
@@ -153,10 +211,12 @@ def test_the_attempt_defaults_to_1():
     assert va._kcc_vm_migrations(None) == {}
 
 
-@pytest.mark.parametrize("header,want", [
-    (f"/batch/Job pv-orch-a/vmm-{VM}-1", True),
-    (f"/v1/ConfigMap pv-orch-a/vmm-{VM}-1", False),
-    (f"/batch/Job pv-orch-a/vmm-{VM}-12", False),
+@pytest.mark.parametrize("header,body,want", [
+    (f"/batch/Job pv-orch-a/vmm-{VM}-1", "+x\n", True),
+    (f"/v1/ConfigMap pv-orch-a/vmm-{VM}-1", "+x\n", False),
+    (f"/batch/Job pv-orch-a/vmm-{VM}-12", "+x\n", False),
+    (f"/batch/Job pv-orch-a/vmm-{VM}-1", "-x\n+y\n", False),     # modified
+    (f"/batch/Job pv-orch-a/vmm-{VM}-1", "-x\n", False),          # deleted
 ])
-def test_only_the_job_itself_counts(header, want):
-    assert va._vmm_job_rendered([(header, "+x\n")], f"vmm-{VM}-1") is want
+def test_only_a_created_job_counts(header, body, want):
+    assert va._vmm_job_created([(header, body)], f"vmm-{VM}-1") is want

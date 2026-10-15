@@ -520,6 +520,10 @@ GATES = {
                     "blocked", ""),
     "nocore_lost": ("A move turns noCore off", None, "blocked",
                     "Set appspace.infra.noCore in the moved customer.yaml"),
+    # COPS-2865 (B2): removing a vmMigration block hands the VM back to KCC on
+    # its target values, so its migration Job must be Complete first.
+    "vmm_pr2": ("The vmMigration block is removed, its Job must be Complete first",
+                "Confirm-VM-Migrated", "blocked", ""),
     # COPS-2833: KCC, the Kubernetes API or ASO rejects the change on sync.
     "immutable": ("A field that cannot change, on a resource that already exists",
                   "Confirm-Recreate", "blocked", ""),

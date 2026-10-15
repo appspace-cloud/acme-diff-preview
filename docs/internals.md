@@ -248,7 +248,7 @@ FAILED, the comment still shows the diff, and the merge summary starts with one
 | Cascade not live | the cascade is armed in config, but ArgoCD has not put `resources-finalizer.argocd.argoproj.io` on the Applications | nothing, it clears itself |
 | Flag typo | a teardown flag that is misspelled or in the wrong place, so Phase 2 reads pending | nothing: fix the key on `main` in a separate PR, then rebase the removal |
 
-The same mechanism has three gates outside a teardown:
+The same mechanism has four gates outside a teardown:
 
 - `Confirm-IP-Release: <env>`: a `ComputeAddress` or `DNSRecordSet` leaves the
   render of a live env with no explicit `deletion-policy: abandon`, so GCP
@@ -259,6 +259,12 @@ The same mechanism has three gates outside a teardown:
   two sides are the full folder paths. The rename guard above uses the same
   trailer with namespaces.
 - A disk shrink: nothing lifts it, because GCP cannot shrink a disk in place.
+- `Confirm-VM-Migrated: <env>` (COPS-2865): a change removes the `vmMigration`
+  block of a KCC VM and keeps its target values (the second PR of an
+  acme-components COPS-2835 migration), so KCC takes the VM back on them. Add
+  it once the Job `vmm-<vm>-<attempt>` is Complete and its journal ConfigMap
+  `vmm-<vm>-journal` says `done`. A revert of the first PR also puts the old
+  values back and opens no gate.
 
 How the line is read:
 

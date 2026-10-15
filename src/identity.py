@@ -274,7 +274,7 @@ def _appset_identity(customer_doc, cohort_doc):
 # COPS-2766: one parser for every Confirm-* line, so they all read the same way.
 _CONFIRM_RE = re.compile(
     r"^[\s*>]*`?(confirm-(?:rename|teardown|decommission|ip-release|clone-sanitized|legacyhelm"
-    r"|recreate)):"
+    r"|recreate|vm-migrated)):"
     r"\s*(.+?)\s*$",
     re.IGNORECASE)
 
