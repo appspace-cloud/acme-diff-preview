@@ -1298,27 +1298,33 @@ def _planned_vm_migrations(flat: dict, sections, base_flat: dict = None,
     """(planned, unrendered, armed): {role: (type, instance, attempt)} each.
 
     Only a block this change sets or changes counts (one equal to main's has
-    its Job on main already). It must name a known type and the role's only
-    VM. planned: the chart created its Job, so it honours the block. armed:
-    allowDeletion is on for the role on main or in the change, so Argo would
-    prune the VM and its data disk with deletion-policy delete; the runbook
-    wants allowDeletion: false synced in its own PR first. unrendered: the
-    env rendered completely but there is no new Job (a chart without the
-    feature): the target values then apply as a plain change. A render that
-    did not complete is in none of them (its error already blocks). A role
-    with other VMs (mongo or rabbit instances) is in none either, because a
-    role-level value would change those VMs in place."""
+    its Job on main already). It must name a known type and a VM of the role.
+    planned: the chart created its Job and the role's only VM is selected, so
+    role-level targets are safe. armed: allowDeletion is on for the role on
+    main or in the change, so Argo would prune the VM and its data disk with
+    deletion-policy delete; the runbook wants allowDeletion: false synced in
+    its own PR first. unrendered: the env rendered completely but there is no
+    new Job (a chart without the feature), including a member of a mongo or
+    rabbit set (COPS-2869): the target values then apply as a plain change.
+    A render that did not complete is in none of them (its error already
+    blocks). A role with other VMs cannot be planned (a role-level value
+    would change those VMs in place), but it can still be unrendered."""
     planned, unrendered, armed = {}, {}, {}
     before = _kcc_vm_migrations(base_flat)
     for role, (kind, inst, att) in _kcc_vm_migrations(flat).items():
         if (kind not in _VMM_TYPES or not inst or before.get(role) == (kind, inst, att)
-                or _kcc_instance_names(flat, role) != {inst}):
+                or inst not in _kcc_instance_names(flat, role)):
             continue
+        only = _kcc_instance_names(flat, role) == {inst}
         if _vmm_deletion_armed(base_flat, role) or _vmm_deletion_armed(flat, role):
-            armed[role] = (kind, inst, att)
+            if only:
+                armed[role] = (kind, inst, att)
         elif _vmm_job_created(sections, f"vmm-{inst}-{att}"):
-            planned[role] = (kind, inst, att)
+            if only:
+                planned[role] = (kind, inst, att)
         elif rendered:
+            # Singleton or a member of a set: without the Job the chart is
+            # ignoring the block (COPS-2869). planned stays singleton-only.
             unrendered[role] = (kind, inst, att)
     return planned, unrendered, armed
 
@@ -1372,12 +1378,100 @@ def _planned_vm_migration_line(env: str, role: str, kind: str, inst: str, att: s
             "documentation/linux-vm-migration.md).")
 
 
+# COPS-2869 (B3): guards around the migration flow that B1/B2 left for later.
+_VMM_UNRENDERED_REASON = "this chart version does not know the key, so the target values apply in place"
+_VMM_SUFFIX_REASON = "diskNameSuffix changes only inside a planned vmMigration"
+_VMM_CHART_REASON = "appspace.version must not change while a vmMigration is still set"
+
+
 def _unrendered_vm_migration_line(env: str, role: str, inst: str, att: str) -> str:
-    """The dangerous VM panel line of a vmMigration block the chart ignored."""
+    """The dangerous VM panel line of a vmMigration block the chart ignored.
+
+    Opens the `vmm_unrendered` gate (COPS-2869): nothing lifts it. Move the
+    env to a chart with the feature first (PR0), then open PR1."""
     return (f"- \U0001f6a8 `{env}` \u00b7 **linux VM (KCC) \u00b7 {role}**: `vmMigration` selects "
-            f"`{inst}`, but the render has no Job `vmm-{inst}-{att}`: this chart version does "
-            "not know the key, so the target values apply in place. Move the env to a chart "
-            "with the VM migration feature (COPS-2835) first.")
+            f"`{inst}`, but the render has no Job `vmm-{inst}-{att}`: {_VMM_UNRENDERED_REASON}. "
+            "Move the env to a chart with the VM migration feature (COPS-2835) first.")
+
+
+def _instances_disk_suffixes(flat: dict, role: str) -> dict:
+    """{instance name: diskNameSuffix or None} from a role's instances list."""
+    out = {}
+    for i in (flat or {}).get(f"{_KCC_PREFIX}{role}.instances") or ():
+        if isinstance(i, dict) and i.get("name") is not None:
+            out[str(i["name"])] = i.get("diskNameSuffix")
+        elif not isinstance(i, dict) and i is not None:
+            out[str(i)] = None
+    return out
+
+
+def _disk_name_suffix_changes(old_flat: dict, new_flat: dict) -> list:
+    """[(role, where)]: diskNameSuffix that differs between old and new.
+
+    `where` is `role` for a role-level key, or the instance name for a
+    per-member suffix on mongo/rabbit."""
+    out = []
+    for role in ("svc", "mongo", "rabbit"):
+        if _kcc_role_value(old_flat or {}, role, "diskNameSuffix") != \
+                _kcc_role_value(new_flat or {}, role, "diskNameSuffix"):
+            out.append((role, "role"))
+        if role == "svc":
+            continue
+        before, after = _instances_disk_suffixes(old_flat, role), \
+            _instances_disk_suffixes(new_flat, role)
+        for name in sorted(set(before) | set(after)):
+            if before.get(name) != after.get(name):
+                out.append((role, name))
+    return out
+
+
+def _suffix_outside_migration(old_flat: dict, new_flat: dict,
+                              planned: dict = None) -> list:
+    """Roles whose diskNameSuffix changes outside a planned migration (B3).
+
+    Allowed when this PR plans the migration of that role (Job in the
+    render). A naked suffix edit, or a suffix edit while the same block
+    stays on both sides (mid-flight tweak), is blocked. A revert of PR1
+    (block leaves and values go back) is not this gate."""
+    planned = planned or {}
+    before, after = _kcc_vm_migrations(old_flat), _kcc_vm_migrations(new_flat)
+    out = []
+    for role, where in _disk_name_suffix_changes(old_flat, new_flat):
+        if role in planned:
+            continue
+        if role not in before and role not in after:
+            out.append((role, where))
+        elif before.get(role) and before.get(role) == after.get(role):
+            out.append((role, where))
+    return out
+
+
+def _suffix_outside_migration_line(env: str, role: str, where: str) -> str:
+    """The dangerous VM panel line that opens the `vmm_suffix` gate."""
+    place = ("the role" if where == "role" else f"instance `{where}`")
+    return (f"- \U0001f6a8 `{env}` \u00b7 **linux VM (KCC) \u00b7 {role}**: `diskNameSuffix` "
+            f"changes on {place} with no planned `vmMigration`: {_VMM_SUFFIX_REASON} "
+            "(set it in PR1 with the block, or keep it after PR2; never edit it alone).")
+
+
+def _chart_bump_during_migration(old_flat: dict, new_flat: dict,
+                                 version_changed: bool) -> dict:
+    """{role: (type, instance, attempt)} still set on both sides while
+    appspace.version changes (B3). A revert of PR1 removes the block and is
+    not this gate."""
+    if not version_changed:
+        return {}
+    before, after = _kcc_vm_migrations(old_flat), _kcc_vm_migrations(new_flat)
+    return {role: block for role, block in before.items()
+            if block[0] in _VMM_TYPES and after.get(role) == block}
+
+
+def _chart_bump_during_migration_line(env: str, role: str, inst: str, att: str) -> str:
+    """The dangerous VM panel line that opens the `vmm_chart` gate."""
+    return (f"- \U0001f6a8 `{env}` \u00b7 **linux VM (KCC) \u00b7 {role}**: `appspace.version` "
+            f"changes while `vmMigration` of `{inst}` (attempt {att}) is still set: "
+            f"{_VMM_CHART_REASON} (Job `vmm-{inst}-{att}`). Finish or abort the migration, "
+            "merge PR2, then bump the chart.")
 
 
 def _new_env_prereq_findings(flat: dict, env: str) -> tuple:

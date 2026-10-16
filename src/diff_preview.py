@@ -287,7 +287,14 @@ from vm_analysis import (  # VM/KCC infrastructure analysis (same-dir module)
     _armed_vm_migration_line,
     _removed_vm_migration_line,
     _vm_migrations_removed,
+    _suffix_outside_migration,
+    _suffix_outside_migration_line,
+    _chart_bump_during_migration,
+    _chart_bump_during_migration_line,
     _VMM_REMOVED_REASON,
+    _VMM_UNRENDERED_REASON,
+    _VMM_SUFFIX_REASON,
+    _VMM_CHART_REASON,
     _VMM_PLANNED_LEAVES,
     _VMM_PLANNED_NOTE,
     _new_env_prereq_findings,
@@ -8658,6 +8665,13 @@ def _merge_gates(decommission_candidates, renames=None, path_map=None,
     # Complete. Lifted by `Confirm-VM-Migrated: <env>`.
     found += [{"kind": "vmm_pr2", "env": (re.findall(r"`([^`]+)`", line) or [""])[0]}
               for line in vm_change_lines or () if _VMM_REMOVED_REASON in line]
+    # COPS-2869 (B3): nothing lifts these. Finish the migration flow first.
+    found += [{"kind": "vmm_unrendered", "env": (re.findall(r"`([^`]+)`", line) or [""])[0]}
+              for line in vm_change_lines or () if _VMM_UNRENDERED_REASON in line]
+    found += [{"kind": "vmm_suffix", "env": (re.findall(r"`([^`]+)`", line) or [""])[0]}
+              for line in vm_change_lines or () if _VMM_SUFFIX_REASON in line]
+    found += [{"kind": "vmm_chart", "env": (re.findall(r"`([^`]+)`", line) or [""])[0]}
+              for line in vm_change_lines or () if _VMM_CHART_REASON in line]
     for hit in (_VM_DISK_LINE_RE.search(line) for line in vm_change_lines or ()
                 if _VM_DISK_FAMILY_REASON in line):
         why = hit and f"{hit[2]} " + " to ".join(filter(None, hit.groups()[2:]))
@@ -11639,21 +11653,25 @@ def _summarize_vm_changes(changed_files, pr_sha, base_sha, path_map,
         if not keys:
             continue
         env_name = posixpath.basename(posixpath.dirname(clean))
-        # COPS-2865 (B1): a VM migration this change plans with the COPS-2835
-        # vmMigration block. When the chart renders its Job, the target values
-        # of that role are what the Job moves the VM to, not an in-place
-        # change: no vm_disk error and no disk type danger for them. A block
-        # the chart ignored is a danger of its own, and every rule stays.
+        # COPS-2865 (B1) + COPS-2869 (B3): a VM migration this change plans
+        # with the COPS-2835 vmMigration block, or a B3 guard on the same
+        # env (suffix outside the flow, chart bump while the block is set).
         planned_vmm = {}
-        if clean.startswith("gcp/") and _is_pv_env_file(clean) and any(
-                k.startswith(_KCC_PREFIX) and ".vmMigration." in k for k in keys):
-            env_apps = [a for a in (path_map.get(clean) or ()) if isinstance(a, str)]
+        _vmm_touch = clean.startswith("gcp/") and _is_pv_env_file(clean) and any(
+            k.startswith(_KCC_PREFIX) and (
+                ".vmMigration." in k or k.rsplit(".", 1)[-1] == "diskNameSuffix"
+                or k.rsplit(".", 1)[-1] == "instances")
+            for k in keys)
+        if _vmm_touch:
+            _apps = path_map.get(clean)
+            env_apps = [a for a in _apps if isinstance(a, str)] if isinstance(_apps, (list, tuple)) else []
             env_results = [(app_results or {}).get(a) for a in env_apps]
             base_vmm = _merged_kcc_flat_for_env(clean, base_sha, repo, strict=True)
             head_vmm = _merged_kcc_flat_for_env(clean, pr_sha, repo, strict=True)
+            sections = [sec for r in env_results for sec in (getattr(r, "sections", None) or ())]
             planned_vmm, unrendered_vmm, armed_vmm = _planned_vm_migrations(
-                head_vmm, [sec for r in env_results for sec in (getattr(r, "sections", None) or ())],
-                base_vmm, rendered=_render_covers(path_map.get(clean), app_results))
+                head_vmm, sections, base_vmm,
+                rendered=_render_covers(path_map.get(clean), app_results))
             # The render decides too: a CR of that VM leaving Argo without
             # abandon is pruned in GCP, whatever the values say.
             for role, (kind, inst, att) in list(planned_vmm.items()):
@@ -11671,6 +11689,10 @@ def _summarize_vm_changes(changed_files, pr_sha, base_sha, path_map,
                                     _vm_migrations_removed(base_vmm, head_vmm).items())]
             routine_lines += [(env_name, _planned_vm_migration_line(env_name, role, *planned))
                               for role, planned in sorted(planned_vmm.items())]
+            # COPS-2869 (B3): diskNameSuffix outside a planned migration.
+            dangerous_lines += [
+                _suffix_outside_migration_line(env_name, role, where)
+                for role, where in _suffix_outside_migration(base_vmm, head_vmm, planned_vmm)]
         # COPS-2766 (C21): an n4 or c4 machine with a pd- disk that this change
         # adds. Only a GCP private-cloud env: KCC renders its VMs.
         if clean.startswith("gcp/") and _is_pv_env_file(clean) and any(
@@ -11881,6 +11903,30 @@ def _summarize_vm_changes(changed_files, pr_sha, base_sha, path_map,
                 new_flat, keys, _KCC_PREFIX):
             routine_lines.append(
                 (env_name if path_map.get(clean) else None, note))
+
+    # COPS-2869 (B3): appspace.version must not change while a vmMigration
+    # block is still set on the env (Job may be running, or PR2 not merged).
+    # The bump can be in customer.yaml or a cohort config.yaml; DiffResult
+    # already carries the effective version change per app.
+    _chart_envs = set()
+    for path, apps in (path_map or {}).items():
+        if not (isinstance(path, str) and path.startswith("gcp/") and _is_pv_env_file(path)):
+            continue
+        # path_map values are normally a list of app names; some tests use
+        # True as a "this file feeds apps" sentinel with no names.
+        env_apps = [a for a in apps if isinstance(a, str)] if isinstance(apps, (list, tuple)) else []
+        if not any(getattr((app_results or {}).get(a), "version_change", None) for a in env_apps):
+            continue
+        env_name = posixpath.basename(posixpath.dirname(path))
+        if env_name in _chart_envs:
+            continue
+        _chart_envs.add(env_name)
+        base_vmm = _merged_kcc_flat_for_env(path, base_sha, repo, strict=True)
+        head_vmm = _merged_kcc_flat_for_env(path, pr_sha, repo, strict=True)
+        for role, (_kind, inst, att) in sorted(
+                _chart_bump_during_migration(base_vmm, head_vmm, True).items()):
+            dangerous_lines.append(
+                _chart_bump_during_migration_line(env_name, role, inst, att))
 
     # COPS-2635: resolve the buffered provisions. Tainted ones (any real
     # danger among their keys) replay their lines verbatim and never

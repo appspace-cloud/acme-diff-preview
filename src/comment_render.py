@@ -524,6 +524,14 @@ GATES = {
     # its target values, so its migration Job must be Complete first.
     "vmm_pr2": ("The vmMigration block is removed, its Job must be Complete first",
                 "Confirm-VM-Migrated", "blocked", ""),
+    # COPS-2869 (B3): no trailer. Fix the values, then push.
+    "vmm_unrendered": ("vmMigration on a chart that ignores it, target values apply in place",
+                       None, "blocked",
+                       "Bump the env to a chart with the VM migration feature first (PR0)"),
+    "vmm_suffix": ("diskNameSuffix changed outside a planned vmMigration", None, "blocked",
+                   "Set it in PR1 with the block, or keep it after PR2"),
+    "vmm_chart": ("appspace.version changed while a vmMigration is still set", None, "blocked",
+                  "Finish or abort the migration and merge PR2 first"),
     # COPS-2833: KCC, the Kubernetes API or ASO rejects the change on sync.
     "immutable": ("A field that cannot change, on a resource that already exists",
                   "Confirm-Recreate", "blocked", ""),

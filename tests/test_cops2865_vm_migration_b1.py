@@ -106,13 +106,15 @@ def test_a_planned_migration_says_what_happens(monkeypatch):
 
 def test_without_the_job_the_gate_stays_and_says_why(monkeypatch):
     lines = _lines(monkeypatch, PR1, results=_result())
-    assert _gates(lines) == ["vm_disk"]
+    assert "vm_disk" in _gates(lines)
+    assert "vmm_unrendered" in _gates(lines)   # COPS-2869: own gate, no trailer
     assert va._unrendered_vm_migration_line("pv-orch-a", "svc", VM, "1") in lines
 
 
 def test_the_job_of_another_attempt_does_not_count(monkeypatch):
     lines = _lines(monkeypatch, PR1, results=_result(f"vmm-{VM}-2"))
-    assert _gates(lines) == ["vm_disk"]
+    assert "vm_disk" in _gates(lines)
+    assert "vmm_unrendered" in _gates(lines)
 
 
 def test_a_type_the_chart_does_not_know_keeps_the_rules(monkeypatch):
@@ -194,6 +196,7 @@ def test_a_modified_job_of_the_same_attempt_is_not_a_plan(monkeypatch):
     lines = _lines(monkeypatch, PR1, results=_result(
         f"vmm-{VM}-1", body="-  backoffLimit: 0\n+  backoffLimit: 1\n"))
     assert "vm_disk" in _gates(lines)
+    assert "vmm_unrendered" in _gates(lines)
 
 
 def test_a_block_equal_to_main_adds_no_line(monkeypatch):
