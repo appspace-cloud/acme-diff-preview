@@ -265,6 +265,10 @@ The same mechanism has four gates outside a teardown:
   it once the Job `vmm-<vm>-<attempt>` is Complete and its journal ConfigMap
   `vmm-<vm>-journal` says `done`. A revert of the first PR also puts the old
   values back and opens no gate.
+- No trailer (COPS-2869): `vmm_unrendered` (a `vmMigration` block whose Job the
+  chart did not create), `vmm_suffix` (`diskNameSuffix` outside a planned
+  migration), and `vmm_chart` (`appspace.version` while the block is still
+  set). Fix the values and push; nothing in a commit message lifts them.
 
 How the line is read:
 
