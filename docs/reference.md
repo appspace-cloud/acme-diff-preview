@@ -797,8 +797,9 @@ bitbucket:
 
 vertex:
   project: appspace-devops
-  location: us-central1
-  model: gemini-2.5-flash
+  location: global              # Gemini 3 and 4 are served only on the global endpoint
+  model: gemini-4-argon
+  thinkingLevel: LOW            # LOW, MEDIUM or HIGH; Gemini 4 refuses a thinking budget
 
 hardRefresh:
   enabled: false                # webhook-only by default; see above

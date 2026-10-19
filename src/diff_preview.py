@@ -10178,10 +10178,14 @@ def fix_stuck_inprogress(pr_sha, pr_id, comment_raw, repo=None):
 # Fails silently: comment posts without AI block if Vertex AI call fails.
 
 VERTEX_PROJECT           = os.environ.get("GCP_PROJECT", "appspace-devops")
-VERTEX_LOCATION          = os.environ.get("VERTEX_LOCATION", "us-central1")
-# gemini-2.5-flash: better reasoning than lite, still fast and cheap.
+# The Gemini 3 and 4 models are served in this project only on the global
+# endpoint; every region answers 404 for them.
+VERTEX_LOCATION          = os.environ.get("VERTEX_LOCATION", "global")
 # One call per PR run (not per resource), so cost impact is negligible.
-VERTEX_MODEL             = os.environ.get("VERTEX_MODEL", "gemini-2.5-flash")
+VERTEX_MODEL             = os.environ.get("VERTEX_MODEL", "gemini-4-argon")
+# LOW, MEDIUM or HIGH. Gemini 4 cannot turn thinking off and refuses a
+# thinking budget; LOW is the level Google gives for summaries.
+VERTEX_THINKING_LEVEL    = (os.environ.get("VERTEX_THINKING_LEVEL") or "LOW").strip().upper()
 # COPS-2555: simple, reversible on/off switch for the whole feature, same
 # convention as DIFF_UI_ENABLED/LEADER_ELECTION_ENABLED. Defaults ON so no
 # other deployment of this chart is affected unless it opts out explicitly.
@@ -10267,6 +10271,14 @@ def _precomputed_facts_note(results: dict) -> str:
         out.append("Workloads with replicas dropping to 0:")
         out += [f"- {app}: {h}" for app, h in zeroed[:30]]
     return "\n".join(out) + "\n"
+
+
+def _vertex_host(location: str) -> str:
+    """The global location has no regional host:
+    global-aiplatform.googleapis.com answers with a 404 page."""
+    if location == "global":
+        return "https://aiplatform.googleapis.com"
+    return f"https://{location}-aiplatform.googleapis.com"
 
 
 def generate_ai_summary(app_results: dict) -> str | None:
@@ -10428,13 +10440,19 @@ def generate_ai_summary(app_results: dict) -> str | None:
 
         token    = _gcp_access_token()
         endpoint = (
-            f"https://{VERTEX_LOCATION}-aiplatform.googleapis.com/v1"
+            f"{_vertex_host(VERTEX_LOCATION)}/v1"
             f"/projects/{VERTEX_PROJECT}/locations/{VERTEX_LOCATION}"
             f"/publishers/google/models/{VERTEX_MODEL}:generateContent"
         )
         prompt_chars = len(prompt)
         logsink.log(f"[AI] Calling {VERTEX_MODEL} | prompt={prompt_chars} chars | "
-                    f"maxTokens={2000}", "DEBUG")
+                    f"thinking={VERTEX_THINKING_LEVEL}", "DEBUG")
+        # No temperature: Gemini 3 and later ignore it. Thinking tokens count
+        # against maxOutputTokens, and Google asks for at least 32768 on
+        # Gemini 4; the prompt itself keeps the answer short.
+        generation = {"maxOutputTokens": 32768}
+        if VERTEX_THINKING_LEVEL:
+            generation["thinkingConfig"] = {"thinkingLevel": VERTEX_THINKING_LEVEL}
         _t0 = time.monotonic()
         resp = http(
             "POST",
@@ -10444,21 +10462,17 @@ def generate_ai_summary(app_results: dict) -> str | None:
                 "contents": [
                     {"role": "user", "parts": [{"text": prompt}]}
                 ],
-                "generationConfig": {
-                    "maxOutputTokens": 2000,
-                    "temperature": 0.1,
-                    # Disable thinking tokens on flash models. Without this,
-                    # the model spends ~1100 thinking tokens leaving almost
-                    # nothing for output (finish=MAX_TOKENS). Pro models do
-                    # not accept thinkingBudget 0, so only send it for flash.
-                    **({"thinkingConfig": {"thinkingBudget": 0}}
-                       if "flash" in VERTEX_MODEL else {}),
-                },
+                "generationConfig": generation,
             },
         )
         candidate = resp["candidates"][0]
         finish    = candidate.get("finishReason", "UNKNOWN")
-        ai_text   = candidate["content"]["parts"][0]["text"].strip()
+        ai_text   = "".join(
+            p.get("text", "") for p in candidate["content"]["parts"]
+            if not p.get("thought")
+        ).strip()
+        if not ai_text:
+            raise ValueError(f"Vertex AI reply had no answer text (finish={finish})")
         elapsed   = round((time.monotonic() - _t0) * 1000)
         usage     = resp.get("usageMetadata", {})
         in_tok    = usage.get("promptTokenCount", "?")

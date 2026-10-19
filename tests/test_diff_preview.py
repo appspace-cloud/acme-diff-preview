@@ -1196,15 +1196,17 @@ def test_vertex_model_env_overridable():
     finally:
         del os.environ["VERTEX_MODEL"]
     mod = _import_module()
-    assert mod.VERTEX_MODEL == "gemini-2.5-flash"
+    assert mod.VERTEX_MODEL == "gemini-4-argon"
 
 
-def test_ai_header_built_in_code_and_thinking_conditional():
-    """Deterministic header assembly and flash-only thinkingConfig."""
+def test_ai_header_built_in_code_and_thinking_level():
+    """Deterministic header assembly, and a thinking level instead of a
+    thinking budget, which Gemini 4 refuses with a 400."""
     src = _source()
     assert "AFFECTED ENVIRONMENT" in src, "env-line strip filter missing"
     assert "_envs_from_apps" in src
-    assert '"flash" in VERTEX_MODEL' in src, "thinkingConfig must be flash-only"
+    assert '"thinkingLevel"' in src
+    assert '"thinkingBudget"' not in src
 
 
 # ── v2.4.3: Bitbucket diff redaction + chart-aware main render cache ────────
