@@ -41,8 +41,8 @@ FIX = ("The ashn names the environment in Customers and PDNS, so the clone and t
        "other environment look like one environment there. Give the clone its own ashn "
        "(runbook https://appspace.atlassian.net/wiki/spaces/cops/pages/66093626 step 2: "
        "change ashn, suffix, customerName and instanceName).")
-UNAVAILABLE = ("⚠️ ashn check unavailable: the ArgoCD app list is not loaded, so the "
-               "clone ashn is not compared with the live environments.")
+UNAVAILABLE = ("⚠️ ashn check unavailable: the ArgoCD app list is not loaded, so a "
+               "new or changed ashn is not compared with the live environments.")
 
 
 def _skipped(n):
@@ -83,7 +83,7 @@ def _no_fleet(monkeypatch):
 
 
 def _detect(changed, renames=None, base_sha=B):
-    return m._detect_copied_clone_ashn(changed, renames or {}, H, base_sha)
+    return m._detect_ashn_gates(changed, renames or {}, H, base_sha)
 
 
 def _env(path):
@@ -226,7 +226,6 @@ def test_a_failed_read_of_a_changed_live_env_retries(monkeypatch):
 
 
 @pytest.mark.parametrize("path", [
-    PROD,                                                            # not a clone
     "gcp/dev/private-cloud/ap1/sandbox/pv-x--sbx1-a/customer.yaml",  # a sandbox
     f"{SPOKE}/monthly/pv-x--aec1-a/cicd-versions.yaml",              # not the identity
     COHORT,
@@ -295,7 +294,7 @@ def test_nothing_lifts_the_gate(monkeypatch):
 def test_the_panel_names_each_clone_and_the_fix():
     gates = m._merge_gates((), extra=[
         _gate(), _gate(Y, [X, PROD], "1234x5678"), {"kind": "shrink", "env": ""}])
-    assert m._ashn_copy_lines(gates, [_skipped(3)]) == [
+    assert m._ashn_lines(gates, [_skipped(3)]) == [
         "## ⛔ CLONE ASHN ALREADY IN USE", "",
         f"- `{ENV}` has `ashn: {ASHN}`, the ashn of `pv-x-a` (`{PROD}`).",
         f"- `pv-y--aec1-a` has `ashn: 1234x5678`, the ashn of `{ENV}` (`{X}`), "
@@ -304,9 +303,9 @@ def test_the_panel_names_each_clone_and_the_fix():
 
 
 def test_the_panel_of_notes_only():
-    assert m._ashn_copy_lines([{"kind": "shrink", "env": ""}], [UNAVAILABLE]) == [
+    assert m._ashn_lines([{"kind": "shrink", "env": ""}], [UNAVAILABLE]) == [
         UNAVAILABLE, ""]
-    assert m._ashn_copy_lines(None, []) == []
+    assert m._ashn_lines(None, []) == []
 
 
 # ── process_pr ───────────────────────────────────────────────────────────
