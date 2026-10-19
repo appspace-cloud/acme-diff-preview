@@ -510,6 +510,12 @@ GATES = {
                      "blocked", "Use git mv, or choose another customerName or suffix"),
     "ashn_copy": ("A clone reuses the ashn of another environment", None, "blocked",
                   "Give the clone its own ashn"),
+    # Prod and AEC: the PowerDNS ASHN map takes one instance per ashn, and its
+    # publisher refuses a malformed ashn.
+    "ashn_taken": ("An environment takes the ashn of another environment", None, "blocked",
+                   "Take a new ashn from the ASHN sheet"),
+    "ashn_format": ("The ashn is not 4 hex digits, x and 4 hex digits", None, "blocked",
+                    "Copy the ashn from column A of the ASHN sheet"),
     "vm_disk": ("An n4 or c4 machine with a pd- disk, GCP rejects it", None, "blocked",
                 "Use hyperdisk-balanced on a new VM, or keep the machine family"),
     "kcc_hosting_id": ("KCC linux VM enabled with no valid appspace.hostingID", None,

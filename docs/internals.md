@@ -13,6 +13,7 @@ here is required to use the tool; it is for people changing it or debugging it.
 - [Why an environment without a chart version is blocked](#why-an-environment-without-a-chart-version-is-blocked)
 - [Why waking an AEC clone is blocked](#why-waking-an-aec-clone-is-blocked)
 - [Why a copied clone ashn is blocked](#why-a-copied-clone-ashn-is-blocked)
+- [Why a prod ashn must be unique and well formed](#why-a-prod-ashn-must-be-unique-and-well-formed)
 - [Why a new env needs an ApplicationSet glob](#why-a-new-env-needs-an-applicationset-glob)
 - [Why a KCC linux VM needs hostingID](#why-a-kcc-linux-vm-needs-hostingid)
 - [Why a key in a file the ApplicationSet does not read is blocked](#why-a-key-in-a-file-the-applicationset-does-not-read-is-blocked)
@@ -468,6 +469,29 @@ cannot be read or parsed is not checked, and a ⚠️ line says how many. When
 the ArgoCD app list is not loaded, a ⚠️ line says that the check is
 unavailable. Neither one is a gate. A failed read of a file of the PR retries
 the PR.
+
+### Why a prod ashn must be unique and well formed
+
+The PowerDNS name servers answer `<ashn>.api.cloud.appspace.com` from a map of
+every Private Cloud ashn. A job on the ArgoCD hub (acme-infrastructure) builds
+that map from `acme-config-prod`, and refuses the whole map when one ashn
+points to two instances or an ashn is malformed. So one bad `customer.yaml`
+stops every DNS update until it is fixed.
+
+The same two cases are merge gates for every prod and AEC private-cloud
+`customer.yaml` whose own `appspace.ashn` is new or changed against `main`,
+not only for the AEC clones:
+
+- `ashn_taken`: an environment with another `customerName` has the same ashn,
+  on `main` or in this PR. Another environment of the same customer has the
+  same instance host, so it is one entry in the map and no hit. A clone keeps
+  the `ashn_copy` gate above.
+- `ashn_format`: the ashn is not 4 hex digits, `x` and 4 hex digits, like
+  `3a02x8649`.
+
+Nothing lifts them. Take the ashn from column A of the ASHN sheet. Dev, QA and
+stage are not checked, because their throwaway environments use placeholder
+ashns. The fleet read and its notes are the same as for the clone gate.
 
 ### Why a new env needs an ApplicationSet glob
 

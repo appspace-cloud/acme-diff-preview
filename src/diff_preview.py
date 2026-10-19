@@ -7688,15 +7688,27 @@ def _fleet_own_identities(repo, base_sha):
     return own, unread
 
 
-def _detect_copied_clone_ashn(changed, renames, sha, base_sha, repo=None):
-    """COPS-2766 (C03): (ashn_copy gates, notes) for the changed clone
-    customer.yaml files whose own `appspace.ashn` is new or changed.
+_ASHN_FORMAT_RE = re.compile(r"^[0-9a-f]{4}x[0-9a-f]{4}$")
+_ASHN_SHEET = "https://appspace.atlassian.net/wiki/spaces/cops/pages/66094009"
 
-    A gate when an env with another customerName has that ashn: a live env
-    at base, or a file of this PR at `sha`, so a move or a delete is not a
-    copy. Nothing lifts it. The fleet is read only for these clones. A failed
-    read of a PR file raises, so the PR is retried; a fleet file that cannot
-    be read is not checked, and a note says so.
+
+def _is_prod_pv_env_file(path):
+    """A prod or AEC private-cloud customer.yaml: its ashn goes to the PowerDNS map."""
+    return _is_pv_env_file(path) and path.split("/")[1] in ("prod", "aec")
+
+
+def _detect_ashn_gates(changed, renames, sha, base_sha, repo=None):
+    """(ashn gates, notes) for the changed customer.yaml files whose own
+    `appspace.ashn` is new or changed: the AEC clones and every prod and AEC
+    environment.
+
+    `ashn_copy` for a clone, `ashn_taken` for any other env, when an env with
+    another customerName has that ashn: a live env at base, or a file of this
+    PR at `sha`, so a move or a delete is not a copy. `ashn_format` for a prod
+    or AEC ashn that is not 4 hex digits, x and 4 hex digits. Nothing lifts
+    them. The fleet is read only for these files. A failed read of a PR file
+    raises, so the PR is retried; a fleet file that cannot be read is not
+    checked, and a note says so.
     """
     if not base_sha:
         return [], []
@@ -7704,7 +7716,7 @@ def _detect_copied_clone_ashn(changed, renames, sha, base_sha, repo=None):
     inv = {n: o for o, n in renames.items()}
     todo = {}
     for f in changed:
-        if not _is_clone_env_file(f) or f in renames:
+        if not (_is_clone_env_file(f) or _is_prod_pv_env_file(f)) or f in renames:
             continue
         ident = _own_identity(_read_first_doc(f, sha, repo)[0])
         if ident[2] and ident[2] != _own_identity(
@@ -7719,33 +7731,58 @@ def _detect_copied_clone_ashn(changed, renames, sha, base_sha, repo=None):
     others.update(todo)
     gates = []
     for f, (cn, _sfx, ashn) in sorted(todo.items()):
+        env = f.split("/")[-2]
+        if _is_prod_pv_env_file(f) and not _ASHN_FORMAT_RE.match(ashn):
+            gates.append({"kind": "ashn_format", "env": env, "why": ashn, "ashn": ashn,
+                          "path": f})
         hits = sorted(g for g, (c, _s, a) in others.items() if a == ashn and c != cn)
         if hits:
-            gates.append({"kind": "ashn_copy", "env": f.split("/")[-2],
+            gates.append({"kind": "ashn_copy" if _is_clone_env_file(f) else "ashn_taken",
+                          "env": env,
                           "why": "the ashn of " + ", ".join(g.split("/")[-2] for g in hits),
                           "ashn": ashn, "path": f, "others": hits})
     notes = [f"\u26a0\ufe0f ashn check skipped {len(unread)} environment(s) that could not "
              "be read, so a copied ashn there is not ruled out."] if unread else []
     if not fleet and not unread:
         notes.append("\u26a0\ufe0f ashn check unavailable: the ArgoCD app list is not "
-                     "loaded, so the clone ashn is not compared with the live environments.")
+                     "loaded, so a new or changed ashn is not compared with the live "
+                     "environments.")
     return gates, notes
 
 
-def _ashn_copy_lines(gates, notes=()) -> list:
-    """COPS-2766: the panel of the ashn_copy gates, then the notes of the check.
-    Plain lines, like _dup_identity_lines."""
-    hits = [g for g in gates or () if g["kind"] == "ashn_copy"]
-    lines = ["## \u26d4 CLONE ASHN ALREADY IN USE", ""] if hits else []
-    for g in hits:
-        lines.append(f"- `{g['env']}` has `ashn: {g['ashn']}`, the ashn of "
-                     + ", ".join(f"`{p.split('/')[-2]}` (`{p}`)" for p in g["others"]) + ".")
-    if hits:
+def _ashn_others(g) -> str:
+    return ", ".join(f"`{p.split('/')[-2]}` (`{p}`)" for p in g["others"])
+
+
+def _ashn_lines(gates, notes=()) -> list:
+    """The panels of the ashn gates (a copied clone ashn, an ashn in use, a
+    malformed ashn), then the notes of the check. Plain lines, like
+    _dup_identity_lines."""
+    lines = []
+    copies = [g for g in gates or () if g["kind"] == "ashn_copy"]
+    if copies:
+        lines += ["## \u26d4 CLONE ASHN ALREADY IN USE", ""]
+        lines += [f"- `{g['env']}` has `ashn: {g['ashn']}`, the ashn of {_ashn_others(g)}."
+                  for g in copies]
         lines += ["", (("The ashn names the environment in Customers and PDNS, so the clone "
                   "and the other environment look like one environment there. Give the "
                   "clone its own ashn (runbook "
                   "https://appspace.atlassian.net/wiki/spaces/cops/pages/66093626 step 2: "
                   "change ashn, suffix, customerName and instanceName).")), ""]
+    taken = [g for g in gates or () if g["kind"] == "ashn_taken"]
+    if taken:
+        lines += ["## \u26d4 ASHN ALREADY IN USE", ""]
+        lines += [f"- `{g['env']}` has `ashn: {g['ashn']}`, the ashn of {_ashn_others(g)}."
+                  for g in taken]
+        lines += ["", ("The name servers answer one ashn with one instance, and the ashn "
+                       "names the environment in Customers. Take a new ashn from the ASHN "
+                       f"sheet ({_ASHN_SHEET})."), ""]
+    bad = [g for g in gates or () if g["kind"] == "ashn_format"]
+    if bad:
+        lines += ["## \u26d4 ASHN NOT IN THE ASHN FORMAT", ""]
+        lines += [f"- `{g['env']}` has `ashn: {g['ashn']}`." for g in bad]
+        lines += ["", ("An ashn is 4 hex digits, `x` and 4 hex digits, like `3a02x8649`. "
+                       f"Copy it from column A of the ASHN sheet ({_ASHN_SHEET})."), ""]
     return lines + [x for n in notes for x in (n, "")]
 
 
@@ -13934,9 +13971,9 @@ def process_pr(pr, path_map, base_sha="", repo=None):
         # A new env with the app names of another env: nothing lifts it.
         dup_gates, dup_unchecked = _detect_duplicate_identities(
             changed, renames, new_env_candidates, render_sha, repo=repo)
-        # A clone with the ashn of another env: nothing lifts it either.
-        ashn_gates, ashn_notes = _detect_copied_clone_ashn(changed, renames, render_sha,
-                                                           base_sha, repo=repo)
+        # An ashn another env uses, or a malformed prod ashn: nothing lifts them either.
+        ashn_gates, ashn_notes = _detect_ashn_gates(changed, renames, render_sha,
+                                                    base_sha, repo=repo)
         # A new GCP env on an n4 or c4 machine with a pd- disk: GCP rejects it.
         disk_gates, prereqs = _new_env_prereqs(new_env_candidates, render_sha, repo=repo)
         # A new or moved env that no ApplicationSet reads: nothing deploys.
@@ -13989,7 +14026,7 @@ def process_pr(pr, path_map, base_sha="", repo=None):
                                     repo, pr_id, base_sha, pr_sha)
                 body, state, desc = format_new_env_comment(
                     pr_sha, _clone_wake_lines(gates) + _dup_identity_lines(gates, dup_unchecked)
-                    + _ashn_copy_lines(gates, ashn_notes)
+                    + _ashn_lines(gates, ashn_notes)
                     + _appset_miss_lines(gates, appset_notes) + new_env_lines,
                     new_env_full_lines, structural_envs,
                     gates, len(new_env_candidates), total_new, base_sha,
@@ -14519,7 +14556,7 @@ def process_pr(pr, path_map, base_sha="", repo=None):
                              + _immutable_gates(app_results))
         _lift_gates(gates, repo, pr_id, base_sha, pr_sha)
         appspace_state_lines = (_clone_wake_lines(gates) + _dup_identity_lines(gates, dup_unchecked)
-                                + _ashn_copy_lines(gates, ashn_notes)
+                                + _ashn_lines(gates, ashn_notes)
                                 + _appset_miss_lines(gates, appset_notes)
                                 + _immutable_lines(gates, app_results) + appspace_state_lines)
         # Direct permalink into the full-diff view for this exact commit.
