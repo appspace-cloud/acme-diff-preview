@@ -113,6 +113,8 @@ spec:
               value: {{ .Values.vertex.location | quote }}
             - name: VERTEX_MODEL
               value: {{ .Values.vertex.model | quote }}
+            - name: VERTEX_THINKING_LEVEL
+              value: {{ .Values.vertex.thinkingLevel | default "LOW" | quote }}
             # argocd login writes ~/.argocd/config. HOME=/tmp redirects to emptyDir.
             - name: HOME
               value: /tmp
