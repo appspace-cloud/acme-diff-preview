@@ -14,6 +14,7 @@ here is required to use the tool; it is for people changing it or debugging it.
 - [Why waking an AEC clone is blocked](#why-waking-an-aec-clone-is-blocked)
 - [Why a copied clone ashn is blocked](#why-a-copied-clone-ashn-is-blocked)
 - [Why a prod ashn must be unique and well formed](#why-a-prod-ashn-must-be-unique-and-well-formed)
+- [Why a prod ashn must fit the ASHN map](#why-a-prod-ashn-must-fit-the-ashn-map)
 - [Why a new env needs an ApplicationSet glob](#why-a-new-env-needs-an-applicationset-glob)
 - [Why a KCC linux VM needs hostingID](#why-a-kcc-linux-vm-needs-hostingid)
 - [Why a key in a file the ApplicationSet does not read is blocked](#why-a-key-in-a-file-the-applicationset-does-not-read-is-blocked)
@@ -483,15 +484,43 @@ The same two cases are merge gates for every prod and AEC private-cloud
 not only for the AEC clones:
 
 - `ashn_taken`: an environment with another `customerName` has the same ashn,
-  on `main` or in this PR. Another environment of the same customer has the
-  same instance host, so it is one entry in the map and no hit. A clone keeps
-  the `ashn_copy` gate above.
+  on `main` or in this PR. Another environment of the same customer is no hit:
+  with the same instance host it is one entry in the map, and with another
+  host it is the `ashn_two_hosts` gate below. A clone keeps the `ashn_copy`
+  gate above.
 - `ashn_format`: the ashn is not 4 hex digits, `x` and 4 hex digits, like
   `3a02x8649`.
 
 Nothing lifts them. Take the ashn from column A of the ASHN sheet. Dev, QA and
 stage are not checked, because their throwaway environments use placeholder
 ashns. The fleet read and its notes are the same as for the clone gate.
+
+### Why a prod ashn must fit the ASHN map
+
+The job that publishes the ASHN map builds one entry per prod and AEC private
+cloud from its merged values: every `config.yaml` from the cloud folder down,
+then its own `customer.yaml`. The name is `<ashn>.<ashnDomain>`. The instance
+host is the one the micro-services chart builds: `customerSubdomain` or
+`customerName`, then `cloud.appspace.com`, or
+`infra.az.loadBalancers.nginxFrontend.subdomainType` on Azure. The job refuses
+the whole map when one entry is wrong, so each case is a merge gate too:
+
+- `ashn_domain`: the name is not `<ashn>.api.cloud.appspace.com`.
+- `ashn_no_host`: there is no instance host. As in the job, an empty
+  `customerSubdomain` is a value, not unset.
+- `ashn_host_format`: the host is not lowercase letters, digits, dots and
+  dashes.
+- `ashn_two_hosts`: another environment has the same name with another host.
+  An environment that `ashn_taken` or `ashn_copy` already names is not checked
+  for it.
+
+The check reads only the entries the PR can change: a `customer.yaml` whose map
+values change (a new environment too), a moved one, and the live environments
+below a `config.yaml` whose map values change. A PR that does not touch those
+values costs two cached reads per file. Only a problem the PR causes is a gate,
+so a problem already on `main` does not block an unrelated PR. The live
+environments are read only for an entry with a host, with the same notes as the
+other ashn gates. A failed read retries the PR. Nothing lifts them.
 
 ### Why a new env needs an ApplicationSet glob
 

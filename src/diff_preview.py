@@ -7754,6 +7754,187 @@ def _ashn_others(g) -> str:
     return ", ".join(f"`{p.split('/')[-2]}` (`{p}`)" for p in g["others"])
 
 
+# The ASHN map publisher (acme-infrastructure, ArgoCD hub) builds one entry per
+# prod and AEC private cloud from these merged values, and refuses the whole
+# map when one entry is wrong. These mirror its build and its checks.
+_ASHN_MAP_KEYS = tuple("appspace." + k for k in (
+    "environmentType", "ashn", "ashnDomain", "customerSubdomain", "customerName",
+    "cloudShortName", "deploymentType", "infra.az.loadBalancers.nginxFrontend.subdomainType"))
+_ASHN_MAP_DOMAIN = "api.cloud.appspace.com"
+_ASHN_MAP_ZONES = {"gcp-pv-prod": "cloud.appspace.com", "gcp-pv-aec": "cloud.appspace.com",
+                   "aws-pv-prod": "cloud.appspace.com"}
+_ASHN_MAP_HOST_RE = re.compile(r"[a-z0-9.-]+")
+
+
+def _jq_or(*values):
+    """jq's `a // b // c`: the first value that is not null or false, else the last."""
+    for v in values[:-1]:
+        if v is not None and v is not False:
+            return v
+    return values[-1]
+
+
+def _jq_str(v):
+    """jq's `tostring`: a string as it is, anything else as compact JSON."""
+    return v if isinstance(v, str) else json.dumps(v, separators=(",", ":"))
+
+
+def _ashn_map_row(flat):
+    """The ASHN map entry the publisher builds from the merged values of an env,
+    as {ashn, name, host, sub, type, zone}, or None for an env it skips: not a
+    private cloud, or no ashn. Like the publisher, "" is a value, not unset."""
+    def get(k):
+        return flat.get("appspace." + k)
+    if get("environmentType") != "private-cloud":
+        return None
+    ashn = _jq_str(_jq_or(get("ashn"), ""))
+    if not ashn:
+        return None
+    sub = _jq_str(_jq_or(get("customerSubdomain"), get("customerName"), ""))
+    kind = (_jq_str(_jq_or(get("cloudShortName"), "")) + "-"
+            + _jq_str(_jq_or(get("deploymentType"), "")))
+    zone = _ASHN_MAP_ZONES.get(kind, "")
+    if kind == "az-pv-prod":
+        zone = _jq_str(_jq_or(get("infra.az.loadBalancers.nginxFrontend.subdomainType"), ""))
+    return {"ashn": ashn, "name": ashn + "." + _jq_str(_jq_or(get("ashnDomain"), "")),
+            "host": f"{sub}.{zone}" if sub and zone else "", "sub": sub, "type": kind,
+            "zone": zone}
+
+
+def _ashn_map_problems(row) -> list:
+    """[(kind, why)] for the cases the publisher refuses in one entry. A
+    malformed ashn is the ashn_format gate, so its name is not checked."""
+    out = []
+    if _ASHN_FORMAT_RE.match(row["ashn"]) and row["name"] != f"{row['ashn']}.{_ASHN_MAP_DOMAIN}":
+        out.append(("ashn_domain", row["name"][len(row["ashn"]) + 1:] or "no ashnDomain"))
+    if not row["host"]:
+        out.append(("ashn_no_host",
+                    "no customerSubdomain or customerName" if not row["sub"]
+                    else "no subdomainType on Azure" if row["type"] == "az-pv-prod"
+                    else f"{row['type']} is not a type the map knows"))
+    elif not _ASHN_MAP_HOST_RE.fullmatch(row["host"]):
+        out.append(("ashn_host_format", row["host"]))
+    return out
+
+
+def _is_prod_pv_config_file(path):
+    """A config.yaml in the merged values of prod or AEC private clouds: the
+    cloud folder, its prod or aec tier, or anything under private-cloud there."""
+    p = path.split("/")
+    return (p[0] in ("gcp", "azure") and p[-1] == "config.yaml"
+            and (len(p) == 2 or p[1] in ("prod", "aec")
+                 and (len(p) == 3 or p[2] == "private-cloud")))
+
+
+def _ashn_map_candidates(changed, renames, path_map, sha, base_sha, repo=None) -> dict:
+    """{path at sha: path at base_sha or None} of the prod and AEC envs whose ASHN
+    map entry this PR can change: a moved customer.yaml, a customer.yaml whose
+    map keys change (a new env too), and the live envs below a config.yaml whose
+    map keys change. A file that does not touch the keys costs two cached reads.
+    A teardown is skipped."""
+    renames = renames or {}
+    targets = set(renames.values())
+    pairs = {n: o for o, n in renames.items() if _is_prod_pv_env_file(n)}
+    for f in sorted({posixpath.normpath(f.lstrip("/")) for f in changed or ()}):
+        env_file = _is_prod_pv_env_file(f)
+        if f in renames or f in targets or not (env_file or _is_prod_pv_config_file(f)):
+            continue
+        old_doc, old_st = _read_first_doc(f, base_sha, repo, True)
+        new_doc, new_st = _read_first_doc(f, sha, repo, True)
+        if env_file and new_st == "absent":
+            continue
+        old, new = _flatten_yaml(old_doc), _flatten_yaml(new_doc)
+        if "unparsable" not in (old_st, new_st) and all(
+                repr(old.get(k)) == repr(new.get(k)) for k in _ASHN_MAP_KEYS):
+            continue
+        if env_file:
+            pairs[f] = None if old_st == "absent" else f
+            continue
+        folder = posixpath.dirname(f) + "/"
+        pairs.update({p: p for p in path_map or () if p.startswith(folder)
+                      and _is_prod_pv_env_file(p) and p not in renames and p not in pairs})
+    return pairs
+
+
+def _ashn_map_entry(path, sha, repo=None):
+    """_ashn_map_row of an env at `sha`, None when it has none or its values
+    cannot be parsed. A failed read raises, so the PR is retried."""
+    flat = _merged_kcc_flat_for_env(path, sha, repo, strict=True) if path else None
+    return _ashn_map_row(flat) if flat is not None else None
+
+
+def _detect_ashn_map_gates(changed, renames, path_map, sha, base_sha, repo=None, skip=()):
+    """(gates, notes): what the ASHN map publisher would refuse in an entry
+    this PR changes (_ashn_map_candidates). One gate per problem that this PR
+    causes, so a problem already on main does not block it:
+
+    - `ashn_domain`: the name is not `<ashn>.api.cloud.appspace.com`.
+    - `ashn_no_host`: the env has no instance host for the map.
+    - `ashn_host_format`: the host is not lowercase letters, digits, dots, dashes.
+    - `ashn_two_hosts`: another env gives the same name another host. An env in
+      `skip`, already named by ashn_taken or ashn_copy, is not checked for it.
+
+    Nothing lifts them. The live envs are read only for an entry with a host."""
+    if not base_sha:
+        return [], []
+    pairs = _ashn_map_candidates(changed, renames, path_map, sha, base_sha, repo)
+    gates, rows = [], {}
+    for path, old_path in sorted(pairs.items()):
+        row = _ashn_map_entry(path, sha, repo)
+        if not row:
+            continue
+        old = _ashn_map_entry(old_path, base_sha, repo)
+        rows[path] = (row, old)
+        known = {k for k, _ in _ashn_map_problems(old)} if old else set()
+        for kind, why in _ashn_map_problems(row):
+            if kind in known:
+                continue
+            g = {"kind": kind, "env": path.split("/")[-2], "why": why, "ashn": row["ashn"],
+                 "path": path}
+            if kind == "ashn_domain":
+                g["src"] = _effective_key(path, sha, "appspace.ashnDomain", repo)[1]
+            gates.append(g)
+    todo = {p: r for p, r in rows.items() if r[0]["host"] and p not in skip}
+    if not todo:
+        return gates, []
+    fleet, unread = _fleet_own_identities(repo, base_sha)
+    changed = {posixpath.normpath(f.lstrip("/")) for f in changed or ()}
+    pool = {p: v[2] for p, v in fleet.items()
+            if p not in changed and p not in (renames or {})}
+    for p in sorted(changed):
+        if _is_prod_pv_env_file(p):
+            doc, st = _read_first_doc(p, sha, repo, True)
+            if st == "ok":
+                pool[p] = _own_identity(doc)[2]
+    back = {n: o for o, n in (renames or {}).items()}
+    for path, (row, old) in sorted(todo.items()):
+        others = []
+        for q in sorted(q for q, a in pool.items() if a == row["ashn"] and q != path):
+            qrow = _ashn_map_entry(q, sha, repo)
+            if not qrow or qrow["name"] != row["name"] or not qrow["host"] \
+                    or qrow["host"] == row["host"]:
+                continue
+            qold = _ashn_map_entry(back.get(q, q), base_sha, repo)
+            if old and qold and qold["name"] == old["name"] and qold["host"] \
+                    and old["host"] and qold["host"] != old["host"]:
+                continue  # the two hosts are on main already
+            others.append({"path": q, "host": qrow["host"]})
+        if others:
+            gates.append({"kind": "ashn_two_hosts", "env": path.split("/")[-2],
+                          "why": f"{others[0]['path'].split('/')[-2]} gives it "
+                                 f"{others[0]['host']}",
+                          "ashn": row["ashn"], "path": path, "host": row["host"],
+                          "others": others})
+    notes = []
+    if unread:
+        notes.append(f"\u26a0\ufe0f ASHN map check skipped {len(unread)} environment(s) that "
+                     "could not be read, so one ashn on two instance hosts is not ruled out.")
+    elif not fleet:
+        notes.append("\u26a0\ufe0f ASHN map check unavailable: the ArgoCD app list is not "
+                     "loaded, so one ashn on two instance hosts is not ruled out.")
+    return gates, notes
+
+
 def _ashn_lines(gates, notes=()) -> list:
     """The panels of the ashn gates (a copied clone ashn, an ashn in use, a
     malformed ashn), then the notes of the check. Plain lines, like
@@ -7783,6 +7964,42 @@ def _ashn_lines(gates, notes=()) -> list:
         lines += [f"- `{g['env']}` has `ashn: {g['ashn']}`." for g in bad]
         lines += ["", ("An ashn is 4 hex digits, `x` and 4 hex digits, like `3a02x8649`. "
                        f"Copy it from column A of the ASHN sheet ({_ASHN_SHEET})."), ""]
+    domain = [g for g in gates or () if g["kind"] == "ashn_domain"]
+    if domain:
+        lines += [f"## \u26d4 ASHN NAME NOT ON {_ASHN_MAP_DOMAIN}", ""]
+        lines += [(f"- `{g['env']}` has `ashn: {g['ashn']}` on `{g['why']}`, set in `{g['src']}`."
+                   if g.get("src") else f"- `{g['env']}` has `ashn: {g['ashn']}` and no "
+                   "`ashnDomain`.") for g in domain]
+        lines += ["", (f"The name servers answer only `<ashn>.{_ASHN_MAP_DOMAIN}`, and the job "
+                       "that publishes the ASHN map refuses the whole map with any other "
+                       f"name. Set `ashnDomain` to `{_ASHN_MAP_DOMAIN}`, or remove the value "
+                       "that overrides it."), ""]
+    no_host = [g for g in gates or () if g["kind"] == "ashn_no_host"]
+    if no_host:
+        lines += ["## \u26d4 NO INSTANCE HOST FOR THE ASHN MAP", ""]
+        lines += [f"- `{g['env']}` (`ashn: {g['ashn']}`): {g['why']}." for g in no_host]
+        lines += ["", ("The ASHN map points each ashn at the instance host the micro-services "
+                       "chart builds: `customerSubdomain` or `customerName`, then "
+                       "`cloud.appspace.com`, or `infra.az.loadBalancers.nginxFrontend."
+                       "subdomainType` on Azure. With no host, the job refuses the whole "
+                       "map."), ""]
+    host = [g for g in gates or () if g["kind"] == "ashn_host_format"]
+    if host:
+        lines += ["## \u26d4 INSTANCE HOST NOT IN LOWERCASE", ""]
+        lines += [f"- `{g['env']}` (`ashn: {g['ashn']}`) gives `{g['why']}`." for g in host]
+        lines += ["", ("The name servers take only lowercase letters, digits, dots and dashes "
+                       "in an instance host, and the job refuses the whole map otherwise. Fix "
+                       "`customerSubdomain` or `customerName`."), ""]
+    two = [g for g in gates or () if g["kind"] == "ashn_two_hosts"]
+    if two:
+        lines += ["## \u26d4 ONE ASHN, TWO INSTANCE HOSTS", ""]
+        lines += [f"- `{g['env']}` gives `ashn: {g['ashn']}` the host `{g['host']}`, and "
+                  + ", ".join(f"`{o['path'].split('/')[-2]}` (`{o['path']}`) gives it "
+                              f"`{o['host']}`" for o in g["others"]) + "."
+                  for g in two]
+        lines += ["", ("The ASHN map takes one instance host per ashn, so the job refuses the "
+                       "whole map. Give one environment its own ashn from the ASHN sheet "
+                       f"({_ASHN_SHEET}), or make both build the same host."), ""]
     return lines + [x for n in notes for x in (n, "")]
 
 
@@ -13988,6 +14205,11 @@ def process_pr(pr, path_map, base_sha="", repo=None):
         # An ashn another env uses, or a malformed prod ashn: nothing lifts them either.
         ashn_gates, ashn_notes = _detect_ashn_gates(changed, renames, render_sha,
                                                     base_sha, repo=repo)
+        # And the rest of what the ASHN map publisher refuses, from the merged values.
+        map_gates, map_notes = _detect_ashn_map_gates(
+            changed, renames, path_map, render_sha, base_sha, repo=repo,
+            skip={g["path"] for g in ashn_gates if g["kind"] in ("ashn_taken", "ashn_copy")})
+        ashn_gates, ashn_notes = ashn_gates + map_gates, ashn_notes + map_notes
         # A new GCP env on an n4 or c4 machine with a pd- disk: GCP rejects it.
         disk_gates, prereqs = _new_env_prereqs(new_env_candidates, render_sha, repo=repo)
         # A new or moved env that no ApplicationSet reads: nothing deploys.
