@@ -172,6 +172,8 @@ def test_s3_chart_pull_timeout_returns_promptly(monkeypatch):
     monkeypatch.setitem(m._app_chart_registry_map, app, "reg.example.com")
     monkeypatch.setitem(m._app_value_files_map, app, ["$config/a/customer.yaml"])
     monkeypatch.setitem(m._app_namespace_map, app, "ns")
+    monkeypatch.setattr(m, "_fetch_value_files",
+                        lambda vfs, sha: {vf: "appspace: {}\n" for vf in vfs})
     monkeypatch.setattr(m, "DIFF_TIMEOUT", 1)
     release = threading.Event()
 
