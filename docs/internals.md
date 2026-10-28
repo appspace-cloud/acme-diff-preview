@@ -400,6 +400,16 @@ really reads and that have live apps: `cl-*/config.yaml`, and
 `constellation/customer.yaml`, which is only a Helm values file). A removed
 environment is not checked: that is a decommission.
 
+### Which chart version the main side renders
+
+The version `appspace.version` resolves to in the value files at the base
+commit, last file wins, the same way the PR side is resolved. The Argo CD
+`targetRevision` is used only when those files set no version. Argo CD lags
+behind `main` (the ApplicationSet refresh plus the `PATH_MAP_TTL` app-list
+cache), so a PR rendered right after `main` moved an environment used to show
+that move as a version bump of its own. When Argo CD still has another version,
+the comment says so in one line.
+
 ### Why waking an AEC clone is blocked
 
 An AEC clone (a folder with an `--aec<n>` token) starts with a copy of the

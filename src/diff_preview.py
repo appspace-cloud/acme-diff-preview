@@ -15,7 +15,8 @@ agents. Typical latency: 4-6s/app with warm chart cache vs 20-360s with ArgoCD.
 
 When the PR bumps appspace.version (= the OCI chart targetRevision), the new
 version is detected from the PR config file via Bitbucket API and used for the
-PR render while main render uses the current stored targetRevision.
+PR render. The main render uses the version the value files set at the base
+sha, and the stored targetRevision only when those files set none.
 
 Diff outcome model:
 - diff          : a real manifest diff was produced (helm renders differ)
@@ -6497,6 +6498,39 @@ def _resolve_effective_pr_chart_revision(app, pr_sha, main_sha=None, renames=Non
     return _effective_chart_version(pr_value_files, vals)
 
 
+# (app, main_sha, argo_rev) -> resolved main revision. Shas are immutable, so
+# an entry never goes stale; the Argo CD revision is in the key because it is
+# the fallback. Cleared past the cap like the other per-sha caches.
+_MAIN_CHART_REVISION_CACHE_MAX = 5000
+_main_chart_revision_cache: dict = {}
+_main_chart_revision_lock = threading.Lock()
+
+
+def _main_chart_revision(app, main_sha):
+    """Chart version the app has on main at main_sha.
+
+    The Argo CD targetRevision lags behind main (ApplicationSet refresh plus
+    the PATH_MAP_TTL app-list cache), so a PR rendered right after main moved
+    an environment would diff against the old chart. Resolve it from the
+    value files at main_sha, the same way the PR side is resolved, and keep
+    the Argo CD revision only when the files set no version. None means the
+    app is not discovered yet.
+    """
+    argo_rev = _app_chart_revision_map.get(app)
+    if not main_sha or not argo_rev:
+        return argo_rev
+    key = (app, main_sha, argo_rev)
+    with _main_chart_revision_lock:
+        if key in _main_chart_revision_cache:
+            return _main_chart_revision_cache[key]
+    rev = _resolve_effective_pr_chart_revision(app, main_sha) or argo_rev
+    with _main_chart_revision_lock:
+        if len(_main_chart_revision_cache) >= _MAIN_CHART_REVISION_CACHE_MAX:
+            _main_chart_revision_cache.clear()
+        _main_chart_revision_cache[key] = rev
+    return rev
+
+
 def _pr_chart_revision(app, candidate_files, pr_sha):
     """Return the new OCI chart targetRevision for an app if the PR changes it.
 
@@ -6550,7 +6584,7 @@ def _pr_chart_revision_checked(app, candidate_files, pr_sha, main_sha=None, rena
     the first changed-file version only when the live valueFiles map is not
     yet cached for the app.
     """
-    current_rev = _app_chart_revision_map.get(app)
+    current_rev = _main_chart_revision(app, main_sha)
     if not current_rev:
         return None, False
     invalid = False
@@ -9418,7 +9452,10 @@ def _run_one_diff(app, pr_sha, main_sha, chart_revision=None, changed_paths=None
       caller decides whether to retry (see RETRYABLE_REASONS).
     """
     chart_name  = _app_chart_map.get(app)
-    main_rev    = _app_chart_revision_map.get(app)
+    try:
+        main_rev = _main_chart_revision(app, main_sha)
+    except Exception as e:
+        return None, REASON_RENDER, f"main chart version lookup failed: {str(e)[:150]}"
     registry    = _app_chart_registry_map.get(app, "")
     value_files = _app_value_files_map.get(app, [])
     namespace   = _app_namespace_map.get(app, "")
@@ -12595,7 +12632,8 @@ def format_comment(pr_sha, app_results, skipped_apps=None, base_sha="",
                     appspace_state_lines=None, appendix_lines=None,
                     vm_change_lines=None, artifact_url="",
                     readable_budget=None, profile=None, paused_apps=None,
-                    gates=None, authors_line="", new_env_awaiting=False):
+                    gates=None, authors_line="", new_env_awaiting=False,
+                    argo_lag=None):
     """Format the full PR comment. Never uses <details>/<summary> — Bitbucket
     does not render them. Large changesets get a compact summary table at the
     top (all apps, one row each) and, for the diff sections below, apps
@@ -12983,6 +13021,20 @@ def format_comment(pr_sha, app_results, skipped_apps=None, base_sha="",
     # (does not blame this PR), but visible so someone finishes the prune.
     if leftover_lines:
         lines += leftover_lines
+
+    # argo_lag: {app: (argo_rev, main_rev)}. Informational: the diff already
+    # compares against main, this only explains why Argo CD shows another
+    # version than the one the comment uses.
+    if argo_lag:
+        by_env = {}
+        for app, (argo_rev, main_rev) in argo_lag.items():
+            for env in _envs_from_apps([app]):
+                by_env[env] = (argo_rev, main_rev)
+        lines += ["\u2139\ufe0f Argo CD has not applied main yet for these apps, so this "
+                  "diff compares against the chart version on main: "
+                  + ", ".join(f"`{env}` (Argo CD `{a}`, main `{b}`)"
+                              for env, (a, b) in sorted(by_env.items()))
+                  + ".", ""]
 
     # ── VM infrastructure changes ─────────────────────────────────────
     # Between the decommission warning (whole-environment destruction
@@ -14437,6 +14489,20 @@ def process_pr(pr, path_map, base_sha="", repo=None):
                         f"{len(pr_chart_revisions)} app(s) -> {unique_bumps}",
                         pr=pr_id)
 
+        # The main side renders the version main has. Where Argo CD has not
+        # applied it yet, the comment says so instead of counting it as part
+        # of this PR.
+        main_chart_revisions = {app: _main_chart_revision(app, base_sha)
+                                for app in affected}
+        argo_lag = {app: (_app_chart_revision_map[app], rev)
+                    for app, rev in main_chart_revisions.items()
+                    if rev and rev != _app_chart_revision_map.get(app)}
+        if argo_lag:
+            logsink.log(f"PR #{pr_id}: Argo CD has not applied main's chart version "
+                        f"for {len(argo_lag)} app(s): "
+                        + ", ".join(f"{a} {o} -> {n}" for a, (o, n) in sorted(argo_lag.items())),
+                        pr=pr_id)
+
         # Record which chart builds this PR renders with, so a republish of
         # any of them (JFrog webhook) can force this PR to recompute. Covers
         # both the main-side build and the PR-side bumped build.
@@ -14445,7 +14511,7 @@ def process_pr(pr, path_map, base_sha="", repo=None):
             _cn = _app_chart_map.get(app)
             if not _cn:
                 continue
-            _mr = _app_chart_revision_map.get(app)
+            _mr = main_chart_revisions.get(app)
             if _mr:
                 _targets.add((_cn, _mr))
             _bumped = pr_chart_revisions.get(app)
@@ -14572,7 +14638,7 @@ def process_pr(pr, path_map, base_sha="", repo=None):
             for app in affected:
                 chart   = _app_chart_map.get(app)
                 reg     = _app_chart_registry_map.get(app)
-                main_rv = _app_chart_revision_map.get(app)
+                main_rv = main_chart_revisions.get(app)
                 pr_rv   = pr_chart_revisions.get(app, main_rv)
                 if chart and reg:
                     if main_rv:
@@ -14816,7 +14882,8 @@ def process_pr(pr, path_map, base_sha="", repo=None):
             appspace_state_lines=appspace_state_lines or None,
             appendix_lines=((decom_full_lines or [])
                             + (new_env_full_lines or [])) or None,
-            vm_change_lines=vm_change_lines or None, gates=gates or None)
+            vm_change_lines=vm_change_lines or None, gates=gates or None,
+            argo_lag=argo_lag or None)
         # COPS-2655: a change to a paused environment is never applied, so
         # both the comment and the full-diff page have to say so. Read at
         # pr_sha because the question is what is true AFTER the merge.

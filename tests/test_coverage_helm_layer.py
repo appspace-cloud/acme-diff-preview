@@ -265,6 +265,10 @@ def diff_world(helm_world, monkeypatch):
     monkeypatch.setitem(m._app_value_files_map, APP,
                         ["$config/gcp/dev/x/pv-helm-a/customer.yaml"])
     monkeypatch.setitem(m._app_namespace_map, APP, "pv-helm-a")
+    # The main chart version is read from the base value files before any
+    # pull. No version there keeps the Argo CD revision above.
+    monkeypatch.setattr(m, "_fetch_value_files",
+                        lambda vfs, sha: {vf: "appspace: {}\n" for vf in vfs})
     with m._main_render_lock:
         m._main_render_cache.clear()
     yield helm_world
