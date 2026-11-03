@@ -17,7 +17,9 @@ shared source of truth and has to be asked.
 
 Deliberately unchanged: with no bucket, a stale sha still resolves to the
 newest local artifact (test_load_by_stale_sha_returns_latest), and a matching
-sha still costs zero network calls (the warm-cache win).
+sha is still served without a download (the warm-cache win). It costs one
+object-generation lookup, because the same sha can be rendered again
+(test_same_sha_rerender_artifact.py).
 """
 import json
 import os
@@ -110,15 +112,16 @@ def test_refetched_artifact_replaces_the_stale_local_copy(tmp_path,
     diff_ui.save_artifact(leader, REPO, PR, NEW_SHA, "new", bucket="b")
     diff_ui.load_artifact(standby, REPO, PR, NEW_SHA, bucket="b")
 
-    # Second read for the same sha is local-only again: the refresh healed
-    # the cache instead of turning every later view into a GCS round trip.
+    # Second read for the same sha is served locally again: the refresh
+    # healed the cache instead of turning every later view into a download.
     before = len(calls)
     art = diff_ui.load_artifact(standby, REPO, PR, NEW_SHA, bucket="b")
     assert art["sha"] == NEW_SHA
-    assert len(calls) == before, "healed cache must not re-hit GCS"
+    assert not [u for u in calls[before:] if "alt=media" in u], \
+        "healed cache must not download again"
 
 
-def test_matching_sha_never_touches_the_network(tmp_path, monkeypatch):
+def test_matching_sha_never_downloads(tmp_path, monkeypatch):
     """The warm-cache win must survive this fix."""
     objects, calls = {}, []
     _gcs(monkeypatch, objects, calls)
@@ -127,7 +130,7 @@ def test_matching_sha_never_touches_the_network(tmp_path, monkeypatch):
     before = len(calls)
     assert diff_ui.load_artifact(base, REPO, PR, NEW_SHA,
                                  bucket="b")["sha"] == NEW_SHA
-    assert len(calls) == before
+    assert not [u for u in calls[before:] if "alt=media" in u]
 
 
 def test_stale_sha_without_bucket_still_returns_the_newest_local(tmp_path):

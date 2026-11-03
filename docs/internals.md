@@ -1279,6 +1279,17 @@ PR's last diff run. The local cache also has a byte budget
 `sizeLimit` the kubelet enforces by **evicting the pod**, and a count is the
 wrong unit for files spanning 2KB to tens of MB.
 
+#### A matching sha is not a fresh copy
+
+The same commit is rendered again when its last result was not final (a chart
+not in the registry yet, a transient error) or its base moved. A replica that
+cached the first render would keep serving it for the same URL. So each
+replica remembers the bucket object generation of its local copies, and a
+local hit with a matching sha costs one metadata read (`?fields=generation`).
+It downloads only when the generation changed. If the bucket cannot be read,
+the local copy is served. After a restart the map is empty, so the first view
+of each PR downloads it once.
+
 #### Navigation and anchors (COPS-2611 / COPS-2622)
 
 An index lists every application with its resource count, collapsed per

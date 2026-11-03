@@ -709,7 +709,8 @@ def test_load_artifact_falls_back_to_gcs_and_caches_locally(tmp_path,
     n = len(calls)
     art2 = diff_ui.load_artifact(dst, "acme-config-stage", 2679,
                                  "d7dfd92fd43b", bucket="b")
-    assert art2 and len(calls) == n  # second read: warmed local cache only
+    # second read: warmed local cache, no download
+    assert art2 and not [u for u in calls[n:] if "alt=media" in u]
 
 
 def test_load_artifact_gcs_404_returns_none_without_warning(tmp_path,

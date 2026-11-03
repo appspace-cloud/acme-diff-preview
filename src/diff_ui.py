@@ -295,11 +295,13 @@ def _gcs_error_is_transient(e) -> bool:
     return isinstance(e, (TimeoutError, urllib.error.URLError, OSError))
 
 
-def _gcs_upload(bucket, name, data):
+def _gcs_upload(bucket, name, data, generations=None):
     """Upload one object, retrying transient failures. True on success.
 
     Still non-fatal in every case: durability is a bonus tier and a bucket
     outage must never block a PR comment or fail a diff run.
+
+    generations, when given, records the new object generation by name.
     """
     last = None
     for attempt in range(1, _GCS_UPLOAD_ATTEMPTS + 1):
@@ -311,8 +313,10 @@ def _gcs_upload(bucket, name, data):
                 url, data=data, method="POST",
                 headers={"Authorization": f"Bearer {_gcs_token()}",
                          "Content-Type": "application/json"})
-            with urllib.request.urlopen(req, timeout=_GCS_TIMEOUT):
-                pass
+            with urllib.request.urlopen(req, timeout=_GCS_TIMEOUT) as r:
+                body = r.read()
+            if generations is not None:
+                _note_generation(generations, name, body)
             _stat("artifact_gcs_upload_ok")
             return True
         except Exception as e:
@@ -388,7 +392,7 @@ def retry_pending_uploads() -> int:
             with _pending_lock:
                 _pending_uploads.pop(key, None)
             continue
-        if _gcs_upload(bucket, name, payload):
+        if _gcs_upload(bucket, name, payload, _local_generation):
             healed += 1
             with _pending_lock:
                 _pending_uploads.pop(key, None)
@@ -396,9 +400,48 @@ def retry_pending_uploads() -> int:
     return healed
 
 
-def _gcs_download(bucket, name):
+# Bucket object generation of each local artifact, by object name. The same
+# commit is rendered again when its last result was not final or its base
+# moved, so a matching sha does not prove the local copy is the current one.
+# One entry per artifact name, so it stays as small as the artifact cache.
+_local_generation: dict = {}
+
+
+def _note_generation(generations, name, upload_response):
+    try:
+        gen = json.loads(upload_response or b"{}").get("generation")
+    except (ValueError, AttributeError):
+        gen = None
+    if gen:
+        generations[name] = str(gen)
+
+
+def _gcs_generation(bucket, name):
+    """The object's current generation, or None when it cannot be read."""
+    try:
+        url = ("https://storage.googleapis.com/storage/v1/b/"
+               f"{urllib.parse.quote(bucket, safe='')}/o/"
+               f"{urllib.parse.quote(name, safe='')}?fields=generation")
+        req = urllib.request.Request(
+            url, headers={"Authorization": f"Bearer {_gcs_token()}"})
+        with urllib.request.urlopen(req, timeout=_GCS_TIMEOUT) as r:
+            gen = json.loads(r.read() or b"{}").get("generation")
+        return str(gen) if gen else None
+    except urllib.error.HTTPError as e:
+        if e.code != 404:
+            _warn(f"[diff-ui] GCS generation of {name} failed (non-fatal): "
+                  f"HTTP {e.code}")
+        return None
+    except Exception as e:
+        _warn(f"[diff-ui] GCS generation of {name} failed (non-fatal): {e}")
+        return None
+
+
+def _gcs_download(bucket, name, generations=None):
     """Return an object's bytes, or None. A 404 is a plain miss, not an
-    operational problem; anything else gets surfaced through the hook."""
+    operational problem; anything else gets surfaced through the hook.
+
+    generations, when given, records the downloaded object generation."""
     try:
         url = ("https://storage.googleapis.com/storage/v1/b/"
                f"{urllib.parse.quote(bucket, safe='')}/o/"
@@ -406,6 +449,11 @@ def _gcs_download(bucket, name):
         req = urllib.request.Request(
             url, headers={"Authorization": f"Bearer {_gcs_token()}"})
         with urllib.request.urlopen(req, timeout=_GCS_TIMEOUT) as r:
+            if generations is not None:
+                gen = (getattr(r, "headers", None) or {}).get(
+                    "x-goog-generation")
+                if gen:
+                    generations[name] = str(gen)
             return r.read()
     except urllib.error.HTTPError as e:
         if e.code != 404:
@@ -499,7 +547,7 @@ def save_artifact(base_dir, repo, pr_id, sha, body, pr_url="",
     _prune(base_dir, max_artifacts, max_bytes)
     if bucket:
         name = os.path.basename(path)
-        if _gcs_upload(bucket, name, payload):
+        if _gcs_upload(bucket, name, payload, _local_generation):
             # Drop the other encoding in GCS so a failed zst upload cannot
             # leave a stale legacy object preferred on the next miss.
             other_name = (name[:-4] if name.endswith(".zst")
@@ -585,7 +633,7 @@ def load_artifact(base_dir, repo, pr_id, sha, bucket=""):
     # inline even though it reads worse.
     base_path = os.path.abspath(base_dir)
     names = (f"{repo}__{pr_s}.json.zst", f"{repo}__{pr_s}.json")
-    local = None
+    local = local_name = None
     for name in names:
         fullpath = os.path.normpath(os.path.join(base_path, name))
         if not fullpath.startswith(base_path):
@@ -595,6 +643,7 @@ def load_artifact(base_dir, repo, pr_id, sha, bucket=""):
             with open(fullpath, "rb") as f:
                 data = f.read()
             local = _decode_artifact_bytes(data)
+            local_name = name
             break
         except (OSError, ValueError, UnicodeDecodeError, json.JSONDecodeError):
             continue
@@ -603,12 +652,17 @@ def load_artifact(base_dir, repo, pr_id, sha, bucket=""):
             if type(e).__name__ == "ZstdError":
                 continue
             raise
-    if local is not None and (not bucket or str(local.get("sha")) == sha):
-        return local
     if not bucket:
         return local
+    rerendered = False
+    if local is not None and str(local.get("sha")) == sha:
+        gen = _gcs_generation(bucket, local_name)
+        if gen is None or gen == _local_generation.get(local_name):
+            return local
+        rerendered = True
     for name in names:
-        data = _gcs_download(bucket, name)
+        downloaded = {}
+        data = _gcs_download(bucket, name, downloaded)
         if data is None:
             continue
         try:
@@ -619,7 +673,7 @@ def load_artifact(base_dir, repo, pr_id, sha, bucket=""):
             if type(e).__name__ == "ZstdError":
                 continue
             raise
-        if (local is not None
+        if (local is not None and not rerendered
                 and str(artifact.get("sha")) == str(local.get("sha"))):
             # GCS is no fresher than what we already hold: keep serving the
             # local copy rather than rewriting it for nothing.
@@ -644,6 +698,7 @@ def load_artifact(base_dir, repo, pr_id, sha, bucket=""):
             with os.fdopen(fd, "wb") as f:
                 f.write(data)
             os.replace(tmp, fullpath)
+            _local_generation.update(downloaded)
             # Drop the other encoding so the healed copy is the only one the
             # next local read can find.
             other = os.path.normpath(os.path.join(
