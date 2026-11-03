@@ -15,6 +15,7 @@ here is required to use the tool; it is for people changing it or debugging it.
 - [Why a copied clone ashn is blocked](#why-a-copied-clone-ashn-is-blocked)
 - [Why a prod ashn must be unique and well formed](#why-a-prod-ashn-must-be-unique-and-well-formed)
 - [Why a prod ashn must fit the ASHN map](#why-a-prod-ashn-must-fit-the-ashn-map)
+- [Why two cells of one customer must not share a DNS name or a VM](#why-two-cells-of-one-customer-must-not-share-a-dns-name-or-a-vm)
 - [Why a new env needs an ApplicationSet glob](#why-a-new-env-needs-an-applicationset-glob)
 - [Why a KCC linux VM needs hostingID](#why-a-kcc-linux-vm-needs-hostingid)
 - [Why a key in a file the ApplicationSet does not read is blocked](#why-a-key-in-a-file-the-applicationset-does-not-read-is-blocked)
@@ -531,6 +532,46 @@ values costs two cached reads per file. Only a problem the PR causes is a gate,
 so a problem already on `main` does not block an unrelated PR. The live
 environments are read only for an entry with a host, with the same notes as the
 other ashn gates. A failed read retries the PR. Nothing lifts them.
+
+### Why two cells of one customer must not share a DNS name or a VM
+
+A customer moves to a new cell by adding a folder with another suffix
+(`pv-<customer>-a` to `pv-<customer>-b`). Both cells keep the `customerName`,
+so the load-balancer chart gives both the same A record,
+`<customerSubdomain or customerName>.<domain>`, each pointing at its own
+address. The chart writes it only when
+`appspace.loadBalancers.dns.managedZone.enabled` is true, and Config Connector
+takes the name at the next sync. Nothing waits for the new load balancer, the
+data, or the cutover decision. With `decommission: true` the record gets
+`deletion-policy: delete`. The zone and domain come from the cloud and
+deployment type, the same map as the chart, on GCP and Azure.
+
+The gates follow from that:
+
+- `dns_two_owners`: a cell turns the record on while another cell of the
+  customer writes it, on `main` or in the PR. Off on the old cell and on in the
+  new one in one PR counts: the two apps sync in any order, so the old
+  controller can write its address back after the new one.
+- `dns_new_sibling`: a new cell turns the record on, and a live cell answers on
+  that name, by its own record or by a record made by hand.
+- `dns_decommission_shared`: a cell armed for deletion still writes a name a
+  live cell answers on.
+- `vm_shared`: two cells render a KCC VM with the same project and name. Both
+  manage one machine, and decommissioning either deletes it.
+
+The cutover the gates allow is one PR per step: the new cell with the record
+off and its own VM names, then the old cell turns the record off (abandon keeps
+it in Cloud DNS), then the new cell turns it on once Argo has pruned the old
+DNSRecordSet. The old cell is decommissioned after that.
+
+The check reads the merged values of the cells the PR can change: a
+`customer.yaml` it adds, changes, moves or deletes, and the live cells below a
+`config.yaml` whose own values for these keys change. Their siblings are the
+live cells at base with the same own `customerName`, or the folder
+`<prefix>-<customerName>-*`. Only a cell the PR changes is judged, so a state
+already on `main` does not block an unrelated PR. A failed read retries the
+PR. A sibling whose values cannot be parsed is a note, not a pass. Nothing
+lifts the gates: each fix is a values change.
 
 ### Why a new env needs an ApplicationSet glob
 
