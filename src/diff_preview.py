@@ -67,6 +67,7 @@ import user_content  # COPS-2697 shared user-content identity (same-dir module, 
 import blast_radius  # COPS-2693 Plan B blast-radius assessment (same-dir module, stdlib only)
 import values_redundancy  # COPS-2721 higher-layer redundant value callout
 import immutable_guard  # COPS-2833 fields that cannot change on a live resource
+import suffix_migration  # two cells of one customer: shared LB record or KCC VM
 import yaml_hygiene  # COPS-2766 YAML slips in a value file (same-dir module, pure)
 import render_cache  # three-tier main-render cache (same-dir module)
 from render_cache import (  # re-exported: the suite reaches these on the hub
@@ -8037,6 +8038,119 @@ def _ashn_lines(gates, notes=()) -> list:
     return lines + [x for n in notes for x in (n, "")]
 
 
+_SUFFIX_KINDS = ("dns_two_owners", "dns_new_sibling", "dns_decommission_shared", "vm_shared")
+
+
+def _suffix_keys(flat) -> dict:
+    """The merged values the suffix migration findings read."""
+    return {k: v for k, v in (flat or {}).items()
+            if k in suffix_migration.KEYS or k.startswith(_KCC_PREFIX)}
+
+
+def _suffix_migration_envs(changed, renames, path_map, sha, base_sha, repo=None) -> dict:
+    """{path at sha: path at base_sha} of the private clouds this PR can move
+    in the findings: a customer.yaml it adds, moves or deletes, or whose own
+    findings keys change, and the live envs below a config.yaml whose own
+    findings keys change. A path is None on the side where the env does not
+    exist."""
+    renames = renames or {}
+    back = {n: o for o, n in renames.items()}
+    pairs = {}
+    for f in sorted({posixpath.normpath(f.lstrip("/")) for f in changed or ()}):
+        env_file = _is_pv_env_file(f)
+        if f in renames or not (env_file or posixpath.basename(f) == "config.yaml"):
+            continue
+        old = _read_first_doc(back.get(f, f), base_sha, repo, True)
+        new = _read_first_doc(f, sha, repo, True)
+        if f not in back and "absent" not in (old[1], new[1]) \
+                and "unparsable" not in (old[1], new[1]) \
+                and repr(_suffix_keys(_flatten_yaml(old[0] or {}))) == \
+                repr(_suffix_keys(_flatten_yaml(new[0] or {}))):
+            continue
+        if env_file:
+            pairs[f] = None if old[1] == "absent" else back.get(f, f)
+        else:
+            folder = posixpath.dirname(f) + "/"
+            pairs.update({p: p for p in path_map or () if p.startswith(folder)
+                          and _is_pv_env_file(p) and p not in renames and p not in pairs})
+    return pairs
+
+
+def _detect_suffix_migration_gates(changed, renames, path_map, sha, base_sha, repo=None):
+    """(gates, notes) for a PR that lets two cells of one customer share the
+    public LB record or a KCC VM (suffix_migration.findings). The PR's envs are
+    judged with their siblings: the live envs at base with the same own
+    customerName, or the folder `<prefix>-<customerName>-*`. Nothing lifts the
+    gates; each fix is a values change. A failed read raises, so the PR is
+    retried. A sibling that cannot be read is a note, never a pass."""
+    if not base_sha:
+        return [], []
+    pairs = _suffix_migration_envs(changed, renames, path_map, sha, base_sha, repo)
+    if not pairs:
+        return [], []
+    base, head, names = {}, {}, set()
+    for path, old in sorted(pairs.items()):
+        env = path.split("/")[-2]
+        now = _merged_kcc_flat_for_env(path, sha, repo, strict=True) \
+            if _read_first_doc(path, sha, repo, True)[1] != "absent" else None
+        was = _merged_kcc_flat_for_env(old, base_sha, repo, strict=True) if old else None
+        for side, flat in ((head, now), (base, was)):
+            if flat is not None:
+                side[env] = _suffix_keys(flat)
+                names.add((str(flat.get("appspace.prefix") or ""),
+                           str(flat.get("appspace.customerName") or "")))
+    names = {n for n in names if n[1]}
+    if not names:
+        return [], []
+    fleet, unread = _fleet_own_identities(repo, base_sha)
+    tokens = {f"{p}-{cn}" for p, cn in names}
+    sibs = sorted(p for p in list(fleet) + unread
+                  if p not in pairs and p not in (renames or {})
+                  and (fleet.get(p, ("",))[0] in {cn for _, cn in names}
+                       or _uc_prefilter_token(p) in tokens))
+    skipped = []
+    for p in sibs:
+        env = p.split("/")[-2]
+        try:
+            was = _merged_kcc_flat_for_env(p, base_sha, repo, strict=True)
+            now = _merged_kcc_flat_for_env(p, sha, repo, strict=True) \
+                if _read_first_doc(p, sha, repo, True)[1] != "absent" else None
+        except ValueFileUnreadable:
+            was = None
+        if was is None:
+            skipped.append(env)
+            continue
+        base[env] = _suffix_keys(was)
+        if now is not None:
+            head[env] = _suffix_keys(now)
+    gates = suffix_migration.findings(base, head)
+    notes = []
+    if skipped:
+        notes.append("\u26a0\ufe0f Suffix migration check could not read "
+                     + ", ".join(f"`{e}`" for e in skipped) + ", so a shared DNS record or "
+                     "VM with it is not ruled out.")
+    elif not fleet:
+        notes.append("\u26a0\ufe0f Suffix migration check could not list the live "
+                     "environments (the ArgoCD app list is not loaded), so a shared DNS "
+                     "record or VM with another cell of the customer is not ruled out.")
+    return gates, notes
+
+
+def _suffix_migration_lines(gates, notes=()) -> list:
+    """The panel of the suffix migration gates, then the notes of the check."""
+    hits = [g for g in gates or () if g["kind"] in _SUFFIX_KINDS]
+    lines = []
+    if hits:
+        lines += ["## \u26d4 TWO CELLS OF ONE CUSTOMER SHARE A DNS NAME OR A VM", ""]
+        lines += [f"- {g['text']}" for g in hits]
+        lines += ["", ("A suffix migration is one PR per step: add the new cell with "
+                       f"`appspace.{suffix_migration.FLAG}: false` and its own VM names, turn "
+                       "the record off on the old cell, then turn it on in the new cell once "
+                       "Argo has pruned the old DNSRecordSet. Decommission the old cell after "
+                       "that."), ""]
+    return lines + [x for n in notes for x in (n, "")]
+
+
 # COPS-2833: what to do about a change the API rejects, by who rejects it.
 _IMMUTABLE_FIX = {
     "kcc": ("Config Connector rejects these changes, so the sync fails and nothing is "
@@ -14262,6 +14376,9 @@ def process_pr(pr, path_map, base_sha="", repo=None):
             changed, renames, path_map, render_sha, base_sha, repo=repo,
             skip={g["path"] for g in ashn_gates if g["kind"] in ("ashn_taken", "ashn_copy")})
         ashn_gates, ashn_notes = ashn_gates + map_gates, ashn_notes + map_notes
+        # Two cells of one customer that share the public LB record or a KCC VM.
+        suffix_gates, suffix_notes = _detect_suffix_migration_gates(
+            changed, renames, path_map, render_sha, base_sha, repo=repo)
         # A new GCP env on an n4 or c4 machine with a pd- disk: GCP rejects it.
         disk_gates, prereqs = _new_env_prereqs(new_env_candidates, render_sha, repo=repo)
         # A new or moved env that no ApplicationSet reads: nothing deploys.
@@ -14310,11 +14427,12 @@ def process_pr(pr, path_map, base_sha="", repo=None):
                 with _seen_lock:
                     _pr_chart_targets[sk] = set(chart_targets)
                 gates = _lift_gates(_merge_gates((), extra=clone_gates + dup_gates + ashn_gates
-                                                 + disk_gates + appset_gates + legacy_gates),
+                                                 + suffix_gates + disk_gates + appset_gates
+                                                 + legacy_gates),
                                     repo, pr_id, base_sha, pr_sha)
                 body, state, desc = format_new_env_comment(
                     pr_sha, _clone_wake_lines(gates) + _dup_identity_lines(gates, dup_unchecked)
-                    + _ashn_lines(gates, ashn_notes)
+                    + _ashn_lines(gates, ashn_notes) + _suffix_migration_lines(gates, suffix_notes)
                     + _appset_miss_lines(gates, appset_notes) + new_env_lines,
                     new_env_full_lines, structural_envs,
                     gates, len(new_env_candidates), total_new, base_sha,
@@ -14853,12 +14971,13 @@ def process_pr(pr, path_map, base_sha="", repo=None):
         # below: a retry, never a lift.
         gates = _merge_gates(decommission_candidates, renames, path_map,
                              vm_change_lines, app_results,
-                             clone_gates + dup_gates + ashn_gates + disk_gates + appset_gates
-                             + legacy_gates + _nocore_gates(nocore_changes)
+                             clone_gates + dup_gates + ashn_gates + suffix_gates + disk_gates
+                             + appset_gates + legacy_gates + _nocore_gates(nocore_changes)
                              + _immutable_gates(app_results))
         _lift_gates(gates, repo, pr_id, base_sha, pr_sha)
         appspace_state_lines = (_clone_wake_lines(gates) + _dup_identity_lines(gates, dup_unchecked)
                                 + _ashn_lines(gates, ashn_notes)
+                                + _suffix_migration_lines(gates, suffix_notes)
                                 + _appset_miss_lines(gates, appset_notes)
                                 + _immutable_lines(gates, app_results) + appspace_state_lines)
         # Direct permalink into the full-diff view for this exact commit.
