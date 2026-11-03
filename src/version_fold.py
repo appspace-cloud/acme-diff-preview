@@ -39,6 +39,7 @@ _FOLD_ISO_TS_RE   = re.compile(
 _FOLD_CHART_LABEL_KEYS = ("helm.sh/chart", "app.kubernetes.io/version",
                           "appVersion", "targetRevision")
 _FOLD_TRAILING_VER_RE  = re.compile(r"^(.*?)-(\d[\w.+-]*)$")
+_REV_SUFFIX_RE         = re.compile(r"-rev\d+$")
 _FOLD_CLASS_ORDER = ("image tags", "chart labels", "version env values",
                      "checksums", "deploy timestamps")
 
@@ -185,7 +186,13 @@ def _classify_version_fold(sections, version_change=None,
     candidates = set()
     if (version_change and version_change[0] and version_change[1]
             and version_change[0] != version_change[1]):
-        candidates.add((str(version_change[0]), str(version_change[1])))
+        old, new = str(version_change[0]), str(version_change[1])
+        candidates.add((old, new))
+        # Pods carry the base release in their version env values, so a bump
+        # from or to a -revN tag shows there without the suffix.
+        base = (_REV_SUFFIX_RE.sub("", old), _REV_SUFFIX_RE.sub("", new))
+        if base[0] != base[1]:
+            candidates.add(base)
     may_go_down = _images_may_go_down(version_change)
     paired = []
     for hdr, body in sections:

@@ -561,7 +561,7 @@ def test_a_pending_artifact_upload_is_reconciled_at_the_top_of_the_iteration(
     blob.write_bytes(b"rendered page")
     uploaded = []
     monkeypatch.setattr(diff_ui, "_gcs_upload",
-                        lambda bucket, name, payload:
+                        lambda bucket, name, payload, *_:
                         uploaded.append((bucket, name, payload)) or True)
     diff_ui._note_pending_upload("bkt", "diff/acme/1/abc.html.zst",
                                  str(blob), REPO, 1)

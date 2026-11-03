@@ -284,7 +284,7 @@ def test_the_pending_map_drops_the_OLDEST_pr_when_it_is_full(
     """A long bucket outage must not grow the map without limit, and the
     entry it sheds has to be the stalest one: the newest commits are the
     ones whose absence from the bucket splits the replicas right now."""
-    monkeypatch.setattr(diff_ui, "_gcs_upload", lambda b, n, d: False)
+    monkeypatch.setattr(diff_ui, "_gcs_upload", lambda b, n, d, *_: False)
     over = diff_ui._PENDING_UPLOAD_MAX + 1
     for i in range(1, over + 1):
         diff_ui.save_artifact(str(tmp_path), REPO, i, "%07x" % (0x1000000 + i),
@@ -296,7 +296,7 @@ def test_the_pending_map_drops_the_OLDEST_pr_when_it_is_full(
 
     attempted = []
 
-    def _recording_upload(bucket, name, data):
+    def _recording_upload(bucket, name, data, *_):
         attempted.append(name)
         return True
 
@@ -438,7 +438,7 @@ def test_a_corrupt_object_in_the_bucket_falls_through_to_the_legacy_object(
         f"{REPO}__{PR}.json": _legacy_artifact(body="served from the bucket"),
     }
     monkeypatch.setattr(diff_ui, "_gcs_download",
-                        lambda bucket, name: objects.get(name))
+                        lambda bucket, name, *_: objects.get(name))
 
     art = diff_ui.load_artifact(str(tmp_path), REPO, PR, SHA, bucket="b")
 
@@ -453,7 +453,7 @@ def test_an_unexpected_bucket_decode_failure_is_not_swallowed_either(
     understood failures become a miss."""
     monkeypatch.setattr(
         diff_ui, "_gcs_download",
-        lambda bucket, name: _legacy_artifact() if name.endswith(".zst")
+        lambda bucket, name, *_: _legacy_artifact() if name.endswith(".zst")
         else None)
 
     def _explode(data):

@@ -124,7 +124,7 @@ def test_a_traversing_object_name_writes_nothing_outside_the_cache_dir(
     monkeypatch.setattr(diff_ui, "_validate",
                         lambda repo, pr_id, sha: ("../evil", "9", "b" * 40))
     monkeypatch.setattr(diff_ui, "_gcs_download",
-                        lambda bucket, name: _artifact_bytes())
+                        lambda bucket, name, *_: _artifact_bytes())
 
     with pytest.raises(ValueError, match="escapes base_dir"):
         diff_ui.load_artifact(str(base), "../evil", 9, "b" * 40,
@@ -145,7 +145,7 @@ def test_a_well_formed_name_is_still_cached(tmp_path, monkeypatch):
     monkeypatch.setattr(diff_ui, "_validate",
                         lambda repo, pr_id, sha: ("goodrepo", "9", "b" * 40))
     monkeypatch.setattr(diff_ui, "_gcs_download",
-                        lambda bucket, name: _artifact_bytes())
+                        lambda bucket, name, *_: _artifact_bytes())
 
     got = diff_ui.load_artifact(str(base), "goodrepo", 9, "b" * 40,
                                 bucket="some-bucket")
