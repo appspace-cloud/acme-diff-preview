@@ -68,6 +68,8 @@ def test_extract_git_repo_ssh_and_https_and_dotgit():
     assert m._extract_app_git_repo(
         _app("a", "git@bitbucket.org:appspace-cloud/acme-config-stage")) == STG
     assert m._extract_app_git_repo(
+        _app("a", "git@ssh.bitbucket.org:appspace-cloud/acme-config-stage")) == STG
+    assert m._extract_app_git_repo(
         _app("a", "https://bitbucket.org/appspace-cloud/acme-config-dev.git")) == DEV
     assert m._extract_app_git_repo(
         _app("a", "https://bitbucket.org/appspace-cloud/acme-config-dev/")) == DEV
