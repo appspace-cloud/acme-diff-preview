@@ -7723,7 +7723,7 @@ def _fleet_own_identities(repo, base_sha):
     return own, unread
 
 
-_ASHN_FORMAT_RE = re.compile(r"^[0-9a-f]{4}x[0-9a-f]{4}$")
+_ASHN_FORMAT_RE = re.compile(r"^[0-9a-f]{4}x[0-9a-f]{4}\Z")
 _ASHN_SHEET = "https://appspace.atlassian.net/wiki/spaces/cops/pages/66094009"
 
 
@@ -7798,7 +7798,7 @@ _ASHN_MAP_KEYS = tuple("appspace." + k for k in (
 _ASHN_MAP_DOMAIN = "api.cloud.appspace.com"
 _ASHN_MAP_ZONES = {"gcp-pv-prod": "cloud.appspace.com", "gcp-pv-aec": "cloud.appspace.com",
                    "aws-pv-prod": "cloud.appspace.com"}
-_ASHN_MAP_HOST_RE = re.compile(r"[a-z0-9.-]+")
+_ASHN_MAP_HOST_RE = re.compile(r"[a-z0-9.-]+\.appspace\.com")
 
 
 def _jq_or(*values):
@@ -8020,11 +8020,12 @@ def _ashn_lines(gates, notes=()) -> list:
                        "map."), ""]
     host = [g for g in gates or () if g["kind"] == "ashn_host_format"]
     if host:
-        lines += ["## \u26d4 INSTANCE HOST NOT IN LOWERCASE", ""]
+        lines += ["## \u26d4 INSTANCE HOST NOT A LOWERCASE APPSPACE.COM HOST", ""]
         lines += [f"- `{g['env']}` (`ashn: {g['ashn']}`) gives `{g['why']}`." for g in host]
-        lines += ["", ("The name servers take only lowercase letters, digits, dots and dashes "
-                       "in an instance host, and the job refuses the whole map otherwise. Fix "
-                       "`customerSubdomain` or `customerName`."), ""]
+        lines += ["", ("The name servers take only an instance host of lowercase letters, "
+                       "digits, dots and dashes under `appspace.com`, and the job refuses the "
+                       "whole map otherwise. Fix `customerSubdomain` or `customerName`, or "
+                       "`subdomainType` on Azure."), ""]
     two = [g for g in gates or () if g["kind"] == "ashn_two_hosts"]
     if two:
         lines += ["## \u26d4 ONE ASHN, TWO INSTANCE HOSTS", ""]

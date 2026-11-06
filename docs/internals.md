@@ -500,7 +500,8 @@ not only for the AEC clones:
   host it is the `ashn_two_hosts` gate below. A clone keeps the `ashn_copy`
   gate above.
 - `ashn_format`: the ashn is not 4 hex digits, `x` and 4 hex digits, like
-  `3a02x8649`.
+  `3a02x8649`. A final newline, which a YAML block scalar adds, is not allowed
+  either: the job refuses it.
 
 Nothing lifts them. Take the ashn from column A of the ASHN sheet. Dev, QA and
 stage are not checked, because their throwaway environments use placeholder
@@ -520,7 +521,7 @@ the whole map when one entry is wrong, so each case is a merge gate too:
 - `ashn_no_host`: there is no instance host. As in the job, an empty
   `customerSubdomain` is a value, not unset.
 - `ashn_host_format`: the host is not lowercase letters, digits, dots and
-  dashes.
+  dashes under `appspace.com`.
 - `ashn_two_hosts`: another environment has the same name with another host.
   An environment that `ashn_taken` or `ashn_copy` already names is not checked
   for it.

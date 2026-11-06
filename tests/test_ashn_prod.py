@@ -120,6 +120,13 @@ def test_a_malformed_prod_ashn_is_a_gate(monkeypatch, bad):
     assert _detect([NEW]) == ([_format(ashn=bad)], [])
 
 
+def test_an_ashn_with_a_final_newline_is_a_gate(monkeypatch):
+    # A YAML block scalar keeps the newline, and the publisher refuses it.
+    _serve(monkeypatch, {NEW: _doc("newco", "|\n    3a02x8649")}, {LIVE: _doc("oldco")})
+    _fleet(monkeypatch, [LIVE])
+    assert _detect([NEW]) == ([_format(ashn="3a02x8649\n")], [])
+
+
 def test_a_malformed_ashn_on_a_clone_is_a_gate(monkeypatch):
     _serve(monkeypatch, {CLONE: _doc("newco--aec1", "98c3z6d18")}, {LIVE: _doc("oldco")})
     _fleet(monkeypatch, [LIVE])
