@@ -3,8 +3,8 @@
 The PowerDNS name servers load a map of every Private Cloud ashn, built from
 acme-config-prod by a job that refuses the whole map when one entry is wrong:
 the name is not `<ashn>.api.cloud.appspace.com`, the instance host is missing
-or is not lowercase letters, digits, dots and dashes, or one ashn points to
-two instance hosts. One bad environment would stop every DNS update until it
+or is not lowercase letters, digits, dots and dashes under appspace.com, or one
+ashn points to two instance hosts. One bad environment would stop every DNS update until it
 is fixed. So the same cases block here, before the merge, but only when this
 PR causes them: a problem already on `main` does not block an unrelated PR.
 
@@ -221,6 +221,13 @@ def test_a_host_that_is_not_lowercase_letters_digits_dots_and_dashes_is_a_gate(
     assert _detect([NEW]) == ([_host_format(host=host)], [])
 
 
+def test_an_azure_host_outside_appspace_com_is_a_gate(monkeypatch):
+    own = ("  infra:\n    az:\n      loadBalancers:\n        nginxFrontend:\n"
+           "          subdomainType: \"cloud.appspace.net\"\n")
+    _serve(monkeypatch, {AZURE: _doc("newco", extra=own)})
+    assert _detect([AZURE]) == ([_host_format(AZURE, "newco.cloud.appspace.net")], [])
+
+
 def test_one_customer_with_one_ashn_on_two_hosts_is_a_gate(monkeypatch):
     live = {NEW: _doc("newco")}
     _serve(monkeypatch, dict(live, **{SECOND: _doc(
@@ -346,7 +353,7 @@ def test_the_panels_name_each_env_and_the_fix():
                          f"`{COHORT}`."]
     assert "## ⛔ NO INSTANCE HOST FOR THE ASHN MAP" in lines
     assert (f"- `pv-newco-a` (`ashn: {ASHN}`): no subdomainType on Azure.") in lines
-    assert "## ⛔ INSTANCE HOST NOT IN LOWERCASE" in lines
+    assert "## ⛔ INSTANCE HOST NOT A LOWERCASE APPSPACE.COM HOST" in lines
     assert f"- `pv-newco-a` (`ashn: {ASHN}`) gives `NewCo.cloud.appspace.com`." in lines
     assert "## ⛔ ONE ASHN, TWO INSTANCE HOSTS" in lines
     assert (f"- `pv-newco-b` gives `ashn: {ASHN}` the host `newco-eu.cloud.appspace.com`, "
@@ -395,7 +402,7 @@ def test_another_ashn_domain_blocks_a_new_prod_env(new_env):
 def test_an_uppercase_host_blocks_a_new_prod_env(new_env):
     body, (state, desc) = new_env(_doc("newco", extra="  customerSubdomain: NewCo\n"))
     assert m._extract_status_token(body) == "blocked" and state == "FAILED"
-    assert "## ⛔ INSTANCE HOST NOT IN LOWERCASE" in body
+    assert "## ⛔ INSTANCE HOST NOT A LOWERCASE APPSPACE.COM HOST" in body
 
 
 def test_a_correct_new_prod_env_stays_green(new_env):
@@ -413,7 +420,7 @@ ANCHOR = "why-a-prod-ashn-must-fit-the-ashn-map"
 
 @pytest.mark.parametrize("guard", ["ASHN name not on api.cloud.appspace.com",
                                    "No instance host for the ASHN map",
-                                   "Instance host not in lowercase",
+                                   "Instance host not a lowercase appspace.com host",
                                    "One ashn, two instance hosts"])
 def test_each_new_gate_has_a_guards_row_with_no_override(guard):
     rows = [r for r in _guard_rows() if _cells(r)[0] == f"**{guard}**"]

@@ -521,7 +521,7 @@ GATES = {
                     "Set ashnDomain to api.cloud.appspace.com"),
     "ashn_no_host": ("The ASHN map finds no instance host for the environment", None,
                      "blocked", "Set customerName, and subdomainType on Azure"),
-    "ashn_host_format": ("The instance host is not lowercase letters, digits, dots and dashes",
+    "ashn_host_format": ("The instance host is not a lowercase host under appspace.com",
                          None, "blocked", "Use lowercase in customerSubdomain or customerName"),
     "ashn_two_hosts": ("One ashn points to two instance hosts", None, "blocked",
                        "Keep one instance host per ashn"),
