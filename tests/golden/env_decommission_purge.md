@@ -24,6 +24,8 @@
 
 ⚠️ Could not verify the cascade finalizer on `pv-foo-c` (ArgoCD lookup failed). Check that `argocd app get pv-foo-c-glb` lists `resources-finalizer.argocd.argoproj.io` before merging.
 
+ℹ️ This cloud's chart does not revoke the Constellation licence by itself (no `LICENCE_RETIRE` on `appspace-client-admins`). If the cloud has a licence, revoke it as the decommission runbook of its release line says before you merge. An AEC tenant has none.
+
 ⚠️ **DATA WILL BE PERMANENTLY DESTROYED.** This environment also has `appspace.decommissionPurgeData: true`, so Config Connector empties and deletes the BigQuery dataset and the user content bucket as part of the cascade. **That data is not recoverable afterwards.**
 
 Soft-delete on the **content** bucket is turned off (`softDeletePolicy.retentionDurationSeconds: 0`) so `force-destroy` can complete. The **content backup** bucket always keeps `deletion-policy: abandon` and is left behind on purpose — destroy it by hand after Phase 3 if needed.

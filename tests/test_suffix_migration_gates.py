@@ -158,7 +158,7 @@ def test_a_new_cell_that_takes_the_name_blocks_the_pr(new_cell):
     assert m._extract_status_token(body) == "blocked" and state == "FAILED"
     assert desc.startswith(f"Blocked - {cr.GATES['dns_new_sibling'][0]} "
                            "(example.cloud.appspace.com) in pv-example-b.")
-    assert "## ⛔ TWO CELLS OF ONE CUSTOMER SHARE A DNS NAME OR A VM" in body
+    assert "## ⛔ TWO CELLS OF ONE CUSTOMER SHARE A DNS NAME, A VM OR A LICENCE" in body
 
 
 def test_a_new_cell_with_the_record_off_stays_green(new_cell):
@@ -170,13 +170,14 @@ def test_a_new_cell_with_the_record_off_stays_green(new_cell):
 
 from test_cops2766_block3_docs import _cells, _guard_rows, _read, _slug  # noqa: E402
 
-ANCHOR = "why-two-cells-of-one-customer-must-not-share-a-dns-name-or-a-vm"
+ANCHOR = "why-two-cells-of-one-customer-must-not-share-a-dns-name-a-vm-or-a-licence"
 
 
 @pytest.mark.parametrize("guard", ["Two cells write one DNS record",
                                    "New cell takes a live DNS name",
                                    "Decommission deletes a shared DNS name",
-                                   "Two cells manage one KCC VM"])
+                                   "Two cells manage one KCC VM",
+                                   "Purge on a shared name"])
 def test_each_gate_has_a_guards_row_with_no_override(guard):
     rows = [r for r in _guard_rows() if _cells(r)[0] == f"**{guard}**"]
     assert len(rows) == 1 and _cells(rows[0])[3] == "none", rows
@@ -187,3 +188,28 @@ def test_the_internals_section_exists_and_is_listed():
     internals = _read("docs/internals.md")
     assert ANCHOR in {_slug(l.lstrip("#")) for l in internals.splitlines() if l.startswith("#")}
     assert f"](#{ANCHOR})" in internals
+
+
+# ── COPS-3099: arming the purge on one cell of two ──────────────────────
+
+PURGE_ON = "  decommission: true\n  decommissionPurgeData: true\n"
+
+
+def test_arming_the_purge_while_the_other_cell_is_live(monkeypatch):
+    base = {OLD: _doc("a"), NEW: _doc("b")}
+    head = {**base, OLD: _doc("a", PURGE_ON)}
+    assert _detect(monkeypatch, [OLD], head, base, fleet=(OLD, NEW)) == (
+        [("purge_shared_name", "pv-example-a")], [])
+
+
+def test_arming_the_purge_with_no_other_cell(monkeypatch):
+    base = {OLD: _doc("a"), OTHER: _doc("a", name="other")}
+    head = {**base, OLD: _doc("a", PURGE_ON)}
+    assert _detect(monkeypatch, [OLD], head, base) == ([], [])
+
+
+def test_the_purge_panel_names_the_licence():
+    gate = {"kind": "purge_shared_name", "env": "pv-example-a", "text": "the text"}
+    lines = m._suffix_migration_lines([gate])
+    assert lines[0].startswith("## ⛔") and "LICENCE" in lines[0]
+    assert "- the text" in lines

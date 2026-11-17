@@ -15,7 +15,7 @@ here is required to use the tool; it is for people changing it or debugging it.
 - [Why a copied clone ashn is blocked](#why-a-copied-clone-ashn-is-blocked)
 - [Why a prod ashn must be unique and well formed](#why-a-prod-ashn-must-be-unique-and-well-formed)
 - [Why a prod ashn must fit the ASHN map](#why-a-prod-ashn-must-fit-the-ashn-map)
-- [Why two cells of one customer must not share a DNS name or a VM](#why-two-cells-of-one-customer-must-not-share-a-dns-name-or-a-vm)
+- [Why two cells of one customer must not share a DNS name, a VM or a licence](#why-two-cells-of-one-customer-must-not-share-a-dns-name-a-vm-or-a-licence)
 - [Why a new env needs an ApplicationSet glob](#why-a-new-env-needs-an-applicationset-glob)
 - [Why a KCC linux VM needs hostingID](#why-a-kcc-linux-vm-needs-hostingid)
 - [Why a key in a file the ApplicationSet does not read is blocked](#why-a-key-in-a-file-the-applicationset-does-not-read-is-blocked)
@@ -249,6 +249,7 @@ FAILED, the comment still shows the diff, and the merge summary starts with one
 | Shared user content | the purge is armed, and a surviving environment uses the same user content bucket and DNS record | `Confirm-Teardown: <env>` |
 | 7-day hold | the cascade is armed, and `zeroPods` or `decommission` has been true on `main` for less than 7 days | `Confirm-Decommission: <env>` |
 | Cascade not live | the cascade is armed in config, but ArgoCD has not put `resources-finalizer.argocd.argoproj.io` on the Applications | nothing, it clears itself |
+| Licence not revoked | the purge is armed on a private cloud whose chart revokes the Constellation licence (the `appspace-client-admins` CronJob renders `LICENCE_RETIRE`, COPS-3099). It holds until the supporting-services app is Synced on a commit that has the last change of the environment's `customer.yaml`, its last sync finished at least 3 minutes ago, and ArgoCD shows the CronJob Healthy with `CronJob has completed its last execution successfully`. Argo CD also shows Healthy while a pass runs, before any pass succeeded and while the CronJob is suspended, so only that message counts. A failed lookup counts as not revoked. So does a supporting-services app that did not render: on a line without the revoke, a retiring CronJob with the monitor on also ends green. A chart without the revoke gets a note and no gate, unless main asks for a chart version Argo CD has not applied yet: then it waits, because the render used the old chart | nothing, it clears itself. `Confirm-Licence-Revoked: <env>` when Engineering revoked the licence by hand |
 | Flag typo | a teardown flag that is misspelled or in the wrong place, so Phase 2 reads pending | nothing: fix the key on `main` in a separate PR, then rebase the removal |
 
 The same mechanism has four gates outside a teardown:
@@ -534,7 +535,7 @@ so a problem already on `main` does not block an unrelated PR. The live
 environments are read only for an entry with a host, with the same notes as the
 other ashn gates. A failed read retries the PR. Nothing lifts them.
 
-### Why two cells of one customer must not share a DNS name or a VM
+### Why two cells of one customer must not share a DNS name, a VM or a licence
 
 A customer moves to a new cell by adding a folder with another suffix
 (`pv-<customer>-a` to `pv-<customer>-b`). Both cells keep the `customerName`,
@@ -559,6 +560,21 @@ The gates follow from that:
   live cell answers on.
 - `vm_shared`: two cells render a KCC VM with the same project and name. Both
   manage one machine, and decommissioning either deletes it.
+- `purge_shared_name` (COPS-3099): a cell is armed with `decommission` and
+  `decommissionPurgeData` while another cell that is not leaving answers on the
+  same public name. On a chart with the licence revoke, the purge revokes the
+  Constellation licence of the cloud within minutes of the sync. Where the
+  monitor check is on, it also stops the synthetic monitors of its host. A
+  cell restored from the other one has the same licence and the same monitors,
+  so both stop. Retire the cell without the purge (a migration), or remove the
+  other cell first. The name is the public name, whether the cell writes the
+  record or not. The gate does not look at the chart line, because the
+  acme-components runbook forbids that purge on every line. It fires when the
+  PR arms the purge, or adds or brings back the other cell. A routine PR on the
+  live cell is not blocked: by then the revoke has already run. The siblings
+  are found like those of the other gates here (the same own `customerName`,
+  or the folder), so a cell with another `customerName` and the same
+  `customerSubdomain` is not found.
 
 The cutover the gates allow is one PR per step: the new cell with the record
 off and its own VM names, then the old cell turns the record off (abandon keeps

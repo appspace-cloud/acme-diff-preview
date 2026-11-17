@@ -7376,6 +7376,197 @@ def _cascade_mismatch_note(env_name, apps, cascade: bool) -> list:
     ]
 
 
+# COPS-3099: a private cloud retired for good (decommission and
+# decommissionPurgeData) revokes its Constellation licence from the
+# appspace-client-admins CronJob of its supporting-services app. A pass that
+# has not revoked it yet fails, so Argo CD shows the CronJob Degraded. Argo CD
+# 3.5.2 also shows it Healthy, with another message, while a pass runs, before
+# any pass succeeded, while it is suspended, and right after the arming sync
+# with the success of an older invite pass. Only the exact success message, at
+# least LICENCE_SETTLE_SECONDS after the last sync, means the licence is gone.
+_LICENCE_CRONJOB = "appspace-client-admins"
+_LICENCE_DONE = "CronJob has completed its last execution successfully"
+LICENCE_SETTLE_SECONDS = 180
+
+
+def _licence_clock() -> float:
+    """Now, in seconds. A function so the tests can set it."""
+    return time.time()
+
+
+def _renders_licence_revoke(resources) -> bool:
+    """True when the rendered appspace-client-admins CronJob revokes the
+    licence (LICENCE_RETIRE=true). A chart line without the revoke, or a cloud
+    that is not retiring, renders no such value."""
+    for (type_key, _ns, name), doc in (resources or {}).items():
+        if type_key.split("/")[-1] != "CronJob" or name != _LICENCE_CRONJOB:
+            continue
+        try:
+            obj = _yaml_safe_load(doc) or {}
+        except yaml.YAMLError:
+            return False
+        spec = obj.get("spec") if isinstance(obj, dict) else None
+        for key in ("jobTemplate", "spec", "template", "spec"):
+            spec = spec.get(key) if isinstance(spec, dict) else None
+        for container in (spec or {}).get("containers") or []:
+            for env in (container or {}).get("env") or []:
+                if (env or {}).get("name") == "LICENCE_RETIRE" \
+                        and str(env.get("value", "")).strip().lower() == "true":
+                    return True
+    return False
+
+
+def _licence_app_json(app):
+    """`argocd app get <app> -o json` as a dict, or None when the lookup fails."""
+    name = app.split("/")[-1]
+    try:
+        r = subprocess.run(
+            [ARGOCD_BIN, "app", "get", name, "-o", "json"] + _auth_flags(),
+            capture_output=True, text=True, timeout=30,
+            env=_argocd_subprocess_env())
+        if r.returncode != 0:
+            logsink.debug(f"licence check: argocd app get {name} failed: "
+                          f"{(r.stderr or '')[:120]}")
+            return None
+        data = json.loads(r.stdout or "null")
+    except Exception as e:
+        logsink.debug(f"licence check failed for {name}: {e}")
+        return None
+    return data if isinstance(data, dict) else None
+
+
+def _licence_revoke_state(app_json, now=None):
+    """(revoked, reason) from the live supporting-services Application.
+    Revoked only when the arming change is Synced, its last sync finished at
+    least LICENCE_SETTLE_SECONDS ago, and the CronJob shows Healthy with the
+    exact success message. Anything else, a failed lookup included, is not."""
+    if not isinstance(app_json, dict):
+        return False, "the ArgoCD lookup failed"
+    status = app_json.get("status") or {}
+    cron = next((r for r in status.get("resources") or ()
+                 if isinstance(r, dict) and r.get("kind") == "CronJob"
+                 and r.get("name") == _LICENCE_CRONJOB), None)
+    if cron is None:
+        return False, f"ArgoCD lists no `{_LICENCE_CRONJOB}` CronJob in this Application yet"
+    if (status.get("sync") or {}).get("status") != "Synced":
+        return False, "the arming change is not Synced yet"
+    finished = str((status.get("operationState") or {}).get("finishedAt") or "")
+    try:
+        done_at = datetime.fromisoformat(finished.replace("Z", "+00:00")).timestamp()
+    except ValueError:
+        return False, "ArgoCD reports no finished sync yet"
+    if (now if now is not None else _licence_clock()) - done_at < LICENCE_SETTLE_SECONDS:
+        return False, ("the last sync finished less than 3 minutes ago, so a retiring "
+                       "pass may not have run yet")
+    health = cron.get("health") or {}
+    if health.get("status") == "Healthy" and health.get("message") == _LICENCE_DONE:
+        return True, "the last pass of the CronJob succeeded"
+    return False, (f"the CronJob shows {health.get('status') or 'no health'}: "
+                   f"{health.get('message') or 'no message'}")
+
+
+def _live_config_revision(app_json) -> str:
+    """The config repo commit the live Application last synced: the revision of
+    its git source (the source without a chart), "" when there is none."""
+    spec = (app_json or {}).get("spec") or {}
+    sources = spec.get("sources") or ([spec["source"]] if spec.get("source") else [])
+    sync = ((app_json or {}).get("status") or {}).get("sync") or {}
+    revisions = sync.get("revisions") or []
+    for i, src in enumerate(sources):
+        if isinstance(src, dict) and not src.get("chart") and src.get("repoURL"):
+            if spec.get("sources"):
+                return str(revisions[i]) if i < len(revisions) else ""
+            return str(sync.get("revision") or "")
+    return ""
+
+
+def _licence_live_is_current(app_json, identity_file, main_sha):
+    """Does the live Application include the last main commit that changed the
+    environment's own file (the one that armed the purge)? True or False. None
+    when the git mirror cannot tell, so the caller waits and checks again."""
+    rev = _live_config_revision(app_json)
+    if not rev or not GIT_MIRROR_ENABLED or _mirror_disabled or not main_sha:
+        return None
+    repo = _repo_for_sha(main_sha)
+    if not repo or not _mirror_has_sha(repo, main_sha) or not _mirror_has_sha(repo, rev):
+        return None
+    clean = posixpath.normpath(str(identity_file).replace("$config/", "").lstrip("/"))
+    last = _git_run(["--git-dir", _mirror_path(repo), "log", "-1", "--format=%H", main_sha,
+                     "--", clean], timeout=30)
+    if last is None or last.returncode != 0 or not last.stdout.strip():
+        return None
+    r = _git_run(["--git-dir", _mirror_path(repo), "merge-base", "--is-ancestor",
+                  last.stdout.strip(), rev], timeout=30)
+    return None if r is None else {0: True, 1: False}.get(r.returncode)
+
+
+def _licence_teardown_check(env_name, apps, purges_data, licence_step, ss_unrendered,
+                            identity_file="", main_sha=""):
+    """(gate or None, panel lines) for a private-cloud folder removal.
+
+    Only a purge revokes the licence: `decommission` alone is a migration, and
+    the licence moves with the database. A chart that does not render the
+    revoke (another release line, an AEC tenant with the registration off)
+    gets a note and no gate, so it never blocks those retirements. A chart
+    that does waits until ArgoCD shows the revoke done on a live state that
+    already has the commit that armed the purge. When the supporting-services
+    app did not render, nothing proves the revoke: on a line without it, a
+    retiring CronJob with the monitor on also ends green every minute."""
+    if not purges_data:
+        return None, []
+    ss = [a for a in apps or () if a.split("/")[-1].endswith("-ss")]
+    if not ss:
+        return None, ["\u2139\ufe0f No supporting-services app was found for this environment, "
+                      "so its Constellation licence was not checked.", ""]
+    way_out = (f"If Engineering revoked the licence by hand, add `Confirm-Licence-Revoked: "
+               f"{env_name}` to a commit message. When the pass log says `licence.failed`, ask "
+               "Engineering.")
+    if ss_unrendered:
+        why = ("the supporting-services app did not render, so it is not known whether its "
+               "chart revokes the licence")
+        return ({"kind": "licence", "env": env_name, "why": why}, [
+            f"\u23f3 **The Constellation licence is not proven revoked**: {why}.", "",
+            way_out, ""])
+    if not licence_step:
+        # The render used the chart Argo CD has. Right after a bump onto a line
+        # with the revoke, main may already ask for another one.
+        argo_rev = _app_chart_revision_map.get(ss[0])
+        try:
+            main_rev = _main_chart_revision(ss[0], main_sha) if main_sha else argo_rev
+        except Exception as e:
+            logsink.debug(f"licence check: main chart version of {ss[0]} unknown: {e}")
+            main_rev = argo_rev
+        if argo_rev and main_rev and main_rev != argo_rev:
+            why = (f"Argo CD has not applied the chart version main asks for yet (main "
+                   f"`{main_rev}`, Argo CD `{argo_rev}`), so it is not known whether that chart "
+                   "revokes the licence")
+            return ({"kind": "licence", "env": env_name, "why": why}, [
+                f"\u23f3 **The Constellation licence is not proven revoked**: {why}.", "",
+                way_out, ""])
+        return None, [
+            "\u2139\ufe0f This cloud's chart does not revoke the Constellation licence by "
+            "itself (no `LICENCE_RETIRE` on `appspace-client-admins`). If the cloud has a "
+            "licence, revoke it as the decommission runbook of its release line says before "
+            "you merge. An AEC tenant has none.", ""]
+    live = _licence_app_json(ss[0])
+    revoked, why = _licence_revoke_state(live)
+    if revoked:
+        current = _licence_live_is_current(live, identity_file, main_sha)
+        if current is not True:
+            revoked = False
+            why = ("ArgoCD does not show the commit that armed the purge yet" if current is False
+                   else "could not tell whether ArgoCD shows the commit that armed the purge")
+    if revoked:
+        return None, [
+            f"\U0001f511 Constellation licence: revoked. ArgoCD shows the last pass of "
+            f"`{_LICENCE_CRONJOB}` succeeded, and the last sync finished at least 3 minutes "
+            "ago.", ""]
+    return ({"kind": "licence", "env": env_name, "why": why}, [
+        f"\u23f3 **The Constellation licence is not revoked yet**: {why}. Removing the "
+        "folder now leaves the instance active on the customer account in Connect.", "",
+        way_out, ""])
+
+
 def _paused_apps_for(apps, path_map, sha, repo=None) -> set:
     """Apps whose OWN environment has `appspace.autosync: false` (COPS-2583).
 
@@ -8039,7 +8230,8 @@ def _ashn_lines(gates, notes=()) -> list:
     return lines + [x for n in notes for x in (n, "")]
 
 
-_SUFFIX_KINDS = ("dns_two_owners", "dns_new_sibling", "dns_decommission_shared", "vm_shared")
+_SUFFIX_KINDS = ("dns_two_owners", "dns_new_sibling", "dns_decommission_shared", "vm_shared",
+                 "purge_shared_name")
 
 
 def _suffix_keys(flat) -> dict:
@@ -8128,12 +8320,12 @@ def _detect_suffix_migration_gates(changed, renames, path_map, sha, base_sha, re
     notes = []
     if skipped:
         notes.append("\u26a0\ufe0f Suffix migration check could not read "
-                     + ", ".join(f"`{e}`" for e in skipped) + ", so a shared DNS record or "
-                     "VM with it is not ruled out.")
+                     + ", ".join(f"`{e}`" for e in skipped) + ", so a shared DNS record, "
+                     "VM or licence with it is not ruled out.")
     elif not fleet:
         notes.append("\u26a0\ufe0f Suffix migration check could not list the live "
                      "environments (the ArgoCD app list is not loaded), so a shared DNS "
-                     "record or VM with another cell of the customer is not ruled out.")
+                     "record, VM or licence with another cell of the customer is not ruled out.")
     return gates, notes
 
 
@@ -8142,7 +8334,7 @@ def _suffix_migration_lines(gates, notes=()) -> list:
     hits = [g for g in gates or () if g["kind"] in _SUFFIX_KINDS]
     lines = []
     if hits:
-        lines += ["## \u26d4 TWO CELLS OF ONE CUSTOMER SHARE A DNS NAME OR A VM", ""]
+        lines += ["## \u26d4 TWO CELLS OF ONE CUSTOMER SHARE A DNS NAME, A VM OR A LICENCE", ""]
         lines += [f"- {g['text']}" for g in hits]
         lines += ["", ("A suffix migration is one PR per step: add the new cell with "
                        f"`appspace.{suffix_migration.FLAG}: false` and its own VM names, turn "
@@ -8697,10 +8889,14 @@ def _evaluate_env_decommissions(candidates: list, pr_sha: str, main_sha: str,
                         and _decommission_fully_phased(c["identity_file"], main_sha))
         app_deleted_docs: dict = {}
         unrendered: list = []
+        # COPS-3099: does the supporting-services app revoke the licence?
+        licence_step, ss_unrendered = False, False
         for app in c["apps"]:
+            is_ss = app.split("/")[-1].endswith("-ss")
             try:
                 resources = _render_main_side_resources(app, main_sha)
             except Exception as e:
+                ss_unrendered = ss_unrendered or is_ss
                 # COPS-2668: this used to `continue` silently, so the totals
                 # below counted only the apps that rendered and the comment
                 # presented that as the inventory of what the cascade is
@@ -8713,6 +8909,7 @@ def _evaluate_env_decommissions(candidates: list, pr_sha: str, main_sha: str,
                 unrendered.append(app)
                 continue
             any_rendered = True
+            licence_step = licence_step or (is_ss and _renders_licence_revoke(resources))
             n, kc, wl = _summarize_resources_dict(resources)
             all_total += n
             for k, v in kc.items():
@@ -8858,6 +9055,13 @@ def _evaluate_env_decommissions(candidates: list, pr_sha: str, main_sha: str,
             hold = _teardown_hold_met(c["identity_file"], main_sha)
             if hold is not True:
                 c["gates"].append({"kind": _HOLD_GATES[hold], "env": c["env_name"]})
+            # COPS-3099: the licence revoke has to finish before the folder goes.
+            licence_gate, licence_lines = _licence_teardown_check(
+                c["env_name"], c["apps"], purges_data, licence_step, ss_unrendered,
+                c["identity_file"], main_sha)
+            lines += licence_lines
+            if licence_gate:
+                c["gates"].append(licence_gate)
         if public_cloud:
             lines += [
                 "\u26a0\ufe0f " + _DECOM_PUBLIC_CLOUD_HDR,
