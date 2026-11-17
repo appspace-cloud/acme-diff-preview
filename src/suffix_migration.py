@@ -33,6 +33,15 @@ The cutover these findings allow, one PR each:
 Steps 2 and 3 in one PR are refused. The two apps sync in any order, so the
 old controller can write its address back after the new one, and the prune
 then leaves it there until the new cell's next reconcile.
+
+COPS-3099. On a chart with the licence revoke, the data purge
+(`decommission` and `decommissionPurgeData`) also revokes the Constellation
+licence of the cloud, and where the monitor check is on it stops the synthetic
+monitors of its host, within minutes of the sync. A cell restored from the
+other one holds the same licence and answers on the same host, so a purge on
+either cell while the other is live turns both off. That is a migration or a
+rollback, and it is retired without the purge. The acme-components runbook
+forbids that purge on every chart line, so the gate does not look at the line.
 """
 import vm_analysis
 
@@ -54,7 +63,7 @@ KEYS = tuple("appspace." + k for k in (
     "environmentType", "cloudShortName", "deploymentType", "customerName",
     "customerSubdomain", "infra.az.loadBalancers.nginxFrontend.subdomainType", FLAG,
     "cloudServices.cloudSfwAddress", "cloudServices.cloudApicSfwAddress", "decommission",
-    "infra.gcp.project", "prefix", "suffix"))
+    "decommissionPurgeData", "infra.gcp.project", "prefix", "suffix"))
 
 
 def _get(flat, key):
@@ -174,6 +183,26 @@ def findings(base: dict, head: dict) -> list:
                 f"`deletion-policy: delete`. {_names(sibs)} answers on that name, and removing "
                 f"the folder deletes the record. Turn the record off on `{env}` first "
                 "(abandon keeps it), and finish the cutover.")))
+
+    for env in sorted(head):
+        name = public_name(head[env])
+        if not name or not (_true(_get(head[env], "decommission"))
+                            and _true(_get(head[env], "decommissionPurgeData"))):
+            continue
+        sibs = {s for s in siblings(env, name) if not _true(_get(head[s], "decommission"))}
+        # Only when the PR arms the purge, or brings in a cell that stays: by
+        # the time a purge is on main its revoke has run, so a routine PR on
+        # the live cell would be blocked for nothing.
+        joined = {s for s in sibs & changed
+                  if s in new or _true(_get(base.get(s), "decommission"))}
+        if sibs and (env in changed or joined):
+            out.append(_gate("purge_shared_name", env, name[1], sibs, (
+                f"`{env}` is armed with `decommissionPurgeData` and answers on `{name[1]}`, "
+                f"like {_names(sibs)}. On a chart with the licence revoke, the purge revokes "
+                "the Constellation licence of the cloud, and where the monitor check is on it "
+                "stops the synthetic monitors of that host. A cell restored from this one has "
+                "the same licence and the same monitors. Retire this cell without the purge "
+                "(a migration), or remove the other cell first.")))
 
     pairs = set()
     for env in sorted(changed & set(head)):

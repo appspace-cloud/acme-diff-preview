@@ -504,6 +504,10 @@ GATES = {
                "GCP cannot shrink a disk in place, so keep the old size or grow it"),
     "not_live": ("The cascade finalizer is not live in ArgoCD yet", None, "transient",
                  "Re-checked automatically after ArgoCD syncs"),
+    # COPS-3099: a retiring private cloud revokes its licence from a CronJob.
+    # Checked again by itself. The trailer is for a licence revoked by hand.
+    "licence": ("The Constellation licence is not revoked yet", "Confirm-Licence-Revoked",
+                "transient", ""),
     "clone_wake": ("An AEC clone starts running with a copy of production data",
                    "Confirm-Clone-Sanitized", "blocked", ""),
     "dup_identity": ("A new environment uses the name of another environment", None,
@@ -536,6 +540,9 @@ GATES = {
                                 None, "blocked", "Turn the record off on this cell first"),
     "vm_shared": ("Two environments manage the same KCC VM", None, "blocked",
                   "Give the new cell its own VM names"),
+    # COPS-3099: the purge revokes the licence the other cell also holds.
+    "purge_shared_name": ("The purge revokes a licence a live environment also holds", None,
+                          "blocked", "Retire it without the purge, or remove the other cell first"),
     "kcc_hosting_id": ("KCC linux VM enabled with no valid appspace.hostingID", None,
                        "blocked", 'Set appspace.hostingID to 8 digits in quotes ("00000000")'),
     "appset_miss": ("No ApplicationSet reads this folder, nothing deploys", None,

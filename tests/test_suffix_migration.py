@@ -160,3 +160,95 @@ def test_a_state_already_on_main_does_not_block_another_pr():
     head = copy.deepcopy(both)
     head["pv-other-a"] = cell("a", customerName="other", zeroPods=True)
     assert kinds(both, head) == []
+
+
+# ── COPS-3099: the purge revokes the licence and stops the monitors of the host ──
+
+PURGE = {"decommission": True, "decommissionPurgeData": True}
+
+
+def purges(base, head):
+    return sorted(f["env"] for f in sm.findings(base, head) if f["kind"] == "purge_shared_name")
+
+
+def test_purge_on_the_old_cell_while_the_new_cell_is_live():
+    base = {"pv-example-a": cell("a"), "pv-example-b": cell("b")}
+    head = {**base, "pv-example-a": cell("a", **PURGE)}
+    assert purges(base, head) == ["pv-example-a"]
+    gate = next(f for f in sm.findings(base, head) if f["kind"] == "purge_shared_name")
+    assert gate["others"] == ["pv-example-b"] and gate["why"] == "example.cloud.appspace.com"
+    assert "licence" in gate["text"] and "`pv-example-b`" in gate["text"]
+
+
+def test_purge_on_the_new_cell_while_the_old_cell_is_live():
+    base = {"pv-example-a": cell("a"), "pv-example-b": cell("b")}
+    head = {**base, "pv-example-b": cell("b", **PURGE)}
+    assert purges(base, head) == ["pv-example-b"]
+
+
+def test_purge_with_no_other_cell_passes():
+    assert purges({"pv-example-a": cell("a")}, {"pv-example-a": cell("a", **PURGE)}) == []
+
+
+def test_purge_while_the_other_cell_leaves_too_passes():
+    base = {"pv-example-a": cell("a"), "pv-example-b": cell("b", decommission=True)}
+    head = {**base, "pv-example-a": cell("a", **PURGE)}
+    assert purges(base, head) == []
+
+
+def test_decommission_alone_is_a_migration_and_passes():
+    base = {"pv-example-a": cell("a"), "pv-example-b": cell("b")}
+    head = {**base, "pv-example-a": cell("a", decommission=True)}
+    assert purges(base, head) == []
+    head = {**base, "pv-example-a": cell("a", decommissionPurgeData=True)}
+    assert purges(base, head) == [], "the purge flag alone arms nothing"
+
+
+def test_new_cell_added_while_the_old_one_is_purged():
+    base = {"pv-example-a": cell("a", **PURGE)}
+    head = {**base, "pv-example-b": cell("b", zeroPods=True)}
+    assert purges(base, head) == ["pv-example-a"]
+
+
+def test_purged_sandbox_or_aec_tenant_has_another_host():
+    for clone, tier in (("example--sbx1", "pv-prod"), ("example--aec1", "pv-aec")):
+        base = {"pv-example-a": cell("a"), f"pv-{clone}-a": cell("a", customerName=clone, tier=tier)}
+        head = {**base, f"pv-{clone}-a": cell("a", customerName=clone, tier=tier, **PURGE)}
+        assert purges(base, head) == [], clone
+
+
+def test_purge_while_another_name_has_the_same_subdomain():
+    # findings() matches the public name. The service only loads siblings with the same
+    # own customerName or folder (docs/internals.md), so this case is caught here only.
+    base = {"pv-example-a": cell("a"), "pv-other-a": cell("a", customerName="other", customerSubdomain="example")}
+    head = {**base, "pv-example-a": cell("a", **PURGE)}
+    assert purges(base, head) == ["pv-example-a"]
+
+
+def test_purged_cell_already_on_main_does_not_block_another_pr():
+    base = {"pv-example-a": cell("a", **PURGE), "pv-example-b": cell("b"), "pv-x-a": cell("a", customerName="x")}
+    head = {**base, "pv-x-a": cell("a", customerName="x", zeroPods=True)}
+    assert purges(base, head) == []
+
+
+def test_purge_flags_as_strings_count():
+    base = {"pv-example-a": cell("a"), "pv-example-b": cell("b")}
+    head = {**base, "pv-example-a": cell("a", decommission="true", decommissionPurgeData="True")}
+    assert purges(base, head) == ["pv-example-a"]
+
+
+def test_the_purge_flag_is_a_key_the_check_reads():
+    assert "appspace.decommissionPurgeData" in sm.KEYS
+
+
+
+def test_a_routine_pr_on_the_live_cell_is_not_blocked_by_a_purge_on_main():
+    base = {"pv-example-a": cell("a", **PURGE), "pv-example-b": cell("b")}
+    head = {**base, "pv-example-b": cell("b", zeroPods=True)}
+    assert purges(base, head) == []
+
+
+def test_bringing_back_a_cell_that_was_leaving_is_blocked():
+    base = {"pv-example-a": cell("a", **PURGE), "pv-example-b": cell("b", decommission=True)}
+    head = {**base, "pv-example-b": cell("b")}
+    assert purges(base, head) == ["pv-example-a"]
