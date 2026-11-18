@@ -333,6 +333,10 @@ _DECOM_CASCADE_NOT_LIVE_HDR = ("**The cascade is armed in config but NOT live "
 # COPS-2766: a paused env still cascades on delete, but what main changed
 # during the pause may not be live. A warning, not a gate.
 _DECOM_PAUSED_HDR = "Auto-sync is paused on main"
+# COPS-3099: the Constellation licence of a purged cloud is not proven revoked.
+# A warning, never a gate: ArgoCD shows a CronJob that runs every minute as
+# running most of the time, so the answer flips between renders.
+_DECOM_LICENCE_HDR = "The Constellation licence is not confirmed revoked yet"
 # COPS-2766: a warning about a new env. The summary counts these lines.
 _NEW_ENV_CHECK_PREFIX = "- ⚠️ **Check:** "
 
@@ -504,10 +508,6 @@ GATES = {
                "GCP cannot shrink a disk in place, so keep the old size or grow it"),
     "not_live": ("The cascade finalizer is not live in ArgoCD yet", None, "transient",
                  "Re-checked automatically after ArgoCD syncs"),
-    # COPS-3099: a retiring private cloud revokes its licence from a CronJob.
-    # Checked again by itself. The trailer is for a licence revoked by hand.
-    "licence": ("The Constellation licence is not revoked yet", "Confirm-Licence-Revoked",
-                "transient", ""),
     "clone_wake": ("An AEC clone starts running with a copy of production data",
                    "Confirm-Clone-Sanitized", "blocked", ""),
     "dup_identity": ("A new environment uses the name of another environment", None,
@@ -763,6 +763,11 @@ def _build_merge_summary(results, rollup_by_sig, vm_change_lines,
                              f"\u23f8\ufe0f **{_DECOM_PAUSED_HDR}** for an environment "
                              "being removed: changes made on main during the pause "
                              "may not be live yet"))
+        if _DECOM_LICENCE_HDR in txt:
+            findings.append((_SEV_REVIEW,
+                             f"\u23f3 **{_DECOM_LICENCE_HDR}**: this does not block the PR. "
+                             "How long it can take, and how to check by hand, are in the "
+                             "decommission panel"))
         if _DECOM_FLAG_TYPO_HDR in txt:
             findings.append((_SEV_BLOCK,
                              "\U0001f6a8 **Teardown flag misspelled** "

@@ -7,11 +7,16 @@ the CronJob Healthy with "CronJob has completed its last execution
 successfully" once a pass succeeds after a failed one. It also shows Healthy,
 with other messages, while a pass runs, before any pass succeeded and while the
 CronJob is suspended, and right after the arming sync it can still show an old
-invite pass. So the folder-removal PR waits for that exact message, at least 3
-minutes after the last sync, on a cloud whose chart renders LICENCE_RETIRE.
+invite pass. The check looks for that exact message, at least 3 minutes after
+the last sync, on a cloud whose chart renders LICENCE_RETIRE.
+
+It is a warning and never a gate (2.136.0). A QA test of 2.135.0 found the hub
+shows the CronJob as running for most of every minute, so the answer flipped
+between renders and the build went red again after it had cleared. The warning
+asks for patience and gives the commands to check by hand.
 
 A chart line without the revoke renders no LICENCE_RETIRE. Its folder removal
-gets a note and no gate, so retirements on other release lines keep working.
+gets a note, so retirements on other release lines keep working.
 """
 import os
 import sys
@@ -63,6 +68,7 @@ def app(health="Healthy", message=DONE, minutes_ago=30, sync="Synced", cron=True
                           "health": {"status": health, "message": message}})
     finished = (NOW - timedelta(minutes=minutes_ago)).strftime("%Y-%m-%dT%H:%M:%SZ")
     return {"metadata": {"name": f"{ENV}-ss"},
+            "spec": {"destination": {"name": "gcp-prod-pv-na2-a", "namespace": ENV}},
             "status": {"sync": {"status": sync}, "resources": resources,
                        "operationState": {"phase": "Succeeded", "finishedAt": finished}}}
 
@@ -137,21 +143,53 @@ def kinds(cand):
     return [g["kind"] for g in cand["gates"]]
 
 
-def test_purge_with_the_revoke_not_finished_is_a_licence_gate(monkeypatch):
+def test_purge_with_the_revoke_not_finished_is_a_warning_and_no_gate(monkeypatch):
     cand, text = _evaluate(monkeypatch, PURGE, ss=ss_resources(),
                            live=app("Degraded", "CronJob has not completed its last execution successfully"))
-    assert kinds(cand) == ["licence"]
-    assert cand["gates"][0]["env"] == ENV and "Degraded" in cand["gates"][0]["why"]
-    assert "not revoked yet" in text and f"Confirm-Licence-Revoked: {ENV}" in text
-    assert "checked again" not in text, "a lifted gate is not checked again"
-    assert all(len(line) <= 350 for line in text.splitlines() if "licence" in line.lower())
+    assert kinds(cand) == [], "the licence never blocks the PR"
+    assert cr._DECOM_LICENCE_HDR in text
+    assert "Degraded" in text and "the last pass failed" in text
+    assert "does not block the PR" in text and "in about 5 minutes" in text and "be patient" in text
+    assert "when main moves" in text and "pushed to the PR" in text, "says when the comment is refreshed"
+    assert "an empty one is enough" in text and "armed long ago" in text and "about 3 minutes" in text
+    assert "Replace `<spoke>`" not in text, "the cluster name is known here"
 
 
-def test_purge_with_the_licence_revoked_passes(monkeypatch):
+def test_the_warning_has_the_commands_to_check_by_hand(monkeypatch):
+    cand, text = _evaluate(monkeypatch, PURGE, ss=ss_resources(),
+                           live=app(message="The job is running. Its last execution may not have been successful"))
+    assert "ArgoCD says the job is running" in text and "says nothing about the licence" in text
+    assert f"argocd app get argocd/{ENV}-ss -o json" in text
+    assert f"kubectl --context gcp-prod-pv-na2-a -n {ENV} get pods" in text
+    assert "grep -E 'licence\\.|Licence:'" in text
+    for word in ("licence.revoked", "licence.waiting", "licence.failed", "Engineering",
+                 "Licence: none for this host", "both decommission flags reached the cloud"):
+        assert word in text
+    assert "clears by itself" not in text and "so wait." not in text
+
+
+def test_a_failed_lookup_has_no_cluster_name_and_says_so(monkeypatch):
+    cand, text = _evaluate(monkeypatch, PURGE, ss=ss_resources(), live=None)
+    assert kinds(cand) == [] and cr._DECOM_LICENCE_HDR in text
+    assert "--context <spoke>" in text and "the ArgoCD lookup failed" in text
+    assert "Replace `<spoke>` with the cluster of this environment" in text
+    assert "appspace.infra.<cloud>.targetCluster" in text
+
+
+@pytest.mark.parametrize("spec", [None, [], ["x"], {}, {"destination": None}, {"destination": []},
+                                  {"destination": {"name": None}}, {"destination": {"server": "https://x"}}])
+def test_a_odd_destination_in_the_application_never_breaks_the_comment(monkeypatch, spec):
+    live = app("Degraded", "CronJob has not completed its last execution successfully")
+    live["spec"] = spec
+    cand, text = _evaluate(monkeypatch, PURGE, ss=ss_resources(), live=live)
+    assert kinds(cand) == [] and cr._DECOM_LICENCE_HDR in text and "--context <spoke>" in text
+
+
+def test_purge_with_the_licence_revoked_says_so(monkeypatch):
     calls = []
     cand, text = _evaluate(monkeypatch, PURGE, ss=ss_resources(), live=app(), lookups=calls)
     assert kinds(cand) == []
-    assert "licence: revoked" in text
+    assert "licence: revoked" in text and cr._DECOM_LICENCE_HDR not in text
     assert calls == [f"{ENV}-ss"], "the supporting-services app is the one read"
 
 
@@ -159,7 +197,7 @@ def test_purge_with_the_licence_revoked_passes(monkeypatch):
                                          (None, "could not tell")])
 def test_a_green_cronjob_on_a_stale_live_state_is_not_a_revoke(monkeypatch, current, why):
     cand, text = _evaluate(monkeypatch, PURGE, ss=ss_resources(), live=app(), current=current)
-    assert kinds(cand) == ["licence"] and why in cand["gates"][0]["why"]
+    assert kinds(cand) == [] and cr._DECOM_LICENCE_HDR in text and why in text
 
 
 def test_no_supporting_services_app_is_a_note(monkeypatch):
@@ -169,17 +207,11 @@ def test_no_supporting_services_app_is_a_note(monkeypatch):
     assert "No supporting-services app" in text
 
 
-def test_a_failed_lookup_is_a_licence_gate_that_retries(monkeypatch):
-    cand, _ = _evaluate(monkeypatch, PURGE, ss=ss_resources(), live=None)
-    assert kinds(cand) == ["licence"]
-    assert cr.GATES["licence"][2] == "transient"
-
-
-def test_a_chart_without_the_revoke_gets_a_note_and_no_gate(monkeypatch):
+def test_a_chart_without_the_revoke_gets_a_note(monkeypatch):
     calls = []
     cand, text = _evaluate(monkeypatch, PURGE, ss=ss_resources(retire=False), live=app("Degraded"), lookups=calls)
     assert kinds(cand) == [] and calls == []
-    assert "does not revoke the Constellation licence" in text
+    assert "does not revoke the Constellation licence" in text and cr._DECOM_LICENCE_HDR not in text
 
 
 def test_a_chart_argo_cd_has_not_applied_yet_is_not_read_as_no_revoke(monkeypatch):
@@ -187,11 +219,13 @@ def test_a_chart_argo_cd_has_not_applied_yet_is_not_read_as_no_revoke(monkeypatc
     monkeypatch.setitem(m._app_chart_revision_map, f"{ENV}-ss", "2604.2.0-rev3")
     monkeypatch.setattr(m, "_main_chart_revision", lambda a, sha: "2604.3.0-rev1")
     cand, text = _evaluate(monkeypatch, PURGE, ss=ss_resources(retire=False), live=app("Degraded"))
-    assert kinds(cand) == ["licence"]
-    assert "2604.3.0-rev1" in cand["gates"][0]["why"] and "2604.2.0-rev3" in cand["gates"][0]["why"]
+    assert kinds(cand) == [] and cr._DECOM_LICENCE_HDR in text
+    assert "2604.3.0-rev1" in text and "2604.2.0-rev3" in text
+    assert "Check it by hand before you merge" in text, "not a timing problem, so no wait"
+    assert "after that" not in text and "Check by hand (read-only):" in text, "no dangling wait"
     monkeypatch.setattr(m, "_main_chart_revision", lambda a, sha: "2604.2.0-rev3")
     cand, text = _evaluate(monkeypatch, PURGE, ss=ss_resources(retire=False), live=app("Degraded"))
-    assert kinds(cand) == [] and "does not revoke" in text
+    assert kinds(cand) == [] and "does not revoke" in text and cr._DECOM_LICENCE_HDR not in text
 
 
 def test_an_unrendered_supporting_services_app_is_never_proven_revoked(monkeypatch):
@@ -199,9 +233,9 @@ def test_an_unrendered_supporting_services_app_is_never_proven_revoked(monkeypat
     # ends green every minute, so the live state alone proves nothing.
     calls = []
     cand, text = _evaluate(monkeypatch, PURGE, ss_fails=True, live=app(), lookups=calls)
-    assert kinds(cand) == ["licence"] and calls == []
-    assert "did not render" in cand["gates"][0]["why"]
-    assert f"Confirm-Licence-Revoked: {ENV}" in text
+    assert kinds(cand) == [] and calls == []
+    assert cr._DECOM_LICENCE_HDR in text and "did not render" in text
+    assert "licence: revoked" not in text
 
 
 def test_decommission_alone_is_a_migration_and_reads_nothing(monkeypatch):
@@ -211,26 +245,31 @@ def test_decommission_alone_is_a_migration_and_reads_nothing(monkeypatch):
     assert "Constellation licence" not in text
 
 
-def test_the_trailer_lifts_the_licence_gate():
-    text, trailer, token, fix = cr.GATES["licence"]
-    assert trailer == "Confirm-Licence-Revoked" and token == "transient" and not fix
-    gate = {"kind": "licence", "env": ENV, "why": "x"}
-    assert cr.gate_trailer(gate) == f"Confirm-Licence-Revoked: {ENV}"
+def test_the_gate_and_its_trailer_are_gone():
+    import identity
+    assert "licence" not in cr.GATES
+    assert identity._confirmations([f"Retire it\n\nConfirm-Licence-Revoked: {ENV}"]) == set()
+
+
+def test_the_merge_summary_says_it_is_a_review_item_and_not_a_stop(monkeypatch):
+    cand, text = _evaluate(monkeypatch, PURGE, ss=ss_resources(), live=app("Degraded"))
+    summary = "\n".join(cr._build_merge_summary({}, {}, [], text.splitlines(), [], [], [], gates=[]))
+    assert "licence is not confirmed revoked yet" in summary
+    assert "this does not block the PR" in summary
+    assert "in the decommission panel" in summary
+    assert "5 minutes" not in summary, "the summary promises no wait: the panel says why and for how long"
+    assert "DO NOT MERGE" not in summary
 
 
 # ── docs ─────────────────────────────────────────────────────────────────
 
-def test_the_licence_gate_has_a_guards_row_and_an_internals_row():
+def test_the_docs_describe_the_warning_and_not_a_gate():
     from test_cops2766_block3_docs import _cells, _guard_rows, _read
-    rows = [r for r in _guard_rows() if _cells(r)[0] == "**Licence not revoked**"]
-    assert len(rows) == 1 and "Confirm-Licence-Revoked: <env>" in _cells(rows[0])[3]
-    assert "| Licence not revoked |" in _read("docs/internals.md")
-
-
-def test_the_trailer_is_read_from_a_commit_message():
-    import identity
-    assert identity._confirmations([f"Retire it\n\nConfirm-Licence-Revoked: {ENV}"]) == \
-        {f"confirm-licence-revoked: {ENV}"}
+    assert not [r for r in _guard_rows() if "icence" in _cells(r)[0]], "no guards row: it is no gate"
+    text = " ".join((_read("docs/internals.md") + _read("docs/reference.md")).split())
+    assert "Confirm-Licence-Revoked" not in text
+    assert "is not confirmed revoked yet" in text and "never a gate" in text
+    assert "never blocks the build" in text
 
 
 # ── the ArgoCD lookup ────────────────────────────────────────────────────

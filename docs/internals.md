@@ -249,10 +249,33 @@ FAILED, the comment still shows the diff, and the merge summary starts with one
 | Shared user content | the purge is armed, and a surviving environment uses the same user content bucket and DNS record | `Confirm-Teardown: <env>` |
 | 7-day hold | the cascade is armed, and `zeroPods` or `decommission` has been true on `main` for less than 7 days | `Confirm-Decommission: <env>` |
 | Cascade not live | the cascade is armed in config, but ArgoCD has not put `resources-finalizer.argocd.argoproj.io` on the Applications | nothing, it clears itself |
-| Licence not revoked | the purge is armed on a private cloud whose chart revokes the Constellation licence (the `appspace-client-admins` CronJob renders `LICENCE_RETIRE`, COPS-3099). It holds until the supporting-services app is Synced on a commit that has the last change of the environment's `customer.yaml`, its last sync finished at least 3 minutes ago, and ArgoCD shows the CronJob Healthy with `CronJob has completed its last execution successfully`. Argo CD also shows Healthy while a pass runs, before any pass succeeded and while the CronJob is suspended, so only that message counts. A failed lookup counts as not revoked. So does a supporting-services app that did not render: on a line without the revoke, a retiring CronJob with the monitor on also ends green. A chart without the revoke gets a note and no gate, unless main asks for a chart version Argo CD has not applied yet: then it waits, because the render used the old chart | nothing, it clears itself. `Confirm-Licence-Revoked: <env>` when Engineering revoked the licence by hand |
 | Flag typo | a teardown flag that is misspelled or in the wrong place, so Phase 2 reads pending | nothing: fix the key on `main` in a separate PR, then rebase the removal |
 
-The same mechanism has four gates outside a teardown:
+The Constellation licence is a warning here, never a gate (COPS-3099, 2.136.0).
+With the purge armed on a private cloud whose chart revokes the licence (the
+`appspace-client-admins` CronJob renders `LICENCE_RETIRE`), the panel says either
+`Constellation licence: revoked` or `The Constellation licence is not confirmed
+revoked yet`. It says revoked only when the supporting-services app is Synced on
+a commit that has the last change of the environment's `customer.yaml`, its last
+sync finished at least 3 minutes ago, and ArgoCD shows the CronJob Healthy with
+`CronJob has completed its last execution successfully`. Anything else, a failed
+lookup and an unrendered supporting-services app included, is the warning. The
+warning is a review item in the merge summary, and the build stays green. It
+asks for patience (the CronJob revokes the licence within a few minutes of the
+sync, about 3 in a QA test), says what the ArgoCD message means, and gives two read-only commands to
+look by hand: the CronJob health in ArgoCD, and the last pass in the cluster,
+with what `licence.revoked`, `licence.waiting` and `licence.failed` mean. It was
+a transient gate in 2.135.0. A QA test showed that the hub shows a CronJob that
+runs every minute as running most of the time, so the exact message was on
+screen for a small part of each minute: the build went red again on a re-render
+after it had cleared, and the check would have been red most of the days between
+the purge and the folder removal. A chart without the revoke gets a note, unless
+main asks for a chart version Argo CD has not applied yet: then it is the warning,
+because the render used the old chart. The comment is recomputed when main moves or
+a commit is pushed to the PR, so a warning that is old can still say "not confirmed"
+after the revoke is done.
+
+The merge gates also cover four cases outside a teardown:
 
 - `Confirm-IP-Release: <env>`: a `ComputeAddress` or `DNSRecordSet` leaves the
   render of a live env with no explicit `deletion-policy: abandon`, so GCP

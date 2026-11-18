@@ -198,6 +198,7 @@ from comment_render import (  # comment rendering (same-dir module, stdlib only)
     _DECOM_FLAG_TYPO_HDR,
     _DECOM_CASCADE_NOT_LIVE_HDR,
     _DECOM_PAUSED_HDR,
+    _DECOM_LICENCE_HDR,
     _SHUTDOWN_MIN_WORKLOADS,
     _is_env_shutdown,
     _NEW_ENV_CHECK_PREFIX,
@@ -7384,6 +7385,10 @@ def _cascade_mismatch_note(env_name, apps, cascade: bool) -> list:
 # any pass succeeded, while it is suspended, and right after the arming sync
 # with the success of an older invite pass. Only the exact success message, at
 # least LICENCE_SETTLE_SECONDS after the last sync, means the licence is gone.
+# That message is only on screen for a small part of every minute (the hub shows
+# the CronJob as running most of the time), so the check is a warning with the
+# commands to look by hand, and never a gate: a QA test of 2.135.0 had the
+# build go red again on a re-render after it had cleared (COPS-3099).
 _LICENCE_CRONJOB = "appspace-client-admins"
 _LICENCE_DONE = "CronJob has completed its last execution successfully"
 LICENCE_SETTLE_SECONDS = 180
@@ -7483,7 +7488,7 @@ def _live_config_revision(app_json) -> str:
 def _licence_live_is_current(app_json, identity_file, main_sha):
     """Does the live Application include the last main commit that changed the
     environment's own file (the one that armed the purge)? True or False. None
-    when the git mirror cannot tell, so the caller waits and checks again."""
+    when the git mirror cannot tell, so the caller says it could not tell."""
     rev = _live_config_revision(app_json)
     if not rev or not GIT_MIRROR_ENABLED or _mirror_disabled or not main_sha:
         return None
@@ -7500,33 +7505,83 @@ def _licence_live_is_current(app_json, identity_file, main_sha):
     return None if r is None else {0: True, 1: False}.get(r.returncode)
 
 
+_LICENCE_CHECK_CMDS = (
+    "# ArgoCD: the health of the CronJob\n"
+    "argocd app get argocd/{env}-ss -o json | jq '.status.resources[] | "
+    "select(.kind==\"CronJob\" and .name==\"appspace-client-admins\") | .health'\n"
+    "# cluster: what the last pass did\n"
+    "kubectl --context {ctx} -n {env} get pods -l app.kubernetes.io/name="
+    "appspace-client-admins-job --sort-by=.metadata.creationTimestamp -o name | tail -1 | "
+    "xargs kubectl --context {ctx} -n {env} logs | grep -E 'licence\\.|Licence:'")
+
+
+def _licence_pending_lines(env_name, why, dest="", timing=True):
+    """The warning for a licence that is not proven revoked. It never blocks
+    the PR. It says why, asks for patience, and gives the commands to check by
+    hand and what each answer means."""
+    lines = [f"\u23f3 **{_DECOM_LICENCE_HDR}**: {why}.", ""]
+    hint = ""
+    if "Degraded" in why:
+        hint = ("ArgoCD shows the CronJob Degraded: the last pass failed, with `licence.waiting` "
+                "(license-service or apigateway not ready yet) or `licence.failed`. The log "
+                "line in the commands below says which.")
+    elif "is running" in why:
+        hint = ("ArgoCD says the job is running. It says that for most of every minute, although "
+                "a pass lasts a few seconds, so on its own it says nothing about the licence.")
+    if hint:
+        lines += [hint, ""]
+    if timing:
+        lines += ["This does not block the PR. The `appspace-client-admins` CronJob revokes the "
+                  "licence within a few minutes of the sync that armed the purge (about 3 minutes "
+                  "in a QA test), and ArgoCD shows its health with a delay, so this line can say "
+                  "'not confirmed' even long after the revoke. If the purge was armed a few "
+                  "minutes ago, please be patient and look at this comment again in about 5 "
+                  "minutes. If it was armed long ago, the commands below give the answer. This "
+                  "comment is refreshed when main moves or when a commit is pushed to the PR "
+                  "(an empty one is enough).", ""]
+    else:
+        lines += ["This does not block the PR, but nothing here proves the licence was revoked. "
+                  "Check it by hand before you merge.", ""]
+    lines += ["If it still says so after that, check by hand (read-only):" if timing
+              else "Check by hand (read-only):", "", "```bash",
+              _LICENCE_CHECK_CMDS.format(env=env_name, ctx=dest or "<spoke>"), "```", ""]
+    if not dest:
+        lines += ["Replace `<spoke>` with the cluster of this environment "
+                  "(`appspace.infra.<cloud>.targetCluster`).", ""]
+    lines += ["`licence.revoked`, `Licence: already revoked.` or `Licence: none for this host in "
+              "license-service.` (nothing to revoke) means it is done. "
+              "`licence.waiting` means license-service or apigateway has no available pod yet: "
+              "wait a few minutes, and if it lasts check that both decommission flags reached "
+              "the cloud. "
+              "`licence.failed` means the pass could not revoke it: its log line says why, and "
+              "Engineering can help. Once the folder is removed, nothing in the cluster can "
+              "revoke the licence any more. The decommission runbook has the call straight to "
+              "Connect.", ""]
+    return lines
+
+
 def _licence_teardown_check(env_name, apps, purges_data, licence_step, ss_unrendered,
                             identity_file="", main_sha=""):
-    """(gate or None, panel lines) for a private-cloud folder removal.
+    """The panel lines about the licence of a private-cloud folder removal.
 
     Only a purge revokes the licence: `decommission` alone is a migration, and
     the licence moves with the database. A chart that does not render the
     revoke (another release line, an AEC tenant with the registration off)
-    gets a note and no gate, so it never blocks those retirements. A chart
-    that does waits until ArgoCD shows the revoke done on a live state that
-    already has the commit that armed the purge. When the supporting-services
-    app did not render, nothing proves the revoke: on a line without it, a
-    retiring CronJob with the monitor on also ends green every minute."""
+    gets a note. A chart that does gets a line that says the licence is
+    revoked, or a warning that says it is not proven yet. Neither blocks the
+    PR. When the supporting-services app did not render, nothing proves the
+    revoke: on a line without it, a retiring CronJob with the monitor on also
+    ends green every minute."""
     if not purges_data:
-        return None, []
+        return []
     ss = [a for a in apps or () if a.split("/")[-1].endswith("-ss")]
     if not ss:
-        return None, ["\u2139\ufe0f No supporting-services app was found for this environment, "
-                      "so its Constellation licence was not checked.", ""]
-    way_out = (f"If Engineering revoked the licence by hand, add `Confirm-Licence-Revoked: "
-               f"{env_name}` to a commit message. When the pass log says `licence.failed`, ask "
-               "Engineering.")
+        return ["\u2139\ufe0f No supporting-services app was found for this environment, "
+                "so its Constellation licence was not checked.", ""]
     if ss_unrendered:
-        why = ("the supporting-services app did not render, so it is not known whether its "
-               "chart revokes the licence")
-        return ({"kind": "licence", "env": env_name, "why": why}, [
-            f"\u23f3 **The Constellation licence is not proven revoked**: {why}.", "",
-            way_out, ""])
+        return _licence_pending_lines(
+            env_name, "the supporting-services app did not render, so it is not known "
+                      "whether its chart revokes the licence", timing=False)
     if not licence_step:
         # The render used the chart Argo CD has. Right after a bump onto a line
         # with the revoke, main may already ask for another one.
@@ -7537,17 +7592,14 @@ def _licence_teardown_check(env_name, apps, purges_data, licence_step, ss_unrend
             logsink.debug(f"licence check: main chart version of {ss[0]} unknown: {e}")
             main_rev = argo_rev
         if argo_rev and main_rev and main_rev != argo_rev:
-            why = (f"Argo CD has not applied the chart version main asks for yet (main "
-                   f"`{main_rev}`, Argo CD `{argo_rev}`), so it is not known whether that chart "
-                   "revokes the licence")
-            return ({"kind": "licence", "env": env_name, "why": why}, [
-                f"\u23f3 **The Constellation licence is not proven revoked**: {why}.", "",
-                way_out, ""])
-        return None, [
-            "\u2139\ufe0f This cloud's chart does not revoke the Constellation licence by "
-            "itself (no `LICENCE_RETIRE` on `appspace-client-admins`). If the cloud has a "
-            "licence, revoke it as the decommission runbook of its release line says before "
-            "you merge. An AEC tenant has none.", ""]
+            return _licence_pending_lines(
+                env_name, f"Argo CD has not applied the chart version main asks for yet (main "
+                          f"`{main_rev}`, Argo CD `{argo_rev}`), so it is not known whether "
+                          "that chart revokes the licence", timing=False)
+        return ["\u2139\ufe0f This cloud's chart does not revoke the Constellation licence by "
+                "itself (no `LICENCE_RETIRE` on `appspace-client-admins`). If the cloud has a "
+                "licence, revoke it as the decommission runbook of its release line says before "
+                "you merge. An AEC tenant has none.", ""]
     live = _licence_app_json(ss[0])
     revoked, why = _licence_revoke_state(live)
     if revoked:
@@ -7557,14 +7609,13 @@ def _licence_teardown_check(env_name, apps, purges_data, licence_step, ss_unrend
             why = ("ArgoCD does not show the commit that armed the purge yet" if current is False
                    else "could not tell whether ArgoCD shows the commit that armed the purge")
     if revoked:
-        return None, [
-            f"\U0001f511 Constellation licence: revoked. ArgoCD shows the last pass of "
-            f"`{_LICENCE_CRONJOB}` succeeded, and the last sync finished at least 3 minutes "
-            "ago.", ""]
-    return ({"kind": "licence", "env": env_name, "why": why}, [
-        f"\u23f3 **The Constellation licence is not revoked yet**: {why}. Removing the "
-        "folder now leaves the instance active on the customer account in Connect.", "",
-        way_out, ""])
+        return [f"\U0001f511 Constellation licence: revoked. ArgoCD shows the last pass of "
+                f"`{_LICENCE_CRONJOB}` succeeded, and the last sync finished at least 3 minutes "
+                "ago.", ""]
+    spec = (live or {}).get("spec") if isinstance(live, dict) else None
+    dest_obj = spec.get("destination") if isinstance(spec, dict) else None
+    dest = str(dest_obj.get("name") or "") if isinstance(dest_obj, dict) else ""
+    return _licence_pending_lines(env_name, why, dest)
 
 
 def _paused_apps_for(apps, path_map, sha, repo=None) -> set:
@@ -9055,13 +9106,10 @@ def _evaluate_env_decommissions(candidates: list, pr_sha: str, main_sha: str,
             hold = _teardown_hold_met(c["identity_file"], main_sha)
             if hold is not True:
                 c["gates"].append({"kind": _HOLD_GATES[hold], "env": c["env_name"]})
-            # COPS-3099: the licence revoke has to finish before the folder goes.
-            licence_gate, licence_lines = _licence_teardown_check(
+            # COPS-3099: whether the licence revoke finished. A warning, never a gate.
+            lines += _licence_teardown_check(
                 c["env_name"], c["apps"], purges_data, licence_step, ss_unrendered,
                 c["identity_file"], main_sha)
-            lines += licence_lines
-            if licence_gate:
-                c["gates"].append(licence_gate)
         if public_cloud:
             lines += [
                 "\u26a0\ufe0f " + _DECOM_PUBLIC_CLOUD_HDR,
