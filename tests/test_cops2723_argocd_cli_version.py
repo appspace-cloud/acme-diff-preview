@@ -31,10 +31,10 @@ def _parts(v):
     return tuple(int(x) for x in v.lstrip("v").split("-")[0].split(".")[:3])
 
 
-def test_argocd_cli_is_at_least_3_5():
-    """A 3.4 CLI against the 3.5 fleet is the skew this ticket removes."""
-    assert _parts(_arg("ARGOCD_VERSION")) >= (3, 5, 0), (
-        f"ARGOCD_VERSION is {_arg('ARGOCD_VERSION')}; the fleet runs Argo CD 3.5.x"
+def test_argocd_cli_is_at_least_3_6():
+    """The CLI tracks the fleet minor. A CLI one minor behind the hub is the skew to avoid."""
+    assert _parts(_arg("ARGOCD_VERSION")) >= (3, 6, 0), (
+        f"ARGOCD_VERSION is {_arg('ARGOCD_VERSION')}; the fleet runs Argo CD 3.6.x"
     )
 
 
